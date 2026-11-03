@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block title %}Collaborators · {{ owner }}/{{ name }}{% endblock %}
+{% block content %}
+<h1><a href="/{{ owner }}">{{ owner }}</a> / <a href="/{{ owner }}/{{ name }}">{{ name }}</a> · Collaborators</h1>
+{% if let Some(e) = error %}<p class="error">{{ e }}</p>{% endif %}
+{% if collaborators.is_empty() %}
+<p class="muted">No collaborators yet.</p>
+{% else %}
+<table class="list">
+<thead><tr><th>User</th><th>Permission</th><th></th></tr></thead>
+<tbody>
+{% for c in collaborators %}
+<tr><td><a href="/{{ c.handle }}">{{ c.handle }}</a></td><td>{{ c.permission }}</td>
+<td><form method="post" action="/{{ owner }}/{{ name }}/settings/collaborators/{{ c.handle }}/remove" class="inline"><input type="hidden" name="_csrf" value="{{ csrf }}"><button type="submit">Remove</button></form></td></tr>
+{% endfor %}
+</tbody>
+</table>
+{% endif %}
+<h2>Add or change a collaborator</h2>
+<form method="post" action="/{{ owner }}/{{ name }}/settings/collaborators" class="stack">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <label>Handle <input name="handle" required></label>
+  <label>Permission <select name="permission">{% for p in permission_choices %}<option value="{{ p }}">{{ p }}</option>{% endfor %}</select></label>
+  <button type="submit">Save</button>
+</form>
+{% endblock %}

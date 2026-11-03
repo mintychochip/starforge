@@ -54,6 +54,15 @@ fn page_routes() -> Router<AppState> {
             get(pages::tokens::list).post(pages::tokens::create),
         )
         .route("/settings/tokens/{id}/revoke", post(pages::tokens::revoke))
+        .route("/{owner}", get(pages::owner::show))
+        .route(
+            "/{owner}/{repo}/settings/collaborators",
+            get(pages::collaborators::list).post(pages::collaborators::add),
+        )
+        .route(
+            "/{owner}/{repo}/settings/collaborators/{handle}/remove",
+            post(pages::collaborators::remove),
+        )
         .route("/static/starforge.css", get(stylesheet))
 }
 
