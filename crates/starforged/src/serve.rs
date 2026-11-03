@@ -18,7 +18,7 @@ pub struct App {
     pub core: Core,
 }
 
-/// The whole application: `/healthz`, web pages, and git smart HTTP.
+/// The whole application: `/healthz`, `/api/v1`, web pages, and git smart HTTP.
 pub async fn build(config: &Config, hook_exe: PathBuf) -> anyhow::Result<App> {
     let core = open_core(config, hook_exe).await?;
     let web = starforged_web::router(
@@ -28,8 +28,10 @@ pub async fn build(config: &Config, hook_exe: PathBuf) -> anyhow::Result<App> {
             secure_cookies: config.secure_cookies(),
         },
     );
+    let api = starforged_api::router(core.clone(), config.server.base_url.clone());
     let router = Router::new()
         .route("/healthz", get(|| async { "ok" }))
+        .nest("/api/v1", api)
         .merge(web);
     Ok(App { router, core })
 }

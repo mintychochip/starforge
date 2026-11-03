@@ -3662,6 +3662,8 @@ dependencies = [
  "hex",
  "reqwest",
  "serde",
+ "serde_json",
+ "starforged-api",
  "starforged-core",
  "starforged-db",
  "starforged-git",
@@ -3671,6 +3673,17 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "starforged-api"
+version = "0.0.0"
+dependencies = [
+ "axum",
+ "serde",
+ "serde_json",
+ "starforged-core",
+ "tracing",
 ]
 
 [[package]]
