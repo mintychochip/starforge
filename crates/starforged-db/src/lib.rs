@@ -18,6 +18,7 @@ pub mod collaborators;
 pub mod repos;
 pub mod tokens;
 pub mod users;
+pub mod web_sessions;
 
 static SQLITE_MIGRATIONS: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/sqlite");
 static POSTGRES_MIGRATIONS: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/postgres");

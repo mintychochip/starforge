@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block title %}Sign in · Starforge{% endblock %}
+{% block content %}
+<h1>Sign in</h1>
+{% if let Some(e) = error %}<p class="error">{{ e }}</p>{% endif %}
+<form method="post" action="/login" class="stack">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <input type="hidden" name="next" value="{{ next }}">
+  <label>Handle or email <input name="login" autocomplete="username" required value="{{ login }}"></label>
+  <label>Password <input name="password" type="password" autocomplete="current-password" required></label>
+  <button type="submit">Sign in</button>
+</form>
+{% endblock %}

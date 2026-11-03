@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block content %}
+{% if nav_user.is_some() %}
+<h1>Your repositories</h1>
+{% if repos.is_empty() %}
+<p>No repositories yet. <a href="/new">Create one</a>.</p>
+{% else %}
+<ul class="repo-list">
+{% for r in repos %}
+<li><a href="/{{ r.owner }}/{{ r.name }}">{{ r.owner }}/{{ r.name }}</a> <span class="badge">{{ r.visibility }}</span>{% if !r.description.is_empty() %} <span class="muted">{{ r.description }}</span>{% endif %}</li>
+{% endfor %}
+</ul>
+{% endif %}
+{% else %}
+<h1>Starforge</h1>
+<p>A self-hosted forge for code and the agent sessions behind it. <a href="/login">Sign in</a> to continue.</p>
+{% endif %}
+{% endblock %}

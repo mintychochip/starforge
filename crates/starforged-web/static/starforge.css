@@ -1,0 +1,35 @@
+:root { color-scheme: light dark; --fg: #1f2328; --muted: #59636e; --border: #d1d9e0; --accent: #0969da; --add: #dafbe1; --del: #ffebe9; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg: #e6edf3; --muted: #9198a1; --border: #3d444d; --accent: #4493f8; --add: #12261e; --del: #25171c; }
+}
+body { font: 15px/1.5 system-ui, sans-serif; color: var(--fg); margin: 0; }
+header.site { display: flex; justify-content: space-between; align-items: center; padding: .6rem 1.2rem; border-bottom: 1px solid var(--border); }
+header.site nav { display: flex; gap: 1rem; align-items: center; }
+main { max-width: 72rem; margin: 1.5rem auto; padding: 0 1.2rem; }
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+.brand { font-weight: 700; }
+.muted { color: var(--muted); }
+.badge { border: 1px solid var(--border); border-radius: 1rem; padding: 0 .5rem; font-size: .8rem; color: var(--muted); }
+.error { color: #cf222e; }
+.notice { border: 1px solid var(--border); border-radius: .4rem; padding: .5rem 1rem; }
+form.inline { display: inline; }
+form.stack { display: grid; gap: .8rem; max-width: 28rem; }
+form.stack label { display: grid; gap: .2rem; }
+label.check { display: flex; gap: .4rem; align-items: center; }
+table.list, table.code, table.diff { border-collapse: collapse; width: 100%; }
+table.list td, table.list th { border-bottom: 1px solid var(--border); padding: .35rem .5rem; text-align: left; }
+table.code td, table.diff td { padding: 0 .5rem; vertical-align: top; }
+td.ln { color: var(--muted); text-align: right; user-select: none; width: 1%; white-space: nowrap; }
+pre { margin: 0; white-space: pre-wrap; word-break: break-word; font: 13px/1.45 ui-monospace, monospace; }
+tr.add { background: var(--add); }
+tr.del { background: var(--del); }
+tr.hunk td { color: var(--muted); padding: .3rem .5rem; }
+td.dir a::before { content: "▸ "; }
+ul.repo-list, ol.commits { list-style: none; padding: 0; }
+ul.repo-list li, ol.commits li { padding: .4rem 0; border-bottom: 1px solid var(--border); }
+nav.tabs { display: flex; gap: 1rem; margin: .5rem 0 1rem; }
+pre.token { font-size: 1rem; padding: .5rem; border: 1px dashed var(--border); }
+article.readme { border: 1px solid var(--border); border-radius: .4rem; padding: 1rem 1.5rem; margin-top: 1.5rem; }
+section.file { border: 1px solid var(--border); border-radius: .4rem; margin: 1rem 0; }
+section.file h3 { margin: 0; padding: .4rem .8rem; border-bottom: 1px solid var(--border); font-size: .95rem; }

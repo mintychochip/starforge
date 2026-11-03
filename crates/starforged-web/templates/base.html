@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}Starforge{% endblock %}</title>
+<link rel="stylesheet" href="/static/starforge.css">
+</head>
+<body>
+<header class="site">
+  <a class="brand" href="/">Starforge</a>
+  <nav>
+  {% if let Some(u) = nav_user %}
+    <a href="/new">New repository</a>
+    <a href="/settings/tokens">Tokens</a>
+    <a href="/{{ u.handle }}">{{ u.handle }}</a>
+    <form method="post" action="/logout" class="inline">
+      <input type="hidden" name="_csrf" value="{{ u.csrf }}">
+      <button type="submit">Sign out</button>
+    </form>
+  {% else %}
+    <a href="/login">Sign in</a>
+  {% endif %}
+  </nav>
+</header>
+<main>
+{% block content %}{% endblock %}
+</main>
+</body>
+</html>

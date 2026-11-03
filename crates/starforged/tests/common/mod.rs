@@ -180,3 +180,83 @@ pub fn noise(len: usize) -> Vec<u8> {
         })
         .collect()
 }
+
+impl TestServer {
+    /// A cookie-keeping client that does not follow redirects.
+    pub fn browser(&self) -> reqwest::Client {
+        reqwest::Client::builder()
+            .cookie_store(true)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap()
+    }
+
+    /// Signs `handle` in through the login form; returns the client and the session's CSRF token.
+    pub async fn login(&self, handle: &str) -> (reqwest::Client, String) {
+        let client = self.browser();
+        let page = client
+            .get(self.url("/login"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        let csrf = extract_input(&page, "_csrf");
+        let response = client
+            .post(self.url("/login"))
+            .form(&[
+                ("_csrf", csrf.as_str()),
+                ("next", "/"),
+                ("login", handle),
+                ("password", PASSWORD),
+            ])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 303, "signing in as {handle} failed");
+        let dashboard = client
+            .get(self.url("/"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        let session_csrf = extract_input(&dashboard, "_csrf");
+        (client, session_csrf)
+    }
+}
+
+/// The value of the first `<input … name="{name}" value="…">` in `html`.
+pub fn extract_input(html: &str, name: &str) -> String {
+    let marker = format!(r#"name="{name}" value=""#);
+    let start = html
+        .find(&marker)
+        .unwrap_or_else(|| panic!("no input named {name} in:\n{html}"))
+        + marker.len();
+    html[start..].split('"').next().unwrap().to_owned()
+}
+
+/// The text between the first `start` and the next `end`.
+pub fn between(html: &str, start: &str, end: &str) -> String {
+    let from = html
+        .find(start)
+        .unwrap_or_else(|| panic!("{start:?} not found in:\n{html}"))
+        + start.len();
+    let len = html[from..]
+        .find(end)
+        .unwrap_or_else(|| panic!("{end:?} not found after {start:?}"));
+    html[from..from + len].to_owned()
+}
+
+/// GET that must succeed; returns the body.
+pub async fn get_text(client: &reqwest::Client, url: &str) -> String {
+    let response = client.get(url).send().await.unwrap();
+    assert!(
+        response.status().is_success(),
+        "GET {url} returned {}",
+        response.status()
+    );
+    response.text().await.unwrap()
+}

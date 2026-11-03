@@ -7,6 +7,7 @@ pub mod crypto;
 pub mod error;
 pub mod permission;
 pub mod repos;
+pub mod sessions;
 pub mod tokens;
 pub mod validate;
 
