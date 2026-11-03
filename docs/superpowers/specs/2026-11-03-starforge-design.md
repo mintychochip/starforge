@@ -585,6 +585,7 @@ Each milestone ends in a usable increment and gets its own implementation plan.
 | Milestone | Delivers |
 |---|---|
 | **M0** Hosting skeleton | Workspace and crate layout; config and `init`; schema and migrations on SQLite and Postgres; local accounts and personal access tokens; user-owned repositories with collaborators and permission levels; push and pull over smart HTTP; code, history, commit, and diff browsing |
+| **M0.5** Forge basics | Registration modes and invites; email verification and password reset over optional SMTP; account settings; repository settings, initial README, rename with redirects, archive, delete with restore; branches, tags, compare; syntax highlighting; site admin; jobs queue (`2026-11-03-starforge-forge-basics-design.md`) |
 | **M1** Traces end to end | Trace Format v1 spec and crate; redaction crate; CLI (device-flow login, enable/disable, git hooks, 5 adapters, trailers, spool, upload, sync); server ingest (re-scan, quarantine, blobs, links); session viewer; commit Sessions panel; blame with sessions; §6.4 rules |
 | **M2** Trails | Trails with intent, comments, labels, assignees; changes (`branch` and `agit`); revisions; reviews with inline threads; commit status API; webhooks; gate rules including session evidence; server-side merge |
 | **M3** Orgs and SSH | Orgs, teams, base permissions; branch and tag protection; SSH via russh; deploy keys; OIDC single sign-on; TOTP |
