@@ -1278,6 +1278,7 @@ dependencies = [
  "serde",
  "starforged-core",
  "starforged-db",
+ "starforged-git",
  "tempfile",
  "tokio",
  "toml",

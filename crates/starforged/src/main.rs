@@ -37,6 +37,12 @@ enum Command {
         #[command(subcommand)]
         command: AdminCommand,
     },
+    /// Entry points for git hooks in hosted repositories.
+    #[command(hide = true)]
+    Hook {
+        #[command(subcommand)]
+        hook: HookCommand,
+    },
 }
 
 #[derive(Subcommand)]
@@ -86,6 +92,12 @@ enum AdminTokenCommand {
         #[arg(long, default_value_t = 30)]
         expires_days: u32,
     },
+}
+
+#[derive(Subcommand)]
+enum HookCommand {
+    /// Checks pushed refs (`<old> <new> <ref>` lines on stdin).
+    PreReceive,
 }
 
 #[tokio::main]
@@ -151,6 +163,14 @@ async fn main() -> anyhow::Result<()> {
                     );
                 }
             }
+        }
+        Command::Hook {
+            hook: HookCommand::PreReceive,
+        } => {
+            std::process::exit(starforged::hook::pre_receive(
+                std::io::stdin().lock(),
+                std::io::stderr(),
+            ));
         }
     }
     Ok(())

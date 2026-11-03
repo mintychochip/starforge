@@ -17,6 +17,7 @@ hex.workspace = true
 serde.workspace = true
 starforged-core = { path = "../starforged-core" }
 starforged-db = { path = "../starforged-db" }
+starforged-git = { path = "../starforged-git" }
 tokio.workspace = true
 toml.workspace = true
 
