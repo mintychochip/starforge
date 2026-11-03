@@ -1,6 +1,7 @@
 //! Repository content for viewers who passed a permission check (they hold a `RepoAccess`).
 
 use starforged_git::GitError;
+use starforged_git::diff::CommitDiff;
 use starforged_git::read::{self, CommitInfo, Resolved, TreeEntry};
 
 use crate::repos::RepoAccess;
@@ -79,5 +80,16 @@ impl Core {
         blocking(move || read::commit(&repo, &id))
             .await?
             .ok_or(CoreError::NotFound)
+    }
+}
+
+/// Diff lines rendered per commit before truncating.
+pub const MAX_DIFF_LINES: usize = 10_000;
+
+impl Core {
+    /// The diff of commit `commit_id` against its first parent.
+    pub async fn diff(&self, access: &RepoAccess, commit_id: &str) -> CoreResult<CommitDiff> {
+        let repo = self.repo_path(access.repo.id);
+        Ok(starforged_git::diff::commit_diff(&repo, commit_id, MAX_DIFF_LINES).await?)
     }
 }

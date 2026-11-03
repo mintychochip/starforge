@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block title %}Commits · {{ owner }}/{{ name }}{% endblock %}
+{% block content %}
+<h1><a href="/{{ owner }}">{{ owner }}</a> / <a href="/{{ owner }}/{{ name }}">{{ name }}</a> · Commits on <span class="badge">{{ ref_name }}</span></h1>
+<ol class="commits">
+{% for c in commits %}
+<li><a href="/{{ owner }}/{{ name }}/commit/{{ c.id }}"><code>{{ c.short_id }}</code></a> {{ c.summary }} <span class="muted">{{ c.author }} · {{ c.when }}</span></li>
+{% endfor %}
+</ol>
+<p class="pager">{% if page > 1 %}<a href="?page={{ page - 1 }}">Newer</a> {% endif %}{% if has_next %}<a href="?page={{ page + 1 }}">Older</a>{% endif %}</p>
+{% endblock %}

@@ -3,6 +3,7 @@
 pub mod code;
 pub mod collaborators;
 pub mod dashboard;
+pub mod history;
 pub mod login;
 pub mod owner;
 pub mod repo_new;

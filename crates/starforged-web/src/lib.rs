@@ -68,6 +68,11 @@ fn page_routes() -> Router<AppState> {
         .route("/{owner}/{repo}/tree/{*rest}", get(pages::code::tree))
         .route("/{owner}/{repo}/blob/{*rest}", get(pages::code::blob))
         .route("/{owner}/{repo}/raw/{*rest}", get(pages::code::raw))
+        .route(
+            "/{owner}/{repo}/commits/{*rest}",
+            get(pages::history::commits),
+        )
+        .route("/{owner}/{repo}/commit/{id}", get(pages::history::commit))
         .route("/static/starforge.css", get(stylesheet))
 }
 
