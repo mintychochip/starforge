@@ -3,6 +3,7 @@
 pub mod auth;
 pub mod error;
 pub mod githttp;
+pub mod markdown;
 mod pages;
 pub mod views;
 
@@ -63,6 +64,10 @@ fn page_routes() -> Router<AppState> {
             "/{owner}/{repo}/settings/collaborators/{handle}/remove",
             post(pages::collaborators::remove),
         )
+        .route("/{owner}/{repo}", get(pages::code::repo_home))
+        .route("/{owner}/{repo}/tree/{*rest}", get(pages::code::tree))
+        .route("/{owner}/{repo}/blob/{*rest}", get(pages::code::blob))
+        .route("/{owner}/{repo}/raw/{*rest}", get(pages::code::raw))
         .route("/static/starforge.css", get(stylesheet))
 }
 

@@ -3,6 +3,7 @@
 
 pub mod accounts;
 pub mod audit;
+pub mod content;
 pub mod crypto;
 pub mod error;
 pub mod permission;

@@ -53,6 +53,65 @@ pub fn format_time(unix: i64) -> String {
         .unwrap_or_default()
 }
 
+use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
+
+/// Characters percent-encoded inside a single URL path segment.
+const SEGMENT: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'%')
+    .add(b'<')
+    .add(b'>')
+    .add(b'?')
+    .add(b'`')
+    .add(b'{')
+    .add(b'}')
+    .add(b'/')
+    .add(b'\\');
+
+/// Percent-encodes each `/`-separated segment of `path`, dropping empty segments.
+pub fn encode_path(path: &str) -> String {
+    path.split('/')
+        .filter(|s| !s.is_empty())
+        .map(|s| utf8_percent_encode(s, SEGMENT).to_string())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// `/{owner}/{repo}/{kind}/{ref}[/{path}]`, every ref and path segment encoded.
+pub fn content_href(owner: &str, repo: &str, kind: &str, ref_name: &str, path: &str) -> String {
+    let mut href = format!("/{owner}/{repo}/{kind}/{}", encode_path(ref_name));
+    let encoded = encode_path(path);
+    if !encoded.is_empty() {
+        href.push('/');
+        href.push_str(&encoded);
+    }
+    href
+}
+
+pub struct Crumb {
+    pub name: String,
+    pub href: String,
+}
+
+/// One tree link per directory level of `dir`.
+pub fn crumbs(owner: &str, repo: &str, ref_name: &str, dir: &str) -> Vec<Crumb> {
+    let mut out = Vec::new();
+    let mut prefix = String::new();
+    for segment in dir.split('/').filter(|s| !s.is_empty()) {
+        if !prefix.is_empty() {
+            prefix.push('/');
+        }
+        prefix.push_str(segment);
+        out.push(Crumb {
+            name: segment.to_owned(),
+            href: content_href(owner, repo, "tree", ref_name, &prefix),
+        });
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -60,5 +119,26 @@ mod tests {
     #[test]
     fn formats_unix_time_in_utc() {
         assert_eq!(format_time(1_700_000_000), "2023-11-14 22:13 UTC");
+    }
+
+    #[test]
+    fn content_hrefs_encode_each_segment() {
+        assert_eq!(
+            content_href("alice", "proj", "blob", "feature/x", "docs/a b.txt"),
+            "/alice/proj/blob/feature/x/docs/a%20b.txt"
+        );
+        assert_eq!(
+            content_href("alice", "proj", "tree", "main", ""),
+            "/alice/proj/tree/main"
+        );
+        assert_eq!(encode_path("a#b/c?d"), "a%23b/c%3Fd");
+        let hrefs: Vec<String> = crumbs("alice", "proj", "main", "src/bin")
+            .into_iter()
+            .map(|c| c.href)
+            .collect();
+        assert_eq!(
+            hrefs,
+            vec!["/alice/proj/tree/main/src", "/alice/proj/tree/main/src/bin"]
+        );
     }
 }

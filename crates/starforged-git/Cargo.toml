@@ -12,6 +12,6 @@ workspace = true
 [dependencies]
 thiserror.workspace = true
 tokio.workspace = true
-
+gix.workspace = true
 [dev-dependencies]
 tempfile.workspace = true

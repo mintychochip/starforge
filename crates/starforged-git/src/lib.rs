@@ -4,5 +4,6 @@
 pub mod command;
 pub mod http;
 pub mod init;
+pub mod read;
 pub mod refpolicy;
 pub use command::GitError;

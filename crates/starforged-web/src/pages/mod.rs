@@ -1,5 +1,6 @@
 //! One module per page or page group.
 
+pub mod code;
 pub mod collaborators;
 pub mod dashboard;
 pub mod login;

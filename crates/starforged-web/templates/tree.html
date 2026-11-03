@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %}{{ owner }}/{{ name }} · Starforge{% endblock %}
+{% block content %}
+<div class="repo-head">
+<h1><a href="/{{ owner }}">{{ owner }}</a> / <a href="/{{ owner }}/{{ name }}">{{ name }}</a> <span class="badge">{{ visibility }}</span></h1>
+{% if !description.is_empty() %}<p class="muted">{{ description }}</p>{% endif %}
+<nav class="tabs">
+<a href="/{{ owner }}/{{ name }}">Code</a>
+{% if !empty %}<a href="{{ commits_href }}">Commits</a>{% endif %}
+{% if can_admin %}<a href="/{{ owner }}/{{ name }}/settings/collaborators">Collaborators</a>{% endif %}
+</nav>
+<p>Clone with <code>git clone {{ clone_url }}</code></p>
+</div>
+{% if empty %}
+<p>This repository is empty. Push an existing repository to it:</p>
+<pre>git remote add origin {{ clone_url }}
+git push -u origin main</pre>
+{% else %}
+<p class="crumbs"><span class="badge">{{ ref_name }}</span>{% for c in crumbs %} / <a href="{{ c.href }}">{{ c.name }}</a>{% endfor %}</p>
+<table class="list files"><tbody>
+{% for e in entries %}
+<tr><td class="{% if e.is_dir %}dir{% else %}file{% endif %}">{% if e.href.is_empty() %}{{ e.name }}{% else %}<a href="{{ e.href }}">{{ e.name }}</a>{% endif %}</td></tr>
+{% endfor %}
+</tbody></table>
+{% if let Some(html) = readme_html %}<article class="readme">{{ html|safe }}</article>{% endif %}
+{% endif %}
+{% endblock %}
