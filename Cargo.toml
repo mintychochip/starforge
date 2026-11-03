@@ -1,0 +1,50 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.99"
+license = "AGPL-3.0-or-later"
+publish = false
+
+[workspace.dependencies]
+ammonia = "4.2.4"
+anyhow = "1.0.104"
+argon2 = "0.6.0"
+askama = "0.16.1"
+askama_web = { version = "0.16.0", features = ["axum-0.8"] }
+async-compression = { version = "0.4.52", features = ["tokio", "gzip"] }
+axum = "0.8.9"
+axum-extra = { version = "0.12.6", features = ["cookie", "form"] }
+base64 = "0.23.1"
+clap = { version = "4.6.7", features = ["derive", "env"] }
+comrak = "0.59.0"
+flate2 = "1.1.10"
+futures-util = "0.3.34"
+getrandom = "0.4.3"
+gix = "0.90.0"
+hex = "0.4.3"
+percent-encoding = "2.3.2"
+reqwest = { version = "0.13.5", default-features = false, features = ["cookies", "json", "form"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "any", "sqlite", "postgres", "migrate", "macros"] }
+subtle = "2.6.1"
+tempfile = "3.27.0"
+thiserror = "2.0.21"
+time = { version = "0.3.55", features = ["formatting", "macros"] }
+tokio = { version = "1.54.1", features = ["full"] }
+tokio-util = { version = "0.7.20", features = ["io"] }
+toml = "1.1.8"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+url = "2.5.8"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }

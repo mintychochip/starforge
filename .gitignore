@@ -1,0 +1,6 @@
+/target
+/data
+/starforged.toml
+*.db
+*.db-shm
+*.db-wal
