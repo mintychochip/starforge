@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+{% block title %}Tokens · Starforge{% endblock %}
+{% block content %}
+<h1>Personal access tokens</h1>
+{% if let Some(secret) = created %}
+<div class="notice">
+<p>Copy your new token now. It will not be shown again.</p>
+<pre class="token">{{ secret }}</pre>
+</div>
+{% endif %}
+{% if let Some(e) = error %}<p class="error">{{ e }}</p>{% endif %}
+<form method="post" action="/settings/tokens" class="stack">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <label>Name <input name="name" required maxlength="64"></label>
+  <fieldset>
+    <legend>Scopes</legend>
+    {% for scope in scope_choices %}<label class="check"><input type="checkbox" name="scopes" value="{{ scope }}"> {{ scope }}</label>{% endfor %}
+  </fieldset>
+  <label>Expires in days <input name="expires_days" type="number" min="1" max="366" value="30"></label>
+  <button type="submit">Create token</button>
+</form>
+<h2>Existing tokens</h2>
+<table class="list">
+<thead><tr><th>Name</th><th>Token</th><th>Scopes</th><th>Expires</th><th>Last used</th><th></th></tr></thead>
+<tbody>
+{% for t in tokens %}
+<tr>
+<td>{{ t.name }}</td><td><code>sfp_…{{ t.hint }}</code></td><td>{{ t.scopes }}</td><td>{{ t.expires }}</td><td>{{ t.last_used }}</td>
+<td>{% if t.revoked %}revoked{% else %}<form method="post" action="/settings/tokens/{{ t.id }}/revoke" class="inline"><input type="hidden" name="_csrf" value="{{ csrf }}"><button type="submit">Revoke</button></form>{% endif %}</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+{% endblock %}

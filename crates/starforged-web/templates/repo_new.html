@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block title %}New repository · Starforge{% endblock %}
+{% block content %}
+<h1>New repository</h1>
+{% if let Some(e) = error %}<p class="error">{{ e }}</p>{% endif %}
+<form method="post" action="/new" class="stack">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <label>Owner <input value="{{ owner }}" disabled></label>
+  <label>Name <input name="name" required maxlength="100" value="{{ name }}"></label>
+  <label>Description <input name="description" maxlength="350" value="{{ description }}"></label>
+  <fieldset>
+    <legend>Visibility</legend>
+    <label class="check"><input type="radio" name="visibility" value="private" checked> Private</label>
+    <label class="check"><input type="radio" name="visibility" value="internal"> Internal (every signed-in user can read)</label>
+    <label class="check"><input type="radio" name="visibility" value="public"> Public</label>
+  </fieldset>
+  <button type="submit">Create repository</button>
+</form>
+{% endblock %}

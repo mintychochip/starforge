@@ -45,6 +45,15 @@ fn page_routes() -> Router<AppState> {
         .route("/", get(pages::dashboard::show))
         .route("/login", get(pages::login::form).post(pages::login::submit))
         .route("/logout", post(pages::login::logout))
+        .route(
+            "/new",
+            get(pages::repo_new::form).post(pages::repo_new::submit),
+        )
+        .route(
+            "/settings/tokens",
+            get(pages::tokens::list).post(pages::tokens::create),
+        )
+        .route("/settings/tokens/{id}/revoke", post(pages::tokens::revoke))
         .route("/static/starforge.css", get(stylesheet))
 }
 
