@@ -10,6 +10,16 @@ use crate::{Core, CoreError, CoreResult};
 /// Largest file the web UI renders inline.
 pub const MAX_INLINE_BLOB_BYTES: usize = 1024 * 1024;
 
+/// A file's identity and size, with content only when it fits inline.
+pub struct FileBlob {
+    /// Full lowercase hex object id of the blob, for [`Core::blob_stream`].
+    pub id: String,
+    /// Size of the blob's content in bytes.
+    pub size: u64,
+    /// The content when `size <= MAX_INLINE_BLOB_BYTES as u64`; otherwise `None`.
+    pub bytes: Option<Vec<u8>>,
+}
+
 async fn blocking<T, F>(f: F) -> CoreResult<T>
 where
     T: Send + 'static,
@@ -49,17 +59,45 @@ impl Core {
             .ok_or(CoreError::NotFound)
     }
 
+    /// Identity, size, and (for small files) content of `file` in `commit_id`.
+    /// Files larger than [`MAX_INLINE_BLOB_BYTES`] are never read into memory:
+    /// `bytes` is `None` and the caller streams them with [`Core::blob_stream`].
     pub async fn blob(
         &self,
         access: &RepoAccess,
         commit_id: &str,
         file: &str,
-    ) -> CoreResult<Vec<u8>> {
+    ) -> CoreResult<FileBlob> {
         let repo = self.repo_path(access.repo.id);
         let (commit_id, file) = (commit_id.to_owned(), file.to_owned());
-        blocking(move || read::blob_bytes(&repo, &commit_id, &file))
+        let probe = (repo.clone(), commit_id.clone(), file.clone());
+        let meta = blocking(move || read::blob_ref(&probe.0, &probe.1, &probe.2))
             .await?
-            .ok_or(CoreError::NotFound)
+            .ok_or(CoreError::NotFound)?;
+        let bytes = if meta.size <= MAX_INLINE_BLOB_BYTES as u64 {
+            Some(
+                blocking(move || read::blob_bytes(&repo, &commit_id, &file))
+                    .await?
+                    .ok_or(CoreError::NotFound)?,
+            )
+        } else {
+            None
+        };
+        Ok(FileBlob {
+            id: meta.id,
+            size: meta.size,
+            bytes,
+        })
+    }
+
+    /// Streams the blob with object id `id` (from [`FileBlob::id`]) without
+    /// loading it into memory.
+    pub async fn blob_stream(
+        &self,
+        access: &RepoAccess,
+        id: &str,
+    ) -> CoreResult<tokio::process::ChildStdout> {
+        read::stream_blob(&self.repo_path(access.repo.id), id).map_err(CoreError::from)
     }
 
     pub async fn log(
@@ -86,10 +124,16 @@ impl Core {
 /// Diff lines rendered per commit before truncating.
 pub const MAX_DIFF_LINES: usize = 10_000;
 
+/// Largest `git show` output the commit page reads before truncating the diff.
+pub const MAX_DIFF_BYTES: usize = 4 * 1024 * 1024;
+
 impl Core {
     /// The diff of commit `commit_id` against its first parent.
     pub async fn diff(&self, access: &RepoAccess, commit_id: &str) -> CoreResult<CommitDiff> {
         let repo = self.repo_path(access.repo.id);
-        Ok(starforged_git::diff::commit_diff(&repo, commit_id, MAX_DIFF_LINES).await?)
+        Ok(
+            starforged_git::diff::commit_diff(&repo, commit_id, MAX_DIFF_LINES, MAX_DIFF_BYTES)
+                .await?,
+        )
     }
 }

@@ -186,6 +186,67 @@ pub fn tree(repo: &Path, commit_id: &str, dir: &str) -> Result<Option<Vec<TreeEn
     Ok(Some(entries))
 }
 
+/// Identity and size of a blob without its content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlobRef {
+    /// Full lowercase hex object id of the blob.
+    pub id: String,
+    /// Size of the blob's content in bytes, from the object header.
+    pub size: u64,
+}
+
+/// Identity and size of file `file` in `commit_id`; `None` when it is missing or not a file.
+/// The blob's content is never decompressed.
+pub fn blob_ref(repo: &Path, commit_id: &str, file: &str) -> Result<Option<BlobRef>, GitError> {
+    if file.is_empty() {
+        return Ok(None);
+    }
+    let r = open(repo)?;
+    let Ok(id) = r.rev_parse_single(format!("{commit_id}:{file}").as_str()) else {
+        return Ok(None);
+    };
+    let header = id.header().map_err(gix_err)?;
+    if header.kind() != gix::object::Kind::Blob {
+        return Ok(None);
+    }
+    Ok(Some(BlobRef {
+        id: id.detach().to_string(),
+        size: header.size(),
+    }))
+}
+
+/// The stdout of `git cat-file blob <id>`, streaming the blob's content.
+/// A reaped task collects the child and warns on a non-zero exit; dropping
+/// stdout makes git exit on EPIPE, so a disconnected client reaps cleanly.
+pub fn stream_blob(repo: &Path, id: &str) -> Result<tokio::process::ChildStdout, GitError> {
+    if !is_object_id(id) {
+        return Err(GitError::Failed {
+            command: "cat-file".into(),
+            stderr: format!("not an object id: {id}"),
+        });
+    }
+    let mut child = crate::command::git()
+        .arg("--git-dir")
+        .arg(repo)
+        .arg("cat-file")
+        .arg("blob")
+        .arg(id)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    let stdout = child.stdout.take().ok_or_else(|| GitError::Failed {
+        command: "cat-file".into(),
+        stderr: "git cat-file produced no stdout".into(),
+    })?;
+    tokio::spawn(async move {
+        let status = child.wait().await;
+        if !matches!(&status, Ok(status) if status.success()) {
+            tracing::warn!(?status, "git cat-file blob finished");
+        }
+    });
+    Ok(stdout)
+}
+
 /// Bytes of file `file` in `commit_id`; `None` when it is missing or not a file.
 pub fn blob_bytes(repo: &Path, commit_id: &str, file: &str) -> Result<Option<Vec<u8>>, GitError> {
     if file.is_empty() {
@@ -420,6 +481,40 @@ mod tests {
             "a directory is not a blob"
         );
         assert!(blob_bytes(p, &main.commit_id, "missing").unwrap().is_none());
+    }
+
+    #[test]
+    fn blob_ref_reports_size_and_id_without_content() {
+        let f = fixture();
+        let p = f.path();
+        let main = resolve(p, "main").unwrap().unwrap();
+        let r = blob_ref(p, &main.commit_id, "README.md")
+            .unwrap()
+            .expect("README.md exists");
+        let bytes = blob_bytes(p, &main.commit_id, "README.md")
+            .unwrap()
+            .unwrap();
+        assert_eq!(r.size, bytes.len() as u64);
+        assert_eq!(r.id.len(), 40);
+        assert!(
+            r.id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+            "unexpected id: {}",
+            r.id
+        );
+        assert!(
+            blob_ref(p, &main.commit_id, "src").unwrap().is_none(),
+            "a directory is not a blob"
+        );
+        assert!(blob_ref(p, &main.commit_id, "missing").unwrap().is_none());
+        assert!(blob_ref(p, &main.commit_id, "").unwrap().is_none());
+    }
+
+    #[test]
+    fn stream_blob_rejects_non_hex_ids() {
+        let f = fixture();
+        assert!(stream_blob(f.path(), "--output=/tmp/x").is_err());
+        assert!(stream_blob(f.path(), "zz").is_err());
+        assert!(stream_blob(f.path(), "").is_err());
     }
 
     #[test]

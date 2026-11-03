@@ -121,3 +121,72 @@ async fn private_and_empty_repositories() {
             .contains("Collaborators")
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn large_files_are_streamed_not_buffered() {
+    let s = TestServer::start().await;
+    let alice = s.user("alice").await;
+    s.repo(&alice, "proj", Visibility::Public).await;
+    let url = s.git_url(
+        "alice",
+        "proj",
+        Some(&s.token(&alice, &[Scope::RepoWrite]).await),
+    );
+    let marker = "large-file-marker-";
+    let mut big = String::new();
+    while big.len() < 1_572_864 {
+        big.push_str(marker);
+        big.push_str(&format!("{:06}\n", big.len()));
+    }
+    let big_bytes = big.into_bytes();
+    let small = b"fn main() {}\n".to_vec();
+    let tmp = tempfile::tempdir().unwrap();
+    let work = work_repo(tmp.path(), "work", &[("small.txt", "placeholder\n")]).await;
+    std::fs::write(work.join("README.md"), vec![b'R'; 1_572_864]).unwrap();
+    commit_files(
+        &work,
+        &[("big.bin", &big_bytes), ("small.txt", &small)],
+        "large and small files",
+    )
+    .await;
+    git_ok(&work, &["push", "-q", &url, "HEAD:main"]).await;
+    let client = s.browser();
+
+    let page = get_text(&client, &s.url("/alice/proj/blob/main/big.bin")).await;
+    assert!(
+        page.contains("This file is too large to display."),
+        "{page}"
+    );
+    assert!(
+        !page.contains(marker),
+        "the blob page must not embed file content"
+    );
+
+    let raw = client
+        .get(s.url("/alice/proj/raw/main/big.bin"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(raw.status(), 200);
+    assert_eq!(raw.headers()["content-type"], "application/octet-stream");
+    assert_eq!(raw.headers()["content-disposition"], "attachment");
+    assert_eq!(raw.headers()["content-length"], big_bytes.len().to_string());
+    assert_eq!(raw.bytes().await.unwrap(), big_bytes);
+
+    let small_raw = client
+        .get(s.url("/alice/proj/raw/main/small.txt"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        small_raw.headers()["content-type"],
+        "text/plain; charset=utf-8"
+    );
+    assert_eq!(small_raw.bytes().await.unwrap(), small);
+
+    let home = get_text(&client, &s.url("/alice/proj")).await;
+    assert!(
+        !home.contains("<article"),
+        "an over-limit README is skipped, got: {home}"
+    );
+}

@@ -3,8 +3,30 @@
 
 use std::ffi::OsStr;
 use std::path::Path;
+use std::process::Stdio;
 
-use crate::command::{GitError, run};
+use tokio::io::AsyncReadExt;
+
+use crate::command::{GitError, git};
+
+/// How much of `git show` stderr is kept for error reports; the rest is drained
+/// and discarded so a chatty child can never block on a full pipe.
+const STDERR_KEEP_BYTES: usize = 64 * 1024;
+
+/// Reads `reader` to EOF, keeping the first [`STDERR_KEEP_BYTES`] bytes.
+async fn drain_bounded(mut reader: tokio::process::ChildStderr) -> Vec<u8> {
+    let mut kept = Vec::new();
+    let mut chunk = [0_u8; 8192];
+    loop {
+        let n = match reader.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        let room = STDERR_KEEP_BYTES.saturating_sub(kept.len());
+        kept.extend_from_slice(&chunk[..n.min(room)]);
+    }
+    kept
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileStatus {
@@ -63,10 +85,13 @@ pub struct CommitDiff {
 }
 
 /// Diff of `commit_id` against its first parent (or the empty tree for a root commit).
+/// Reads at most `max_bytes` of `git show` output; larger diffs are cut after
+/// their last complete line and reported as `truncated`.
 pub async fn commit_diff(
     repo: &Path,
     commit_id: &str,
     max_lines: usize,
+    max_bytes: usize,
 ) -> Result<CommitDiff, GitError> {
     if commit_id.is_empty() || !commit_id.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(GitError::Failed {
@@ -74,23 +99,70 @@ pub async fn commit_diff(
             stderr: format!("not an object id: {commit_id}"),
         });
     }
-    let out = run([
-        OsStr::new("-c"),
-        OsStr::new("core.quotePath=false"),
-        OsStr::new("--git-dir"),
-        repo.as_os_str(),
-        OsStr::new("show"),
-        OsStr::new("--format="),
-        OsStr::new("--patch"),
-        OsStr::new("--find-renames"),
-        OsStr::new("--diff-merges=first-parent"),
-        OsStr::new("--no-color"),
-        OsStr::new("--no-ext-diff"),
-        OsStr::new("--no-textconv"),
-        OsStr::new(commit_id),
-    ])
-    .await?;
-    Ok(parse(&String::from_utf8_lossy(&out), max_lines))
+    let mut child = git()
+        .args([
+            OsStr::new("-c"),
+            OsStr::new("core.quotePath=false"),
+            OsStr::new("--git-dir"),
+            repo.as_os_str(),
+            OsStr::new("show"),
+            OsStr::new("--format="),
+            OsStr::new("--patch"),
+            OsStr::new("--find-renames"),
+            OsStr::new("--diff-merges=first-parent"),
+            OsStr::new("--no-color"),
+            OsStr::new("--no-ext-diff"),
+            OsStr::new("--no-textconv"),
+            OsStr::new(commit_id),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut stdout = child.stdout.take().ok_or_else(|| GitError::Failed {
+        command: "show".into(),
+        stderr: "git show produced no stdout".into(),
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| GitError::Failed {
+        command: "show".into(),
+        stderr: "git show produced no stderr".into(),
+    })?;
+    let stderr_text = tokio::spawn(drain_bounded(stderr));
+    let mut kept = Vec::new();
+    let mut byte_truncated = false;
+    let mut chunk = [0_u8; 8192];
+    loop {
+        let n = stdout.read(&mut chunk).await?;
+        if n == 0 {
+            break;
+        }
+        kept.extend_from_slice(&chunk[..n]);
+        if kept.len() > max_bytes {
+            byte_truncated = true;
+            break;
+        }
+    }
+    if byte_truncated {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        let _ = stderr_text.await;
+        kept.truncate(max_bytes);
+        // Keep only complete lines; `\n` never appears inside a multi-byte
+        // UTF-8 sequence, so this also keeps a character boundary.
+        let end = kept.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+        kept.truncate(end);
+        let mut diff = parse(&String::from_utf8_lossy(&kept), max_lines);
+        diff.truncated = true;
+        return Ok(diff);
+    }
+    let status = child.wait().await?;
+    let stderr = stderr_text.await.unwrap_or_default();
+    if !status.success() {
+        return Err(GitError::Failed {
+            command: "show".into(),
+            stderr: String::from_utf8_lossy(&stderr).trim().to_owned(),
+        });
+    }
+    Ok(parse(&String::from_utf8_lossy(&kept), max_lines))
 }
 
 /// Parses `git diff`/`git show` patch output, keeping at most `max_lines` diff lines.
@@ -370,11 +442,83 @@ Binary files /dev/null and b/img.png differ
         let root = git(&["rev-parse", "HEAD~1"]).trim().to_owned();
         let repo = p.join(".git");
 
-        let second = commit_diff(&repo, &head, 100).await.unwrap();
+        let second = commit_diff(&repo, &head, 100, 4 * 1024 * 1024)
+            .await
+            .unwrap();
         assert_eq!(second.files[0].status, FileStatus::Modified);
         assert_eq!(second.files[0].hunks[0].lines.last().unwrap().text, "two");
-        let first = commit_diff(&repo, &root, 100).await.unwrap();
+        let first = commit_diff(&repo, &root, 100, 4 * 1024 * 1024)
+            .await
+            .unwrap();
         assert_eq!(first.files[0].status, FileStatus::Added);
-        assert!(commit_diff(&repo, "--output=/tmp/x", 100).await.is_err());
+        assert!(
+            commit_diff(&repo, "--output=/tmp/x", 100, 4 * 1024 * 1024)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_diff_bounds_memory_with_max_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(["-c", "user.name=T", "-c", "user.email=t@example.com"])
+                .args(args)
+                .current_dir(p)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout).unwrap()
+        };
+        git(&["init", "-q", "-b", "main", "."]);
+        let numbered: Vec<String> = (1..=1000).map(|i| i.to_string()).collect();
+        std::fs::write(p.join("big.txt"), numbered.join("\n") + "\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "big"]);
+        let head = git(&["rev-parse", "HEAD"]).trim().to_owned();
+        let repo = p.join(".git");
+
+        let capped = commit_diff(&repo, &head, 10_000, 1024).await.unwrap();
+        assert!(capped.truncated);
+        let added: Vec<&str> = capped
+            .files
+            .iter()
+            .flat_map(|f| &f.hunks)
+            .flat_map(|h| &h.lines)
+            .filter(|l| l.kind == LineKind::Added)
+            .map(|l| l.text.as_str())
+            .collect();
+        assert!(
+            (1..1000).contains(&added.len()),
+            "expected a strict subset of the 1000 lines, got {}",
+            added.len()
+        );
+        assert!(
+            numbered
+                .iter()
+                .any(|n| Some(n.as_str()) == added.last().copied()),
+            "the last capped line is not complete"
+        );
+
+        let full = commit_diff(&repo, &head, 10_000, 4 * 1024 * 1024)
+            .await
+            .unwrap();
+        assert!(!full.truncated);
+        let total: usize = full
+            .files
+            .iter()
+            .flat_map(|f| &f.hunks)
+            .flat_map(|h| &h.lines)
+            .filter(|l| l.kind == LineKind::Added)
+            .count();
+        assert_eq!(total, 1000);
     }
 }

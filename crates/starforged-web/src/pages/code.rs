@@ -1,13 +1,14 @@
 use askama::Template;
 use askama_web::WebTemplate;
+use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::{HeaderValue, header};
 use axum::response::{IntoResponse, Response};
-use starforged_core::content::MAX_INLINE_BLOB_BYTES;
 use starforged_core::permission::Permission;
 use starforged_core::repos::RepoAccess;
 use starforged_core::sessions::WebSession;
 use starforged_git::read::{Blob, EntryKind, TreeEntry, classify};
+use tokio_util::io::ReaderStream;
 
 use crate::AppState;
 use crate::auth::MaybeUser;
@@ -129,18 +130,17 @@ pub async fn blob(
         .repo_for(session.as_ref().map(|s| &s.user), &owner, &repo)
         .await?;
     let resolved = state.core.resolve(&access, &rest).await?;
-    let bytes = state
+    let file = state
         .core
         .blob(&access, &resolved.commit_id, &resolved.path)
         .await?;
-    let size = bytes.len();
-    let (lines, notice) = if size > MAX_INLINE_BLOB_BYTES {
-        (Vec::new(), Some("This file is too large to display."))
-    } else {
-        match classify(bytes) {
+    let size = usize::try_from(file.size).unwrap_or(usize::MAX);
+    let (lines, notice) = match file.bytes {
+        None => (Vec::new(), Some("This file is too large to display.")),
+        Some(bytes) => match classify(bytes) {
             Blob::Text(text) => (text.lines().map(str::to_owned).collect(), None),
             Blob::Binary => (Vec::new(), Some("Binary file not shown.")),
-        }
+        },
     };
     let repo = &access.repo;
     let (dir, file_name) = resolved
@@ -179,10 +179,36 @@ pub async fn raw(
         .repo_for(session.as_ref().map(|s| &s.user), &owner, &repo)
         .await?;
     let resolved = state.core.resolve(&access, &rest).await?;
-    let bytes = state
+    let file = state
         .core
         .blob(&access, &resolved.commit_id, &resolved.path)
         .await?;
+    let Some(bytes) = file.bytes else {
+        // Large files are always served as attachments, with no text sniffing.
+        let stdout = state.core.blob_stream(&access, &file.id).await?;
+        let length = HeaderValue::from_str(&file.size.to_string()).map_err(|_| {
+            WebError::Internal(format!("unrepresentable content length: {}", file.size))
+        })?;
+        return Ok((
+            [
+                (
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/octet-stream"),
+                ),
+                (
+                    header::CONTENT_DISPOSITION,
+                    HeaderValue::from_static("attachment"),
+                ),
+                (header::CONTENT_LENGTH, length),
+                (
+                    header::CONTENT_SECURITY_POLICY,
+                    HeaderValue::from_static("sandbox"),
+                ),
+            ],
+            Body::from_stream(ReaderStream::new(stdout)),
+        )
+            .into_response());
+    };
     let is_text =
         !bytes[..bytes.len().min(8000)].contains(&0) && std::str::from_utf8(&bytes).is_ok();
     let mut response = bytes.into_response();
@@ -290,7 +316,7 @@ fn tree_page(
     }
 }
 
-/// Rendered README of `dir`, if it has one that is text and at most `MAX_INLINE_BLOB_BYTES`.
+/// Rendered README of `dir`, if it has one that is text and fits the inline limit.
 async fn readme(
     state: &AppState,
     access: &RepoAccess,
@@ -309,10 +335,11 @@ async fn readme(
     } else {
         format!("{dir}/{}", entry.name)
     };
-    let bytes = state.core.blob(access, commit_id, &file).await?;
-    if bytes.len() > MAX_INLINE_BLOB_BYTES {
+    let blob = state.core.blob(access, commit_id, &file).await?;
+    // A README over the inline limit has `bytes == None` and is skipped.
+    let Some(bytes) = blob.bytes else {
         return Ok(None);
-    }
+    };
     let lower = entry.name.to_ascii_lowercase();
     Ok(match classify(bytes) {
         Blob::Text(text) if lower.ends_with(".md") || lower.ends_with(".markdown") => {
