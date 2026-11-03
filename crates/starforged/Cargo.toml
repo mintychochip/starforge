@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 anyhow.workspace = true
+axum.workspace = true
 clap.workspace = true
 getrandom.workspace = true
 hex.workspace = true
@@ -18,8 +19,13 @@ serde.workspace = true
 starforged-core = { path = "../starforged-core" }
 starforged-db = { path = "../starforged-db" }
 starforged-git = { path = "../starforged-git" }
+starforged-web = { path = "../starforged-web" }
 tokio.workspace = true
 toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
 
 [dev-dependencies]
+reqwest.workspace = true
+starforged-db = { path = "../starforged-db", features = ["testing"] }
 tempfile.workspace = true

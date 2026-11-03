@@ -32,6 +32,8 @@ enum Command {
     },
     /// Create or update the database schema.
     Migrate,
+    /// Run the server.
+    Serve,
     /// Administrative tasks.
     Admin {
         #[command(subcommand)]
@@ -124,6 +126,12 @@ async fn main() -> anyhow::Result<()> {
         Command::Migrate => {
             admin::migrate(&Config::load(&cli.config)?).await?;
             println!("database schema is up to date");
+        }
+        Command::Serve => {
+            let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+            tracing_subscriber::fmt().with_env_filter(filter).init();
+            starforged::serve::run(Config::load(&cli.config)?).await?;
         }
         Command::Admin { command } => {
             let config = Config::load(&cli.config)?;

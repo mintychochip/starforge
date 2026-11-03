@@ -2,6 +2,7 @@
 //! read paths use gix (spec D11).
 
 pub mod command;
+pub mod http;
 pub mod init;
 pub mod refpolicy;
 pub use command::GitError;
