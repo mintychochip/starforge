@@ -2,8 +2,10 @@
 //! nothing else reads or writes stored state.
 
 pub mod accounts;
+pub mod audit;
 pub mod crypto;
 pub mod error;
+pub mod tokens;
 pub mod validate;
 
 use std::path::PathBuf;

@@ -13,6 +13,8 @@ use sqlx::AnyPool;
 use sqlx::Executor;
 use sqlx::any::AnyPoolOptions;
 
+pub mod audit;
+pub mod tokens;
 pub mod users;
 
 static SQLITE_MIGRATIONS: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/sqlite");

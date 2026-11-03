@@ -1276,7 +1276,10 @@ dependencies = [
  "getrandom",
  "hex",
  "serde",
+ "starforged-core",
+ "starforged-db",
  "tempfile",
+ "tokio",
  "toml",
 ]
 
