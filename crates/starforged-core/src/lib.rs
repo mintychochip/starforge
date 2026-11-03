@@ -5,6 +5,8 @@ pub mod accounts;
 pub mod audit;
 pub mod crypto;
 pub mod error;
+pub mod permission;
+pub mod repos;
 pub mod tokens;
 pub mod validate;
 
@@ -48,6 +50,17 @@ impl Core {
 
     pub fn config(&self) -> &CoreConfig {
         &self.inner.config
+    }
+}
+
+impl Core {
+    /// `<repos_dir>/<id % 100, two digits>/<id>.git` (spec §5.3). Renames never move directories.
+    pub fn repo_path(&self, repo_id: i64) -> PathBuf {
+        self.inner
+            .config
+            .repos_dir
+            .join(format!("{:02}", repo_id.rem_euclid(100)))
+            .join(format!("{repo_id}.git"))
     }
 }
 

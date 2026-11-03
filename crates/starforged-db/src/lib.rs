@@ -14,6 +14,8 @@ use sqlx::Executor;
 use sqlx::any::AnyPoolOptions;
 
 pub mod audit;
+pub mod collaborators;
+pub mod repos;
 pub mod tokens;
 pub mod users;
 

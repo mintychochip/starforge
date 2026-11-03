@@ -20,4 +20,9 @@ pub enum CoreError {
     Db(#[from] DbError),
 }
 
+impl From<starforged_git::GitError> for CoreError {
+    fn from(e: starforged_git::GitError) -> CoreError {
+        CoreError::Git(e.to_string())
+    }
+}
 pub type CoreResult<T> = Result<T, CoreError>;

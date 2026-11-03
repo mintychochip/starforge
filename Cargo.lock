@@ -1293,6 +1293,7 @@ dependencies = [
  "sha2 0.11.1",
  "sqlx",
  "starforged-db",
+ "starforged-git",
  "tempfile",
  "thiserror",
  "tokio",
@@ -1309,6 +1310,15 @@ dependencies = [
  "thiserror",
  "tokio",
  "url",
+]
+
+[[package]]
+name = "starforged-git"
+version = "0.0.0"
+dependencies = [
+ "tempfile",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]
