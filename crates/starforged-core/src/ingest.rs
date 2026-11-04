@@ -112,7 +112,9 @@ impl Core {
         let repo_id = auth.access.repo.id;
         let models = stringify(meta.get("models"));
         let files_touched = stringify(meta.get("files_touched"));
-        let redaction_counts = stringify(meta.get("redaction_counts"));
+        let redaction_counts = stringify(meta_lookup(meta, &["redaction", "counts"]));
+        let started_at = meta_ts_unix(meta, &["started_at"])?;
+        let ended_at = meta_ts_unix_opt(meta, &["ended_at"])?;
         let new = session_from_meta(
             repo_id,
             auth.user.id,
@@ -122,6 +124,14 @@ impl Core {
             &models,
             &files_touched,
             &redaction_counts,
+            started_at,
+            ended_at,
+            meta_u64(meta, &["usage", "input"]),
+            meta_u64(meta, &["usage", "output"]),
+            meta_u64(meta, &["usage", "cache_read"]),
+            meta_u64(meta, &["usage", "cache_write"]),
+            meta_u64(meta, &["usage", "reasoning"]),
+            i64::from(meta_bool(meta, &["capture", "adapter_version_verified"])),
         );
         match db_sessions::session_by_ulid(self.db(), repo_id, ulid).await? {
             None => {
@@ -146,15 +156,23 @@ impl Core {
                     &models,
                     &files_touched,
                     &redaction_counts,
+                    started_at,
+                    ended_at,
+                    meta_u64(meta, &["usage", "input"]),
+                    meta_u64(meta, &["usage", "output"]),
+                    meta_u64(meta, &["usage", "cache_read"]),
+                    meta_u64(meta, &["usage", "cache_write"]),
+                    meta_u64(meta, &["usage", "reasoning"]),
+                    i64::from(meta_bool(meta, &["capture", "adapter_version_verified"])),
                 );
                 // Re-PUT never moves quarantine or uploader ownership, never
-                // drops server-merged redaction counts the metadata refresh did
-                // not observe, and never resets segment-derived counters (the
-                // stats job owns them; the metadata body carries no segments).
+                // resets segment-derived counters (the stats job owns them), and
+                // merges fresh client counts with server-found ones per key
+                // (max wins: client numbers are totals, server numbers are
+                // evidence, and neither may clobber the other).
                 updated.quarantine = existing.quarantine.as_str();
-                if !existing.redaction_counts.is_empty() {
-                    updated.redaction_counts = existing.redaction_counts.as_str();
-                }
+                let merged = merge_counts(&existing.redaction_counts, &redaction_counts);
+                updated.redaction_counts = merged.as_str();
                 updated.usage_input = existing.usage_input;
                 updated.usage_output = existing.usage_output;
                 updated.usage_cache_read = existing.usage_cache_read;
@@ -667,10 +685,11 @@ fn segment_seq_range(text: &str) -> CoreResult<(i64, i64)> {
     Ok((start, end))
 }
 
-/// Builds a [`NewSession`] from the CLI's `SessionMeta` JSON. D3 extracts what
-/// the schema needs and defaults the rest; D4 validates the document.
-/// Structured values arrive pre-serialized from the caller so every borrow in
-/// the row outlives the call.
+/// Builds a [`NewSession`] from the CLI's `SessionMeta` JSON. Paths mirror the
+/// wire shape (`meta.repo.branch`, `meta.usage.input`, `meta.redaction.counts`,
+/// `meta.capture.cli_version`, …); timestamps and counters arrive
+/// pre-converted from the caller. The CLI owns usage numbers at creation; the
+/// stats job owns them afterwards (re-PUT preserves them).
 #[allow(clippy::too_many_arguments)]
 fn session_from_meta<'a>(
     repo_id: i64,
@@ -681,6 +700,14 @@ fn session_from_meta<'a>(
     models: &'a str,
     files_touched: &'a str,
     redaction_counts: &'a str,
+    started_at: i64,
+    ended_at: Option<i64>,
+    usage_input: i64,
+    usage_output: i64,
+    usage_cache_read: i64,
+    usage_cache_write: i64,
+    usage_reasoning: i64,
+    adapter_verified: i64,
 ) -> NewSession<'a> {
     NewSession {
         repo_id,
@@ -690,16 +717,16 @@ fn session_from_meta<'a>(
         agent_version: meta_str(meta, &["agent", "version"]),
         models,
         title: meta_str(meta, &["title"]),
-        branch: meta_str(meta, &["branch"]),
-        head_sha: meta_str(meta, &["head_sha"]),
-        started_at: 0,
-        ended_at: None,
+        branch: meta_str(meta, &["repo", "branch"]),
+        head_sha: meta_str(meta, &["repo", "head_at_start"]),
+        started_at,
+        ended_at,
         parent_ulid: meta_str_opt(meta, &["parent_id"]),
-        usage_input: 0,
-        usage_output: 0,
-        usage_cache_read: 0,
-        usage_cache_write: 0,
-        usage_reasoning: 0,
+        usage_input,
+        usage_output,
+        usage_cache_read,
+        usage_cache_write,
+        usage_reasoning,
         files_touched,
         turn_count: 0,
         tool_call_count: 0,
@@ -712,8 +739,8 @@ fn session_from_meta<'a>(
         redaction_fingerprint: meta_str(meta, &["redaction", "fingerprint"]),
         redaction_counts,
         capture_mode: meta_str(meta, &["capture", "mode"]),
-        cli_version: meta_str(meta, &["cli_version"]),
-        adapter_verified: 0,
+        cli_version: meta_str(meta, &["capture", "cli_version"]),
+        adapter_verified,
     }
 }
 
@@ -743,6 +770,62 @@ fn stringify(value: Option<&serde_json::Value>) -> String {
     }
 }
 
+/// Unsigned counter at `path` (`0` when absent; saturates at `i64::MAX`).
+/// `SessionMeta::parse` already rejected wrong types, so a non-number here
+/// can only mean a caller that skipped validation.
+fn meta_u64(meta: &serde_json::Value, path: &[&str]) -> i64 {
+    meta_lookup(meta, path)
+        .and_then(serde_json::Value::as_u64)
+        .map(|n| i64::try_from(n).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+/// Boolean flag at `path` (`false` when absent).
+fn meta_bool(meta: &serde_json::Value, path: &[&str]) -> bool {
+    meta_lookup(meta, path)
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// RFC 3339 timestamp at `path` as unix seconds. `SessionMeta::parse` already
+/// validated the shape, so a failure here is an internal inconsistency.
+fn meta_ts_unix(meta: &serde_json::Value, path: &[&str]) -> CoreResult<i64> {
+    let raw = meta_lookup(meta, path).and_then(serde_json::Value::as_str);
+    match raw {
+        Some(ts) => time::OffsetDateTime::parse(ts, &time::format_description::well_known::Rfc3339)
+            .map(|dt| dt.unix_timestamp())
+            .map_err(|_| CoreError::Invalid(format!("invalid timestamp at {}", path.join(".")))),
+        None => Err(CoreError::Internal(format!(
+            "validated metadata lost {}",
+            path.join(".")
+        ))),
+    }
+}
+
+/// Optional RFC 3339 timestamp at `path` (`None` when absent or null).
+fn meta_ts_unix_opt(meta: &serde_json::Value, path: &[&str]) -> CoreResult<Option<i64>> {
+    match meta_lookup(meta, path) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(_) => meta_ts_unix(meta, path).map(Some),
+    }
+}
+
+/// Merges fresh client counts into the stored ones per key, max wins. Client
+/// numbers are re-reported totals and server numbers are accumulated
+/// evidence: taking the max keeps both without double-counting either.
+/// Unparseable sides contribute nothing.
+fn merge_counts(existing: &str, fresh: &str) -> String {
+    use std::collections::BTreeMap;
+
+    let mut merged: BTreeMap<String, u64> = serde_json::from_str(existing).unwrap_or_default();
+    let fresh_map: BTreeMap<String, u64> = serde_json::from_str(fresh).unwrap_or_default();
+    for (id, n) in fresh_map {
+        let slot = merged.entry(id).or_insert(0);
+        *slot = (*slot).max(n);
+    }
+    serde_json::to_string(&merged).unwrap_or_else(|_| existing.to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -763,12 +846,12 @@ mod tests {
             "title": "test session",
             "started_at": "2026-11-04T00:00:00Z",
             "ended_at": null,
-            "repo": {},
+            "repo": {"branch": "feature/widget", "head_at_start": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
             "parent_id": null,
-            "usage": {},
-            "files_touched": [],
-            "redaction": {},
-            "capture": {"mode": "discovery"},
+            "usage": {"input": 1, "output": 2, "cache_read": 3, "cache_write": 4, "reasoning": 5},
+            "files_touched": ["src/main.rs"],
+            "redaction": {"fingerprint": "fp-test", "counts": {}},
+            "capture": {"mode": "discovery", "cli_version": "9.9.9", "adapter_version_verified": true},
         })
     }
 

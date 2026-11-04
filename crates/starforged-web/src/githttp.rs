@@ -310,7 +310,8 @@ fn changed_refs(
 /// Commits to scan: for each changed ref, `rev-list new --not old` (moved tip) or
 /// `rev-list new --not <pre-push tips>` (brand-new ref; an empty pre-push snapshot
 /// means the full history). Unioned across refs in sorted order, deduplicated, and
-/// capped at [`MAX_SCAN_COMMITS`] total. Per-ref failures warn and are skipped.
+/// capped at [`MAX_SCAN_COMMITS`] total; hitting the cap warns with the cap and the
+/// ref it cut off at. Per-ref failures warn and are skipped.
 async fn new_commits(
     repo: &StdPath,
     before: &BTreeMap<String, String>,
@@ -318,8 +319,11 @@ async fn new_commits(
 ) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
+    // The ref whose enumeration the commit cap cut off, if any — warned once below.
+    let mut truncated: Option<&str> = None;
     for (name, old, new) in changes {
         if out.len() >= MAX_SCAN_COMMITS {
+            truncated = Some(name.as_str());
             break;
         }
         let mut args: Vec<OsString> = vec![
@@ -349,6 +353,7 @@ async fn new_commits(
             Ok(bytes) => {
                 for line in String::from_utf8_lossy(&bytes).lines() {
                     if out.len() >= MAX_SCAN_COMMITS {
+                        truncated = Some(name.as_str());
                         break;
                     }
                     let sha = line.trim();
@@ -359,6 +364,17 @@ async fn new_commits(
             }
             Err(err) => tracing::warn!(%name, %err, "trailer scan: rev-list failed"),
         }
+        if truncated.is_some() {
+            break;
+        }
+    }
+    if let Some(refname) = truncated {
+        tracing::warn!(
+            %refname,
+            cap = MAX_SCAN_COMMITS,
+            enumerated = out.len(),
+            "trailer scan: commit cap cut the scan; trailers past the cap were not scanned"
+        );
     }
     out
 }

@@ -19,8 +19,8 @@ use crate::ApiState;
 use crate::auth::ApiAuth;
 use crate::error::ApiError;
 
-fn session_json(id: i64, ulid: &str, state: &str, quarantine: &str) -> Value {
-    json!({ "id": id, "ulid": ulid, "state": state, "quarantine": quarantine })
+fn session_json(id: i64, ulid: &str, lifecycle: &str, quarantine: &str) -> Value {
+    json!({ "id": id, "ulid": ulid, "lifecycle": lifecycle, "quarantine": quarantine })
 }
 
 /// Query for the session listing: only the quarantine queue exists in M1d.

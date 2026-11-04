@@ -25,6 +25,7 @@ starforged-blob = { path = "../starforged-blob" }
 starforged-db = { path = "../starforged-db" }
 starforged-git = { path = "../starforged-git" }
 thiserror.workspace = true
+time.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 url.workspace = true

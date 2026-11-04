@@ -2,6 +2,7 @@ mod common;
 
 use common::*;
 use serde_json::{Value, json};
+use starforge_format::SessionMeta;
 use starforged_core::permission::Permission;
 use starforged_core::tokens::Scope;
 use starforged_db::sessions as db_sessions;
@@ -27,12 +28,12 @@ fn meta_body(ulid: &str) -> Value {
         "title": "test session",
         "started_at": "2026-11-04T00:00:00Z",
         "ended_at": null,
-        "repo": {},
+        "repo": {"branch": "feature/widget", "head_at_start": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
         "parent_id": null,
-        "usage": {},
-        "files_touched": [],
-        "redaction": {},
-        "capture": {"mode": "discovery"},
+        "usage": {"input": 10, "output": 20, "cache_read": 30, "cache_write": 40, "reasoning": 50},
+        "files_touched": ["src/main.rs"],
+        "redaction": {"fingerprint": "fp-test", "counts": {}},
+        "capture": {"mode": "discovery", "cli_version": "9.9.9", "adapter_version_verified": true},
     })
 }
 
@@ -189,7 +190,7 @@ async fn meta_status_matrix() {
     assert_eq!(created.status(), 201);
     let body: Value = created.json().await.unwrap();
     assert_eq!(body["ulid"], ULID_A);
-    assert_eq!(body["state"], "receiving");
+    assert_eq!(body["lifecycle"], "receiving");
     assert!(body["id"].is_number());
 
     let again = client
@@ -202,7 +203,7 @@ async fn meta_status_matrix() {
     assert_eq!(again.status(), 200);
     let again_body: Value = again.json().await.unwrap();
     assert_eq!(again_body["ulid"], ULID_A);
-    assert_eq!(again_body["state"], "receiving");
+    assert_eq!(again_body["lifecycle"], "receiving");
 
     // Malformed JSON → 422.
     let malformed = client
@@ -284,7 +285,7 @@ async fn segment_complete_links_flow() {
     assert_eq!(put.status(), 200);
     let put_body: Value = put.json().await.unwrap();
     assert_eq!(put_body["ulid"], ULID_B);
-    assert_eq!(put_body["state"], "receiving");
+    assert_eq!(put_body["lifecycle"], "receiving");
 
     // Same bytes again → 200 (idempotent).
     let retry = client
@@ -337,7 +338,7 @@ async fn segment_complete_links_flow() {
     assert_eq!(done.status(), 200);
     let done_body: Value = done.json().await.unwrap();
     assert_eq!(done_body["ulid"], ULID_B);
-    assert_eq!(done_body["state"], "complete");
+    assert_eq!(done_body["lifecycle"], "complete");
 
     // links: insert + idempotent re-post of the same SHA → one row.
     let links_url =
@@ -862,7 +863,7 @@ async fn complete_is_idempotent() {
             .unwrap();
         assert_eq!(done.status(), 200);
         let body: Value = done.json().await.unwrap();
-        assert_eq!(body["state"], "complete");
+        assert_eq!(body["lifecycle"], "complete");
     }
 
     // Unknown session → 404.
@@ -973,4 +974,71 @@ async fn links_batch_is_atomic() {
             .len(),
         1
     );
+}
+
+const ULID_M: &str = "01ARZ3NDEKTSV4RRFFQ69G5FA6";
+const ULID_PARENT: &str = "01ARZ3NDEKTSV4RRFFQ69G5FA7";
+
+/// The full CLI shape through the real `SessionMeta` struct: every column the
+/// server stores must arrive, not just the stubs the old fixtures carried.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn meta_round_trip_stores_cli_fields() {
+    let c = Ctx::start().await;
+    let client = reqwest::Client::new();
+    // The exact struct the CLI sends, serialized — never a hand-written stub.
+    let raw = json!({
+        "format": "starforge.session/v1",
+        "id": ULID_M,
+        "agent": {"name": "codex", "version": "3.0.0"},
+        "models": ["opus", "sonnet"],
+        "title": "Round trip session",
+        "started_at": "2026-11-04T00:00:00Z",
+        "ended_at": "2026-11-04T01:30:00Z",
+        "repo": {"branch": "feature/round-trip", "head_at_start": "cccccccccccccccccccccccccccccccccccccccc"},
+        "parent_id": ULID_PARENT,
+        "usage": {"input": 100, "output": 200, "cache_read": 300, "cache_write": 400, "reasoning": 500},
+        "files_touched": ["src/main.rs", "src/lib.rs"],
+        "redaction": {"fingerprint": "fp-roundtrip", "counts": {"email": 2, "literal": 1}},
+        "capture": {"mode": "hook", "cli_version": "1.2.3", "adapter_version_verified": true},
+    });
+    let parsed = SessionMeta::parse(&raw.to_string()).expect("fixture is valid CLI metadata");
+    let created = client
+        .put(meta_url(&c.s, ULID_M))
+        .bearer_auth(&c.upload)
+        .json(&serde_json::to_value(&parsed).unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201);
+    let body: Value = created.json().await.unwrap();
+    assert_eq!(body["lifecycle"], "receiving");
+    assert_eq!(body["quarantine"], "none");
+
+    let row = db_sessions::session_by_ulid(c.s.core.db(), 1, ULID_M)
+        .await
+        .unwrap()
+        .expect("session row");
+    assert_eq!(row.agent_name, "codex");
+    assert_eq!(row.agent_version, "3.0.0");
+    assert_eq!(row.title, "Round trip session");
+    assert_eq!(row.branch, "feature/round-trip");
+    assert_eq!(row.head_sha, "cccccccccccccccccccccccccccccccccccccccc");
+    assert_eq!(row.started_at, 1793750400);
+    assert_eq!(row.ended_at, Some(1793755800));
+    assert_eq!(row.parent_ulid.as_deref(), Some(ULID_PARENT));
+    assert_eq!(row.usage_input, 100);
+    assert_eq!(row.usage_output, 200);
+    assert_eq!(row.usage_cache_read, 300);
+    assert_eq!(row.usage_cache_write, 400);
+    assert_eq!(row.usage_reasoning, 500);
+    assert_eq!(row.models, r#"["opus","sonnet"]"#);
+    assert_eq!(row.files_touched, r#"["src/main.rs","src/lib.rs"]"#);
+    assert_eq!(row.redaction_fingerprint, "fp-roundtrip");
+    let counts: Value = serde_json::from_str(&row.redaction_counts).unwrap();
+    assert_eq!(counts, json!({"email": 2, "literal": 1}));
+    assert_eq!(row.capture_mode, "hook");
+    assert_eq!(row.cli_version, "1.2.3");
+    assert_eq!(row.adapter_verified, 1);
+    assert_eq!(row.lifecycle, "receiving");
+    assert_eq!(row.quarantine, "none");
 }

@@ -593,12 +593,12 @@ mod tests {
             "title": "test session",
             "started_at": "2026-11-04T00:00:00Z",
             "ended_at": null,
-            "repo": {},
+            "repo": {"branch": "feature/widget", "head_at_start": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
             "parent_id": null,
-            "usage": {},
-            "files_touched": [],
-            "redaction": {},
-            "capture": {"mode": "discovery"},
+            "usage": {"input": 1, "output": 2, "cache_read": 3, "cache_write": 4, "reasoning": 5},
+            "files_touched": ["src/main.rs"],
+            "redaction": {"fingerprint": "fp-test", "counts": {}},
+            "capture": {"mode": "discovery", "cli_version": "9.9.9", "adapter_version_verified": true},
         })
     }
 
