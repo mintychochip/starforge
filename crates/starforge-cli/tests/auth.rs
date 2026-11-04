@@ -315,6 +315,38 @@ fn credentials_roundtrip_and_unix_mode() {
     assert!(credentials_for(&loaded, "other.com").is_none());
 }
 
+#[cfg(unix)]
+#[test]
+fn save_overwrites_stale_temp_and_keeps_0600() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_dir, paths) = test_paths();
+    std::fs::create_dir_all(&paths.config_dir).unwrap();
+    // Simulate a crashed run's leftover temp file with wide permissions.
+    let tmp = paths.credential_file.with_extension("toml.tmp");
+    std::fs::write(&tmp, "junk").unwrap();
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let mut map = BTreeMap::new();
+    map.insert(
+        "example.com".to_string(),
+        starforge_cli::auth::Credentials {
+            access_token: "a".to_string(),
+            refresh_token: "r".to_string(),
+            expires_at: "1970-01-01T01:00:00Z".to_string(),
+        },
+    );
+    starforge_cli::auth::save_credentials(&paths, &map).unwrap();
+
+    assert!(!tmp.exists(), "stale temp must be renamed away");
+    let mode = std::fs::metadata(&paths.credential_file)
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600, "credential file must be 0600, got {mode:o}");
+    assert_eq!(load_credentials(&paths).unwrap(), map);
+}
+
 #[test]
 fn resolve_token_env_wins_then_file_then_error_naming_both() {
     let (_dir, paths) = test_paths();
@@ -360,6 +392,36 @@ fn credentials_debug_redacts_tokens() {
     let dbg = format!("{creds:?}");
     assert!(!dbg.contains("access-token-abcdef1234"), "debug: {dbg}");
     assert!(!dbg.contains("refresh-sekrit"), "debug: {dbg}");
+}
+
+#[test]
+fn resolved_token_debug_redacts_both_variants() {
+    let (_dir, paths) = test_paths();
+    let mut map = BTreeMap::new();
+    map.insert(
+        "example.com".to_string(),
+        starforge_cli::auth::Credentials {
+            access_token: "file-token-sekrit98765432".to_string(),
+            refresh_token: "r".to_string(),
+            expires_at: "1970-01-01T01:00:00Z".to_string(),
+        },
+    );
+    starforge_cli::auth::save_credentials(&paths, &map).unwrap();
+
+    let env = resolve_token(&paths, "example.com", |k| match k {
+        "STARFORGE_TOKEN" => Some("env-token-sekrit12345678".to_string()),
+        _ => None,
+    })
+    .unwrap();
+    let file = resolve_token(&paths, "example.com", |_| None).unwrap();
+    for (tok, secret) in [
+        (&env, "env-token-sekrit12345678"),
+        (&file, "file-token-sekrit98765432"),
+    ] {
+        let dbg = format!("{tok:?}");
+        assert!(!dbg.contains(secret), "debug: {dbg}");
+        assert!(!dbg.contains(&secret[secret.len() - 8..]), "debug: {dbg}");
+    }
 }
 
 #[test]

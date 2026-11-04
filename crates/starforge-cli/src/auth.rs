@@ -66,12 +66,25 @@ pub enum AuthError {
 }
 
 /// Where a resolved token came from.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` is redacted by hand like [`Credentials`]: the bearer token must
+/// never appear in logs.
+#[derive(Clone, PartialEq, Eq)]
 pub enum ResolvedToken {
     /// `STARFORGE_TOKEN` env var.
     Env(String),
     /// Credentials file entry for the host.
     File(String),
+}
+
+impl fmt::Debug for ResolvedToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let variant = match self {
+            ResolvedToken::Env(_) => "Env",
+            ResolvedToken::File(_) => "File",
+        };
+        f.debug_tuple(variant).field(&"<redacted>").finish()
+    }
 }
 
 impl ResolvedToken {
@@ -134,12 +147,30 @@ pub fn save_credentials(
     };
     let raw = toml::to_string_pretty(&file).map_err(|err| AuthError::Config(err.to_string()))?;
     let tmp = paths.credential_file.with_extension("toml.tmp");
-    std::fs::write(&tmp, raw).map_err(|err| AuthError::Io(err.to_string()))?;
+    // Drop a stale temp file first so the `mode(0o600)` below always applies
+    // at creation time (it has no effect when opening an existing file). The
+    // temp file holds secrets, so it is created with the restrictive mode up
+    // front — not chmod-after-write, which leaves a world-readable window.
+    // `rename` preserves the mode on the final path.
+    let _ = std::fs::remove_file(&tmp);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)
+            .and_then(|mut f| {
+                use std::io::Write;
+                f.write_all(raw.as_bytes())
+            })
             .map_err(|err| AuthError::Io(err.to_string()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(&tmp, raw).map_err(|err| AuthError::Io(err.to_string()))?;
     }
     std::fs::rename(&tmp, &paths.credential_file).map_err(|err| AuthError::Io(err.to_string()))?;
     Ok(())
