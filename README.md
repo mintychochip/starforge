@@ -172,9 +172,41 @@ inside the data directory) at `<hash[0..2]>/<hash>`, refcounted across sessions;
 are swept by the hourly cleanup job. The CLI learns commit links from `Starforge-Session: <ULID>`
 trailers found by the post-push scan, merged with its own claims.
 
-Not yet: a session viewer (M1e), raw native-slice upload — the CLI spools raw slices but never
+Not yet: raw native-slice upload — the CLI spools raw slices but never
 sends them, so `raw_blob_hash` stays empty and adapter re-normalization has to wait for the M1f
 follow-up — refresh-token rotation (M3), and per-token rate limiting (M5).
+
+## Sessions in the UI
+
+Every session opens at `/{owner}/{repo}/sessions/{ulid}`: header metadata (agent, models,
+branch, usage, redaction fingerprint), the event transcript in stored order (200 per page,
+`?page=N`, `#turn-<seq>` deep links), and a `Download JSONL` link carrying the same redacted
+bytes the page renders. Prose renders as sanitized Markdown inside a visible untrusted frame —
+with `<img>` elements stripped entirely (even relative ones), so an image in an
+attacker-influenced transcript can never phone home when viewed; repository Markdown
+(READMEs, blobs) keeps images. Tool input, tool output, diffs, and unknown event kinds
+render as escaped text in collapsed
+`<details>` blocks, and `[redacted:<id>]` markers show verbatim. Tool calls expand inline —
+there is no JavaScript on the page, so nothing fetches or executes. The JSON API mirrors the
+viewer: `GET /api/v1/repos/{owner}/{repo}/sessions/{ulid}` (metadata plus commit links) and
+`GET .../sessions/{ulid}/events?page=N`.
+
+Quarantined sessions show a banner (reason plus detail) over the full transcript to the uploader
+and repo admins, with release, purge, and rescan buttons; everyone else gets `404`, so ULIDs
+stay undiscoverable. Commit pages list a Sessions panel and blame pages list session chips —
+both only for sessions the viewer may read, never locked placeholders. Publishing flips a
+session to `published` on public repositories (repo `maintain` or above), which makes it
+readable to strangers; unpublish flips it back to `inherit`. Delete removes the session, its
+segments, and its links. Every web form carries a `_csrf` token; the API uses Bearer tokens
+and answers `401` without one.
+
+The viewer, download, and blame pages (the three surfaces rendered from
+attacker-influenced content) carry a strict Content-Security-Policy
+(`default-src 'none'; img-src 'self'; style-src 'self'; script-src 'self'`)
+as defense in depth; other pages use the site default.
+
+Not yet: a repository session index (commit panels and direct ULID links are the discovery
+paths) and blame syntax highlighting.
 
 ## Development
 

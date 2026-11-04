@@ -15,7 +15,7 @@ use crate::AppState;
 use crate::auth::{CsrfForm, MaybeUser, verify_csrf};
 use crate::error::WebError;
 use crate::session_render::render_event;
-use crate::views::{NavUser, RepoHead, format_time, nav};
+use crate::views::{NavUser, RepoHead, STRICT_CSP, format_time, nav};
 
 #[derive(Deserialize)]
 pub struct SessionQuery {
@@ -163,9 +163,15 @@ pub async fn show(
         prev: (view.page > 1).then_some(view.page - 1),
         next: (view.page < view.pages).then_some(view.page + 1),
     };
-    // Sessions never reach search indexes (spec §11.1).
+    // Sessions never reach search indexes (spec §11.1). The transcript is
+    // attacker-influenced, so the viewer also carries the strict CSP (it
+    // wins over the middleware default, which uses `or_insert`).
     let mut headers = HeaderMap::new();
     headers.insert("x-robots-tag", HeaderValue::from_static("noindex"));
+    headers.insert(
+        axum::http::header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(STRICT_CSP),
+    );
     Ok((headers, page_view))
 }
 
@@ -363,5 +369,9 @@ pub async fn download(
         .unwrap_or(HeaderValue::from_static("attachment")),
     );
     headers.insert("x-robots-tag", HeaderValue::from_static("noindex"));
+    headers.insert(
+        axum::http::header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(STRICT_CSP),
+    );
     Ok((headers, jsonl).into_response())
 }

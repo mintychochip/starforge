@@ -1,10 +1,12 @@
 //! Safe rendering of session events (spec §10.2, §11.1).
 //!
 //! Every fragment returned here is sanitized HTML: prose is framed with
-//! [`wrap_untrusted`] and only the INNER lines are [`markdown::render`]ed —
+//! [`wrap_untrusted`] and only the INNER lines are [`markdown::render_prose`]ed —
 //! the `BEGINS`/`ENDS` marker lines render as escaped literal text, so the
 //! untrusted frame stays visible and intact (comrak would otherwise eat the
-//! markers as inline HTML). Data renders through escaped `<pre>` blocks,
+//! markers as inline HTML). `render_prose` additionally strips `<img>`
+//! elements entirely, so attacker-influenced transcripts cannot phone home
+//! when viewed. Data renders through escaped `<pre>` blocks,
 //! and `[redacted:<id>]` markers are wrapped verbatim in a `.redacted` span
 //! (forensic evidence — styling only, bytes unchanged). Templates insert
 //! fragments with `|safe`; nothing else on the page is unescaped.
@@ -125,7 +127,7 @@ fn prose_block(kind: &str, class: &str, text: &str, model: Option<&str>) -> Stri
     };
     debug_assert_eq!(begins, UNTRUSTED_BEGINS);
     debug_assert_eq!(ends, UNTRUSTED_ENDS);
-    let body = with_redaction_spans(&markdown::render(&lines.join("\n")));
+    let body = with_redaction_spans(&markdown::render_prose(&lines.join("\n")));
     let model_line = match model {
         Some(model) if !model.is_empty() => {
             format!(

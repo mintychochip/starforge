@@ -4,13 +4,14 @@
 use askama::Template;
 use askama_web::WebTemplate;
 use axum::extract::{Path, Query, State};
+use axum::http::{HeaderMap, HeaderValue};
 use serde::Deserialize;
 
 use crate::AppState;
 use crate::auth::MaybeUser;
 use crate::error::WebError;
 use crate::views::{
-    BlameLineGroup, Crumb, NavUser, RepoHead, SessionChip, content_href, crumbs, nav,
+    BlameLineGroup, Crumb, NavUser, RepoHead, STRICT_CSP, SessionChip, content_href, crumbs, nav,
 };
 
 /// Lines per blame page.
@@ -49,7 +50,7 @@ pub async fn show(
     MaybeUser(session): MaybeUser,
     Path((owner, repo, rest)): Path<(String, String, String)>,
     Query(query): Query<BlameQuery>,
-) -> Result<BlamePage, WebError> {
+) -> Result<(HeaderMap, BlamePage), WebError> {
     if rest.is_empty() || rest.starts_with('/') || rest.split('/').any(|s| s == "..") {
         return Err(WebError::NotFound);
     }
@@ -95,10 +96,13 @@ pub async fn show(
         groups: Vec::new(),
     };
     if let Some(reason) = view.unavailable {
-        return Ok(BlamePage {
-            notice: Some(reason),
-            ..base
-        });
+        return Ok((
+            strict_csp_headers(),
+            BlamePage {
+                notice: Some(reason),
+                ..base
+            },
+        ));
     }
     let total: usize = view.blocks.iter().map(|b| b.lines.len()).sum();
     let pages = total.div_ceil(PER_PAGE).max(1);
@@ -156,13 +160,28 @@ pub async fn show(
             lines,
         });
     }
-    Ok(BlamePage {
-        page,
-        pages,
-        total,
-        prev: (page > 1).then_some(page - 1),
-        next: (page < pages).then_some(page + 1),
-        groups,
-        ..base
-    })
+    Ok((
+        strict_csp_headers(),
+        BlamePage {
+            page,
+            pages,
+            total,
+            prev: (page > 1).then_some(page - 1),
+            next: (page < pages).then_some(page + 1),
+            groups,
+            ..base
+        },
+    ))
+}
+
+/// The strict CSP for a page rendered from attacker-influenced content
+/// (blamed lines, commit summaries, and session chips). Wins over the
+/// `security_headers` middleware default, which uses `or_insert`.
+fn strict_csp_headers() -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(STRICT_CSP),
+    );
+    headers
 }

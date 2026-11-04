@@ -9,6 +9,25 @@ pub fn render(markdown: &str) -> String {
     ammonia::clean(&comrak::markdown_to_html(markdown, &options))
 }
 
+/// Session-transcript prose: like [`render`], but `<img>` elements are
+/// disallowed entirely. Agent transcripts are attacker-influenced, so a
+/// `![alt](https://…)` image must not become a live fetch leaking the
+/// viewer's IP/user-agent — not even a relative one (session prose has no
+/// legitimate image use, and same-origin allow-listing would add an origin
+/// check to every render). Only the session renderer uses this; repository
+/// content (READMEs, blobs) keeps [`render`].
+pub fn render_prose(markdown: &str) -> String {
+    let mut options = comrak::Options::default();
+    options.extension.table = true;
+    options.extension.strikethrough = true;
+    options.extension.autolink = true;
+    options.extension.tasklist = true;
+    ammonia::Builder::default()
+        .rm_tags(&["img"])
+        .clean(&comrak::markdown_to_html(markdown, &options))
+        .to_string()
+}
+
 /// Plain text as escaped, preformatted HTML. Escapes markup characters only;
 /// spaces and prose pass through byte-identically (unlike
 /// `ammonia::clean_text`, which encodes spaces as `&#32;`).
@@ -46,6 +65,28 @@ mod tests {
         assert!(html.contains("<table>"), "{html}");
         assert!(!html.contains("<script"), "{html}");
         assert!(!html.contains("javascript:"), "{html}");
+    }
+
+    #[test]
+    fn prose_strips_images_but_keeps_markdown() {
+        let html = render_prose(
+            "**bold** [ok](https://example.com) ![x](https://attacker.example/t.png) ![y](/static/y.png)\n\n| a |\n|---|\n| 1 |\n",
+        );
+        assert!(html.contains("<strong>bold</strong>"), "{html}");
+        assert!(html.contains("<table>"), "{html}");
+        assert!(html.contains("<a"), "{html}");
+        assert!(!html.contains("<img"), "{html}");
+        assert!(!html.contains("attacker.example"), "{html}");
+        assert!(!html.contains("/static/y.png"), "{html}");
+    }
+
+    #[test]
+    fn prose_strips_raw_img_elements() {
+        let html = render_prose("before <img src=\"https://attacker.example/t.svg\"> after");
+        assert!(!html.contains("<img"), "{html}");
+        assert!(!html.contains("attacker.example"), "{html}");
+        assert!(html.contains("before"), "{html}");
+        assert!(html.contains("after"), "{html}");
     }
 
     #[test]
