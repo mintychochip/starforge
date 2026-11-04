@@ -3,6 +3,8 @@
 {% block content %}
 <h1>Site administration</h1>
 {% include "admin_nav.html" %}
+{% if let Some(e) = error %}<p class="error">{{ e }}</p>{% endif %}
+{% if let Some(n) = notice %}<p class="notice">{{ n }}</p>{% endif %}
 <section>
   <h2>{{ summary.user.handle }}</h2>
   <dl>

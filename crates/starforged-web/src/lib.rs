@@ -110,6 +110,27 @@ fn page_routes() -> Router<AppState> {
         .route("/admin", get(pages::admin::overview))
         .route("/admin/users", get(pages::admin::users))
         .route("/admin/users/{handle}", get(pages::admin::user_detail))
+        .route("/admin/users/{handle}/suspend", post(pages::admin::suspend))
+        .route(
+            "/admin/users/{handle}/unsuspend",
+            post(pages::admin::unsuspend),
+        )
+        .route(
+            "/admin/users/{handle}/grant",
+            post(pages::admin::grant_admin),
+        )
+        .route(
+            "/admin/users/{handle}/revoke",
+            post(pages::admin::revoke_admin),
+        )
+        .route(
+            "/admin/users/{handle}/delete",
+            post(pages::admin::delete_user),
+        )
+        .route(
+            "/admin/users/{handle}/reset-password",
+            post(pages::admin::reset_password),
+        )
         .route("/{owner}", get(pages::owner::show))
         .route(
             "/{owner}/{repo}/settings",
