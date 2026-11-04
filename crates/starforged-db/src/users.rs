@@ -115,6 +115,36 @@ pub async fn set_state(db: &Db, id: i64, state: &str) -> DbResult<()> {
         .await?;
     Ok(())
 }
+
+/// All users whose handle or email contains `query` (already lowercased; empty matches all),
+/// by handle, at most `limit` rows.
+pub async fn list_users(db: &Db, query: &str, limit: i64) -> DbResult<Vec<UserRow>> {
+    let rows = sqlx::query(select_user!(
+        "WHERE LOWER(o.handle) LIKE '%' || LOWER($1) || '%' OR LOWER(u.email) LIKE '%' || LOWER($1) || '%' ORDER BY o.handle ASC LIMIT $2"
+    ))
+    .bind(query)
+    .bind(limit)
+    .fetch_all(db.pool())
+    .await?;
+    rows.iter().map(from_row).collect()
+}
+
+/// Sets or clears the site-admin flag (`0`/`1` on both engines).
+pub async fn set_is_admin(db: &Db, id: i64, is_admin: bool) -> DbResult<()> {
+    sqlx::query("UPDATE users SET is_admin = $1 WHERE id = $2")
+        .bind(if is_admin { 1 } else { 0 })
+        .bind(id)
+        .execute(db.pool())
+        .await?;
+    Ok(())
+}
+
+/// Total user count, for the admin overview.
+pub async fn count(db: &Db) -> DbResult<i64> {
+    Ok(sqlx::query_scalar("SELECT COUNT(*) FROM users")
+        .fetch_one(db.pool())
+        .await?)
+}
 pub async fn set_email_verified(db: &Db, id: i64, verified: bool) -> DbResult<()> {
     sqlx::query("UPDATE users SET email_verified = $1 WHERE id = $2")
         .bind(i64::from(verified))
@@ -261,5 +291,49 @@ mod tests {
         assert!(by_id(&t.db, id).await.unwrap().unwrap().email_verified);
         set_email_verified(&t.db, id, false).await.unwrap();
         assert!(!by_id(&t.db, id).await.unwrap().unwrap().email_verified);
+    }
+    #[tokio::test]
+    async fn list_users_searches_handle_and_email() {
+        let db = TestDb::new().await;
+        insert(
+            &db.db,
+            &NewUser {
+                handle: "alice",
+                display_name: "A",
+                email: Some("alice@example.com"),
+                email_verified: true,
+                password_hash: None,
+                is_admin: true,
+            },
+        )
+        .await
+        .unwrap();
+        insert(
+            &db.db,
+            &NewUser {
+                handle: "bob",
+                display_name: "B",
+                email: Some("bob@example.com"),
+                email_verified: false,
+                password_hash: None,
+                is_admin: false,
+            },
+        )
+        .await
+        .unwrap();
+        let handles = |rows: Vec<UserRow>| rows.into_iter().map(|r| r.handle).collect::<Vec<_>>();
+        assert_eq!(
+            handles(list_users(&db.db, "", 200).await.unwrap()),
+            vec!["alice", "bob"]
+        );
+        assert_eq!(
+            handles(list_users(&db.db, "ali", 200).await.unwrap()),
+            vec!["alice"]
+        );
+        assert_eq!(
+            handles(list_users(&db.db, "BOB@EXAMPLE", 200).await.unwrap()),
+            vec!["bob"]
+        );
+        assert_eq!(count(&db.db).await.unwrap(), 2);
     }
 }
