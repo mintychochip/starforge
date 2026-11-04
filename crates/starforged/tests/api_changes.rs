@@ -1016,3 +1016,141 @@ async fn pagination_limits() {
         assert_eq!(res.status(), 422);
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn thread_outdated_counts_final_line_without_newline() {
+    let c = Ctx::start().await;
+    let url = c.s.git_url(
+        "alice",
+        "proj",
+        Some(&c.s.token(&c.alice, &[Scope::RepoWrite]).await),
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    let tmp_path = tmp.path().to_path_buf();
+    std::mem::forget(tmp);
+    let work = work_repo(&tmp_path, "work", &[("a.txt", "one\n")]).await;
+    git_ok(&work, &["checkout", "-q", "-b", "feature/eol"]).await;
+    // No trailing newline: two lines in two bytes of newline.
+    commit_files(&work, &[("noeol.txt", b"l1\nl2")], "add noeol").await;
+    commit_files(&work, &[("other.txt", b"other\n")], "add other").await;
+    git_ok(&work, &["push", "-q", &url, "main", "feature/eol"]).await;
+
+    let n = c.trail().await;
+    let client = reqwest::Client::new();
+    let res = client
+        .post(c.changes(n))
+        .bearer_auth(&c.bob_rw)
+        .json(&json!({"kind": "branch", "head_branch": "feature/eol", "base_branch": "main"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 201);
+
+    // A second revision so anchor-1 threads exercise the outdated path.
+    commit_files(&work, &[("third.txt", b"third\n")], "add third").await;
+    git_ok(&work, &["push", "-q", &url, "feature/eol"]).await;
+    let new_tip = git_ok(&work, &["rev-parse", "feature/eol"]).await;
+    let repo_id =
+        c.s.core
+            .repo_for(Some(&c.alice), "alice", "proj")
+            .await
+            .unwrap()
+            .repo
+            .id;
+    c.s.core
+        .record_branch_move(repo_id, "feature/eol", None, new_tip.trim())
+        .await
+        .unwrap();
+
+    let threads = format!("{}/threads", c.change(n, 1));
+    // The last line (line 2, no trailing newline) still exists → not outdated.
+    let at_last = client
+        .post(&threads)
+        .bearer_auth(&c.carol_rw)
+        .json(&json!({"revision": 1, "path": "noeol.txt", "side": "head", "start_line": 2, "end_line": 2, "body": "last"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(at_last.status(), 201);
+    assert_eq!(at_last.json::<Value>().await.unwrap()["outdated"], false);
+    // One line past the end no longer exists → outdated.
+    let past_end = client
+        .post(&threads)
+        .bearer_auth(&c.carol_rw)
+        .json(&json!({"revision": 1, "path": "noeol.txt", "side": "head", "start_line": 3, "end_line": 3, "body": "past"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(past_end.status(), 201);
+    assert_eq!(past_end.json::<Value>().await.unwrap()["outdated"], true);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resolve_thread_idempotent_writes_one_event() {
+    let c = Ctx::start().await;
+    c.push_basic().await;
+    let n = c.trail().await;
+    c.create_branch_change(n, &c.bob_rw).await;
+    let client = reqwest::Client::new();
+    let threads = format!("{}/threads", c.change(n, 1));
+    let tid = client
+        .post(&threads)
+        .bearer_auth(&c.carol_rw)
+        .json(&json!({"path": "a.txt", "side": "head", "start_line": 1, "end_line": 2, "body": "nit"}))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap()["id"]
+        .as_i64()
+        .unwrap();
+
+    let resolved_events = || async {
+        let repo_id =
+            c.s.core
+                .repo_for(Some(&c.alice), "alice", "proj")
+                .await
+                .unwrap()
+                .repo
+                .id;
+        let trail = db_trails::trail_by_number(c.s.core.db(), repo_id, n)
+            .await
+            .unwrap()
+            .expect("trail");
+        starforged_db::trails::timeline_of_trail(c.s.core.db(), trail.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == "thread.resolved")
+            .collect::<Vec<_>>()
+    };
+
+    for body in [json!({"resolved": true}), json!({"resolved": true})] {
+        let res = client
+            .post(format!("{threads}/{tid}/resolve"))
+            .bearer_auth(&c.carol_rw)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        assert_eq!(res.json::<Value>().await.unwrap()["resolved"], true);
+    }
+    let events = resolved_events().await;
+    assert_eq!(events.len(), 1, "a no-op resolve writes no second event");
+    let payload: Value = serde_json::from_str(&events[0].payload).unwrap();
+    assert_eq!(payload["thread"], tid);
+    assert_eq!(payload["resolved"], true);
+
+    // A real flip still writes.
+    let reopen = client
+        .post(format!("{threads}/{tid}/resolve"))
+        .bearer_auth(&c.carol_rw)
+        .json(&json!({"resolved": false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reopen.status(), 200);
+    assert_eq!(resolved_events().await.len(), 2);
+}

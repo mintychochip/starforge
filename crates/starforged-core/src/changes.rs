@@ -1580,7 +1580,10 @@ impl Core {
         if bytes.iter().take(8000).any(|&b| b == 0) {
             return Ok(true);
         }
-        let lines = bytes.iter().filter(|&&b| b == b'\n').count() as i64;
+        let mut lines = bytes.iter().filter(|&&b| b == b'\n').count() as i64;
+        if !bytes.is_empty() && *bytes.last().unwrap() != b'\n' {
+            lines += 1;
+        }
         Ok(thread.end_line > lines)
     }
 
@@ -1614,19 +1617,21 @@ impl Core {
         if author != Some(user.id) && access.permission < Permission::Triage {
             return Err(CoreError::Forbidden);
         }
-        db_changes::set_thread_resolved(self.db(), thread.id, i64::from(resolved)).await?;
-        self.change_timeline(
-            access.repo.id,
-            trail.id,
-            "thread.resolved",
-            Some(user.id),
-            serde_json::json!({
-                "change": change.number,
-                "thread": thread.id,
-                "resolved": resolved,
-            }),
-        )
-        .await?;
+        if (thread.resolved != 0) != resolved {
+            db_changes::set_thread_resolved(self.db(), thread.id, i64::from(resolved)).await?;
+            self.change_timeline(
+                access.repo.id,
+                trail.id,
+                "thread.resolved",
+                Some(user.id),
+                serde_json::json!({
+                    "change": change.number,
+                    "thread": thread.id,
+                    "resolved": resolved,
+                }),
+            )
+            .await?;
+        }
         let thread = db_changes::threads_of_change(self.db(), change.id)
             .await?
             .into_iter()
