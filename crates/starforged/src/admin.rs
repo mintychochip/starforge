@@ -24,14 +24,12 @@ pub async fn open_core(config: &Config, hook_exe: PathBuf) -> anyhow::Result<Cor
         CoreConfig {
             repos_dir: config.repos_dir(),
             tmp_dir: config.tmp_dir(),
-            blob_dir: config.sessions.blob_dir.clone(),
+            blob_dir: config.blob_dir(),
             max_segment_bytes: config.sessions.max_segment_bytes,
             max_repo_bytes: config.sessions.max_repo_bytes,
             max_user_bytes: config.sessions.max_user_bytes,
             max_hourly_bytes: config.sessions.max_hourly_bytes,
-            blob_store: Arc::new(starforged_blob::FsBlobStore::new(
-                config.sessions.blob_dir.clone(),
-            )),
+            blob_store: Arc::new(starforged_blob::FsBlobStore::new(config.blob_dir())),
             hook_exe,
             base_url: config.server.base_url.clone(),
             mailer: config.mailer()?,

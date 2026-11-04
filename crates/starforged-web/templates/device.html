@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block title %}Authorize device · Starforge{% endblock %}
+{% block content %}
+<h1>Authorize a device</h1>
+{% if let Some(done) = approved %}
+<div class="notice"><p>{{ done }}</p></div>
+{% endif %}
+{% if let Some(e) = error %}<p class="error">{{ e }}</p>{% endif %}
+<p>Your terminal is waiting to log in. Enter the code it shows, then choose
+Approve to finish signing in or Deny to reject the attempt. Codes expire after
+15 minutes and work only once.</p>
+<form method="post" action="/oauth/device/approve" class="stack">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <label>Device code <input name="user_code" value="{{ user_code }}" required maxlength="9" autocomplete="off" spellcheck="false"></label>
+  <div class="row">
+    <button type="submit" name="decision" value="approve">Approve</button>
+    <button type="submit" name="decision" value="deny">Deny</button>
+  </div>
+</form>
+{% endblock %}

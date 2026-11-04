@@ -54,6 +54,8 @@ fn page_routes() -> Router<AppState> {
         .route("/login", get(pages::login::form).post(pages::login::submit))
         .route("/join", get(pages::join::form).post(pages::join::submit))
         .route("/logout", post(pages::login::logout))
+        .route("/oauth/device", get(pages::device::show))
+        .route("/oauth/device/approve", post(pages::device::approve))
         .route("/verify/resend", post(pages::verify::resend))
         .route(
             "/verify/{token}",

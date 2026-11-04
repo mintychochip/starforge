@@ -3,6 +3,7 @@
 pub mod auth;
 pub mod error;
 mod moved;
+mod oauth;
 mod repos;
 mod sessions;
 mod user;
@@ -21,8 +22,21 @@ pub struct ApiState {
     /// Public URL without a trailing slash, for `clone_url`.
     pub base_url: Arc<str>,
 }
+/// Headroom above the configured segment cap for the transport body limit: the segment body
+/// itself has no framing, so this only absorbs chunked-encoding overhead.
+const SEGMENT_BODY_SLACK: u64 = 8 * 1024;
 
 pub fn router(core: Core, base_url: String) -> Router {
+    // The segment body streams straight into the handler, so the transport limit must bound it:
+    // without one, any session:upload token holder could stream gigabytes and OOM the server
+    // before the handler's length check ever runs. The handler's `body.len() > cap` check stays
+    // the second line of defense for bodies that slip through under the transport limit.
+    let segment_limit = usize::try_from(
+        core.config()
+            .max_segment_bytes
+            .saturating_add(SEGMENT_BODY_SLACK),
+    )
+    .unwrap_or(usize::MAX);
     let state = ApiState {
         core,
         base_url: Arc::from(base_url),
@@ -30,6 +44,8 @@ pub fn router(core: Core, base_url: String) -> Router {
     Router::new()
         .route("/user", get(user::show))
         .route("/user/repos", post(repos::create))
+        .route("/oauth/device/code", post(oauth::device_code))
+        .route("/oauth/token", post(oauth::token))
         .route("/repos/{owner}/{repo}", get(repos::show))
         .route(
             "/repos/{owner}/{repo}/collaborators",
@@ -45,7 +61,8 @@ pub fn router(core: Core, base_url: String) -> Router {
         )
         .route(
             "/repos/{owner}/{repo}/sessions/{ulid}/segments/{n}",
-            put(sessions::put_segment).route_layer(axum::extract::DefaultBodyLimit::disable()),
+            put(sessions::put_segment)
+                .route_layer(axum::extract::DefaultBodyLimit::max(segment_limit)),
         )
         .route(
             "/repos/{owner}/{repo}/sessions/{ulid}/complete",

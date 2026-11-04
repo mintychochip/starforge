@@ -118,8 +118,11 @@ impl Default for RegistrationConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionsConfig {
-    /// Content-addressed blob root (spec §5.3). Relative paths resolve against the process
-    /// working directory; operators should set an absolute path.
+    /// Content-addressed blob root (spec §5.3). An absolute `blob_dir` is used
+    /// verbatim; a relative one resolves against `storage.data_dir` (so
+    /// `blob_dir = "data/blobs"` with `data_dir = "/srv/starforge"` stores
+    /// blobs under `/srv/starforge/data/blobs`), matching how `repos_dir` and
+    /// `tmp_dir` are derived. See [`Config::blob_dir`] for the resolved path.
     #[serde(default = "default_blob_dir")]
     pub blob_dir: PathBuf,
     /// Rejects session segment bodies larger than this (spec §6.3).
@@ -295,6 +298,18 @@ impl Config {
 
     pub fn tmp_dir(&self) -> PathBuf {
         self.storage.data_dir.join("tmp")
+    }
+
+    /// Resolved content-addressed blob root: an absolute
+    /// `sessions.blob_dir` is used verbatim, a relative one resolves against
+    /// `storage.data_dir`, matching how [`Config::repos_dir`] and
+    /// [`Config::tmp_dir`] are derived.
+    pub fn blob_dir(&self) -> PathBuf {
+        if self.sessions.blob_dir.is_absolute() {
+            self.sessions.blob_dir.clone()
+        } else {
+            self.storage.data_dir.join(&self.sessions.blob_dir)
+        }
     }
 
     /// Cookies carry `Secure` when the public URL is HTTPS.
@@ -587,5 +602,39 @@ mod tests {
             )])
             .unwrap_err();
         assert!(bad.to_string().contains("byte count"), "{bad:?}");
+    }
+
+    #[test]
+    fn relative_blob_dir_resolves_under_data_dir() {
+        let mut config = sample();
+        config.sessions.blob_dir = PathBuf::from("data/blobs");
+        assert_eq!(
+            config.blob_dir(),
+            PathBuf::from("/srv/starforge/data/blobs")
+        );
+    }
+
+    #[test]
+    fn absolute_blob_dir_is_kept_verbatim() {
+        let mut config = sample();
+        config.sessions.blob_dir = PathBuf::from("/var/lib/blobs");
+        assert_eq!(config.blob_dir(), PathBuf::from("/var/lib/blobs"));
+    }
+
+    #[test]
+    fn init_generated_config_resolves_blobs_under_data_dir() {
+        let data = tempfile::tempdir().unwrap();
+        let config_path = data.path().join("starforged.toml");
+        let returned = crate::init::run(&crate::init::InitOptions {
+            config_path: &config_path,
+            data_dir: data.path(),
+            base_url: "http://127.0.0.1:3000",
+            http_addr: "127.0.0.1:3000",
+        })
+        .unwrap();
+        let loaded = Config::load(&config_path).unwrap();
+        assert_eq!(loaded.storage.data_dir, returned.storage.data_dir);
+        assert!(loaded.blob_dir().starts_with(&loaded.storage.data_dir));
+        assert_eq!(loaded.blob_dir(), returned.blob_dir());
     }
 }

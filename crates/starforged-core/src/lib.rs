@@ -13,6 +13,7 @@ pub mod ingest;
 pub mod invites;
 pub mod jobs;
 pub mod mail;
+pub mod oauth;
 pub mod passwords;
 pub mod permission;
 pub mod quota;

@@ -45,7 +45,13 @@ pub fn run(opts: &InitOptions<'_>) -> anyhow::Result<Config> {
         sessions: SessionsConfig::default(),
     };
     config.validate()?;
-    write_private(opts.config_path, &toml::to_string_pretty(&config)?)?;
+    // Document the blob_dir resolution rule in the generated file so operators
+    // editing it see the same contract as `SessionsConfig::blob_dir`.
+    let mut text = String::from(
+        "# `sessions.blob_dir`: an absolute path is used verbatim; a relative one resolves\n# against `storage.data_dir` (like `repos` and `tmp` do).\n",
+    );
+    text.push_str(&toml::to_string_pretty(&config)?);
+    write_private(opts.config_path, &text)?;
     Ok(config)
 }
 
