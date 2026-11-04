@@ -817,3 +817,238 @@ async fn read_token_branch_push_rejected_and_branch_unmoved() {
     let tip_after = git_ok(&work, &["ls-remote", &bob_url, "refs/heads/main"]).await;
     assert_eq!(tip_before, tip_after, "rejected push moved the branch");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pinned_trail_push_matches_by_id_not_number() {
+    let s = TestServer::start().await;
+    let alice = s.user("alice").await;
+    let (repo_id, url, work, _server) = setup_repo(&s, &alice, "proj").await;
+    // Shift global trail ids: this other-repo trail takes id 2, so proj's
+    // trail number 2 will have a different id.
+    s.repo(&alice, "other", Visibility::Private).await;
+    let _other = s
+        .core
+        .create_trail(&alice, "alice", "other", "Other", "")
+        .await
+        .unwrap();
+
+    // Unpinned push creates proj trail number 1; a titled push creates
+    // number 2 (global id 3, not 2).
+    commit_files(&work, &[("a.txt", b"a\n")], "first").await;
+    git_ok(&work, &["push", "-q", &url, "HEAD:refs/for/main/feat"]).await;
+    wait_for_open_change(&s, repo_id, alice.id, "main", "feat").await;
+    commit_files(&work, &[("b.txt", b"b\n")], "pin me").await;
+    git_ok(
+        &work,
+        &[
+            "push",
+            "-q",
+            "-o",
+            "title=Pinned",
+            &url,
+            "HEAD:refs/for/main/pin",
+        ],
+    )
+    .await;
+    let pinned = wait_for_open_change(&s, repo_id, alice.id, "main", "pin").await;
+    wait_for_revisions(&s, pinned.id, 1).await;
+    let trail = starforged_db::trails::trail_by_number(s.core.db(), repo_id, 2)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(trail.id, pinned.trail_id);
+    assert_ne!(
+        trail.id, trail.number,
+        "test premise: trail id must differ from its number"
+    );
+
+    // A second `-o trail=2` push must update that same change (r=2), not
+    // scope by the number-as-id (which names the other repo's trail) and
+    // open a duplicate.
+    commit_files(&work, &[("c.txt", b"c\n")], "pin again").await;
+    let sha = git_ok(&work, &["rev-parse", "HEAD"])
+        .await
+        .trim()
+        .to_owned();
+    git_ok(
+        &work,
+        &[
+            "push",
+            "-q",
+            "-o",
+            "trail=2",
+            &url,
+            "HEAD:refs/for/main/pin",
+        ],
+    )
+    .await;
+    let start = Instant::now();
+    loop {
+        let revs = starforged_db::changes::revisions_of_change(s.core.db(), pinned.id)
+            .await
+            .unwrap();
+        if revs.len() == 2 {
+            assert_eq!(revs[1].head_sha, sha);
+            break;
+        }
+        let changes = starforged_db::changes::changes_of_trail(s.core.db(), trail.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            changes.len(),
+            1,
+            "pinned push opened a duplicate change instead of updating"
+        );
+        assert!(
+            start.elapsed() < SCAN_TIMEOUT,
+            "pinned push never appended r=2"
+        );
+        sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scan_consumes_only_its_own_sidecar() {
+    let s = TestServer::start().await;
+    let alice = s.user("alice").await;
+    let (repo_id, url, work, server) = setup_repo(&s, &alice, "proj").await;
+    let zero = "0".repeat(40);
+
+    // Two foreign sidecars for the same refname with different nonces and
+    // options: the scan must touch neither.
+    for (nonce, title) in [
+        ("aaaa1111bbbb2222", "Stolen A"),
+        ("cccc3333dddd4444", "Stolen B"),
+    ] {
+        starforged_git::pushsidecar::write_sidecar(
+            &server,
+            nonce,
+            "refs/for/main/victim",
+            &starforged_git::pushsidecar::Sidecar {
+                repo_id,
+                user_id: Some(alice.id),
+                base: "main".to_owned(),
+                topic: "victim".to_owned(),
+                trail: None,
+                title: Some(title.to_owned()),
+                refname: "refs/for/main/victim".to_owned(),
+                old: zero.clone(),
+                new: "f".repeat(40),
+                nonce: nonce.to_owned(),
+            },
+        )
+        .unwrap();
+    }
+
+    commit_files(&work, &[("v.txt", b"v\n")], "victim work").await;
+    git_ok(&work, &["push", "-q", &url, "HEAD:refs/for/main/victim"]).await;
+    let change = wait_for_open_change(&s, repo_id, alice.id, "main", "victim").await;
+    wait_for_revisions(&s, change.id, 1).await;
+    // Ingested without options: the trail takes the tip subject, and both
+    // foreign sidecars are still on disk (the push's own nonce file was
+    // consumed).
+    let trail = starforged_db::trails::trail_by_number(s.core.db(), repo_id, 1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(trail.title, "victim work");
+    let left = starforged_git::pushsidecar::find_for_ref(&server, "refs/for/main/victim");
+    assert_eq!(left.len(), 2, "a foreign sidecar was stolen: {left:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn base_branch_delete_recomputes_mergeability() {
+    let s = TestServer::start().await;
+    let alice = s.user("alice").await;
+    let (repo_id, url, work, server) = setup_repo(&s, &alice, "proj").await;
+
+    // The base must not be the repo's current branch: git refuses to delete
+    // HEAD's target, so the change tracks `develop` instead of `main`.
+    git_ok(&work, &["checkout", "-q", "-b", "develop"]).await;
+    git_ok(&work, &["push", "-q", &url, "develop"]).await;
+    git_ok(&work, &["checkout", "-q", "-b", "feature"]).await;
+    commit_files(&work, &[("feat.txt", b"f\n")], "feature work").await;
+    git_ok(&work, &["push", "-q", &url, "feature"]).await;
+    let feature_tip = server_rev_ok(&work, &server, "refs/heads/feature").await;
+    let develop_tip = server_rev_ok(&work, &server, "refs/heads/develop").await;
+    git_ok(&work, &["checkout", "-q", "main"]).await;
+
+    let view = s
+        .core
+        .create_trail(&alice, "alice", "proj", "Branch work", "")
+        .await
+        .unwrap();
+    let trail = starforged_db::trails::trail_by_number(s.core.db(), repo_id, view.number)
+        .await
+        .unwrap()
+        .unwrap();
+    let now = starforged_db::now();
+    let change = starforged_db::changes::insert_change(
+        s.core.db(),
+        trail.id,
+        "branch",
+        Some("feature"),
+        "develop",
+        alice.id,
+        now,
+    )
+    .await
+    .unwrap();
+    let rev = starforged_db::changes::insert_revision(
+        s.core.db(),
+        change.id,
+        &feature_tip,
+        &develop_tip,
+        Some(alice.id),
+        now,
+    )
+    .await
+    .unwrap();
+    starforged_db::changes::set_current_revision(s.core.db(), change.id, rev.id, now)
+        .await
+        .unwrap();
+    // Baseline: mergeability resolves clean while the base exists.
+    s.core
+        .enqueue(&starforged_core::jobs::Job::ChangeMergeability {
+            change_id: change.id,
+        })
+        .await
+        .unwrap();
+    s.core.run_due_jobs().await.unwrap();
+    let baseline =
+        starforged_db::changes::change_by_trail_number(s.core.db(), trail.id, change.number)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(baseline.mergeability, "clean");
+
+    // Deleting the base branch records no revision but recomputes
+    // mergeability to conflict (missing base).
+    git_ok(&work, &["push", "-q", &url, ":develop"]).await;
+    let start = Instant::now();
+    loop {
+        s.core.run_due_jobs().await.unwrap();
+        let row =
+            starforged_db::changes::change_by_trail_number(s.core.db(), trail.id, change.number)
+                .await
+                .unwrap()
+                .unwrap();
+        if row.mergeability == "conflict" {
+            break;
+        }
+        assert!(
+            start.elapsed() < SCAN_TIMEOUT,
+            "base delete never recomputed (is {})",
+            row.mergeability
+        );
+        sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        starforged_db::changes::revisions_of_change(s.core.db(), change.id)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "a delete must not record a revision"
+    );
+}

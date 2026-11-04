@@ -558,20 +558,30 @@ async fn scan_push_changes(
     // Orphaned sidecars (a scan that never ran) must not accumulate.
     pushsidecar::reap(&repo, pushsidecar::MAX_AGE_SECS);
     let changes = changed_refs(&before, &after);
-    if changes.is_empty() {
+    // Deleted branches never appear in `changed_refs` (it only walks `after`
+    // — see its unit test); collect them separately so base deletions still
+    // recompute mergeability.
+    let deletes: Vec<(&str, &str)> = before
+        .iter()
+        .filter(|(name, _)| name.starts_with("refs/heads/") && !after.contains_key(*name))
+        .map(|(name, old)| (name.as_str(), old.as_str()))
+        .collect();
+    if changes.is_empty() && deletes.is_empty() {
         return;
     }
-    scan_push_trailers(&core, repo_id, &repo, &before, &changes).await;
-    ingest_for_refs(
-        &core,
-        repo_id,
-        &repo,
-        pusher.as_ref(),
-        nonce.as_deref(),
-        &after,
-        &changes,
-    )
-    .await;
+    if !changes.is_empty() {
+        scan_push_trailers(&core, repo_id, &repo, &before, &changes).await;
+        ingest_for_refs(
+            &core,
+            repo_id,
+            &repo,
+            pusher.as_ref(),
+            nonce.as_deref(),
+            &after,
+            &changes,
+        )
+        .await;
+    }
     for (name, old, new) in &changes {
         let Some(branch) = name.strip_prefix("refs/heads/") else {
             continue;
@@ -584,6 +594,19 @@ async fn scan_push_changes(
             .await
         {
             tracing::warn!(repo_id, branch, error = %err, "push scan: branch move ingest failed");
+        }
+    }
+    // Report the deletions collected above: no revision is recorded for a
+    // delete (the zero oid marks it as one), but base deletions recompute.
+    for (name, old) in &deletes {
+        let Some(branch) = name.strip_prefix("refs/heads/") else {
+            continue;
+        };
+        if let Err(err) = core
+            .record_branch_move(repo_id, branch, Some(*old), &"0".repeat(40))
+            .await
+        {
+            tracing::warn!(repo_id, branch, error = %err, "push scan: branch delete ingest failed");
         }
     }
 }
@@ -632,9 +655,13 @@ async fn ingest_for_refs(
                 },
             ),
             None => {
-                // Optionless fallback: the sidecar is gone (or was never
-                // written); re-derive the addressing and attribute the push to
-                // the authenticated pusher.
+                // No sidecar for this push's nonce: skip the options (never
+                // borrow another push's file) and ingest optionless.
+                tracing::warn!(
+                    repo_id,
+                    refname = name,
+                    "push scan: no sidecar for this push; ingesting without options"
+                );
                 let Some(pusher) = pusher else {
                     tracing::warn!(
                         repo_id,
@@ -700,36 +727,20 @@ async fn ingest_for_refs(
     }
 }
 
-/// The sidecar for this push's `refname`: the exact `(nonce, refname)` file
-/// first (consumed exactly once), then any same-ref file from a hook that ran
-/// without the nonce, newest first. Every file read is deleted.
+/// The sidecar for this push's `(nonce, refname)` pair, consumed exactly once.
+/// Strictly the RPC-generated file: a missing file means the options are
+/// skipped (the caller falls back to optionless addressing), never borrowed
+/// from another push's sidecar for the same refname.
 fn load_sidecar(
     repo: &StdPath,
     nonce: Option<&str>,
     refname: &str,
 ) -> Option<pushsidecar::Sidecar> {
-    if let Some(nonce) = nonce.filter(|nonce| pushsidecar::valid_nonce(nonce)) {
-        let path = repo
-            .join(pushsidecar::DIR_NAME)
-            .join(pushsidecar::sidecar_name(nonce, refname));
-        if let Ok(sidecar) = pushsidecar::consume_sidecar(&path) {
-            return Some(sidecar);
-        }
-    }
-    let mut files = pushsidecar::find_for_ref(repo, refname);
-    files.sort_by_key(|path| {
-        std::cmp::Reverse(
-            std::fs::metadata(path)
-                .and_then(|meta| meta.modified())
-                .ok(),
-        )
-    });
-    for path in &files {
-        if let Ok(sidecar) = pushsidecar::consume_sidecar(path) {
-            return Some(sidecar);
-        }
-    }
-    None
+    let nonce = nonce.filter(|nonce| pushsidecar::valid_nonce(nonce))?;
+    let path = repo
+        .join(pushsidecar::DIR_NAME)
+        .join(pushsidecar::sidecar_name(nonce, refname));
+    pushsidecar::consume_sidecar(&path).ok()
 }
 
 /// from a changed ref (not just the new tips), so multi-commit pushes and new branches

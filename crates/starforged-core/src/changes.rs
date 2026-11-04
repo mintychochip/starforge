@@ -76,13 +76,18 @@ impl Core {
         let trail_id = trail.id;
         let trail_number = trail.number;
 
+        // Scope the lookup by the resolved trail id — never by the
+        // user-facing trail number (`sc.trail`): ids and numbers diverge
+        // across repos, and scoping by number would miss the change and open
+        // a duplicate (or match another repo's trail, which the repo join
+        // would then wrongly exclude).
         let existing = db_changes::open_agit_change(
             self.db(),
             repo_id,
             user_id,
             &sc.base,
             &sc.topic,
-            sc.trail,
+            sc.trail.map(|_| trail_id),
         )
         .await?;
         let (change, revision) = match existing {
@@ -228,14 +233,21 @@ impl Core {
         if old.is_some_and(|old| old == new) {
             return Ok(());
         }
-        if !refpolicy::is_oid(new) {
-            // Deletes carry the zero oid: no revision records a deletion.
-            return Ok(());
-        }
         let live = db_repos::by_id(self.db(), repo_id)
             .await?
             .is_some_and(|row| row.deleted_at.is_none());
         if !live {
+            return Ok(());
+        }
+        // Base moves recompute mergeability for every open change targeting
+        // that base — including deletes, which otherwise leave a stale
+        // verdict behind (the worker reports a missing base as conflict).
+        for id in db_changes::open_change_ids_with_base(self.db(), repo_id, branch).await? {
+            self.enqueue(&Job::ChangeMergeability { change_id: id })
+                .await?;
+        }
+        if !refpolicy::is_oid(new) {
+            // Deletes carry the zero oid: no revision records a deletion.
             return Ok(());
         }
         for change in db_changes::open_branch_changes(self.db(), repo_id, branch).await? {
@@ -273,10 +285,6 @@ impl Core {
                 change_id: change.id,
             })
             .await?;
-        }
-        for id in db_changes::open_change_ids_with_base(self.db(), repo_id, branch).await? {
-            self.enqueue(&Job::ChangeMergeability { change_id: id })
-                .await?;
         }
         Ok(())
     }
