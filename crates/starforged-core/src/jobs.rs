@@ -59,6 +59,10 @@ pub enum Job {
     UpdateSessionStats { session_id: i64 },
     /// M2/M5 own delivery: the M1d arm enqueues and succeeds (stub, documented).
     SessionWebhookOutbox { session_id: i64, event: String },
+    /// Recomputes one change's mergeability against its base tip (M2b G3).
+    /// Deduplicated per change: rapid pushes collapse into one run over the
+    /// latest revision.
+    ChangeMergeability { change_id: i64 },
 }
 
 impl Job {
@@ -74,6 +78,7 @@ impl Job {
             Job::ResolveCommitLinks { .. } => "resolve_commit_links",
             Job::UpdateSessionStats { .. } => "update_session_stats",
             Job::SessionWebhookOutbox { .. } => "session_webhook_outbox",
+            Job::ChangeMergeability { .. } => "change_mergeability",
         }
     }
 
@@ -89,6 +94,7 @@ impl Job {
             Job::IndexSessionEvents { .. } => None,
             Job::ResolveCommitLinks { .. } => None,
             Job::UpdateSessionStats { .. } => None,
+            Job::ChangeMergeability { .. } => None,
             Job::SessionWebhookOutbox { .. } => None,
         }
     }
@@ -97,6 +103,9 @@ impl Job {
     fn dedupe_key(&self) -> Option<String> {
         match self {
             Job::GitMaintenance { repo_id } => Some(format!("git_maintenance:{repo_id}")),
+            Job::ChangeMergeability { change_id } => {
+                Some(format!("change_mergeability:{change_id}"))
+            }
             _ => self.recurrence().map(|_| self.kind().to_owned()),
         }
     }
@@ -196,6 +205,7 @@ impl Core {
             Job::UpdateSessionStats { session_id } => {
                 self.update_session_stats(*session_id).await.map(|_| ())
             }
+            Job::ChangeMergeability { change_id } => self.recompute_mergeability(*change_id).await,
             // M2/M5 own delivery; M1d only records the enqueue.
             Job::SessionWebhookOutbox { .. } => Ok(()),
             Job::SendEmail { to, subject, body } => {

@@ -298,6 +298,19 @@ fn permission_at_least_read(permission: &str) -> bool {
     )
 }
 
+/// Branch/tag pushes need a write-level permission AND a write-scoped token.
+/// The RPC gate admits readers (for `refs/for` only), so the hook owns this
+/// half of the split; unknown or lower permissions fail closed.
+pub fn check_branch_push(permission: Option<&str>, scope_write: bool) -> Result<(), String> {
+    if !matches!(permission, Some("write" | "maintain" | "admin")) {
+        return Err("branch and tag pushes need write permission".to_owned());
+    }
+    if !scope_write {
+        return Err("branch and tag pushes need a token with repo:write scope".to_owned());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

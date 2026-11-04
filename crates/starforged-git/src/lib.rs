@@ -7,6 +7,7 @@ pub mod diff;
 pub mod http;
 pub mod init;
 pub mod maintenance;
+pub mod merge;
 pub mod pushsidecar;
 pub mod read;
 pub mod refpolicy;

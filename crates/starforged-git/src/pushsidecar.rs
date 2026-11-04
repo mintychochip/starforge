@@ -426,8 +426,9 @@ pub fn find_for_ref(gitdir: &Path, refname: &str) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Deletes sidecar files older than `max_age_secs` (default [`MAX_AGE_SECS`]);
-/// returns the number removed. Called at push start so orphans never accumulate.
+/// Deletes sidecar files and orphaned `.tmp-*` temp files older than
+/// `max_age_secs` (default [`MAX_AGE_SECS`]); returns the number removed.
+/// Called at push start so orphans never accumulate.
 pub fn reap(gitdir: &Path, max_age_secs: u64) -> usize {
     let dir = dir(gitdir);
     let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -436,11 +437,15 @@ pub fn reap(gitdir: &Path, max_age_secs: u64) -> usize {
     let now = SystemTime::now();
     let mut removed = 0;
     for path in entries.filter_map(|e| e.ok()).map(|e| e.path()) {
-        if path.extension().is_none_or(|x| x != "json")
-            || path
-                .file_name()
-                .is_some_and(|n| n.to_string_lossy().starts_with(".tmp-"))
-        {
+        // Sidecar JSON files and orphaned `.tmp-<pid>-<nanos>` temp files (a
+        // crash between create and rename leaks them; they never match a
+        // sidecar name). Anything else is left alone.
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let candidate = path.extension().is_some_and(|x| x == "json") || name.starts_with(".tmp-");
+        if !candidate {
             continue;
         }
         let old = path
@@ -577,6 +582,33 @@ mod tests {
         assert_eq!(reap(gitdir, MAX_AGE_SECS), 1);
         assert!(!old_path.exists());
         assert!(fresh_path.exists());
+        assert_eq!(reap(gitdir, MAX_AGE_SECS), 0);
+    }
+
+    #[test]
+    fn reaper_removes_orphaned_temp_files_but_keeps_fresh_ones() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gitdir = tmp.path();
+        let dir = gitdir.join(DIR_NAME);
+        std::fs::create_dir_all(&dir).unwrap();
+        let old_tmp = dir.join(".tmp-123-456");
+        let fresh_tmp = dir.join(".tmp-789-101112");
+        let other = dir.join("notes.txt");
+        std::fs::write(&old_tmp, b"partial").unwrap();
+        std::fs::write(&fresh_tmp, b"partial").unwrap();
+        std::fs::write(&other, b"not a sidecar").unwrap();
+        // Backdate only the orphan (2h ago), shelling to `touch` like the
+        // sidecar test above.
+        let status = std::process::Command::new("touch")
+            .args(["-d", "2 hours ago"])
+            .arg(&old_tmp)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(reap(gitdir, MAX_AGE_SECS), 1);
+        assert!(!old_tmp.exists());
+        assert!(fresh_tmp.exists());
+        assert!(other.exists());
         assert_eq!(reap(gitdir, MAX_AGE_SECS), 0);
     }
 

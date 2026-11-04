@@ -9,13 +9,14 @@ use base64::Engine;
 use futures_util::TryStreamExt;
 use serde::Deserialize;
 use starforged_core::accounts::User;
+use starforged_core::changes::IngestSidecar;
 use starforged_core::jobs::Job;
 use starforged_core::permission::Permission;
 use starforged_core::repos::RepoAccess;
 use starforged_core::tokens::{self, Scope};
 use starforged_core::{Core, CoreError};
 use starforged_git::http::{self as smart, Service};
-use starforged_git::{command, read};
+use starforged_git::{command, pushsidecar, read, refpolicy, write};
 use std::collections::{BTreeMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path as StdPath, PathBuf};
@@ -92,15 +93,36 @@ fn git_protocol(headers: &HeaderMap) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// Maps a `require_repo` failure to the HTTP error for an authenticated caller.
+fn map_repo_error(e: CoreError) -> GitHttpError {
+    match e {
+        CoreError::NotFound => GitHttpError::NotFound,
+        CoreError::Forbidden => GitHttpError::Forbidden,
+        CoreError::Unauthenticated => GitHttpError::Unauthorized,
+        other => GitHttpError::Internal(other.to_string()),
+    }
+}
+
+fn map_repo_access(result: Result<RepoAccess, CoreError>) -> Result<RepoAccess, GitHttpError> {
+    result.map_err(map_repo_error)
+}
+
 /// Authenticates (optional for fetch), checks token scope and repository permission.
 /// Anonymous requests that fail get 401 so git prompts for credentials; authenticated ones get 404 or 403.
+///
+/// Receive-pack has two entry tiers: writers (`repo:write` scope + `Write`
+/// permission, as before) and readers (`repo:read` scope + `Read` permission,
+/// only when the repo's `refs_for_access` opens `refs/for` to them). The bool
+/// reports the write tier; the pre-receive hook enforces the split (branches
+/// and tags need the write tier, `refs/for` needs the read tier), because the
+/// RPC never sees the pushed refs.
 async fn authorize(
     state: &AppState,
     headers: &HeaderMap,
     owner: &str,
     repo_segment: &str,
     service: Service,
-) -> Result<(RepoAccess, Option<User>), GitHttpError> {
+) -> Result<(RepoAccess, Option<User>, bool), GitHttpError> {
     let name = repo_segment.strip_suffix(".git").unwrap_or(repo_segment);
     let auth = match basic_password(headers) {
         Some(secret) => Some(
@@ -112,28 +134,95 @@ async fn authorize(
         ),
         None => None,
     };
-    let (needed, scope) = match service {
-        Service::UploadPack => (Permission::Read, Scope::RepoRead),
-        Service::ReceivePack => (Permission::Write, Scope::RepoWrite),
+    if service == Service::UploadPack {
+        if let Some(auth) = &auth
+            && !tokens::grants(&auth.scopes, Scope::RepoRead)
+        {
+            return Err(GitHttpError::Forbidden);
+        }
+        let user: Option<&User> = auth.as_ref().map(|a| &a.user);
+        return match state
+            .core
+            .require_repo(user, owner, name, Permission::Read)
+            .await
+        {
+            Ok(access) => Ok((access, user.cloned(), false)),
+            Err(CoreError::NotFound | CoreError::Unauthenticated) if user.is_none() => {
+                Err(GitHttpError::Unauthorized)
+            }
+            Err(CoreError::NotFound) => Err(GitHttpError::NotFound),
+            Err(CoreError::Forbidden) => Err(GitHttpError::Forbidden),
+            Err(other) => Err(GitHttpError::Internal(other.to_string())),
+        };
+    }
+    // Receive-pack: anonymous pushes stay rejected (401 prompts for credentials).
+    let Some(auth) = auth else {
+        return Err(GitHttpError::Unauthorized);
     };
-    if let Some(auth) = &auth
-        && !tokens::grants(&auth.scopes, scope)
-    {
-        return Err(GitHttpError::Forbidden);
-    }
-    let user: Option<&User> = auth.as_ref().map(|a| &a.user);
-    match state.core.require_repo(user, owner, name, needed).await {
-        Ok(access) if service == Service::ReceivePack && access.repo.archived_at.is_some() => {
-            Err(GitHttpError::Archived)
+    let write_path = tokens::grants(&auth.scopes, Scope::RepoWrite);
+    let read_path = tokens::grants(&auth.scopes, Scope::RepoRead);
+    // The write tier is tried first; a reader holding a write-scoped token
+    // falls through to the read tier instead of failing here (the hook still
+    // rejects their branch pushes per ref).
+    let (access, write_path) = if write_path {
+        match state
+            .core
+            .require_repo(Some(&auth.user), owner, name, Permission::Write)
+            .await
+        {
+            Ok(access) => (access, true),
+            Err(e)
+                if read_path
+                    && matches!(
+                        e,
+                        CoreError::NotFound | CoreError::Forbidden | CoreError::Unauthenticated
+                    ) =>
+            {
+                let access = map_repo_access(
+                    state
+                        .core
+                        .require_repo(Some(&auth.user), owner, name, Permission::Read)
+                        .await,
+                )?;
+                (access, false)
+            }
+            Err(e) => return Err(map_repo_error(e)),
         }
-        Ok(access) => Ok((access, user.cloned())),
-        Err(CoreError::NotFound | CoreError::Unauthenticated) if user.is_none() => {
-            Err(GitHttpError::Unauthorized)
-        }
-        Err(CoreError::NotFound) => Err(GitHttpError::NotFound),
-        Err(CoreError::Forbidden) => Err(GitHttpError::Forbidden),
-        Err(other) => Err(GitHttpError::Internal(other.to_string())),
+    } else {
+        let access = map_repo_access(
+            state
+                .core
+                .require_repo(Some(&auth.user), owner, name, Permission::Read)
+                .await,
+        )?;
+        (access, false)
+    };
+    if access.repo.archived_at.is_some() {
+        return Err(GitHttpError::Archived);
     }
+    if !write_path {
+        // Read tier: `refs/for` only, and only when the repo opens it to this
+        // user — the same rule the hook enforces per ref (`anyone_with_read`
+        // admits any reader; `members` needs an explicit grant).
+        let refs_for = state
+            .core
+            .refs_for_access(access.repo.id)
+            .await
+            .map_err(|e| GitHttpError::Internal(e.to_string()))?;
+        let allowed = match refs_for.as_str() {
+            "anyone_with_read" => true,
+            "members" => state
+                .core
+                .is_repo_member(access.repo.id, auth.user.id)
+                .await
+                .map_err(|e| GitHttpError::Internal(e.to_string()))?,
+            _ => false,
+        };
+        if !allowed {
+            return Err(GitHttpError::Forbidden);
+        }
+    }
+    Ok((access, Some(auth.user.clone()), write_path))
 }
 
 pub async fn info_refs(
@@ -149,9 +238,14 @@ pub async fn info_refs(
         .ok_or(GitHttpError::BadRequest(
             "only the smart HTTP protocol is supported\n",
         ))?;
-    let (access, _) = authorize(&state, &headers, &owner, &repo, service).await?;
+    let (access, _, _) = authorize(&state, &headers, &owner, &repo, service).await?;
     let path = state.core.repo_path(access.repo.id);
-    let body = smart::advertisement(&path, service, git_protocol(&headers).as_deref())
+    // The per-service env tells push clients that `-o` options are accepted
+    // and hides the server-only namespaces (`refs/for`, `refs/trails`) from
+    // fetches. Push-side hiding would deny refs/for updates, so the
+    // receive-pack advertisement stays complete.
+    let env = smart::rpc_env(service);
+    let body = smart::advertisement(&path, service, git_protocol(&headers).as_deref(), &env)
         .await
         .map_err(|e| GitHttpError::Internal(e.to_string()))?;
     Ok((
@@ -191,7 +285,7 @@ async fn rpc(
     body: Body,
     service: Service,
 ) -> Result<Response, GitHttpError> {
-    let (access, user) = authorize(&state, &headers, owner, repo, service).await?;
+    let (access, user, write_path) = authorize(&state, &headers, owner, repo, service).await?;
     let path = state.core.repo_path(access.repo.id);
     // Snapshot every ref tip before spawning receive-pack: the post-push task
     // diffs per ref and enumerates the newly reachable commits for the trailer
@@ -205,7 +299,10 @@ async fn rpc(
     // so the RPC layer passes identity, permission, and refs/for mode down as
     // env, plus the git-config entries that advertise push options and hide
     // the server-only namespaces.
-    let mut env: Vec<(&str, String)> = smart::receive_pack_env();
+    let mut env: Vec<(&str, String)> = smart::rpc_env(service);
+    // The nonce keys the push-option sidecars the hook writes per accepted
+    // `refs/for` line; the post-push scan consumes exactly this push's files.
+    let mut scan_nonce: Option<String> = None;
     if service == Service::ReceivePack {
         let refs_for = state
             .core
@@ -238,10 +335,21 @@ async fn rpc(
             },
         ));
         env.push(("STARFORGE_REFS_FOR", refs_for));
+        // The write tier admits branch/tag pushes in the hook; the read tier
+        // is `refs/for`-only down there too.
         env.push((
-            "STARFORGE_PUSH_NONCE",
-            starforged_git::pushsidecar::new_nonce(),
+            "STARFORGE_SCOPE_WRITE",
+            if write_path {
+                "1".to_owned()
+            } else {
+                "0".to_owned()
+            },
         ));
+        // The nonce keys the push-option sidecars the hook writes per accepted
+        // `refs/for` line; the post-push scan consumes exactly this push's files.
+        let nonce = pushsidecar::new_nonce();
+        env.push(("STARFORGE_PUSH_NONCE", nonce.clone()));
+        scan_nonce = Some(nonce);
     }
     let gzip = headers
         .get(header::CONTENT_ENCODING)
@@ -262,9 +370,18 @@ async fn rpc(
     // A successful push queues `git maintenance` for the repository (one pending run per repository).
     let maintenance =
         (service == Service::ReceivePack).then(|| (state.core.clone(), access.repo.id));
-    // ... and scans the pushed commits for session trailers in the background.
-    let scan = (service == Service::ReceivePack)
-        .then(|| (state.core.clone(), access.repo.id, path, before));
+    // ... and ingests the pushed refs in the background: session trailers,
+    // `refs/for` changes, and branch-head moves.
+    let scan = (service == Service::ReceivePack).then(|| {
+        (
+            state.core.clone(),
+            access.repo.id,
+            path,
+            user,
+            scan_nonce,
+            before,
+        )
+    });
     tokio::spawn(async move {
         let mut text = String::new();
         let _ = stderr.read_to_string(&mut text).await;
@@ -279,8 +396,8 @@ async fn rpc(
             {
                 tracing::warn!(error = %err, repo_id, "queueing git maintenance failed");
             }
-            if let Some((core, repo_id, repo, before)) = scan {
-                scan_push_trailers(core, repo_id, repo, before).await;
+            if let Some((core, repo_id, repo, pusher, nonce, before)) = scan {
+                scan_push_changes(core, repo_id, repo, pusher, nonce, before).await;
             }
         }
     });
@@ -421,27 +538,214 @@ async fn new_commits(
     out
 }
 
-/// Records trailer links for the commits a push added: every commit newly reachable
-/// from a changed ref (not just the new tips), so multi-commit pushes and new branches
-/// scan fully. Failures only warn: a push never fails because of links.
-async fn scan_push_trailers(
+/// Post-push ingest for one successful receive-pack: session trailers, accepted
+/// `refs/for` tips (agit changes + revisions + trail refs), and branch-head
+/// moves. The `before` snapshot was taken before the push ran; `pusher` is the
+/// authenticated user and `nonce` keys this push's pre-receive sidecars.
+/// Failures only warn: a push never fails because of the scan.
+async fn scan_push_changes(
     core: Core,
     repo_id: i64,
     repo: PathBuf,
+    pusher: Option<User>,
+    nonce: Option<String>,
     before: Option<BTreeMap<String, String>>,
 ) {
     let Some(before) = before else { return };
     let Some(after) = list_refs(&repo).await else {
         return;
     };
+    // Orphaned sidecars (a scan that never ran) must not accumulate.
+    pushsidecar::reap(&repo, pushsidecar::MAX_AGE_SECS);
     let changes = changed_refs(&before, &after);
     if changes.is_empty() {
         return;
     }
-    let shas = new_commits(&repo, &before, &changes).await;
+    scan_push_trailers(&core, repo_id, &repo, &before, &changes).await;
+    ingest_for_refs(
+        &core,
+        repo_id,
+        &repo,
+        pusher.as_ref(),
+        nonce.as_deref(),
+        &after,
+        &changes,
+    )
+    .await;
+    for (name, old, new) in &changes {
+        let Some(branch) = name.strip_prefix("refs/heads/") else {
+            continue;
+        };
+        if refpolicy::is_zero_oid(new) {
+            continue;
+        }
+        if let Err(err) = core
+            .record_branch_move(repo_id, branch, old.as_deref(), new)
+            .await
+        {
+            tracing::warn!(repo_id, branch, error = %err, "push scan: branch move ingest failed");
+        }
+    }
+}
+
+/// Ingests every new `refs/for/*` tip: change + revision + trail refs via
+/// [`Core::record_agit_push`]. The consumed pseudo-ref (the hook accepted it
+/// so receive-pack stored it; it is never kept) is deleted first, so every
+/// row the scan's readers can observe implies the cleanup already happened.
+/// The head ingested is the current tip from `after`, never a stale sidecar
+/// address; the sidecar only supplies base/topic/options and is consumed
+/// (deleted) either way.
+async fn ingest_for_refs(
+    core: &Core,
+    repo_id: i64,
+    repo: &StdPath,
+    pusher: Option<&User>,
+    nonce: Option<&str>,
+    after: &BTreeMap<String, String>,
+    changes: &[(String, Option<String>, String)],
+) {
+    let mut branches: Option<Vec<String>> = None;
+    for (name, _old, new) in changes {
+        if !name.starts_with("refs/for/") {
+            continue;
+        }
+        if refpolicy::is_zero_oid(new) {
+            continue;
+        }
+        if refpolicy::parse_for_ref(name).is_none() {
+            tracing::warn!(
+                repo_id,
+                refname = name,
+                "push scan: ignoring malformed refs/for ref"
+            );
+            continue;
+        }
+        let sidecar = load_sidecar(repo, nonce, name);
+        let (user_id, sc) = match sidecar {
+            Some(sidecar) => (
+                sidecar.user_id,
+                IngestSidecar {
+                    base: sidecar.base,
+                    topic: sidecar.topic,
+                    trail: sidecar.trail,
+                    title: sidecar.title,
+                },
+            ),
+            None => {
+                // Optionless fallback: the sidecar is gone (or was never
+                // written); re-derive the addressing and attribute the push to
+                // the authenticated pusher.
+                let Some(pusher) = pusher else {
+                    tracing::warn!(
+                        repo_id,
+                        refname = name,
+                        "push scan: no sidecar and no pusher; skipping"
+                    );
+                    continue;
+                };
+                if branches.is_none() {
+                    let repo_path = repo.to_path_buf();
+                    branches = tokio::task::spawn_blocking(move || {
+                        read::branches(&repo_path).unwrap_or_default()
+                    })
+                    .await
+                    .ok();
+                }
+                let remainder = name.strip_prefix("refs/for/").unwrap_or_default();
+                let default = refpolicy::default_topic(&pusher.handle);
+                match refpolicy::split_for(remainder, branches.as_deref().unwrap_or(&[]), &default)
+                {
+                    Ok((base, topic)) => (
+                        Some(pusher.id),
+                        IngestSidecar {
+                            base,
+                            topic,
+                            trail: None,
+                            title: None,
+                        },
+                    ),
+                    Err(err) => {
+                        tracing::warn!(repo_id, refname = name, error = %err, "push scan: cannot resolve refs/for target; skipping");
+                        continue;
+                    }
+                }
+            }
+        };
+        let Some(user_id) = user_id else {
+            tracing::warn!(
+                repo_id,
+                refname = name,
+                "push scan: sidecar has no user; skipping"
+            );
+            continue;
+        };
+        // Delete the consumed pseudo-ref BEFORE ingesting: the hook accepted
+        // it so receive-pack stored it, and it is never kept. Deleting first
+        // means every row the scan's readers can observe implies the cleanup
+        // already happened (readers poll rows, never refs). A failed ingest
+        // still warns loudly; re-pushing recreates the ref and its sidecar.
+        if let Err(err) = write::delete_ref(repo, name).await {
+            tracing::warn!(repo_id, refname = name, error = %err, "push scan: the refs/for pseudo-ref survived; it will be retried on the next push");
+        }
+        let base_tip = after
+            .get(&format!("refs/heads/{}", sc.base))
+            .cloned()
+            .unwrap_or_else(|| new.clone());
+        if let Err(err) = core
+            .record_agit_push(repo_id, user_id, &sc, new, &base_tip)
+            .await
+        {
+            tracing::warn!(repo_id, refname = name, error = %err, "push scan: refs/for ingest failed");
+        }
+    }
+}
+
+/// The sidecar for this push's `refname`: the exact `(nonce, refname)` file
+/// first (consumed exactly once), then any same-ref file from a hook that ran
+/// without the nonce, newest first. Every file read is deleted.
+fn load_sidecar(
+    repo: &StdPath,
+    nonce: Option<&str>,
+    refname: &str,
+) -> Option<pushsidecar::Sidecar> {
+    if let Some(nonce) = nonce.filter(|nonce| pushsidecar::valid_nonce(nonce)) {
+        let path = repo
+            .join(pushsidecar::DIR_NAME)
+            .join(pushsidecar::sidecar_name(nonce, refname));
+        if let Ok(sidecar) = pushsidecar::consume_sidecar(&path) {
+            return Some(sidecar);
+        }
+    }
+    let mut files = pushsidecar::find_for_ref(repo, refname);
+    files.sort_by_key(|path| {
+        std::cmp::Reverse(
+            std::fs::metadata(path)
+                .and_then(|meta| meta.modified())
+                .ok(),
+        )
+    });
+    for path in &files {
+        if let Ok(sidecar) = pushsidecar::consume_sidecar(path) {
+            return Some(sidecar);
+        }
+    }
+    None
+}
+
+/// from a changed ref (not just the new tips), so multi-commit pushes and new branches
+/// scan fully. Failures only warn: a push never fails because of links.
+async fn scan_push_trailers(
+    core: &Core,
+    repo_id: i64,
+    repo: &StdPath,
+    before: &BTreeMap<String, String>,
+    changes: &[(String, Option<String>, String)],
+) {
+    let shas = new_commits(repo, before, changes).await;
     if shas.is_empty() {
         return;
     }
+    let repo = repo.to_path_buf();
     let messages = tokio::task::spawn_blocking(move || {
         let mut out = Vec::with_capacity(shas.len());
         for sha in &shas {

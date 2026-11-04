@@ -419,6 +419,58 @@ pub async fn open_agit_change(
     row.as_ref().map(change_from_row).transpose()
 }
 
+pub async fn change_by_id(db: &Db, id: i64) -> DbResult<Option<ChangeRow>> {
+    let row = sqlx::query(select_change!("WHERE id = $1"))
+        .bind(id)
+        .fetch_optional(db.pool())
+        .await?;
+    row.as_ref().map(change_from_row).transpose()
+}
+
+pub async fn revision_by_id(db: &Db, id: i64) -> DbResult<Option<RevisionRow>> {
+    let row = sqlx::query(select_revision!("WHERE id = $1"))
+        .bind(id)
+        .fetch_optional(db.pool())
+        .await?;
+    row.as_ref().map(revision_from_row).transpose()
+}
+
+/// The open branch changes for `(repo, head branch)`: the update targets when a
+/// head-branch push lands. Joins trails for the repo scope; closed/merged rows
+/// and other branches never match.
+pub async fn open_branch_changes(db: &Db, repo_id: i64, branch: &str) -> DbResult<Vec<ChangeRow>> {
+    // Column-qualified: the join would make the shared SELECT list ambiguous.
+    let rows = sqlx::query(
+        "SELECT changes.id, changes.trail_id, changes.number, changes.kind, changes.head_branch, \
+         changes.base_branch, changes.topic, changes.current_revision_id, changes.state, \
+         changes.merge_method, changes.merge_commit, changes.creator_id, changes.created_at, \
+         changes.updated_at, changes.mergeability, changes.conflict_paths \
+         FROM changes JOIN trails t ON t.id = changes.trail_id \
+         WHERE t.repo_id = $1 AND changes.head_branch = $2 AND changes.state = 'open' \
+         AND changes.kind = 'branch' ORDER BY changes.id ASC",
+    )
+    .bind(repo_id)
+    .bind(branch)
+    .fetch_all(db.pool())
+    .await?;
+    rows.iter().map(change_from_row).collect()
+}
+
+/// Ids of every open change in the repo whose base branch is `base` (any kind):
+/// a base-branch move recomputes mergeability for all of them but revises none.
+pub async fn open_change_ids_with_base(db: &Db, repo_id: i64, base: &str) -> DbResult<Vec<i64>> {
+    let rows: Vec<i64> = sqlx::query_scalar(
+        "SELECT changes.id FROM changes JOIN trails t ON t.id = changes.trail_id \
+         WHERE t.repo_id = $1 AND changes.base_branch = $2 AND changes.state = 'open' \
+         ORDER BY changes.id ASC",
+    )
+    .bind(repo_id)
+    .bind(base)
+    .fetch_all(db.pool())
+    .await?;
+    Ok(rows)
+}
+
 pub async fn set_current_revision(
     db: &Db,
     change_id: i64,
@@ -499,6 +551,117 @@ pub async fn insert_revision(
         now,
     )
     .await
+}
+
+/// Reserves the next per-change revision number from `revision_sequences` in
+/// its own transaction (same upsert pattern as the insert path, so concurrent
+/// reservers serialize on the sequence row lock). The caller publishes side
+/// effects (trail refs) against the reserved number and then inserts the row
+/// with [`insert_revision_numbered`], so a visible revision always has its
+/// refs. A crash between reserve and insert skips the number; that is the
+/// price of publishing refs before the row commits.
+pub async fn reserve_revision_number(db: &Db, change_id: i64) -> DbResult<i64> {
+    let mut tx = db.pool().begin().await?;
+    let number = alloc_revision_number(&mut tx, change_id).await?;
+    tx.commit().await?;
+    Ok(number)
+}
+
+/// Inserts the revision with an explicitly reserved number (see
+/// [`reserve_revision_number`]). Same row defaults as [`insert_revision`]:
+/// `merge_base_sha` starts NULL and the mergeability snapshot starts
+/// `unknown`/empty.
+pub async fn insert_revision_numbered(
+    db: &Db,
+    change_id: i64,
+    number: i64,
+    head_sha: &str,
+    base_sha: &str,
+    pusher: Option<i64>,
+    now: i64,
+) -> DbResult<RevisionRow> {
+    let row = sqlx::query(
+        "INSERT INTO revisions (change_id, number, head_sha, base_sha, pusher_id, created_at) \
+         VALUES ($1, $2, $3, $4, $5, $6) \
+         RETURNING id, change_id, number, head_sha, base_sha, merge_base_sha, pusher_id, created_at, \
+         mergeability, conflict_paths",
+    )
+    .bind(change_id)
+    .bind(number)
+    .bind(head_sha)
+    .bind(base_sha)
+    .bind(pusher)
+    .bind(now)
+    .fetch_one(db.pool())
+    .await?;
+    revision_from_row(&row)
+}
+
+/// Inserts an agit change with its first revision and current pointer in one
+/// transaction: allocates the change number, inserts the change, allocates
+/// the revision number, inserts the revision, and points the change at it.
+/// Readers polling for the change (the post-push scan's `open_agit_change`)
+/// see it only once the revision and its current pointer exist — combined
+/// with refs written before this commits (the fresh-trail `k == 1`, `r == 1`
+/// pre-write), a visible first revision always has its refs and its current
+/// pointer. The change row is re-read before commit so the returned row
+/// carries the current revision id.
+#[allow(clippy::too_many_arguments)]
+pub async fn insert_agit_change_with_revision(
+    db: &Db,
+    trail_id: i64,
+    base: &str,
+    topic: &str,
+    creator_id: i64,
+    head_sha: &str,
+    base_sha: &str,
+    pusher: Option<i64>,
+    now: i64,
+) -> DbResult<(ChangeRow, RevisionRow)> {
+    let mut tx = db.pool().begin().await?;
+    let k = alloc_change_number(&mut tx, trail_id).await?;
+    let change_id: i64 = sqlx::query_scalar(
+        "INSERT INTO changes (trail_id, number, kind, head_branch, base_branch, topic, state, \
+         creator_id, created_at, updated_at) \
+         VALUES ($1, $2, 'agit', NULL, $3, $4, 'open', $5, $6, $6) RETURNING id",
+    )
+    .bind(trail_id)
+    .bind(k)
+    .bind(base)
+    .bind(topic)
+    .bind(creator_id)
+    .bind(now)
+    .fetch_one(&mut *tx)
+    .await?;
+    let r = alloc_revision_number(&mut tx, change_id).await?;
+    let rev_row = sqlx::query(
+        "INSERT INTO revisions (change_id, number, head_sha, base_sha, pusher_id, created_at) \
+         VALUES ($1, $2, $3, $4, $5, $6) \
+         RETURNING id, change_id, number, head_sha, base_sha, merge_base_sha, pusher_id, created_at, \
+         mergeability, conflict_paths",
+    )
+    .bind(change_id)
+    .bind(r)
+    .bind(head_sha)
+    .bind(base_sha)
+    .bind(pusher)
+    .bind(now)
+    .fetch_one(&mut *tx)
+    .await?;
+    let revision = revision_from_row(&rev_row)?;
+    sqlx::query("UPDATE changes SET current_revision_id = $1, updated_at = $2 WHERE id = $3")
+        .bind(revision.id)
+        .bind(now)
+        .bind(change_id)
+        .execute(&mut *tx)
+        .await?;
+    let change_row = sqlx::query(select_change!("WHERE id = $1"))
+        .bind(change_id)
+        .fetch_one(&mut *tx)
+        .await?;
+    let change = change_from_row(&change_row)?;
+    tx.commit().await?;
+    Ok((change, revision))
 }
 
 /// Revisions of the change in ascending number order.

@@ -15,6 +15,9 @@ pub struct HookCtx {
     pub handle: String,
     pub permission: Option<String>,
     pub is_member: bool,
+    /// The token granted `repo:write` scope. Branch/tag pushes need it on top
+    /// of a write-level permission; the RPC admits readers for `refs/for`.
+    pub scope_write: bool,
     pub refs_for: String,
     pub git_dir: PathBuf,
     pub branches: Vec<String>,
@@ -54,6 +57,7 @@ impl HookCtx {
             handle: env("STARFORGE_USER_HANDLE").unwrap_or_default(),
             permission: env("STARFORGE_PERMISSION"),
             is_member: env("STARFORGE_IS_MEMBER").is_some_and(|v| v == "1"),
+            scope_write: env("STARFORGE_SCOPE_WRITE").is_some_and(|v| v == "1"),
             refs_for: env("STARFORGE_REFS_FOR").unwrap_or_else(|| "anyone_with_read".to_owned()),
             git_dir,
             branches,
@@ -123,7 +127,21 @@ pub fn pre_receive_with(input: impl BufRead, mut err: impl Write, ctx: &HookCtx)
                     }
                 }
             }
-            Ok(_) => {}
+            Ok(refpolicy::RefKind::Branch) | Ok(refpolicy::RefKind::Tag) => {
+                // The RPC admits readers for `refs/for`, so branches and tags
+                // enforce the write half here: write-level permission plus a
+                // write-scoped token.
+                if let Err(message) =
+                    refpolicy::check_branch_push(ctx.permission.as_deref(), ctx.scope_write)
+                {
+                    let _ = writeln!(
+                        err,
+                        "starforge: pushing to {} is not allowed: {message}",
+                        update.name
+                    );
+                    code = 1;
+                }
+            }
         }
     }
     let options = match &ctx.options {
@@ -180,6 +198,7 @@ mod tests {
             handle: "Alice".to_owned(),
             permission: Some("read".to_owned()),
             is_member: false,
+            scope_write: true,
             refs_for: "anyone_with_read".to_owned(),
             git_dir,
             branches: vec!["main".to_owned(), "release/1.x".to_owned()],
@@ -199,13 +218,31 @@ mod tests {
     }
 
     #[test]
-    fn accepts_branches_and_tags() {
+    fn accepts_branches_and_tags_for_writers() {
         let tmp = tempfile::tempdir().unwrap();
-        let c = ctx(tmp.path().to_owned());
+        let mut c = ctx(tmp.path().to_owned());
+        c.permission = Some("write".to_owned());
         assert_eq!(
             run("0 1 refs/heads/main\n0 2 refs/tags/v1\n\n", &c),
             (0, String::new())
         );
+    }
+
+    #[test]
+    fn branch_and_tag_pushes_need_write_permission_and_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let c = ctx(tmp.path().to_owned());
+        // Reader permission with a write-scoped token: rejected on permission.
+        let (code, err) = run("0 1 refs/heads/main\n", &c);
+        assert_eq!(code, 1);
+        assert!(err.contains("need write permission"), "{err}");
+        // Write permission with a read-scoped token: rejected on scope.
+        let mut scoped = ctx(tmp.path().to_owned());
+        scoped.permission = Some("write".to_owned());
+        scoped.scope_write = false;
+        let (code, err) = run("0 2 refs/tags/v1\n", &scoped);
+        assert_eq!(code, 1);
+        assert!(err.contains("repo:write scope"), "{err}");
     }
 
     #[test]

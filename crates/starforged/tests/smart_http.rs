@@ -141,34 +141,30 @@ async fn git_access_follows_visibility_permissions_and_scopes() {
         ],
     )
     .await;
-    let denied = git(
-        &work,
-        &[
-            "push",
-            &s.git_url("alice", "private", Some(&bob_write)),
-            "main",
-        ],
-    )
-    .await;
+    // A read collaborator enters receive-pack (for refs/for) but the hook
+    // rejects the branch push with a clear message and moves nothing.
+    let bob_url = s.git_url("alice", "private", Some(&bob_write));
+    let tip_before = git_ok(&work, &["ls-remote", &bob_url, "refs/heads/main"]).await;
+    let denied = git(&work, &["push", &bob_url, "main"]).await;
+    assert!(!denied.status.success());
+    let denied_stderr = String::from_utf8_lossy(&denied.stderr);
     assert!(
-        String::from_utf8_lossy(&denied.stderr).contains("403"),
-        "{}",
-        String::from_utf8_lossy(&denied.stderr)
+        denied_stderr.contains("need write permission"),
+        "{denied_stderr}"
     );
-    let read_only = git(
-        &work,
-        &[
-            "push",
-            &s.git_url("alice", "private", Some(&alice_read)),
-            "main",
-        ],
-    )
-    .await;
+    let tip_after = git_ok(&work, &["ls-remote", &bob_url, "refs/heads/main"]).await;
+    assert_eq!(tip_before, tip_after, "rejected push moved the branch");
+    // A read-only token is likewise rejected at the hook (scope tier).
+    let alice_url = s.git_url("alice", "private", Some(&alice_read));
+    let read_only = git(&work, &["push", &alice_url, "main"]).await;
+    assert!(!read_only.status.success());
+    let read_only_stderr = String::from_utf8_lossy(&read_only.stderr);
     assert!(
-        String::from_utf8_lossy(&read_only.stderr).contains("403"),
-        "{}",
-        String::from_utf8_lossy(&read_only.stderr)
+        read_only_stderr.contains("repo:write scope"),
+        "{read_only_stderr}"
     );
+    let tip_still = git_ok(&work, &["ls-remote", &alice_url, "refs/heads/main"]).await;
+    assert_eq!(tip_before, tip_still, "rejected push moved the branch");
 
     // A write collaborator can push.
     s.core

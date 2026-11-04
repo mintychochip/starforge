@@ -59,6 +59,7 @@ pub async fn advertisement(
     repo: &Path,
     service: Service,
     git_protocol: Option<&str>,
+    env: &[(&str, String)],
 ) -> Result<Vec<u8>, GitError> {
     let mut cmd = git();
     cmd.arg(service.subcommand())
@@ -67,6 +68,9 @@ pub async fn advertisement(
         .arg(repo);
     if let Some(protocol) = git_protocol {
         cmd.env("GIT_PROTOCOL", protocol);
+    }
+    for (key, value) in env {
+        cmd.env(key, value);
     }
     let out = cmd.output().await?;
     if !out.status.success() {
@@ -123,23 +127,33 @@ pub fn spawn_rpc(
     })
 }
 
-/// `GIT_CONFIG_*` env for spawned RPC processes: advertise push options (else
-/// clients never transmit `-o`) and hide the server-only namespaces
-/// (`refs/for`, `refs/trails`) from advertisements so default clones never
-/// fetch them. Passed through the existing `spawn_rpc` `env` seam.
-pub fn receive_pack_env() -> Vec<(&'static str, String)> {
-    vec![
-        ("GIT_CONFIG_COUNT", "3".to_owned()),
-        (
-            "GIT_CONFIG_KEY_0",
-            "receive.advertisePushOptions".to_owned(),
-        ),
-        ("GIT_CONFIG_VALUE_0", "true".to_owned()),
-        ("GIT_CONFIG_KEY_1", "transfer.hideRefs".to_owned()),
-        ("GIT_CONFIG_VALUE_1", "refs/for".to_owned()),
-        ("GIT_CONFIG_KEY_2", "transfer.hideRefs".to_owned()),
-        ("GIT_CONFIG_VALUE_2", "refs/trails".to_owned()),
-    ]
+/// `GIT_CONFIG_*` env for spawned RPC processes and advertisements, per service.
+/// Receive-pack advertises push options (else clients never transmit `-o`);
+/// it hides nothing: every `hideRefs` flavor makes receive-pack deny updates
+/// to the hidden refs ("deny updating a hidden ref" — verified live against
+/// the in-process server, and documented in `git-config`), so `refs/for`
+/// must stay visible to stay pushable. Upload-pack hides the server-only
+/// namespaces (`refs/for`, `refs/trails`) from fetches via
+/// `uploadpack.hideRefs`, so default clones and `ls-remote` never see them.
+/// Passed through the existing `spawn_rpc` / `advertisement` `env` seam.
+pub fn rpc_env(service: Service) -> Vec<(&'static str, String)> {
+    match service {
+        Service::ReceivePack => vec![
+            ("GIT_CONFIG_COUNT", "1".to_owned()),
+            (
+                "GIT_CONFIG_KEY_0",
+                "receive.advertisePushOptions".to_owned(),
+            ),
+            ("GIT_CONFIG_VALUE_0", "true".to_owned()),
+        ],
+        Service::UploadPack => vec![
+            ("GIT_CONFIG_COUNT", "2".to_owned()),
+            ("GIT_CONFIG_KEY_0", "uploadpack.hideRefs".to_owned()),
+            ("GIT_CONFIG_VALUE_0", "refs/for".to_owned()),
+            ("GIT_CONFIG_KEY_1", "uploadpack.hideRefs".to_owned()),
+            ("GIT_CONFIG_VALUE_1", "refs/trails".to_owned()),
+        ],
+    }
 }
 
 #[cfg(test)]
@@ -180,26 +194,33 @@ mod tests {
         assert!(!is_v2(None));
     }
 
-    #[test]
-    fn push_option_env_advertises_and_hides_namespaces() {
-        let env = receive_pack_env();
+    fn pairs_of(env: &[(&str, String)]) -> Vec<(String, String)> {
         let get = |k: &str| {
             env.iter()
                 .find(|(key, _)| *key == k)
                 .map(|(_, v)| v.clone())
         };
-        assert_eq!(get("GIT_CONFIG_COUNT").as_deref(), Some("3"));
-        let pairs: Vec<(String, String)> = (0..3)
+        let count: usize = get("GIT_CONFIG_COUNT").unwrap().parse().unwrap();
+        (0..count)
             .map(|i| {
                 (
                     get(&format!("GIT_CONFIG_KEY_{i}")).unwrap(),
                     get(&format!("GIT_CONFIG_VALUE_{i}")).unwrap(),
                 )
             })
-            .collect();
-        assert!(pairs.contains(&("receive.advertisePushOptions".to_owned(), "true".to_owned())));
-        assert!(pairs.contains(&("transfer.hideRefs".to_owned(), "refs/for".to_owned())));
-        assert!(pairs.contains(&("transfer.hideRefs".to_owned(), "refs/trails".to_owned())));
+            .collect()
+    }
+
+    #[test]
+    fn push_option_env_advertises_and_hides_namespaces() {
+        // Pushes to refs/for must stay accepted: every `hideRefs` flavor makes
+        // receive-pack deny them, so only the fetch side hides.
+        let push = pairs_of(&rpc_env(Service::ReceivePack));
+        assert!(push.contains(&("receive.advertisePushOptions".to_owned(), "true".to_owned())));
+        assert!(!push.iter().any(|(k, _)| k.ends_with("hideRefs")));
+        let fetch = pairs_of(&rpc_env(Service::UploadPack));
+        assert!(fetch.contains(&("uploadpack.hideRefs".to_owned(), "refs/for".to_owned())));
+        assert!(fetch.contains(&("uploadpack.hideRefs".to_owned(), "refs/trails".to_owned())));
     }
 
     #[tokio::test]
@@ -209,11 +230,11 @@ mod tests {
         crate::init::init_bare(&repo, "main", Path::new("/bin/false"))
             .await
             .unwrap();
-        let v0 = advertisement(&repo, Service::UploadPack, None)
+        let v0 = advertisement(&repo, Service::UploadPack, None, &[])
             .await
             .unwrap();
         assert!(v0.starts_with(b"001e# service=git-upload-pack\n0000"));
-        let v2 = advertisement(&repo, Service::UploadPack, Some("version=2"))
+        let v2 = advertisement(&repo, Service::UploadPack, Some("version=2"), &[])
             .await
             .unwrap();
         assert!(

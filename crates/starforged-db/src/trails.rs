@@ -204,6 +204,14 @@ pub async fn trail_by_number(db: &Db, repo_id: i64, number: i64) -> DbResult<Opt
     row.as_ref().map(trail_from_row).transpose()
 }
 
+pub async fn trail_by_id(db: &Db, id: i64) -> DbResult<Option<TrailRow>> {
+    let row = sqlx::query(select_trail!("WHERE id = $1"))
+        .bind(id)
+        .fetch_optional(db.pool())
+        .await?;
+    row.as_ref().map(trail_from_row).transpose()
+}
+
 /// Trails of the repository in ascending number order, at most `f.limit` rows.
 /// Every filter is optional: `after` is the keyset cursor (rows above it only),
 /// label/assignee match through `EXISTS` subqueries, state/author directly.
