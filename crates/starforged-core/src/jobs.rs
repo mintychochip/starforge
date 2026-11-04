@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use starforged_db::jobs::{self, NewJob};
+use starforged_db::sessions as db_sessions;
 use starforged_db::{now, web_sessions};
 
 use crate::mail::Email;
@@ -49,6 +50,15 @@ pub enum Job {
     },
     /// `git maintenance run --auto` for one repository, after a push to it (forge-basics design §8.4).
     GitMaintenance { repo_id: i64 },
+    /// M4 owns event indexing: the M1d arm only confirms the session still exists (stub, documented).
+    IndexSessionEvents { session_id: i64 },
+    /// Links resolve synchronously at write time (trailer scan + CLI claims);
+    /// the M1d arm is a no-op marker for future layers (stub, documented).
+    ResolveCommitLinks { repo_id: i64, session_ulid: String },
+    /// Recomputes the session's turn/tool counts and usage sums from its segment events.
+    UpdateSessionStats { session_id: i64 },
+    /// M2/M5 own delivery: the M1d arm enqueues and succeeds (stub, documented).
+    SessionWebhookOutbox { session_id: i64, event: String },
 }
 
 impl Job {
@@ -60,6 +70,10 @@ impl Job {
             Job::PurgeDeletedRepos => "purge_deleted_repos",
             Job::SendEmail { .. } => "send_email",
             Job::GitMaintenance { .. } => "git_maintenance",
+            Job::IndexSessionEvents { .. } => "index_session_events",
+            Job::ResolveCommitLinks { .. } => "resolve_commit_links",
+            Job::UpdateSessionStats { .. } => "update_session_stats",
+            Job::SessionWebhookOutbox { .. } => "session_webhook_outbox",
         }
     }
 
@@ -72,6 +86,10 @@ impl Job {
             Job::PurgeDeletedRepos => Some(DAY),
             Job::SendEmail { .. } => None,
             Job::GitMaintenance { .. } => None,
+            Job::IndexSessionEvents { .. } => None,
+            Job::ResolveCommitLinks { .. } => None,
+            Job::UpdateSessionStats { .. } => None,
+            Job::SessionWebhookOutbox { .. } => None,
         }
     }
 
@@ -168,6 +186,18 @@ impl Core {
             }
             Job::PurgeDeletedRepos => self.purge_deleted_repos().await.map(|_| ()),
             Job::GitMaintenance { repo_id } => self.maintain_repo(*repo_id).await,
+            // M4 owns event indexing; M1d only confirms the session still exists.
+            Job::IndexSessionEvents { session_id } => {
+                let _ = db_sessions::session_by_id(self.db(), *session_id).await?;
+                Ok(())
+            }
+            // Links resolve synchronously at write time; nothing left to do.
+            Job::ResolveCommitLinks { .. } => Ok(()),
+            Job::UpdateSessionStats { session_id } => {
+                self.update_session_stats(*session_id).await.map(|_| ())
+            }
+            // M2/M5 own delivery; M1d only records the enqueue.
+            Job::SessionWebhookOutbox { .. } => Ok(()),
             Job::SendEmail { to, subject, body } => {
                 let mailer = self
                     .config()
@@ -200,6 +230,23 @@ impl Core {
                 && !body.is_empty()
             {
                 self.blank_email(row.id, &to, &subject).await?;
+            }
+        }
+        // Zero-ref blob files left behind by purged sessions: delete the file,
+        // then the row. One bad blob warns and is skipped; cleanup never fails
+        // because of the sweep.
+        for blob in db_sessions::zero_ref_blobs(self.db(), 100).await? {
+            let key = starforged_blob::BlobRef {
+                hash: blob.hash.clone(),
+                size: u64::try_from(blob.size).unwrap_or(0),
+                key: blob.backend_key.clone(),
+            };
+            if let Err(err) = self.config().blob_store.delete(&key).await {
+                tracing::warn!(hash = %blob.hash, error = %err, "blob sweep: file delete failed");
+                continue;
+            }
+            if let Err(err) = db_sessions::delete_blob(self.db(), &blob.hash).await {
+                tracing::warn!(hash = %blob.hash, error = %err, "blob sweep: row delete failed");
             }
         }
         Ok(())
@@ -482,5 +529,209 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(states, vec!["done", "done"]);
+    }
+
+    /// Ingest fixture for the job tests: a private repo plus an upload-capable auth.
+    async fn ingest_ctx() -> (
+        Core,
+        crate::testing::Fixture,
+        crate::ingest::IngestAuth,
+        crate::accounts::User,
+    ) {
+        use crate::repos::CreateRepo;
+        use crate::tokens::Scope;
+        let (core, f) = test_core().await;
+        let alice = user(&core, "alice").await;
+        core.create_repo(
+            &alice,
+            CreateRepo {
+                name: "proj".into(),
+                description: String::new(),
+                visibility: Visibility::Private,
+                readme: false,
+            },
+        )
+        .await
+        .unwrap();
+        let created = core
+            .create_token(&alice, "t", &[Scope::SessionUpload], 30)
+            .await
+            .unwrap();
+        let token = core.authenticate_token(&created.secret).await.unwrap();
+        let auth = core
+            .authorize_upload(&token, "alice", "proj")
+            .await
+            .unwrap();
+        (core, f, auth, alice)
+    }
+
+    /// Payload lines for one segment: two user turns, one tool call, one assistant message with usage.
+    fn stats_lines() -> Vec<String> {
+        let ts = "2026-11-04T00:00:00Z";
+        vec![
+            format!(r#"{{"v":1,"seq":0,"ts":"{ts}","kind":"user_message","text":"hi"}}"#),
+            format!(r#"{{"v":1,"seq":1,"ts":"{ts}","kind":"tool_call","tool":{{"name":"read"}}}}"#),
+            format!(
+                r#"{{"v":1,"seq":2,"ts":"{ts}","kind":"assistant_message","text":"done","usage":{{"input":10,"output":5,"cache_read":2,"cache_write":3,"reasoning":7}}}}"#
+            ),
+            format!(r#"{{"v":1,"seq":3,"ts":"{ts}","kind":"user_message","text":"thanks"}}"#),
+        ]
+    }
+
+    fn session_meta(ulid: &str) -> serde_json::Value {
+        serde_json::json!({
+            "format": "starforge.session/v1",
+            "id": ulid,
+            "agent": {"name": "claude-code", "version": "1.0"},
+            "models": ["opus"],
+            "title": "test session",
+            "started_at": "2026-11-04T00:00:00Z",
+            "ended_at": null,
+            "repo": {},
+            "parent_id": null,
+            "usage": {},
+            "files_touched": [],
+            "redaction": {},
+            "capture": {"mode": "discovery"},
+        })
+    }
+
+    fn segment_payload(lines: &[String]) -> (Vec<u8>, String) {
+        let mut jsonl = lines.join("\n");
+        jsonl.push('\n');
+        let bytes = starforge_format::compress(jsonl.as_bytes());
+        let hash = starforge_format::blake3_hex(&bytes);
+        (bytes, hash)
+    }
+
+    #[tokio::test]
+    async fn segment_store_enqueues_four_jobs_and_stats_recompute() {
+        use crate::ingest::SegmentPut;
+        let (core, _f, auth, _alice) = ingest_ctx().await;
+        let ulid = "01ARZ3NDEKTSV4RRFFQ69G5FB0";
+        core.upsert_session_meta(&auth, ulid, &session_meta(ulid))
+            .await
+            .unwrap();
+        let (bytes, hash) = segment_payload(&stats_lines());
+        match core
+            .put_segment(&auth, ulid, 0, &bytes, Some(hash))
+            .await
+            .unwrap()
+        {
+            SegmentPut::Stored(_) => {}
+            other => panic!("unexpected put outcome: {other:?}"),
+        }
+        // One segment store enqueues all four ingest jobs with the right payloads.
+        let kinds: Vec<String> = sqlx::query_scalar("SELECT kind FROM jobs ORDER BY id")
+            .fetch_all(core.db().pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            kinds,
+            vec![
+                "index_session_events",
+                "resolve_commit_links",
+                "update_session_stats",
+                "session_webhook_outbox",
+            ]
+        );
+        let payloads: Vec<String> = sqlx::query_scalar("SELECT payload FROM jobs ORDER BY id")
+            .fetch_all(core.db().pool())
+            .await
+            .unwrap();
+        let session_id =
+            starforged_db::sessions::session_by_ulid(core.db(), auth.access.repo.id, ulid)
+                .await
+                .unwrap()
+                .unwrap()
+                .id;
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&payloads[0]).unwrap(),
+            serde_json::json!({"kind": "index_session_events", "session_id": session_id})
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&payloads[1]).unwrap(),
+            serde_json::json!({"kind": "resolve_commit_links", "repo_id": auth.access.repo.id, "session_ulid": ulid})
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&payloads[2]).unwrap(),
+            serde_json::json!({"kind": "update_session_stats", "session_id": session_id})
+        );
+        // `run_due_jobs` recomputes the session counts from the segment events;
+        // the three stub arms succeed and every job lands `done`.
+        core.run_due_jobs().await.unwrap();
+        let row = starforged_db::sessions::session_by_ulid(core.db(), auth.access.repo.id, ulid)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((row.turn_count, row.tool_call_count), (2, 1));
+        assert_eq!(
+            (
+                row.usage_input,
+                row.usage_output,
+                row.usage_cache_read,
+                row.usage_cache_write,
+                row.usage_reasoning
+            ),
+            (10, 5, 2, 3, 7)
+        );
+        let states: Vec<String> = sqlx::query_scalar("SELECT state FROM jobs ORDER BY id")
+            .fetch_all(core.db().pool())
+            .await
+            .unwrap();
+        assert_eq!(states, vec!["done"; 4]);
+    }
+
+    #[tokio::test]
+    async fn hourly_cleanup_sweeps_only_zero_ref_blobs() {
+        use crate::ingest::SegmentPut;
+        let (core, _f, auth, alice) = ingest_ctx().await;
+        let ulid_a = "01ARZ3NDEKTSV4RRFFQ69G5FB0";
+        let ulid_b = "01ARZ3NDEKTSV4RRFFQ69G5FB1";
+        let mut hashes = Vec::new();
+        for (ulid, text) in [(ulid_a, "alpha"), (ulid_b, "beta")] {
+            core.upsert_session_meta(&auth, ulid, &session_meta(ulid))
+                .await
+                .unwrap();
+            let line = format!(
+                r#"{{"v":1,"seq":0,"ts":"2026-11-04T00:00:00Z","kind":"user_message","text":"{text}"}}"#
+            );
+            let (bytes, hash) = segment_payload(&[line]);
+            match core
+                .put_segment(&auth, ulid, 0, &bytes, Some(hash.clone()))
+                .await
+                .unwrap()
+            {
+                SegmentPut::Stored(_) => {}
+                other => panic!("unexpected put outcome: {other:?}"),
+            }
+            hashes.push(hash);
+        }
+        // Purging session A drops its blob to zero references; the file lingers for the sweep.
+        core.purge_session(&alice, &auth.access, ulid_a)
+            .await
+            .unwrap();
+        for hash in &hashes {
+            assert!(
+                starforged_blob::blob_file_path(&core.config().blob_dir, hash).exists(),
+                "blob file present before sweep"
+            );
+        }
+        core.enqueue(&Job::HourlyCleanup).await.unwrap();
+        core.run_due_jobs().await.unwrap();
+        // The zero-ref blob is gone (row + file); the live blob is untouched.
+        assert!(
+            starforged_db::sessions::blob_by_hash(core.db(), &hashes[0])
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(!starforged_blob::blob_file_path(&core.config().blob_dir, &hashes[0]).exists());
+        let live = starforged_db::sessions::blob_by_hash(core.db(), &hashes[1])
+            .await
+            .unwrap()
+            .expect("live blob row");
+        assert_eq!(live.refcount, 1);
+        assert!(starforged_blob::blob_file_path(&core.config().blob_dir, &hashes[1]).exists());
     }
 }

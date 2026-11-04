@@ -12,6 +12,7 @@ use starforged_db::sessions::{self as db_sessions, NewSession, SessionRow};
 use ulid::Ulid;
 
 use crate::accounts::User;
+use crate::jobs::Job;
 use crate::permission::Permission;
 use crate::quota;
 use crate::repos::RepoAccess;
@@ -125,6 +126,9 @@ impl Core {
         match db_sessions::session_by_ulid(self.db(), repo_id, ulid).await? {
             None => {
                 let id = db_sessions::insert_session(self.db(), &new).await?;
+                // Trailers may have arrived before the upload (push first, sync later):
+                // point those rows at the session now that it exists.
+                db_sessions::backfill_trailer_session_id(self.db(), repo_id, ulid, id).await?;
                 let row = db_sessions::session_by_ulid(self.db(), repo_id, ulid)
                     .await?
                     .ok_or_else(|| CoreError::Internal("session vanished after insert".into()))?;
@@ -151,6 +155,8 @@ impl Core {
                     updated.redaction_counts = existing.redaction_counts.as_str();
                 }
                 db_sessions::update_session_meta(self.db(), existing.id, &updated).await?;
+                db_sessions::backfill_trailer_session_id(self.db(), repo_id, ulid, existing.id)
+                    .await?;
                 let row = db_sessions::session_by_ulid(self.db(), repo_id, ulid)
                     .await?
                     .ok_or_else(|| CoreError::Internal("session vanished after update".into()))?;
@@ -285,6 +291,7 @@ impl Core {
                 let done = db_sessions::session_by_ulid(self.db(), repo_id, ulid)
                     .await?
                     .ok_or_else(|| CoreError::Internal("session vanished after insert".into()))?;
+                self.enqueue_ingest_jobs(&done).await?;
                 Ok(SegmentPut::Stored(done))
             }
             Err(e) if e.is_unique_violation() => {
@@ -398,6 +405,148 @@ impl Core {
             .await?;
         Ok(valid.len())
     }
+    /// Records one trailer row per `Starforge-Session: <ULID>` trailer found in
+    /// each commit message. `commits` pairs the full commit SHA with the full
+    /// message; malformed SHAs and invalid ULIDs are skipped with a warning and
+    /// never fail a push. Trailer-first rows carry a `NULL` session id until
+    /// the upload arrives, when [`Core::upsert_session_meta`] backfills it.
+    /// Idempotent: re-scanning the same commit touches the same rows.
+    /// Returns the distinct trailer links recorded.
+    pub async fn record_trailer_links(
+        &self,
+        repo_id: i64,
+        commits: &[(String, String)],
+    ) -> CoreResult<usize> {
+        let mut seen = HashSet::new();
+        let mut recorded = 0;
+        for (sha, message) in commits {
+            if sha.len() != 40 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+                tracing::warn!(%sha, "trailer scan: skipping malformed commit sha");
+                continue;
+            }
+            for ulid in trailer_ulids(message) {
+                if seen.insert((sha.clone(), ulid.clone())) {
+                    db_sessions::upsert_trailer_link(self.db(), repo_id, &ulid, sha).await?;
+                    recorded += 1;
+                }
+            }
+        }
+        Ok(recorded)
+    }
+
+    /// Recomputes the segment-derived counters for `session_id` from its
+    /// segment events: one turn per `user_message`, one tool call per
+    /// `tool_call`, and the summed `usage` objects of `assistant_message`
+    /// events. Unknown sessions (already purged) succeed with zeros; corrupt
+    /// blobs fail the job so the queue retries with backoff. Idempotent:
+    /// recomputing twice writes the same values.
+    pub async fn update_session_stats(&self, session_id: i64) -> CoreResult<SessionStats> {
+        if db_sessions::session_by_id(self.db(), session_id)
+            .await?
+            .is_none()
+        {
+            return Ok(SessionStats::default());
+        }
+        let limit = usize::try_from(self.config().max_decompressed_bytes).unwrap_or(usize::MAX);
+        let mut stats = SessionStats::default();
+        for segment in db_sessions::segments_of(self.db(), session_id).await? {
+            let bytes = self
+                .config()
+                .blob_store
+                .get_by_hash(&segment.blob_hash)
+                .await
+                .map_err(|e| {
+                    CoreError::Internal(format!(
+                        "stats: reading segment {} blob {}: {e}",
+                        segment.n, segment.blob_hash
+                    ))
+                })?;
+            let raw = starforge_format::decompress_bounded(&bytes, limit).map_err(|e| {
+                CoreError::Internal(format!("stats: decompressing segment {}: {e}", segment.n))
+            })?;
+            let text = String::from_utf8(raw).map_err(|e| {
+                CoreError::Internal(format!("stats: segment {} is not UTF-8: {e}", segment.n))
+            })?;
+            for (index, line) in text.split('\n').enumerate() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let event = match parse_event(line) {
+                    Ok(event) => event,
+                    Err(err) => {
+                        tracing::warn!(
+                            session_id,
+                            segment = segment.n,
+                            line = index + 1,
+                            error = %err,
+                            "stats: skipping unparseable event line"
+                        );
+                        continue;
+                    }
+                };
+                match &event.kind {
+                    starforge_format::EventKind::UserMessage(_) => stats.turn_count += 1,
+                    starforge_format::EventKind::ToolCall(_) => stats.tool_call_count += 1,
+                    starforge_format::EventKind::AssistantMessage(message) => {
+                        stats.usage_input = stats
+                            .usage_input
+                            .saturating_add(as_i64(message.usage.input));
+                        stats.usage_output = stats
+                            .usage_output
+                            .saturating_add(as_i64(message.usage.output));
+                        stats.usage_cache_read = stats
+                            .usage_cache_read
+                            .saturating_add(as_i64(message.usage.cache_read));
+                        stats.usage_cache_write = stats
+                            .usage_cache_write
+                            .saturating_add(as_i64(message.usage.cache_write));
+                        stats.usage_reasoning = stats
+                            .usage_reasoning
+                            .saturating_add(as_i64(message.usage.reasoning));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        db_sessions::set_session_stats(
+            self.db(),
+            session_id,
+            stats.usage_input,
+            stats.usage_output,
+            stats.usage_cache_read,
+            stats.usage_cache_write,
+            stats.usage_reasoning,
+            stats.turn_count,
+            stats.tool_call_count,
+        )
+        .await?;
+        Ok(stats)
+    }
+
+    /// Queues the per-segment ingest jobs after a new segment is stored. Queue
+    /// failures propagate (the segment write already committed; the jobs rerun
+    /// idempotently on the next store or a manual enqueue).
+    async fn enqueue_ingest_jobs(&self, session: &SessionRow) -> CoreResult<()> {
+        let ulid = session.ulid.clone();
+        self.enqueue(&Job::IndexSessionEvents {
+            session_id: session.id,
+        })
+        .await?;
+        self.enqueue(&Job::ResolveCommitLinks {
+            repo_id: session.repo_id,
+            session_ulid: ulid,
+        })
+        .await?;
+        self.enqueue(&Job::UpdateSessionStats {
+            session_id: session.id,
+        })
+        .await?;
+        self.enqueue(&Job::SessionWebhookOutbox {
+            session_id: session.id,
+            event: "segment.stored".to_owned(),
+        })
+        .await
+    }
 }
 
 fn number_as_i64(value: &serde_json::Value) -> Option<i64> {
@@ -405,6 +554,47 @@ fn number_as_i64(value: &serde_json::Value) -> Option<i64> {
         .as_u64()
         .and_then(|n| i64::try_from(n).ok())
         .or_else(|| value.as_i64())
+}
+
+/// Segment-derived counters recomputed by [`Core::update_session_stats`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SessionStats {
+    pub turn_count: i64,
+    pub tool_call_count: i64,
+    pub usage_input: i64,
+    pub usage_output: i64,
+    pub usage_cache_read: i64,
+    pub usage_cache_write: i64,
+    pub usage_reasoning: i64,
+}
+
+/// ULIDs claimed by `Starforge-Session: <ULID>` trailer lines in `message`, in
+/// order. Binding with the CLI's `trailer_line`: the value must be exactly 26
+/// Crockford characters and parse as a ULID, or the line is ignored.
+fn trailer_ulids(message: &str) -> Vec<String> {
+    message
+        .lines()
+        .filter_map(|line| {
+            let rest = line.strip_prefix("Starforge-Session: ")?;
+            if rest.len() != 26
+                || !rest.bytes().all(|b| {
+                    matches!(
+                        b,
+                        b'0'..=b'9' | b'A'..=b'H' | b'J'..=b'K' | b'M'..=b'N' | b'P'..=b'T' | b'V'..=b'Z'
+                    )
+                })
+            {
+                return None;
+            }
+            Ulid::from_string(rest).ok()?;
+            Some(rest.to_owned())
+        })
+        .collect()
+}
+
+/// Saturating `u64` → `i64` for usage sums that must fit the sessions columns.
+fn as_i64(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
 }
 
 /// One link entry that passed whole-batch validation, ready to upsert.
@@ -542,5 +732,227 @@ fn stringify(value: Option<&serde_json::Value>) -> String {
     match value {
         None | Some(serde_json::Value::Null) => String::new(),
         Some(v) => serde_json::to_string(v).unwrap_or_default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::permission::Visibility;
+    use crate::repos::CreateRepo;
+    use crate::testing::{Fixture, test_core, user};
+    use crate::tokens::Scope;
+
+    const ULID_A: &str = "01ARZ3NDEKTSV4RRFFQ69G5FB0";
+    const ULID_B: &str = "01ARZ3NDEKTSV4RRFFQ69G5FB1";
+
+    fn meta(ulid: &str) -> serde_json::Value {
+        serde_json::json!({
+            "format": "starforge.session/v1",
+            "id": ulid,
+            "agent": {"name": "claude-code", "version": "1.0"},
+            "models": ["opus"],
+            "title": "test session",
+            "started_at": "2026-11-04T00:00:00Z",
+            "ended_at": null,
+            "repo": {},
+            "parent_id": null,
+            "usage": {},
+            "files_touched": [],
+            "redaction": {},
+            "capture": {"mode": "discovery"},
+        })
+    }
+
+    async fn ingest_ctx() -> (Core, Fixture, IngestAuth) {
+        let (core, f) = test_core().await;
+        let alice = user(&core, "alice").await;
+        core.create_repo(
+            &alice,
+            CreateRepo {
+                name: "proj".into(),
+                description: String::new(),
+                visibility: Visibility::Private,
+                readme: false,
+            },
+        )
+        .await
+        .unwrap();
+        let created = core
+            .create_token(&alice, "t", &[Scope::SessionUpload], 30)
+            .await
+            .unwrap();
+        let token = core.authenticate_token(&created.secret).await.unwrap();
+        let auth = core
+            .authorize_upload(&token, "alice", "proj")
+            .await
+            .unwrap();
+        (core, f, auth)
+    }
+
+    /// `(sha, confidence, trailer_seen, claim_seen, session_id)` for every link filed under `ulid`.
+    async fn link_rows(
+        core: &Core,
+        repo_id: i64,
+        ulid: &str,
+    ) -> Vec<(String, String, i64, i64, Option<i64>)> {
+        sqlx::query_as::<_, (String, String, i64, i64, Option<i64>)>(
+            "SELECT sha, confidence, trailer_seen, claim_seen, session_id FROM commit_links \
+             WHERE repo_id = $1 AND session_ulid = $2 ORDER BY sha",
+        )
+        .bind(repo_id)
+        .bind(ulid)
+        .fetch_all(core.db().pool())
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn trailer_scan_records_rows_and_claim_merges() {
+        let (core, _f, auth) = ingest_ctx().await;
+        let repo_id = auth.access.repo.id;
+        core.upsert_session_meta(&auth, ULID_A, &meta(ULID_A))
+            .await
+            .unwrap();
+        let sha_a = "ab".repeat(20);
+        let sha_b = "cd".repeat(20);
+        let message = format!(
+            "implement feature\n\nStarforge-Session: {ULID_A}\nStarforge-Session: nope\nStarforge-Session: {ULID_B}\n"
+        );
+        let n = core
+            .record_trailer_links(
+                repo_id,
+                &[
+                    (sha_a.clone(), message.clone()),
+                    (sha_b.clone(), "no trailers here\n".to_owned()),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(n, 2);
+        // The garbage `nope` line is skipped; the trailer-less commit creates nothing.
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM commit_links")
+            .fetch_one(core.db().pool())
+            .await
+            .unwrap();
+        assert_eq!(total, 2);
+        let rows_a = link_rows(&core, repo_id, ULID_A).await;
+        assert_eq!(rows_a.len(), 1);
+        assert_eq!(
+            rows_a[0],
+            (sha_a.clone(), "heuristic".to_owned(), 1, 0, None)
+        );
+        // Re-scanning the same commit is a no-op (no duplicate rows).
+        core.record_trailer_links(repo_id, &[(sha_a.clone(), message)])
+            .await
+            .unwrap();
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM commit_links")
+            .fetch_one(core.db().pool())
+            .await
+            .unwrap();
+        assert_eq!(total, 2);
+        // A later CLI claim merges into the trailer row; the other row is untouched.
+        core.claim_links(
+            &auth,
+            ULID_A,
+            &[serde_json::json!({"sha": sha_a, "confidence": "exact", "seq_start": 0, "seq_end": 5})],
+        )
+        .await
+        .unwrap();
+        let session_id = db_sessions::session_by_ulid(core.db(), repo_id, ULID_A)
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        assert_eq!(
+            link_rows(&core, repo_id, ULID_A).await,
+            vec![(sha_a, "exact".to_owned(), 1, 1, Some(session_id))]
+        );
+        let rows_b = link_rows(&core, repo_id, ULID_B).await;
+        assert_eq!(rows_b.len(), 1);
+        assert_eq!(rows_b[0].1, "heuristic".to_owned());
+        assert_eq!((rows_b[0].2, rows_b[0].3), (1, 0));
+    }
+
+    #[tokio::test]
+    async fn trailer_first_row_is_backfilled_on_upload() {
+        let (core, _f, auth) = ingest_ctx().await;
+        let repo_id = auth.access.repo.id;
+        // Trailer arrives before any session upload: the row stores with a NULL session id.
+        let sha = "ef".repeat(20);
+        core.record_trailer_links(
+            repo_id,
+            &[(
+                sha.clone(),
+                format!("work\n\nStarforge-Session: {ULID_B}\n"),
+            )],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            link_rows(&core, repo_id, ULID_B).await,
+            vec![(sha.clone(), "heuristic".to_owned(), 1, 0, None)]
+        );
+        // The later upload backfills the session id; the later claim merges into the same row.
+        let (row, created) = core
+            .upsert_session_meta(&auth, ULID_B, &meta(ULID_B))
+            .await
+            .unwrap();
+        assert!(created);
+        assert_eq!(
+            link_rows(&core, repo_id, ULID_B).await,
+            vec![(sha.clone(), "heuristic".to_owned(), 1, 0, Some(row.id))]
+        );
+        core.claim_links(
+            &auth,
+            ULID_B,
+            &[serde_json::json!({"sha": sha, "confidence": "exact"})],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            link_rows(&core, repo_id, ULID_B).await,
+            vec![(sha, "exact".to_owned(), 1, 1, Some(row.id))]
+        );
+    }
+
+    #[tokio::test]
+    async fn claim_before_trailer_still_merges() {
+        let (core, _f, auth) = ingest_ctx().await;
+        let repo_id = auth.access.repo.id;
+        core.upsert_session_meta(&auth, ULID_A, &meta(ULID_A))
+            .await
+            .unwrap();
+        let sha = "ab".repeat(20);
+        core.claim_links(
+            &auth,
+            ULID_A,
+            &[serde_json::json!({"sha": sha, "confidence": "exact"})],
+        )
+        .await
+        .unwrap();
+        let session_id = db_sessions::session_by_ulid(core.db(), repo_id, ULID_A)
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        assert_eq!(
+            link_rows(&core, repo_id, ULID_A).await,
+            vec![(sha.clone(), "exact".to_owned(), 0, 1, Some(session_id))]
+        );
+        // The trailer arriving second flips `trailer_seen` without touching the claim.
+        core.record_trailer_links(
+            repo_id,
+            &[(
+                sha.clone(),
+                format!("work\n\nStarforge-Session: {ULID_A}\n"),
+            )],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            link_rows(&core, repo_id, ULID_A).await,
+            vec![(sha, "exact".to_owned(), 1, 1, Some(session_id))]
+        );
     }
 }

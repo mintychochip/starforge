@@ -394,6 +394,39 @@ pub async fn segment_by_n(db: &Db, session_id: i64, n: i64) -> DbResult<Option<S
     row.as_ref().map(segment_from_row).transpose()
 }
 
+/// Overwrites the segment-derived counters (recomputed by the stats job from
+/// segment events, since uploads only ever append).
+#[allow(clippy::too_many_arguments)]
+pub async fn set_session_stats(
+    db: &Db,
+    id: i64,
+    usage_input: i64,
+    usage_output: i64,
+    usage_cache_read: i64,
+    usage_cache_write: i64,
+    usage_reasoning: i64,
+    turn_count: i64,
+    tool_call_count: i64,
+) -> DbResult<()> {
+    sqlx::query(
+        "UPDATE sessions SET usage_input = $1, usage_output = $2, usage_cache_read = $3, \
+         usage_cache_write = $4, usage_reasoning = $5, turn_count = $6, tool_call_count = $7, \
+         updated_at = $8 WHERE id = $9",
+    )
+    .bind(usage_input)
+    .bind(usage_output)
+    .bind(usage_cache_read)
+    .bind(usage_cache_write)
+    .bind(usage_reasoning)
+    .bind(turn_count)
+    .bind(tool_call_count)
+    .bind(now())
+    .bind(id)
+    .execute(db.pool())
+    .await?;
+    Ok(())
+}
+
 pub async fn segment_count(db: &Db, session_id: i64) -> DbResult<i64> {
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM segments WHERE session_id = $1")
         .bind(session_id)
@@ -478,6 +511,26 @@ pub async fn upsert_trailer_link(db: &Db, repo_id: i64, ulid: &str, sha: &str) -
     .execute(db.pool())
     .await?;
     link_id_by_key(db, repo_id, ulid, sha).await
+}
+
+/// Points trailer-first rows filed under `ulid` (which arrived with a `NULL`
+/// `session_id`) at the now-existing session. Returns the rows updated.
+pub async fn backfill_trailer_session_id(
+    db: &Db,
+    repo_id: i64,
+    ulid: &str,
+    session_id: i64,
+) -> DbResult<u64> {
+    let result = sqlx::query(
+        "UPDATE commit_links SET session_id = $3 \
+         WHERE repo_id = $1 AND session_ulid = $2 AND session_id IS NULL",
+    )
+    .bind(repo_id)
+    .bind(ulid)
+    .bind(session_id)
+    .execute(db.pool())
+    .await?;
+    Ok(result.rows_affected())
 }
 
 /// Records the CLI's commit claim, merging into the trailer row when one arrived first.

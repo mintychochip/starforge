@@ -8,13 +8,17 @@ use axum::response::{IntoResponse, Response};
 use base64::Engine;
 use futures_util::TryStreamExt;
 use serde::Deserialize;
-use starforged_core::CoreError;
 use starforged_core::accounts::User;
 use starforged_core::jobs::Job;
 use starforged_core::permission::Permission;
 use starforged_core::repos::RepoAccess;
 use starforged_core::tokens::{self, Scope};
+use starforged_core::{Core, CoreError};
 use starforged_git::http::{self as smart, Service};
+use starforged_git::{command, read};
+use std::collections::HashSet;
+use std::ffi::OsStr;
+use std::path::{Path as StdPath, PathBuf};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio_util::io::{ReaderStream, StreamReader};
 
@@ -189,6 +193,14 @@ async fn rpc(
 ) -> Result<Response, GitHttpError> {
     let access = authorize(&state, &headers, owner, repo, service).await?;
     let path = state.core.repo_path(access.repo.id);
+    // Snapshot every reachable object before spawning receive-pack: the
+    // post-push task diffs against it to find the pushed commits for the
+    // trailer scan. A failed snapshot disables the scan for this push.
+    let before = if service == Service::ReceivePack {
+        list_objects(&path).await
+    } else {
+        None
+    };
     let gzip = headers
         .get(header::CONTENT_ENCODING)
         .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"gzip"));
@@ -208,6 +220,9 @@ async fn rpc(
     // A successful push queues `git maintenance` for the repository (one pending run per repository).
     let maintenance =
         (service == Service::ReceivePack).then(|| (state.core.clone(), access.repo.id));
+    // ... and scans the pushed commits for session trailers in the background.
+    let scan = (service == Service::ReceivePack)
+        .then(|| (state.core.clone(), access.repo.id, path, before));
     tokio::spawn(async move {
         let mut text = String::new();
         let _ = stderr.read_to_string(&mut text).await;
@@ -216,11 +231,15 @@ async fn rpc(
         if failed || !text.trim().is_empty() {
             tracing::warn!(stderr = %text.trim(), ?status, "git rpc finished");
         }
-        if !failed
-            && let Some((core, repo_id)) = maintenance
-            && let Err(err) = core.enqueue(&Job::GitMaintenance { repo_id }).await
-        {
-            tracing::warn!(error = %err, repo_id, "queueing git maintenance failed");
+        if !failed {
+            if let Some((core, repo_id)) = maintenance
+                && let Err(err) = core.enqueue(&Job::GitMaintenance { repo_id }).await
+            {
+                tracing::warn!(error = %err, repo_id, "queueing git maintenance failed");
+            }
+            if let Some((core, repo_id, repo, before)) = scan {
+                scan_push_trailers(core, repo_id, repo, before).await;
+            }
         }
     });
 
@@ -232,6 +251,90 @@ async fn rpc(
         Body::from_stream(ReaderStream::new(process.stdout)),
     )
         .into_response())
+}
+
+/// Upper bound on commits read per push for the trailer scan: a push can only
+/// add so many commits, and the scan must stay bounded.
+const MAX_SCAN_SHAS: usize = 1_000;
+
+/// Every reachable object in `repo`; `None` when the snapshot itself fails (the
+/// scan is skipped rather than treating the whole repository as new).
+async fn list_objects(repo: &StdPath) -> Option<Vec<String>> {
+    match command::run([
+        OsStr::new("-C"),
+        repo.as_os_str(),
+        OsStr::new("for-each-ref"),
+        OsStr::new("--format=%(objectname)"),
+    ])
+    .await
+    {
+        Ok(out) => Some(
+            String::from_utf8_lossy(&out)
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .map(str::to_owned)
+                .collect(),
+        ),
+        Err(err) => {
+            tracing::warn!(%err, "trailer scan: ref snapshot failed");
+            None
+        }
+    }
+}
+
+/// SHAs in `after` missing from `before`, in `after` order, deduplicated and
+/// capped at `cap`.
+fn new_shas(before: &[String], after: &[String], cap: usize) -> Vec<String> {
+    let known: HashSet<&str> = before.iter().map(String::as_str).collect();
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for sha in after {
+        if out.len() >= cap {
+            break;
+        }
+        if !known.contains(sha.as_str()) && seen.insert(sha.clone()) {
+            out.push(sha.clone());
+        }
+    }
+    out
+}
+
+/// Records trailer links for the commits a push added. Failures only warn: a
+/// push never fails because of links.
+async fn scan_push_trailers(core: Core, repo_id: i64, repo: PathBuf, before: Option<Vec<String>>) {
+    let Some(before) = before else { return };
+    let Some(after) = list_objects(&repo).await else {
+        return;
+    };
+    let shas = new_shas(&before, &after, MAX_SCAN_SHAS);
+    if shas.is_empty() {
+        return;
+    }
+    let messages = tokio::task::spawn_blocking(move || {
+        let mut out = Vec::with_capacity(shas.len());
+        for sha in &shas {
+            match read::commit(&repo, sha) {
+                Ok(Some(info)) => out.push((sha.clone(), info.message.clone())),
+                Ok(None) => tracing::warn!(%sha, "trailer scan: pushed commit not found"),
+                Err(err) => tracing::warn!(%sha, %err, "trailer scan: commit read failed"),
+            }
+        }
+        out
+    })
+    .await;
+    let messages = match messages {
+        Ok(messages) => messages,
+        Err(err) => {
+            tracing::warn!(%err, "trailer scan: commit read task failed");
+            return;
+        }
+    };
+    if messages.is_empty() {
+        return;
+    }
+    if let Err(err) = core.record_trailer_links(repo_id, &messages).await {
+        tracing::warn!(repo_id, %err, "trailer scan: storing links failed");
+    }
 }
 
 /// The request body as bytes, gunzipped when the client sent `Content-Encoding: gzip`.
@@ -264,6 +367,27 @@ mod tests {
             HeaderValue::from_static("Bearer sfp_secret"),
         );
         assert_eq!(basic_password(&headers), None);
+    }
+
+    #[test]
+    fn new_shas_dedupes_orders_and_caps() {
+        let before = vec!["aaa".to_owned()];
+        let after = vec![
+            "aaa".to_owned(),
+            "bbb".to_owned(),
+            "bbb".to_owned(),
+            "ccc".to_owned(),
+        ];
+        assert_eq!(
+            new_shas(&before, &after, 1_000),
+            vec!["bbb".to_owned(), "ccc".to_owned()]
+        );
+        assert_eq!(
+            new_shas(&before, &after, 1),
+            vec!["bbb".to_owned()],
+            "the cap bounds work per push"
+        );
+        assert!(new_shas(&before, &before, 1_000).is_empty());
     }
 
     #[tokio::test]
