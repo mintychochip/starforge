@@ -362,6 +362,17 @@ pub struct TimelineItem {
     time: String,
 }
 
+/// One change on a trail, as the trail page's Changes section renders it.
+pub struct TrailChangeItem {
+    k: i64,
+    kind: String,
+    head_branch: Option<String>,
+    base_branch: String,
+    current_revision: i64,
+    state: String,
+    mergeability: String,
+}
+
 #[derive(Template, WebTemplate)]
 #[template(path = "trail.html")]
 pub struct TrailPage {
@@ -382,6 +393,8 @@ pub struct TrailPage {
     intent_raw: String,
     comments: Vec<CommentItem>,
     timeline: Vec<TimelineItem>,
+    changes: Vec<TrailChangeItem>,
+    can_create_change: bool,
     can_edit: bool,
     can_triage: bool,
     can_comment: bool,
@@ -390,7 +403,7 @@ pub struct TrailPage {
 }
 
 /// Builds the detail view; shared by the viewer and the 422 re-renders.
-async fn detail_view(
+pub(crate) async fn detail_view(
     state: &AppState,
     session: Option<&WebSession>,
     owner: &str,
@@ -466,9 +479,25 @@ async fn detail_view(
         intent_raw: trail.intent.clone(),
         comments,
         timeline,
+        changes: state
+            .core
+            .list_changes(user, owner, repo, number, None)
+            .await?
+            .into_iter()
+            .map(|c| TrailChangeItem {
+                k: c.k,
+                kind: c.kind,
+                head_branch: c.head_branch,
+                base_branch: c.base_branch,
+                current_revision: c.current_revision,
+                state: c.state,
+                mergeability: c.mergeability,
+            })
+            .collect(),
         can_edit: detail.can_edit,
         can_triage: detail.can_triage,
         can_comment: session.is_some(),
+        can_create_change: detail.can_triage,
         is_open: trail.state == "open",
         error,
     })

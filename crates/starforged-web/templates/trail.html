@@ -82,6 +82,24 @@ opened by {% if author_handle == "deleted user" %}deleted user{% else %}<a href=
   <dt>Updated</dt><dd>{{ updated }}</dd>
 {% if let Some(c) = closed %}<dt>Closed</dt><dd>{{ c }}</dd>{% endif %}
 </dl>
+<h3>Changes</h3>
+{% if changes.is_empty() %}<p class="muted">No changes yet.</p>{% else %}
+<ul>
+{% for ch in changes %}<li><a href="/{{ head.owner }}/{{ head.name }}/trails/{{ number }}/changes/{{ ch.k }}">change {{ ch.k }}</a> <span class="badge">{{ ch.kind }}</span> <span class="badge">{{ ch.state }}</span>{% if let Some(h) = ch.head_branch %} <code>{{ h }}</code>{% endif %} onto <code>{{ ch.base_branch }}</code> · r{{ ch.current_revision }} · <span class="badge">{{ ch.mergeability }}</span></li>
+{% endfor %}
+</ul>
+{% endif %}
+{% if can_create_change && is_open %}
+<details id="new-branch-change">
+  <summary>Track a branch as a change</summary>
+  <form method="post" action="/{{ head.owner }}/{{ head.name }}/trails/{{ number }}/changes/new">
+    <input type="hidden" name="_csrf" value="{{ csrf }}">
+    <label>Head branch <input type="text" name="head"></label>
+    <label>Base branch <input type="text" name="base"></label>
+    <button type="submit">Create change</button>
+  </form>
+</details>
+{% endif %}
 <h3>Timeline</h3>
 <ul class="timeline">
 {% for ev in timeline %}

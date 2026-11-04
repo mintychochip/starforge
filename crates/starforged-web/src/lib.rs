@@ -266,6 +266,38 @@ fn page_routes() -> Router<AppState> {
             "/{owner}/{repo}/trails/{number}/comments/{id}/edit",
             post(pages::trails::edit_comment),
         )
+        .route(
+            "/{owner}/{repo}/trails/{number}/changes/new",
+            post(pages::changes::create_branch),
+        )
+        .route(
+            "/{owner}/{repo}/trails/{number}/changes/{k}",
+            get(pages::changes::detail),
+        )
+        .route(
+            "/{owner}/{repo}/trails/{number}/changes/{k}/reviews",
+            post(pages::changes::submit_review),
+        )
+        .route(
+            "/{owner}/{repo}/trails/{number}/changes/{k}/reviews/{id}/dismiss",
+            post(pages::changes::dismiss_review),
+        )
+        .route(
+            "/{owner}/{repo}/trails/{number}/changes/{k}/threads",
+            post(pages::changes::create_thread),
+        )
+        .route(
+            "/{owner}/{repo}/trails/{number}/changes/{k}/threads/{id}/resolve",
+            post(pages::changes::resolve_thread),
+        )
+        .route(
+            "/{owner}/{repo}/trails/{number}/changes/{k}/threads/{id}/comments",
+            post(pages::changes::add_thread_comment),
+        )
+        .route(
+            "/{owner}/{repo}/trails/{number}/changes/{k}/state",
+            post(pages::changes::set_state),
+        )
         .route("/{owner}/{repo}/compare", get(pages::compare::pick))
         .route(
             "/{owner}/{repo}/compare/{*spec}",

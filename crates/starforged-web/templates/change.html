@@ -1,0 +1,100 @@
+{% extends "base.html" %}
+{% block title %}Change {{ k }} · #{{ trail_number }} {{ head.owner }}/{{ head.name }}{% endblock %}
+{% block content %}
+{% include "repo_head.html" %}
+<h2>Change {{ k }} <span class="badge">{{ kind }}</span> <span class="badge">{{ state }}</span></h2>
+<p class="muted">current revision r{{ current_revision }}</p>
+<p class="muted">on <a href="/{{ head.owner }}/{{ head.name }}/trails/{{ trail_number }}">trail #{{ trail_number }}</a>
+{% if let Some(h) = head_branch %} · head <code>{{ h }}</code>{% endif %} · base <code>{{ base_branch }}</code>
+ · opened by {% if creator_handle == "deleted user" %}deleted user{% else %}<a href="/{{ creator_handle }}">{{ creator_handle }}</a>{% endif %}
+ · <span class="muted">{{ created }} · updated {{ updated }}</span></p>
+{% if let Some(e) = error %}<p class="notice">{{ e }}</p>{% endif %}
+<p>Mergeability: <span class="badge">{{ mergeability }}</span>
+{% if !conflict_paths.is_empty() %}<span class="muted">conflicting paths:</span>
+<ul>{% for p in conflict_paths %}<li><code>{{ p }}</code></li>{% endfor %}</ul>{% endif %}</p>
+<form method="get" action="/{{ head.owner }}/{{ head.name }}/trails/{{ trail_number }}/changes/{{ k }}" class="inline" id="revision-selector">
+  <label>Revision <select name="rev">{% for r in revisions %}<option value="{{ r.r }}"{% if r.selected %} selected{% endif %}>r{{ r.r }} {{ r.short }} · {{ r.time }}</option>{% endfor %}</select></label>
+  <button type="submit">Show</button>
+</form>
+<h3>Diff (r{{ selected_r }})</h3>
+{% include "diff_files.html" %}
+<h3>Reviews</h3>
+<p id="review-summary">Approvals: {{ approvals }} · Requesting changes: {{ request_changes }} (only reviews from writers and above count){% if !reviewers.is_empty() %} · reviewers: {% for h in reviewers %}{{ h }} {% endfor %}{% endif %}</p>
+{% for r in reviews %}
+<article id="review-{{ r.id }}" class="review">
+<p><a href="/{{ r.author_handle }}">{{ r.author_handle }}</a> <span class="badge">{{ r.verdict }}</span> <span class="muted">on r{{ r.revision }} · {{ r.created }} · {{ r.state }}</span>
+{% if r.counting %}<span class="badge">counts toward merge</span>{% else %}<span class="muted">does not count toward merge (needs write access)</span>{% endif %}</p>
+<div class="prose">{{ r.body_html|safe }}</div>
+{% if r.can_dismiss && r.state != "dismissed" %}
+<form method="post" action="/{{ head.owner }}/{{ head.name }}/trails/{{ trail_number }}/changes/{{ k }}/reviews/{{ r.id }}/dismiss" class="inline">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <button type="submit">Dismiss</button>
+</form>
+{% endif %}
+</article>
+{% endfor %}
+{% if can_review %}
+<form method="post" action="/{{ head.owner }}/{{ head.name }}/trails/{{ trail_number }}/changes/{{ k }}/reviews" id="add-review">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <label>Verdict
+    <label><input type="radio" name="verdict" value="approve"> approve</label>
+    <label><input type="radio" name="verdict" value="request_changes"> request changes</label>
+    <label><input type="radio" name="verdict" value="comment" checked> comment</label>
+  </label>
+  <label>Session <input type="text" name="session" placeholder="optional session ULID"></label>
+  <label>Body (Markdown) <textarea name="body"></textarea></label>
+  <button type="submit">Submit review</button>
+</form>
+{% endif %}
+<h3>Threads</h3>
+{% for t in threads %}
+<article id="thread-{{ t.id }}" class="thread{% if t.resolved %} resolved{% endif %}{% if t.outdated %} outdated{% endif %}">
+<h4><code>{{ t.path }}</code> <span class="muted">L{{ t.start_line }}–L{{ t.end_line }} · {{ t.side }} · anchored at r{{ t.revision }}</span>
+{% if t.resolved %}<span class="badge">Resolved</span>{% endif %}
+{% if t.outdated %}<span class="badge">Outdated</span>{% endif %}</h4>
+{% for c in t.comments %}
+<div class="comment"><p><a href="/{{ c.author_handle }}">{{ c.author_handle }}</a> <span class="muted">{{ c.created }}</span></p>
+<div class="prose">{{ c.body_html|safe }}</div></div>
+{% endfor %}
+{% if t.can_resolve %}
+<form method="post" action="/{{ head.owner }}/{{ head.name }}/trails/{{ trail_number }}/changes/{{ k }}/threads/{{ t.id }}/resolve" class="inline">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  {% if t.resolved %}<button type="submit" name="action" value="reopen">Reopen</button>
+  {% else %}<button type="submit" name="action" value="resolve">Resolve</button>{% endif %}
+</form>
+{% endif %}
+{% if can_review %}
+<form method="post" action="/{{ head.owner }}/{{ head.name }}/trails/{{ trail_number }}/changes/{{ k }}/threads/{{ t.id }}/comments" id="comment-{{ t.id }}">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <label>Comment (Markdown) <textarea name="body"></textarea></label>
+  <button type="submit">Comment</button>
+</form>
+{% endif %}
+</article>
+{% endfor %}
+{% if can_review %}
+<form method="post" action="/{{ head.owner }}/{{ head.name }}/trails/{{ trail_number }}/changes/{{ k }}/threads" id="new-thread">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <label>Path <input type="text" name="path"></label>
+  <label>Side <select name="side"><option value="head">head</option><option value="base">base</option></select></label>
+  <label>Start line <input type="text" name="start"></label>
+  <label>End line <input type="text" name="end"></label>
+  <label>Body (Markdown) <textarea name="body"></textarea></label>
+  <button type="submit">Open thread</button>
+</form>
+{% endif %}
+{% if can_close && is_open %}
+<form method="post" action="/{{ head.owner }}/{{ head.name }}/trails/{{ trail_number }}/changes/{{ k }}/state" class="inline" id="close-change">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <button type="submit" name="state" value="closed">Close change</button>
+</form>
+{% endif %}
+{% if can_close && !is_open %}
+<form method="post" action="/{{ head.owner }}/{{ head.name }}/trails/{{ trail_number }}/changes/{{ k }}/state" class="inline" id="reopen-change">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <button type="submit" name="state" value="open">Reopen change</button>
+</form>
+{% endif %}
+{% if can_triage %}<p class="muted">Dismiss controls are visible because you have triage access. Gate counting and merge land in M2c.</p>{% endif %}
+<p><button disabled title="{{ merge_title }}">Merge</button></p>
+{% endblock %}
