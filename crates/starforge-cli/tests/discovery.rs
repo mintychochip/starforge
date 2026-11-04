@@ -387,3 +387,27 @@ async fn file_only_remote_errors_no_server() {
         other => panic!("expected NoServer, got {other:?}"),
     }
 }
+
+/// PAT-in-username remotes (`https://ghp_xxx@host/o/r.git`) are the common CI
+/// shape; the token is the username, so any userinfo must be stripped.
+#[test]
+fn sanitize_remote_url_strips_pathless_and_pat_usernames() {
+    use starforge_cli::discovery::sanitize_remote_url;
+    assert_eq!(
+        sanitize_remote_url("https://ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA@github.com/o/r.git"),
+        "https://github.com/o/r.git"
+    );
+    assert_eq!(
+        sanitize_remote_url("https://user:token@example.com/o/r.git"),
+        "https://example.com/o/r.git"
+    );
+    assert_eq!(
+        sanitize_remote_url("https://example.com/o/r.git"),
+        "https://example.com/o/r.git"
+    );
+    // scp-style needs its user to stay.
+    assert_eq!(
+        sanitize_remote_url("git@github.com:o/r.git"),
+        "git@github.com:o/r.git"
+    );
+}

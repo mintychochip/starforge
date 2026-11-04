@@ -235,18 +235,19 @@ async fn fetch_well_known(client: &reqwest::Client, url: &str) -> Option<ServerI
 
 /// Strip credential userinfo from a remote URL, preserving everything else.
 ///
-/// `https://user:token@host/o/r.git` becomes `https://host/o/r.git` so
-/// tokens never reach the spool (`meta.repo.remote_urls`), `sessions show`,
-/// `status`, or the wire. Only `scheme://` URLs with a password are
-/// rewritten: scp-style `user@host:path` and plain paths carry no password
-/// form and must keep their `user@` (scp needs it), as must password-less
-/// `https://user@host` URLs. Unparseable input is returned unchanged.
+/// `https://user:token@host/o/r.git` and `https://ghp_xxx@host/o/r.git` both
+/// become `https://host/o/r.git`, so tokens never reach the spool
+/// (`meta.repo.remote_urls`), `sessions show`, `status`, or the wire. A
+/// token can be either the password or the username (PAT-in-username remote
+/// shapes are common in CI), so ANY `scheme://` URL carrying a username or
+/// password loses its userinfo. scp-style `git@host:path` has no `://` and
+/// keeps its `user@` (scp needs it). Unparseable input is returned unchanged.
 pub fn sanitize_remote_url(url: &str) -> String {
     if !url.contains("://") {
         return url.to_string();
     }
     match url::Url::parse(url) {
-        Ok(mut parsed) if parsed.password().is_some() => {
+        Ok(mut parsed) if !parsed.username().is_empty() || parsed.password().is_some() => {
             let _ = parsed.set_username("");
             let _ = parsed.set_password(None);
             parsed.to_string()
