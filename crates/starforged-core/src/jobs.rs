@@ -172,6 +172,7 @@ impl Core {
         let ts = now();
         web_sessions::delete_expired(self.db(), ts).await?;
         starforged_db::email_tokens::delete_expired(self.db(), ts).await?;
+        starforged_db::invites::delete_expired_before(self.db(), ts - 30 * DAY).await?;
         // Every link in a message is dead 7 days after it was sent (invites live longest), so a failed
         // message's body is kept no longer than that.
         for row in jobs::failed_of_kind_before(self.db(), "send_email", ts - 7 * DAY).await? {

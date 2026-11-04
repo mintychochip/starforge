@@ -49,6 +49,7 @@ impl Core {
     pub async fn create_user(&self, input: CreateUser) -> CoreResult<User> {
         let handle = validate::handle(&input.handle)?;
         let email = input.email.as_deref().map(validate::email).transpose()?;
+        let display_name = validate::display_name(&input.display_name)?;
         let password_hash = match input.password {
             Some(password) => {
                 validate::password(&password)?;
@@ -58,7 +59,7 @@ impl Core {
         };
         let new = NewUser {
             handle: &handle,
-            display_name: input.display_name.trim(),
+            display_name: &display_name,
             email: email.as_deref(),
             email_verified: input.email_verified && email.is_some(),
             password_hash: password_hash.as_deref(),

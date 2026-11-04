@@ -12,6 +12,7 @@ use crate::views::{NavUser, RepoItem, nav};
 pub struct DashboardPage {
     nav_user: Option<NavUser>,
     repos: Vec<RepoItem>,
+    sign_up_open: bool,
 }
 
 pub async fn show(
@@ -31,5 +32,6 @@ pub async fn show(
     Ok(DashboardPage {
         nav_user: nav(session.as_ref()),
         repos,
+        sign_up_open: state.core.sign_up_open(),
     })
 }

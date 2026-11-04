@@ -25,6 +25,7 @@ pub async fn open_core(config: &Config, hook_exe: PathBuf) -> anyhow::Result<Cor
             hook_exe,
             base_url: config.server.base_url.clone(),
             mailer: config.mailer()?,
+            registration: config.registration_settings()?,
         },
     ))
 }

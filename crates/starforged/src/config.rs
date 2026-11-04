@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 use starforged_core::mail::Mailer;
+use starforged_core::registration::{Registration, RegistrationMode};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
@@ -13,6 +14,8 @@ pub struct Config {
     pub database: DatabaseConfig,
     pub storage: StorageConfig,
     pub security: SecurityConfig,
+    #[serde(default)]
+    pub registration: RegistrationConfig,
     #[serde(default)]
     pub mail: MailConfig,
 }
@@ -68,6 +71,29 @@ pub struct MailConfig {
     pub from: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegistrationConfig {
+    /// `invite` (default), `open`, or `domains` (forge-basics design §4.1).
+    #[serde(default = "default_registration_mode")]
+    pub mode: String,
+    /// Email domains that `domains` mode accepts, e.g. `["example.com"]`.
+    #[serde(default)]
+    pub allowed_domains: Vec<String>,
+}
+
+fn default_registration_mode() -> String {
+    "invite".into()
+}
+
+impl Default for RegistrationConfig {
+    fn default() -> Self {
+        RegistrationConfig {
+            mode: default_registration_mode(),
+            allowed_domains: Vec::new(),
+        }
+    }
+}
+
 impl Config {
     /// Reads `path`, applies environment overrides, and validates.
     pub fn load(path: &Path) -> anyhow::Result<Config> {
@@ -98,6 +124,15 @@ impl Config {
                 "security__secret_key" => self.security.secret_key = value,
                 "mail__url" => self.mail.url = value,
                 "mail__from" => self.mail.from = value,
+                "registration__mode" => self.registration.mode = value,
+                "registration__allowed_domains" => {
+                    self.registration.allowed_domains = value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|d| !d.is_empty())
+                        .map(str::to_owned)
+                        .collect();
+                }
                 _ => bail!("unknown configuration override {key}"),
             }
         }
@@ -112,8 +147,40 @@ impl Config {
         if self.server.base_url.ends_with('/') {
             bail!("server.base_url must not end with '/'");
         }
+        self.registration_settings()?;
         self.mailer()?;
         Ok(())
+    }
+
+    /// The `[registration]` section as core settings, with domains lowercased.
+    pub fn registration_settings(&self) -> anyhow::Result<Registration> {
+        let mode = RegistrationMode::parse(&self.registration.mode).with_context(|| {
+            format!(
+                "registration.mode must be \"invite\", \"open\", or \"domains\", not {:?}",
+                self.registration.mode
+            )
+        })?;
+        let allowed_domains: Vec<String> = self
+            .registration
+            .allowed_domains
+            .iter()
+            .map(|d| d.trim().trim_start_matches('@').to_ascii_lowercase())
+            .filter(|d| !d.is_empty())
+            .collect();
+        if mode == RegistrationMode::Domains {
+            if allowed_domains.is_empty() {
+                bail!("registration.mode = \"domains\" needs registration.allowed_domains");
+            }
+            if self.mail.url.trim().is_empty() {
+                bail!(
+                    "registration.mode = \"domains\" needs [mail], because addresses must be verified"
+                );
+            }
+        }
+        Ok(Registration {
+            mode,
+            allowed_domains,
+        })
     }
 
     pub fn database_url(&self) -> String {
@@ -167,6 +234,7 @@ mod tests {
             security: SecurityConfig {
                 secret_key: "ab".repeat(32),
             },
+            registration: RegistrationConfig::default(),
             mail: MailConfig::default(),
         }
     }
@@ -260,5 +328,58 @@ mod tests {
         assert!(config.mailer().unwrap().is_some());
         config.mail.from = "not a mailbox".into();
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn registration_settings_are_validated() {
+        let mut config = sample();
+        assert_eq!(
+            config.registration_settings().unwrap(),
+            Registration::default()
+        );
+        config
+            .apply_env([
+                (
+                    "STARFORGE__REGISTRATION__MODE".to_owned(),
+                    "domains".to_owned(),
+                ),
+                (
+                    "STARFORGE__REGISTRATION__ALLOWED_DOMAINS".to_owned(),
+                    " Example.com, @corp.example ".to_owned(),
+                ),
+            ])
+            .unwrap();
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("needs [mail]")
+        );
+        config.mail = MailConfig {
+            url: "file:///tmp/starforge-mail".into(),
+            from: "Starforge <forge@example.com>".into(),
+        };
+        assert_eq!(
+            config.registration_settings().unwrap().allowed_domains,
+            vec!["example.com".to_owned(), "corp.example".to_owned()]
+        );
+        assert!(config.validate().is_ok());
+        config.registration.allowed_domains.clear();
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("allowed_domains")
+        );
+        config.registration.mode = "everyone".into();
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("registration.mode")
+        );
     }
 }

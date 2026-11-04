@@ -5,7 +5,8 @@ use std::path::Path;
 use anyhow::{Context, bail};
 
 use crate::config::{
-    Config, DatabaseConfig, MailConfig, SecurityConfig, ServerConfig, StorageConfig,
+    Config, DatabaseConfig, MailConfig, RegistrationConfig, SecurityConfig, ServerConfig,
+    StorageConfig,
 };
 
 pub struct InitOptions<'a> {
@@ -40,6 +41,7 @@ pub fn run(opts: &InitOptions<'_>) -> anyhow::Result<Config> {
             secret_key: hex::encode(key),
         },
         mail: MailConfig::default(),
+        registration: RegistrationConfig::default(),
     };
     config.validate()?;
     write_private(opts.config_path, &toml::to_string_pretty(&config)?)?;

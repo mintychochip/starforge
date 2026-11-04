@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 use std::process::Output;
 
 use starforged::config::{
-    Config, DatabaseConfig, MailConfig, SecurityConfig, ServerConfig, StorageConfig,
+    Config, DatabaseConfig, MailConfig, RegistrationConfig, SecurityConfig, ServerConfig,
+    StorageConfig,
 };
 use starforged_core::Core;
 use starforged_core::accounts::{CreateUser, User};
@@ -45,6 +46,7 @@ impl TestServer {
                 secret_key: "0".repeat(64),
             },
             mail: MailConfig::default(),
+            registration: RegistrationConfig::default(),
         };
         configure(&mut config);
         let app =

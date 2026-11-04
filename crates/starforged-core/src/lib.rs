@@ -7,9 +7,11 @@ pub mod content;
 pub mod crypto;
 pub mod email_tokens;
 pub mod error;
+pub mod invites;
 pub mod jobs;
 pub mod mail;
 pub mod permission;
+pub mod registration;
 pub mod repos;
 pub mod sessions;
 pub mod tokens;
@@ -33,6 +35,8 @@ pub struct CoreConfig {
     pub base_url: String,
     /// `None`: this instance sends no email.
     pub mailer: Option<mail::Mailer>,
+    /// Who may sign up.
+    pub registration: registration::Registration,
 }
 
 /// The service layer. Cheap to clone; share one per process.
@@ -116,6 +120,7 @@ pub(crate) mod testing {
             hook_exe: PathBuf::from("/bin/false"),
             base_url: "http://forge.test".into(),
             mailer: None,
+            registration: registration::Registration::default(),
         };
         configure(&mut config, dir.path());
         (Core::new(db.db.clone(), config), Fixture { _db: db, dir })

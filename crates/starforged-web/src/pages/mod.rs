@@ -4,6 +4,7 @@ pub mod code;
 pub mod collaborators;
 pub mod dashboard;
 pub mod history;
+pub mod join;
 pub mod login;
 pub mod message;
 pub mod owner;

@@ -1,0 +1,7 @@
+{{ inviter }} invited you to join Starforge.
+
+Create your account here:
+
+{{ link }}
+
+The invite works once and expires in 7 days.

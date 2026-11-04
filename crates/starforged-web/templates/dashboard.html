@@ -13,6 +13,6 @@
 {% endif %}
 {% else %}
 <h1>Starforge</h1>
-<p>A self-hosted forge for code and the agent sessions behind it. <a href="/login">Sign in</a> to continue.</p>
+<p>A self-hosted forge for code and the agent sessions behind it. <a href="/login">Sign in</a>{% if sign_up_open %} or <a href="/join">create an account</a>{% endif %} to continue.</p>
 {% endif %}
 {% endblock %}

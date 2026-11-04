@@ -43,6 +43,7 @@ struct LoginPage {
     error: Option<String>,
     /// The password was right but the address is unverified: show the resend form.
     unverified: bool,
+    sign_up_open: bool,
 }
 
 pub async fn form(
@@ -65,6 +66,7 @@ pub async fn form(
             login: String::new(),
             error: None,
             unverified: false,
+            sign_up_open: state.core.sign_up_open(),
         },
     )
         .into_response()
@@ -110,6 +112,7 @@ pub async fn submit(
                 login: form.login,
                 error: Some("Incorrect handle, email, or password.".into()),
                 unverified: false,
+                sign_up_open: state.core.sign_up_open(),
             };
             Ok((StatusCode::UNAUTHORIZED, page).into_response())
         }
@@ -121,6 +124,7 @@ pub async fn submit(
                 login: form.login,
                 error: None,
                 unverified: true,
+                sign_up_open: state.core.sign_up_open(),
             };
             Ok((StatusCode::FORBIDDEN, page).into_response())
         }

@@ -209,6 +209,22 @@ pub(crate) fn verify_email(to: &str, handle: &str, link: &str) -> CoreResult<Ema
     })
 }
 
+#[derive(Template)]
+#[template(path = "mail/invite.txt")]
+struct InviteText<'a> {
+    inviter: &'a str,
+    link: &'a str,
+}
+
+/// An invite to sign up, with a link valid for 7 days.
+pub(crate) fn invite_email(to: &str, inviter: &str, link: &str) -> CoreResult<Email> {
+    Ok(Email {
+        to: to.to_owned(),
+        subject: format!("{inviter} invited you to Starforge"),
+        body: render(&InviteText { inviter, link })?,
+    })
+}
+
 impl Core {
     /// Whether this instance sends email (`[mail] url` is set).
     pub fn mail_enabled(&self) -> bool {

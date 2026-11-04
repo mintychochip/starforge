@@ -4,8 +4,9 @@ use crate::CoreError;
 
 /// Handles that would collide with top-level routes (`/<handle>` pages).
 pub const RESERVED_HANDLES: &[&str] = &[
-    "admin", "api", "assets", "explore", "healthz", "login", "logout", "metrics", "new", "org",
-    "orgs", "readyz", "repo", "repos", "settings", "static", "user", "users",
+    "admin", "api", "assets", "explore", "forgot", "healthz", "join", "login", "logout", "metrics",
+    "new", "org", "orgs", "readyz", "repo", "repos", "reset", "settings", "static", "user",
+    "users", "verify",
 ];
 
 /// Lowercases and checks a user or org handle: 1–39 of `a-z 0-9 -`, no leading, trailing, or doubled `-`,
@@ -85,6 +86,18 @@ pub fn password(input: &str) -> Result<(), CoreError> {
     }
 }
 
+/// Display names: surrounding whitespace dropped, at most 100 characters, no control characters.
+pub fn display_name(input: &str) -> Result<String, CoreError> {
+    let name = input.trim();
+    if name.chars().count() > 100 || name.chars().any(char::is_control) {
+        Err(CoreError::Invalid(
+            "display names are at most 100 characters, without control characters".into(),
+        ))
+    } else {
+        Ok(name.to_owned())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,5 +165,20 @@ mod tests {
         assert!(password("0123456789").is_ok());
         assert!(password("short").is_err());
         assert!(password(&"x".repeat(1025)).is_err());
+    }
+
+    #[test]
+    fn display_names() {
+        assert_eq!(display_name("  Alice A.  ").unwrap(), "Alice A.");
+        assert_eq!(display_name(&"é".repeat(100)).unwrap().chars().count(), 100);
+        assert!(display_name(&"x".repeat(101)).is_err());
+        assert!(display_name("tab\there").is_err());
+    }
+
+    #[test]
+    fn sign_up_routes_are_reserved() {
+        for reserved in ["forgot", "join", "reset", "verify"] {
+            assert!(handle(reserved).is_err(), "{reserved}");
+        }
     }
 }
