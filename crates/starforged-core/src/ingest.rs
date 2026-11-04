@@ -165,12 +165,15 @@ impl Core {
                     meta_u64(meta, &["usage", "reasoning"]),
                     i64::from(meta_bool(meta, &["capture", "adapter_version_verified"])),
                 );
-                // Re-PUT never moves quarantine or uploader ownership, never
-                // resets segment-derived counters (the stats job owns them), and
-                // merges fresh client counts with server-found ones per key
-                // (max wins: client numbers are totals, server numbers are
-                // evidence, and neither may clobber the other).
+                // Re-PUT never moves quarantine or uploader ownership (flag,
+                // detector id, and location all stay pinned for the M1e admin
+                // queue), never resets segment-derived counters (the stats job
+                // owns them), and merges fresh client counts with server-found
+                // ones per key (max wins: client numbers are totals, server
+                // numbers are evidence, and neither may clobber the other).
                 updated.quarantine = existing.quarantine.as_str();
+                updated.quarantine_reason = existing.quarantine_reason.as_str();
+                updated.quarantine_detail = existing.quarantine_detail.as_str();
                 let merged = merge_counts(&existing.redaction_counts, &redaction_counts);
                 updated.redaction_counts = merged.as_str();
                 updated.usage_input = existing.usage_input;

@@ -811,3 +811,66 @@ async fn session_writes_require_uploader_or_admin() {
     assert_eq!(links.status(), 200);
     assert_eq!(links.json::<Value>().await.unwrap()["accepted"], 1);
 }
+
+const PQ_REPUT: &str = "01ARZ3NDEKTSV4RRFFQ69G5FC0";
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reput_preserves_quarantine_evidence() {
+    let c = Ctx::start().await;
+    c.put_meta(PQ_REPUT).await;
+    let pem = "key -----BEGIN PRIVATE KEY-----\\nMIIEvAIBADANBgkqhkiG9w0BAQEF\\n-----END PRIVATE KEY----- done";
+    assert_eq!(
+        c.put_segment(PQ_REPUT, 0, &[event_with_text(0, pem)])
+            .await
+            .status(),
+        200
+    );
+    let quarantined = c.session_row(PQ_REPUT).await;
+    assert_eq!(quarantined.quarantine, "quarantined");
+    assert_eq!(quarantined.quarantine_reason, "private-key");
+    assert_eq!(quarantined.quarantine_detail, "segment 0 line 1");
+
+    // A metadata re-PUT (the CLI re-syncs meta on every run) is a 200 refresh
+    // that must keep the flag, the detector, and the location for the admin
+    // queue — not just the flag.
+    let client = reqwest::Client::new();
+    let again = client
+        .put(c.meta_url(PQ_REPUT))
+        .bearer_auth(&c.upload)
+        .json(&meta_body(PQ_REPUT))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(again.status(), 200);
+    let row = c.session_row(PQ_REPUT).await;
+    assert_eq!(row.quarantine, "quarantined");
+    assert_eq!(row.quarantine_reason, "private-key");
+    assert_eq!(row.quarantine_detail, "segment 0 line 1");
+
+    // A released session stays released with its evidence intact.
+    let release_url = c.s.url(&format!(
+        "/api/v1/repos/alice/proj/sessions/{PQ_REPUT}/release"
+    ));
+    assert_eq!(
+        client
+            .post(&release_url)
+            .bearer_auth(&c.upload)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    let again = client
+        .put(c.meta_url(PQ_REPUT))
+        .bearer_auth(&c.upload)
+        .json(&meta_body(PQ_REPUT))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(again.status(), 200);
+    let row = c.session_row(PQ_REPUT).await;
+    assert_eq!(row.quarantine, "released");
+    assert_eq!(row.quarantine_reason, "private-key");
+    assert_eq!(row.quarantine_detail, "segment 0 line 1");
+}
