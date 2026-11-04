@@ -14,6 +14,7 @@
     <label class="check"><input type="radio" name="visibility" value="internal"> Internal (every signed-in user can read)</label>
     <label class="check"><input type="radio" name="visibility" value="public"> Public</label>
   </fieldset>
+  <label class="check"><input type="checkbox" name="readme" value="on"{% if readme %} checked{% endif %}> Initialize with a README</label>
   <button type="submit">Create repository</button>
 </form>
 {% endblock %}

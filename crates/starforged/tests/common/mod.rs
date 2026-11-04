@@ -144,6 +144,7 @@ impl TestServer {
                     name: name.into(),
                     description: String::new(),
                     visibility,
+                    readme: false,
                 },
             )
             .await

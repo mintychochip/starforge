@@ -1,7 +1,11 @@
 //! Repositories: creation, permission-checked lookup, collaborators.
 
+use std::path::Path;
+
 use starforged_db::collaborators;
+use starforged_db::now;
 use starforged_db::repos::{self as db_repos, NewRepo, RepoRow};
+use starforged_git::write::Identity;
 
 use crate::accounts::User;
 use crate::permission::{self, Permission, Viewer, Visibility};
@@ -38,6 +42,8 @@ pub struct CreateRepo {
     pub name: String,
     pub description: String,
     pub visibility: Visibility,
+    /// Commit a `README.md` (the name as a heading, then the description) as the first commit of `main`.
+    pub readme: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,7 +92,8 @@ fn checked_description(input: &str) -> CoreResult<String> {
 }
 
 impl Core {
-    /// Creates a repository owned by `actor` (organizations arrive in M3) and its bare git directory.
+    /// Creates a repository owned by `actor` (organizations arrive in M3) and its bare git directory, with a
+    /// README commit when `input.readme` is set (forge-basics design §5.1).
     pub async fn create_repo(&self, actor: &User, input: CreateRepo) -> CoreResult<Repo> {
         let name = validate::repo_name(&input.name)?;
         let description = checked_description(&input.description)?;
@@ -105,18 +112,15 @@ impl Core {
             }
         })?;
         let path = self.repo_path(id);
-        if let Err(err) =
-            starforged_git::init::init_bare(&path, "main", &self.config().hook_exe).await
+        if let Err(err) = self
+            .initialize(actor, &path, &name, &description, input.readme)
+            .await
         {
             db_repos::delete(self.db(), id).await?;
             let _ = tokio::fs::remove_dir_all(&path).await;
-            return Err(err.into());
+            return Err(err);
         }
-        let repo = to_repo(
-            db_repos::by_id(self.db(), id)
-                .await?
-                .ok_or(CoreError::NotFound)?,
-        )?;
+        let repo = self.reload_repo(id).await?;
         self.audit(
             Some(actor.id),
             "repo.create",
@@ -125,6 +129,60 @@ impl Core {
         )
         .await?;
         Ok(repo)
+    }
+
+    /// Creates the bare repository and, when asked, its first commit with a README.
+    async fn initialize(
+        &self,
+        actor: &User,
+        path: &Path,
+        name: &str,
+        description: &str,
+        readme: bool,
+    ) -> CoreResult<()> {
+        starforged_git::init::init_bare(path, "main", &self.config().hook_exe).await?;
+        if readme {
+            let (author, email) = self.commit_identity(actor);
+            let text = if description.is_empty() {
+                format!("# {name}\n")
+            } else {
+                format!("# {name}\n\n{description}\n")
+            };
+            starforged_git::write::initial_commit(
+                path,
+                "main",
+                &[("README.md", text.as_bytes())],
+                Identity {
+                    name: &author,
+                    email: &email,
+                    time: now(),
+                },
+                "Initial commit",
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// The name and email on commits the server writes for `user`: the display name (or the handle), and the
+    /// verified email or `<handle>@users.noreply.<host of base_url>`.
+    pub(crate) fn commit_identity(&self, user: &User) -> (String, String) {
+        let name = if user.display_name.is_empty() {
+            user.handle.clone()
+        } else {
+            user.display_name.clone()
+        };
+        let email = match &user.email {
+            Some(email) if user.email_verified => email.clone(),
+            _ => {
+                let host = url::Url::parse(&self.config().base_url)
+                    .ok()
+                    .and_then(|u| u.host_str().map(str::to_owned))
+                    .unwrap_or_else(|| "localhost".to_owned());
+                format!("{}@users.noreply.{host}", user.handle)
+            }
+        };
+        (name, email)
     }
 
     /// The repository and the viewer's permission. A missing repository and one the viewer cannot read
@@ -387,6 +445,7 @@ impl Core {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::accounts::CreateUser;
     use crate::testing::{seed_branches, test_core, user};
 
     fn new(name: &str, visibility: Visibility) -> CreateRepo {
@@ -394,6 +453,7 @@ mod tests {
             name: name.into(),
             description: String::new(),
             visibility,
+            readme: false,
         }
     }
 
@@ -416,6 +476,7 @@ mod tests {
                     name: "Proj".into(),
                     description: " demo ".into(),
                     visibility: Visibility::Private,
+                    readme: false,
                 },
             )
             .await
@@ -450,6 +511,79 @@ mod tests {
             .map(|e| e.action)
             .collect();
         assert_eq!(actions, vec!["repo.create"]);
+    }
+
+    #[tokio::test]
+    async fn a_readme_commit_uses_the_owners_identity() {
+        let (core, _f) = test_core().await;
+        let alice = user(&core, "alice").await;
+        core.create_repo(
+            &alice,
+            CreateRepo {
+                name: "proj".into(),
+                description: "A demo".into(),
+                visibility: Visibility::Public,
+                readme: true,
+            },
+        )
+        .await
+        .unwrap();
+        let access = core.repo_for(Some(&alice), "alice", "proj").await.unwrap();
+        let main = core.resolve(&access, "main").await.unwrap();
+        let log = core.log(&access, &main.commit_id, 0, 10).await.unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!(
+            (log[0].author_name.as_str(), log[0].author_email.as_str()),
+            ("alice", "alice@users.noreply.forge.test")
+        );
+        let readme = core
+            .blob(&access, &main.commit_id, "README.md")
+            .await
+            .unwrap();
+        assert_eq!(readme.bytes.unwrap(), b"# proj\n\nA demo\n");
+
+        for (handle, display_name, verified, expected) in [
+            ("bo", "Bo Diaz", true, ("Bo Diaz", "bo@example.com")),
+            ("cy", "", false, ("cy", "cy@users.noreply.forge.test")),
+        ] {
+            let owner = core
+                .create_user(CreateUser {
+                    handle: handle.into(),
+                    display_name: display_name.into(),
+                    email: Some(format!("{handle}@example.com")),
+                    email_verified: verified,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            core.create_repo(
+                &owner,
+                CreateRepo {
+                    name: "notes".into(),
+                    description: String::new(),
+                    visibility: Visibility::Private,
+                    readme: true,
+                },
+            )
+            .await
+            .unwrap();
+            let access = core.repo_for(Some(&owner), handle, "notes").await.unwrap();
+            let main = core.resolve(&access, "main").await.unwrap();
+            let log = core.log(&access, &main.commit_id, 0, 1).await.unwrap();
+            assert_eq!(
+                (log[0].author_name.as_str(), log[0].author_email.as_str()),
+                expected,
+                "{handle}: only a verified address is used"
+            );
+            assert_eq!(
+                core.blob(&access, &main.commit_id, "README.md")
+                    .await
+                    .unwrap()
+                    .bytes
+                    .unwrap(),
+                b"# notes\n"
+            );
+        }
     }
 
     #[tokio::test]

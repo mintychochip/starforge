@@ -48,6 +48,9 @@ pub struct CreateRepoBody {
     description: String,
     #[serde(default = "private")]
     visibility: String,
+    /// Commit a README as the first commit.
+    #[serde(default)]
+    readme: bool,
 }
 
 fn private() -> String {
@@ -72,6 +75,7 @@ pub async fn create(
                 name: body.name,
                 description: body.description,
                 visibility,
+                readme: body.readme,
             },
         )
         .await?;

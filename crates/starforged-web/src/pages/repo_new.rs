@@ -23,6 +23,9 @@ pub struct NewRepoForm {
     #[serde(default)]
     description: String,
     visibility: String,
+    /// The "Initialize with a README" checkbox: present only when ticked.
+    #[serde(default)]
+    readme: Option<String>,
 }
 
 #[derive(Template, WebTemplate)]
@@ -33,6 +36,7 @@ pub struct RepoNewPage {
     owner: String,
     name: String,
     description: String,
+    readme: bool,
     error: Option<String>,
 }
 
@@ -40,6 +44,7 @@ fn page(
     session: &WebSession,
     name: String,
     description: String,
+    readme: bool,
     error: Option<String>,
 ) -> RepoNewPage {
     RepoNewPage {
@@ -48,12 +53,13 @@ fn page(
         owner: session.user.handle.clone(),
         name,
         description,
+        readme,
         error,
     }
 }
 
 pub async fn form(RequireUser(session): RequireUser) -> RepoNewPage {
-    page(&session, String::new(), String::new(), None)
+    page(&session, String::new(), String::new(), false, None)
 }
 
 pub async fn submit(
@@ -64,15 +70,17 @@ pub async fn submit(
     verify_csrf(&session.csrf_token, &form.csrf)?;
     let visibility = Visibility::parse(&form.visibility)
         .ok_or_else(|| WebError::BadRequest("unknown visibility".into()))?;
+    let readme = form.readme.is_some();
     let input = CreateRepo {
         name: form.name.clone(),
         description: form.description.clone(),
         visibility,
+        readme,
     };
     match state.core.create_repo(&session.user, input).await {
         Ok(repo) => Ok(Redirect::to(&format!("/{}/{}", repo.owner, repo.name)).into_response()),
         Err(CoreError::Invalid(message) | CoreError::Conflict(message)) => {
-            let page = page(&session, form.name, form.description, Some(message));
+            let page = page(&session, form.name, form.description, readme, Some(message));
             Ok((StatusCode::UNPROCESSABLE_ENTITY, page).into_response())
         }
         Err(other) => Err(other.into()),
