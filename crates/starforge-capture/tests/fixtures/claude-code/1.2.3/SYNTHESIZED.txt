@@ -1,0 +1,10 @@
+SYNTHESIZED — no real Claude Code transcript was available on this machine.
+
+This fixture mimics the native shape of `~/.claude/projects/<slug>/<session-id>.jsonl`
+as written by Claude Code: one JSON object per line, each with `type`, `cwd`,
+`sessionId`, `version`, `uuid`, `timestamp`, and either a `message` object
+(`user` / `assistant` records whose `content` is an array of `text` /
+`thinking` / `tool_use` / `tool_result` blocks, with `model` and token
+`usage` on assistant messages) or a bare `summary` record carrying compaction
+context. Field names follow the documented native shape; uuids, token counts,
+and prose are invented.

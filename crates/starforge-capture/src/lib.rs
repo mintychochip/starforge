@@ -7,6 +7,7 @@
 //! the CLI spool path.
 
 pub mod adapter;
+pub mod agents;
 pub mod cursor;
 pub mod discover;
 

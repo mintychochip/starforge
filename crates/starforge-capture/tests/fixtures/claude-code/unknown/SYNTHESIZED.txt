@@ -1,0 +1,6 @@
+SYNTHESIZED — no real Claude Code transcript was available on this machine.
+
+Same shape as the `1.2.3` fixture (see its SYNTHESIZED.txt), but every record
+carries `"version": "0.0.0-unknown"` — a version with no golden coverage — to
+prove the adapter parses with the closest known parser while reporting
+`capture.adapter_version_verified == false`.
