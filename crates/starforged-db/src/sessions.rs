@@ -733,6 +733,18 @@ pub async fn delete_blob(db: &Db, hash: &str) -> DbResult<()> {
     Ok(())
 }
 
+/// Deletes the blob row only when nothing references it. Returns whether the row
+/// was deleted. Row-first GC ordering: callers delete the file only after this
+/// claims the row, so a concurrent `blob_incref` between selection and deletion
+/// keeps its bytes instead of losing them to a stale sweep.
+pub async fn delete_blob_if_unreferenced(db: &Db, hash: &str) -> DbResult<bool> {
+    let result = sqlx::query("DELETE FROM blobs WHERE hash = $1 AND refcount <= 0")
+        .bind(hash)
+        .execute(db.pool())
+        .await?;
+    Ok(result.rows_affected() == 1)
+}
+
 /// Total segment bytes stored for the repository.
 pub async fn repo_storage_bytes(db: &Db, repo_id: i64) -> DbResult<i64> {
     let bytes: i64 = sqlx::query_scalar(
@@ -1043,6 +1055,27 @@ mod tests {
         delete_blob(&t.db, "h1").await.unwrap();
         assert_eq!(blob_by_hash(&t.db, "h1").await.unwrap(), None);
         assert!(zero_ref_blobs(&t.db, 100).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn conditional_blob_delete_spares_newly_referenced_blobs() {
+        let (t, _, _) = setup().await;
+        let hash = "ab".repeat(32);
+        // A purge leaves a zero-ref row behind for the sweep.
+        blob_incref(&t.db, &hash, 4, &hash).await.unwrap();
+        blob_decref(&t.db, &hash).await.unwrap();
+        // A concurrent upload references the bytes again after the sweep's
+        // selection but before its delete: the conditional delete claims nothing.
+        blob_incref(&t.db, &hash, 4, &hash).await.unwrap();
+        assert!(!delete_blob_if_unreferenced(&t.db, &hash).await.unwrap());
+        let row = blob_by_hash(&t.db, &hash).await.unwrap().unwrap();
+        assert_eq!(row.refcount, 1);
+        // Once truly unreferenced, the delete claims exactly one row.
+        blob_decref(&t.db, &hash).await.unwrap();
+        assert!(delete_blob_if_unreferenced(&t.db, &hash).await.unwrap());
+        assert_eq!(blob_by_hash(&t.db, &hash).await.unwrap(), None);
+        // Deleting again claims nothing.
+        assert!(!delete_blob_if_unreferenced(&t.db, &hash).await.unwrap());
     }
 
     #[tokio::test]

@@ -147,13 +147,21 @@ impl Core {
                     &files_touched,
                     &redaction_counts,
                 );
-                // Re-PUT never moves quarantine or uploader ownership, and never
+                // Re-PUT never moves quarantine or uploader ownership, never
                 // drops server-merged redaction counts the metadata refresh did
-                // not observe.
+                // not observe, and never resets segment-derived counters (the
+                // stats job owns them; the metadata body carries no segments).
                 updated.quarantine = existing.quarantine.as_str();
                 if !existing.redaction_counts.is_empty() {
                     updated.redaction_counts = existing.redaction_counts.as_str();
                 }
+                updated.usage_input = existing.usage_input;
+                updated.usage_output = existing.usage_output;
+                updated.usage_cache_read = existing.usage_cache_read;
+                updated.usage_cache_write = existing.usage_cache_write;
+                updated.usage_reasoning = existing.usage_reasoning;
+                updated.turn_count = existing.turn_count;
+                updated.tool_call_count = existing.tool_call_count;
                 db_sessions::update_session_meta(self.db(), existing.id, &updated).await?;
                 db_sessions::backfill_trailer_session_id(self.db(), repo_id, ulid, existing.id)
                     .await?;
@@ -953,6 +961,56 @@ mod tests {
         assert_eq!(
             link_rows(&core, repo_id, ULID_A).await,
             vec![(sha, "exact".to_owned(), 1, 1, Some(session_id))]
+        );
+    }
+    #[tokio::test]
+    async fn reput_meta_preserves_segment_derived_stats() {
+        let (core, _f, auth) = ingest_ctx().await;
+        core.upsert_session_meta(&auth, ULID_A, &meta(ULID_A))
+            .await
+            .unwrap();
+        let ts = "2026-11-04T00:00:00Z";
+        let lines = [
+            format!(r#"{{"v":1,"seq":0,"ts":"{ts}","kind":"user_message","text":"hi"}}"#),
+            format!(r#"{{"v":1,"seq":1,"ts":"{ts}","kind":"tool_call","tool":{{"name":"read"}}}}"#),
+            format!(
+                r#"{{"v":1,"seq":2,"ts":"{ts}","kind":"assistant_message","text":"done","usage":{{"input":10,"output":5,"cache_read":2,"cache_write":3,"reasoning":7}}}}"#
+            ),
+        ];
+        let mut jsonl = lines.join("\n");
+        jsonl.push('\n');
+        let bytes = starforge_format::compress(jsonl.as_bytes());
+        let hash = starforge_format::blake3_hex(&bytes);
+        match core
+            .put_segment(&auth, ULID_A, 0, &bytes, Some(hash))
+            .await
+            .unwrap()
+        {
+            SegmentPut::Stored(_) => {}
+            other => panic!("unexpected put outcome: {other:?}"),
+        }
+        core.run_due_jobs().await.unwrap();
+        let before = db_sessions::session_by_ulid(core.db(), auth.access.repo.id, ULID_A)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((before.turn_count, before.tool_call_count), (1, 1));
+        // A metadata re-PUT (the CLI re-syncs meta on every run) must not reset them.
+        let (after, created) = core
+            .upsert_session_meta(&auth, ULID_A, &meta(ULID_A))
+            .await
+            .unwrap();
+        assert!(!created);
+        assert_eq!((after.turn_count, after.tool_call_count), (1, 1));
+        assert_eq!(
+            (
+                after.usage_input,
+                after.usage_output,
+                after.usage_cache_read,
+                after.usage_cache_write,
+                after.usage_reasoning
+            ),
+            (10, 5, 2, 3, 7)
         );
     }
 }

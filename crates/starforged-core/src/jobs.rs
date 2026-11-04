@@ -232,10 +232,20 @@ impl Core {
                 self.blank_email(row.id, &to, &subject).await?;
             }
         }
-        // Zero-ref blob files left behind by purged sessions: delete the file,
-        // then the row. One bad blob warns and is skipped; cleanup never fails
-        // because of the sweep.
+        // Zero-ref blob files left behind by purged sessions: claim the row first
+        // (conditional on still being unreferenced), then delete the file. A
+        // concurrent incref between selection and deletion loses the race for the
+        // row, so its bytes survive. One bad blob warns and is skipped; cleanup
+        // never fails because of the sweep.
         for blob in db_sessions::zero_ref_blobs(self.db(), 100).await? {
+            match db_sessions::delete_blob_if_unreferenced(self.db(), &blob.hash).await {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(err) => {
+                    tracing::warn!(hash = %blob.hash, error = %err, "blob sweep: row delete failed");
+                    continue;
+                }
+            }
             let key = starforged_blob::BlobRef {
                 hash: blob.hash.clone(),
                 size: u64::try_from(blob.size).unwrap_or(0),
@@ -243,10 +253,6 @@ impl Core {
             };
             if let Err(err) = self.config().blob_store.delete(&key).await {
                 tracing::warn!(hash = %blob.hash, error = %err, "blob sweep: file delete failed");
-                continue;
-            }
-            if let Err(err) = db_sessions::delete_blob(self.db(), &blob.hash).await {
-                tracing::warn!(hash = %blob.hash, error = %err, "blob sweep: row delete failed");
             }
         }
         Ok(())
@@ -733,5 +739,48 @@ mod tests {
             .expect("live blob row");
         assert_eq!(live.refcount, 1);
         assert!(starforged_blob::blob_file_path(&core.config().blob_dir, &hashes[1]).exists());
+    }
+    #[tokio::test]
+    async fn hourly_cleanup_spares_blob_referenced_after_selection() {
+        use crate::ingest::SegmentPut;
+        let (core, _f, auth, alice) = ingest_ctx().await;
+        let ulid = "01ARZ3NDEKTSV4RRFFQ69G5FB0";
+        core.upsert_session_meta(&auth, ulid, &session_meta(ulid))
+            .await
+            .unwrap();
+        let line =
+            r#"{"v":1,"seq":0,"ts":"2026-11-04T00:00:00Z","kind":"user_message","text":"alpha"}"#
+                .to_owned();
+        let (bytes, hash) = segment_payload(&[line]);
+        match core
+            .put_segment(&auth, ulid, 0, &bytes, Some(hash.clone()))
+            .await
+            .unwrap()
+        {
+            SegmentPut::Stored(_) => {}
+            other => panic!("unexpected put outcome: {other:?}"),
+        }
+        // Purging leaves a zero-ref row behind; a concurrent upload references the
+        // bytes again before the sweep claims the row.
+        core.purge_session(&alice, &auth.access, ulid)
+            .await
+            .unwrap();
+        starforged_db::sessions::blob_incref(
+            core.db(),
+            &hash,
+            i64::try_from(bytes.len()).unwrap_or(0),
+            &hash,
+        )
+        .await
+        .unwrap();
+        core.enqueue(&Job::HourlyCleanup).await.unwrap();
+        core.run_due_jobs().await.unwrap();
+        // Neither the row nor the file is deleted.
+        let row = starforged_db::sessions::blob_by_hash(core.db(), &hash)
+            .await
+            .unwrap()
+            .expect("blob row");
+        assert_eq!(row.refcount, 1);
+        assert!(starforged_blob::blob_file_path(&core.config().blob_dir, &hash).exists());
     }
 }

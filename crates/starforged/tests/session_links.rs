@@ -72,6 +72,26 @@ async fn wait_for_link(core: &starforged_core::Core, repo_id: i64, ulid: &str, s
     panic!("link row for {ulid} {sha} never appeared");
 }
 
+/// Polls until `ulid` has exactly `expected` link rows (the scan writes one row
+/// per trailer-bearing commit, including non-tip commits).
+async fn wait_for_link_count(
+    core: &starforged_core::Core,
+    repo_id: i64,
+    ulid: &str,
+    expected: usize,
+) {
+    for _ in 0..200 {
+        if link_rows(core, repo_id, ulid).await.len() == expected {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!(
+        "ulid {ulid} never reached {expected} link rows: {:?}",
+        link_rows(core, repo_id, ulid).await
+    );
+}
+
 /// Waits for a push's spawned post-push task to finish its scan. The task leaves no
 /// completion handle, and a trailer-less push writes no link rows, so there is no direct
 /// signal — but the same task enqueues `git_maintenance` immediately before scanning.
@@ -250,4 +270,89 @@ async fn push_trailers_create_links_and_claims_merge() {
         .await
         .unwrap();
     assert_eq!(link_count(&s.core).await, before);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn push_scans_non_tip_commits() {
+    let s = TestServer::start().await;
+    let alice = s.user("alice").await;
+    s.repo(&alice, "proj", Visibility::Private).await;
+    let upload = s.token(&alice, &[Scope::SessionUpload]).await;
+    let write = s.token(&alice, &[Scope::RepoWrite]).await;
+    let repo_id = s
+        .core
+        .repo_for(Some(&alice), "alice", "proj")
+        .await
+        .unwrap()
+        .repo
+        .id;
+    let client = reqwest::Client::new();
+    let put = client
+        .put(s.url(&format!("/api/v1/repos/alice/proj/sessions/{ULID_A}")))
+        .bearer_auth(&upload)
+        .json(&meta_body(ULID_A))
+        .send()
+        .await
+        .unwrap();
+    assert!(put.status().is_success());
+
+    let tmp = tempfile::tempdir().unwrap();
+    let work = work_repo(tmp.path(), "work", &[("README.md", "# proj\n")]).await;
+    let url = s.git_url("alice", "proj", Some(&write));
+
+    // Three trailer-bearing commits in one push: the scan must record all three,
+    // not just the new tip.
+    for (file, subject) in [("a.txt", "first"), ("b.txt", "second"), ("c.txt", "third")] {
+        commit_files(
+            &work,
+            &[(file, b"content\n".as_slice())],
+            &format!("{subject}\n\nStarforge-Session: {ULID_A}\n"),
+        )
+        .await;
+    }
+    git_ok(&work, &["push", "-q", &url, "main"]).await;
+    let mut pushed: Vec<String> = git_ok(&work, &["rev-list", "HEAD"])
+        .await
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    // The initial commit carries no trailer; the three pushed ones do.
+    pushed.truncate(3);
+    wait_for_link_count(&s.core, repo_id, ULID_A, 3).await;
+    let mut got: Vec<String> = link_rows(&s.core, repo_id, ULID_A)
+        .await
+        .into_iter()
+        .map(|row| row.0)
+        .collect();
+    got.sort();
+    pushed.sort();
+    assert_eq!(got, pushed);
+    assert!(
+        link_rows(&s.core, repo_id, ULID_A)
+            .await
+            .iter()
+            .all(|row| row.1 == "heuristic" && row.2 == 1)
+    );
+
+    // A new branch push includes its non-tip commits too.
+    git_ok(&work, &["checkout", "-qb", "feature"]).await;
+    for (file, subject) in [("d.txt", "fourth"), ("e.txt", "fifth")] {
+        commit_files(
+            &work,
+            &[(file, b"content\n".as_slice())],
+            &format!("{subject}\n\nStarforge-Session: {ULID_A}\n"),
+        )
+        .await;
+    }
+    git_ok(&work, &["push", "-q", &url, "feature"]).await;
+    wait_for_link_count(&s.core, repo_id, ULID_A, 5).await;
+
+    // Pushing to main leaves the unchanged branch alone and duplicates nothing.
+    git_ok(&work, &["checkout", "-q", "main"]).await;
+    s.core.run_due_jobs().await.unwrap();
+    let before = link_count(&s.core).await;
+    commit_files(&work, &[("plain.txt", b"plain\n")], "plain commit\n").await;
+    git_ok(&work, &["push", "-q", &url, "main"]).await;
+    assert_eq!(wait_for_post_push_scan(&s.core).await, before);
+    assert_eq!(link_count(&s.core).await, 5);
 }
