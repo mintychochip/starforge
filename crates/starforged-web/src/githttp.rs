@@ -100,7 +100,7 @@ async fn authorize(
     owner: &str,
     repo_segment: &str,
     service: Service,
-) -> Result<RepoAccess, GitHttpError> {
+) -> Result<(RepoAccess, Option<User>), GitHttpError> {
     let name = repo_segment.strip_suffix(".git").unwrap_or(repo_segment);
     let auth = match basic_password(headers) {
         Some(secret) => Some(
@@ -126,7 +126,7 @@ async fn authorize(
         Ok(access) if service == Service::ReceivePack && access.repo.archived_at.is_some() => {
             Err(GitHttpError::Archived)
         }
-        Ok(access) => Ok(access),
+        Ok(access) => Ok((access, user.cloned())),
         Err(CoreError::NotFound | CoreError::Unauthenticated) if user.is_none() => {
             Err(GitHttpError::Unauthorized)
         }
@@ -149,7 +149,7 @@ pub async fn info_refs(
         .ok_or(GitHttpError::BadRequest(
             "only the smart HTTP protocol is supported\n",
         ))?;
-    let access = authorize(&state, &headers, &owner, &repo, service).await?;
+    let (access, _) = authorize(&state, &headers, &owner, &repo, service).await?;
     let path = state.core.repo_path(access.repo.id);
     let body = smart::advertisement(&path, service, git_protocol(&headers).as_deref())
         .await
@@ -191,7 +191,7 @@ async fn rpc(
     body: Body,
     service: Service,
 ) -> Result<Response, GitHttpError> {
-    let access = authorize(&state, &headers, owner, repo, service).await?;
+    let (access, user) = authorize(&state, &headers, owner, repo, service).await?;
     let path = state.core.repo_path(access.repo.id);
     // Snapshot every ref tip before spawning receive-pack: the post-push task
     // diffs per ref and enumerates the newly reachable commits for the trailer
@@ -201,10 +201,52 @@ async fn rpc(
     } else {
         None
     };
+    // Pre-receive policy snapshot: the hook process never opens the database,
+    // so the RPC layer passes identity, permission, and refs/for mode down as
+    // env, plus the git-config entries that advertise push options and hide
+    // the server-only namespaces.
+    let mut env: Vec<(&str, String)> = smart::receive_pack_env();
+    if service == Service::ReceivePack {
+        let refs_for = state
+            .core
+            .refs_for_access(access.repo.id)
+            .await
+            .map_err(|e| GitHttpError::Internal(e.to_string()))?;
+        let is_member = match &user {
+            Some(user) => state
+                .core
+                .is_repo_member(access.repo.id, user.id)
+                .await
+                .map_err(|e| GitHttpError::Internal(e.to_string()))?,
+            None => false,
+        };
+        env.push(("STARFORGE_REPO_ID", access.repo.id.to_string()));
+        if let Some(user) = &user {
+            env.push(("STARFORGE_USER_ID", user.id.to_string()));
+            env.push(("STARFORGE_USER_HANDLE", user.handle.clone()));
+        }
+        env.push((
+            "STARFORGE_PERMISSION",
+            access.permission.as_str().to_owned(),
+        ));
+        env.push((
+            "STARFORGE_IS_MEMBER",
+            if is_member {
+                "1".to_owned()
+            } else {
+                "0".to_owned()
+            },
+        ));
+        env.push(("STARFORGE_REFS_FOR", refs_for));
+        env.push((
+            "STARFORGE_PUSH_NONCE",
+            starforged_git::pushsidecar::new_nonce(),
+        ));
+    }
     let gzip = headers
         .get(header::CONTENT_ENCODING)
         .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"gzip"));
-    let process = smart::spawn_rpc(&path, service, git_protocol(&headers).as_deref(), &[])
+    let process = smart::spawn_rpc(&path, service, git_protocol(&headers).as_deref(), &env)
         .map_err(|e| GitHttpError::Internal(e.to_string()))?;
 
     let mut input = request_reader(body, gzip);

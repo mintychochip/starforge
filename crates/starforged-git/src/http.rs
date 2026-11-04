@@ -123,6 +123,25 @@ pub fn spawn_rpc(
     })
 }
 
+/// `GIT_CONFIG_*` env for spawned RPC processes: advertise push options (else
+/// clients never transmit `-o`) and hide the server-only namespaces
+/// (`refs/for`, `refs/trails`) from advertisements so default clones never
+/// fetch them. Passed through the existing `spawn_rpc` `env` seam.
+pub fn receive_pack_env() -> Vec<(&'static str, String)> {
+    vec![
+        ("GIT_CONFIG_COUNT", "3".to_owned()),
+        (
+            "GIT_CONFIG_KEY_0",
+            "receive.advertisePushOptions".to_owned(),
+        ),
+        ("GIT_CONFIG_VALUE_0", "true".to_owned()),
+        ("GIT_CONFIG_KEY_1", "transfer.hideRefs".to_owned()),
+        ("GIT_CONFIG_VALUE_1", "refs/for".to_owned()),
+        ("GIT_CONFIG_KEY_2", "transfer.hideRefs".to_owned()),
+        ("GIT_CONFIG_VALUE_2", "refs/trails".to_owned()),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,6 +178,28 @@ mod tests {
         assert!(is_v2(Some("object-format=sha1:version=2")));
         assert!(!is_v2(Some("version=1")));
         assert!(!is_v2(None));
+    }
+
+    #[test]
+    fn push_option_env_advertises_and_hides_namespaces() {
+        let env = receive_pack_env();
+        let get = |k: &str| {
+            env.iter()
+                .find(|(key, _)| *key == k)
+                .map(|(_, v)| v.clone())
+        };
+        assert_eq!(get("GIT_CONFIG_COUNT").as_deref(), Some("3"));
+        let pairs: Vec<(String, String)> = (0..3)
+            .map(|i| {
+                (
+                    get(&format!("GIT_CONFIG_KEY_{i}")).unwrap(),
+                    get(&format!("GIT_CONFIG_VALUE_{i}")).unwrap(),
+                )
+            })
+            .collect();
+        assert!(pairs.contains(&("receive.advertisePushOptions".to_owned(), "true".to_owned())));
+        assert!(pairs.contains(&("transfer.hideRefs".to_owned(), "refs/for".to_owned())));
+        assert!(pairs.contains(&("transfer.hideRefs".to_owned(), "refs/trails".to_owned())));
     }
 
     #[tokio::test]

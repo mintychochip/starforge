@@ -395,6 +395,12 @@ impl Core {
         )
         .await
     }
+
+    /// The `refs/for` access mode for the pre-receive snapshot (G1 getter;
+    /// unknown values fail closed in the hook policy, never here).
+    pub async fn refs_for_access(&self, repo_id: i64) -> CoreResult<String> {
+        Ok(db_repos::refs_for_access(self.db(), repo_id).await?)
+    }
 }
 
 impl Core {

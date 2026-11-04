@@ -98,6 +98,57 @@ async fn plumbing(
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
+/// Points a server-only `refs/trails/*` ref at `sha`. Argv-only (`update-ref`
+/// takes no rev spec); the name must stay inside `refs/trails/` and the sha
+/// must pass [`crate::refpolicy::is_oid`], so client input can never escape
+/// into another namespace or inject flags.
+pub async fn set_ref(repo: &Path, name: &str, sha: &str) -> Result<(), GitError> {
+    if !name.starts_with("refs/trails/") || crate::refpolicy::parse_for_ref(name).is_some() {
+        return Err(GitError::Failed {
+            command: "update-ref".to_owned(),
+            stderr: format!("refusing to set non-trails ref {name:?}"),
+        });
+    }
+    if !crate::refpolicy::is_oid(sha) {
+        return Err(GitError::Failed {
+            command: "update-ref".to_owned(),
+            stderr: format!("refusing to set {name:?} to non-oid {sha:?}"),
+        });
+    }
+    run([
+        OsStr::new("--git-dir"),
+        repo.as_os_str(),
+        OsStr::new("update-ref"),
+        OsStr::new(name),
+        OsStr::new(sha),
+    ])
+    .await?;
+    Ok(())
+}
+
+/// Deletes a pseudo-ref after the scan ingests it: `refs/for/*` (physically
+/// created by receive-pack, never stored) or `refs/trails/*`. Argv-only; any
+/// other namespace is refused without touching git.
+pub async fn delete_ref(repo: &Path, name: &str) -> Result<(), GitError> {
+    let deletable =
+        crate::refpolicy::parse_for_ref(name).is_some() || name.starts_with("refs/trails/");
+    if !deletable {
+        return Err(GitError::Failed {
+            command: "update-ref".to_owned(),
+            stderr: format!("refusing to delete non-pseudo ref {name:?}"),
+        });
+    }
+    run([
+        OsStr::new("--git-dir"),
+        repo.as_os_str(),
+        OsStr::new("update-ref"),
+        OsStr::new("-d"),
+        OsStr::new(name),
+    ])
+    .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,5 +226,55 @@ mod tests {
                 .commit_id,
             id
         );
+    }
+
+    #[tokio::test]
+    async fn pseudo_refs_set_and_delete_inside_their_namespaces() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("r.git");
+        crate::init::init_bare(&repo, "main", Path::new("/bin/false"))
+            .await
+            .unwrap();
+        let sha = initial_commit(
+            &repo,
+            "main",
+            &[("README.md", b"# proj\n")],
+            Identity {
+                name: "A",
+                email: "a@x",
+                time: 1,
+            },
+            "Init",
+        )
+        .await
+        .unwrap();
+        set_ref(&repo, "refs/trails/1/changes/1/head", &sha)
+            .await
+            .unwrap();
+        delete_ref(&repo, "refs/trails/1/changes/1/head")
+            .await
+            .unwrap();
+        delete_ref(&repo, "refs/trails/1/changes/1/head")
+            .await
+            .unwrap();
+        // Validation happens before git runs: no repo needed for these.
+        assert!(set_ref(&repo, "refs/heads/main", &sha).await.is_err());
+        assert!(set_ref(&repo, "refs/for/main/t", &sha).await.is_err());
+        assert!(
+            set_ref(&repo, "refs/trails/1/changes/1/head", "xyz")
+                .await
+                .is_err()
+        );
+        assert!(
+            set_ref(&repo, "refs/trails/x", &"0".repeat(40))
+                .await
+                .is_err()
+        );
+        assert!(delete_ref(&repo, "refs/heads/main").await.is_err());
+        assert!(delete_ref(&repo, "refs/tags/v1").await.is_err());
+        delete_ref(&repo, "refs/trails/1/changes/1/head")
+            .await
+            .unwrap();
+        delete_ref(&repo, "refs/for/main/t").await.unwrap();
     }
 }

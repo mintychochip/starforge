@@ -33,6 +33,271 @@ pub fn check(update: &RefUpdate) -> Result<(), String> {
     }
 }
 
+/// True for a 40- or 64-char lowercase-hex object id. All-zero markers (create/delete)
+/// are NOT oids; callers check those separately.
+pub fn is_oid(s: &str) -> bool {
+    (s.len() == 40 || s.len() == 64)
+        && s.bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        && s.bytes().any(|b| b != b'0')
+}
+
+/// True when `s` is all ASCII `0` (a create/delete marker of either hash width).
+pub fn is_zero_oid(s: &str) -> bool {
+    (s.len() == 40 || s.len() == 64) && s.bytes().all(|b| b == b'0')
+}
+
+/// Strict single-component check shared by bases and topics (spec §8.2, `git
+/// check-ref-format`-style): 1–100 bytes, `[A-Za-z0-9-_.]` only, no leading `-`,
+/// no leading/trailing `.`, no `..`. The charset alone already excludes spaces,
+/// control chars, `~^:?*[\`, and `@{`.
+pub fn valid_component(s: &str) -> bool {
+    if s.is_empty() || s.len() > 100 {
+        return false;
+    }
+    if !s
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+    {
+        return false;
+    }
+    if s.starts_with('-') || s.starts_with('.') || s.ends_with('.') {
+        return false;
+    }
+    if s.contains("..") {
+        return false;
+    }
+    if s.ends_with(".lock") {
+        return false;
+    }
+    true
+}
+
+/// A validated `refs/for/<base>[/<topic>]` target. An empty `topic` means the
+/// ref named no topic and the caller must substitute the pusher default.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForRef {
+    pub base: String,
+    pub topic: String,
+}
+
+/// Syntax-checks `name` as `refs/for/<base>[/<topic>]` (base may contain `/`).
+/// Returns `None` for other namespaces and for any shape violating
+/// [`valid_component`]. Base existence is NOT checked here; resolve it with
+/// [`split_for`] against the repository's branch list.
+pub fn parse_for_ref(name: &str) -> Option<ForRef> {
+    let remainder = name.strip_prefix("refs/for/")?;
+    if remainder.is_empty() {
+        return None;
+    }
+    if !remainder.split('/').all(valid_component) {
+        return None;
+    }
+    match remainder.rfind('/') {
+        Some(i) => Some(ForRef {
+            base: remainder[..i].to_owned(),
+            topic: remainder[i + 1..].to_owned(),
+        }),
+        None => Some(ForRef {
+            base: remainder.to_owned(),
+            topic: String::new(),
+        }),
+    }
+}
+
+/// Deterministic base/topic split needing the branch list: when the whole
+/// remainder names an existing branch it is the base and the topic defaults;
+/// otherwise the base is all-but-the-last segment (which must name an existing
+/// branch) and the topic is the last segment. Anything else is
+/// `Err("unknown base branch …")`. This longest-match rule is the only split
+/// that accepts both `refs/for/main/foo` and `refs/for/release/1.x/foo`.
+pub fn split_for(
+    remainder: &str,
+    branches: &[String],
+    default_topic: &str,
+) -> Result<(String, String), String> {
+    if branches.iter().any(|b| b == remainder) {
+        return Ok((remainder.to_owned(), default_topic.to_owned()));
+    }
+    let Some((base, topic)) = remainder.rsplit_once('/') else {
+        return Err(format!("unknown base branch {remainder:?}: no such branch"));
+    };
+    if !valid_component(topic) {
+        return Err(format!("invalid topic {topic:?} for base {base:?}"));
+    }
+    if branches.iter().any(|b| b == base) {
+        return Ok((base.to_owned(), topic.to_owned()));
+    }
+    Err(format!("unknown base branch {base:?}: no such branch"))
+}
+
+/// Stable per-pusher default topic: the handle lowercased with every char
+/// outside `[a-z0-9-_.]` replaced by `-`, trimmed of edge dots/dashes,
+/// truncated to 63 chars, never empty (`"topic"`). Re-pushes from the same
+/// user land on the same topic, so updates match the same change.
+pub fn default_topic(handle: &str) -> String {
+    let mut topic: String = handle
+        .to_lowercase()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    // Bound by chars first (never split a char), then by bytes.
+    if topic.len() > 63 {
+        topic.truncate(63);
+        while !topic.is_char_boundary(topic.len()) {
+            topic.pop();
+        }
+    }
+    let trimmed = topic.trim_matches(['.', '-']).to_owned();
+    if trimmed.is_empty() || !valid_component(&trimmed) {
+        return "topic".to_owned();
+    }
+    trimmed
+}
+
+/// Parsed `-o` push options (spec §8.2).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PushOptions {
+    pub trail: Option<i64>,
+    pub title: Option<String>,
+}
+
+/// Reads `GIT_PUSH_OPTION_COUNT` (`None` = no options) and
+/// `GIT_PUSH_OPTION_<i>` via `get`. Unknown keys, missing `=`, duplicates,
+/// `trail=0`/non-numeric, and empty/overlong/multiline `title=` reject the
+/// WHOLE push with `Err("starforge: bad push option …")`.
+pub fn parse_push_options(
+    count: Option<&str>,
+    get: impl Fn(usize) -> Option<String>,
+) -> Result<PushOptions, String> {
+    let Some(count) = count else {
+        return Ok(PushOptions::default());
+    };
+    let count: usize = count
+        .parse()
+        .map_err(|_| format!("starforge: bad push option count {count:?}"))?;
+    let mut opts = PushOptions::default();
+    for i in 0..count {
+        let raw = get(i).ok_or_else(|| {
+            format!("starforge: bad push option #{i}: missing GIT_PUSH_OPTION_{i}")
+        })?;
+        let Some((key, value)) = raw.split_once('=') else {
+            return Err(format!(
+                "starforge: bad push option #{i}: {raw:?} has no '='"
+            ));
+        };
+        match key {
+            "trail" => {
+                if opts.trail.is_some() {
+                    return Err("starforge: bad push option: duplicate trail=".to_owned());
+                }
+                if value.len() > 19
+                    || value.is_empty()
+                    || !value.bytes().all(|b| b.is_ascii_digit())
+                {
+                    return Err(format!(
+                        "starforge: bad push option: trail={value:?} is not a positive integer"
+                    ));
+                }
+                let n: i64 = value.parse().map_err(|_| {
+                    format!("starforge: bad push option: trail={value:?} is not a positive integer")
+                })?;
+                if n < 1 {
+                    return Err(format!(
+                        "starforge: bad push option: trail={value:?} is not a positive integer"
+                    ));
+                }
+                opts.trail = Some(n);
+            }
+            "title" => {
+                if opts.title.is_some() {
+                    return Err("starforge: bad push option: duplicate title=".to_owned());
+                }
+                let title = value.trim().to_owned();
+                if title.is_empty() || title.chars().count() > 200 || title.contains(['\n', '\r']) {
+                    return Err(
+                        "starforge: bad push option: title= must be 1-200 chars on one line"
+                            .to_owned(),
+                    );
+                }
+                opts.title = Some(title);
+            }
+            _ => return Err(format!("starforge: bad push option: unknown key {key:?}")),
+        }
+    }
+    Ok(opts)
+}
+
+/// How a refname classified by [`check_allowed`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefKind {
+    Branch,
+    Tag,
+    For(ForRef),
+}
+
+/// Pure push policy (spec §8.2). Branches/tags need no identity at hook level
+/// (the RPC layer owns the write gate, so readers stay accepted here);
+/// `refs/for` needs an authenticated user with ≥ Read AND (`anyone_with_read`
+/// or explicit membership); `refs/trails/*` and everything else fail closed.
+pub fn check_allowed(
+    name: &str,
+    permission: Option<&str>,
+    is_member: bool,
+    refs_for: &str,
+) -> Result<RefKind, String> {
+    if name.starts_with("refs/heads/") {
+        return Ok(RefKind::Branch);
+    }
+    if name.starts_with("refs/tags/") {
+        return Ok(RefKind::Tag);
+    }
+    if name.starts_with("refs/for/") {
+        let target = parse_for_ref(name).ok_or_else(|| {
+            format!("pushing to {name} is not allowed: malformed refs/for target")
+        })?;
+        let level = permission
+            .filter(|p| permission_at_least_read(p))
+            .ok_or_else(|| {
+                format!("pushing to {name} is not allowed: refs/for pushes require authentication")
+            })?;
+        let _ = level;
+        match refs_for {
+            "anyone_with_read" => Ok(RefKind::For(target)),
+            "members" if is_member => Ok(RefKind::For(target)),
+            "members" => Err(format!(
+                "pushing to {name} is not allowed: repository restricts refs/for to members"
+            )),
+            other => Err(format!(
+                "pushing to {name} is not allowed: unknown refs/for access {other:?}"
+            )),
+        }
+    } else if name.starts_with("refs/trails/") {
+        Err(format!(
+            "pushing to {name} is not allowed: refs/trails/* is server-only"
+        ))
+    } else {
+        Err(format!(
+            "pushing to {name} is not allowed; only branches and tags are accepted"
+        ))
+    }
+}
+
+/// True for any known permission level (`read|triage|write|maintain|admin`);
+/// every known level grants at least read.
+fn permission_at_least_read(permission: &str) -> bool {
+    matches!(
+        permission,
+        "read" | "triage" | "write" | "maintain" | "admin"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -74,5 +339,251 @@ mod tests {
             let err = check(&update(rejected)).unwrap_err();
             assert!(err.contains(rejected), "{err}");
         }
+    }
+
+    #[test]
+    fn for_ref_grammar_accepts_bases_with_slashes() {
+        // (refname, expected base, expected topic; empty topic = pusher default)
+        for (name, base, topic) in [
+            ("refs/for/main", "main", ""),
+            ("refs/for/main/my-topic", "main", "my-topic"),
+            ("refs/for/release/1.x/feat", "release/1.x", "feat"),
+            ("refs/for/a/b/c/t", "a/b/c", "t"),
+            ("refs/for/main/v1.0_rc-1", "main", "v1.0_rc-1"),
+        ] {
+            let parsed = parse_for_ref(name).unwrap_or_else(|| panic!("accept {name}"));
+            assert_eq!(
+                (parsed.base.as_str(), parsed.topic.as_str()),
+                (base, topic),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn for_ref_grammar_rejects_bad_shapes() {
+        let long = "x".repeat(101);
+        let cases = [
+            "refs/for/",
+            "refs/for//t",
+            "refs/for/main//t",
+            "refs/for/main/",
+            "refs/for/../etc",
+            "refs/for/main/..",
+            "refs/for/-main/t",
+            "refs/for/main/-t",
+            "refs/for/main/.t",
+            "refs/for/main/t.",
+            "refs/for/ma in/t",
+            "refs/for/main/t itle",
+            "refs/for/main/t~1",
+            "refs/for/main/t^2",
+            "refs/for/main/t:v",
+            "refs/for/main/t?v",
+            "refs/for/main/t*v",
+            "refs/for/main/t[v",
+            "refs/for/main/t\\v",
+            "refs/for/main/t@{1}",
+            "refs/for/main/.lock",
+            "refs/heads/main",
+            "refs/for/main/t/extra/../x",
+        ];
+        for name in cases {
+            assert!(parse_for_ref(name).is_none(), "reject {name}");
+        }
+        assert!(
+            parse_for_ref(&format!("refs/for/main/{long}")).is_none(),
+            "reject long topic"
+        );
+        assert!(
+            parse_for_ref(&format!("refs/for/{long}/t")).is_none(),
+            "reject long segment"
+        );
+        assert!(
+            parse_for_ref("refs/for/main/\u{7}").is_none(),
+            "reject control char"
+        );
+    }
+
+    #[test]
+    fn split_for_prefers_the_longest_existing_branch() {
+        let branches = [
+            "main".to_owned(),
+            "release/1.x".to_owned(),
+            "a/b".to_owned(),
+            "a".to_owned(),
+        ];
+        let has = |v: &[String]| v.to_vec();
+        assert_eq!(
+            split_for("main", &has(&branches), "d").unwrap(),
+            ("main".to_owned(), "d".to_owned())
+        );
+        // Whole remainder names a branch: topic defaults even when a shorter prefix is also a branch.
+        assert_eq!(
+            split_for("a/b", &has(&branches), "d").unwrap(),
+            ("a/b".to_owned(), "d".to_owned())
+        );
+        assert_eq!(
+            split_for("release/1.x/feat", &has(&branches), "d").unwrap(),
+            ("release/1.x".to_owned(), "feat".to_owned())
+        );
+        assert_eq!(
+            split_for("a/b/c", &has(&branches), "d").unwrap(),
+            ("a/b".to_owned(), "c".to_owned())
+        );
+        assert!(
+            split_for("nope", &has(&branches), "d")
+                .unwrap_err()
+                .contains("unknown base branch")
+        );
+        assert!(
+            split_for("nope/t", &has(&branches), "d")
+                .unwrap_err()
+                .contains("unknown base branch")
+        );
+        // Known base but bad topic still fails closed.
+        assert!(split_for("main/-t", &has(&branches), "d").is_err());
+    }
+
+    #[test]
+    fn default_topic_is_stable_and_always_valid() {
+        assert_eq!(default_topic("Alice"), "alice");
+        assert_eq!(default_topic("Bob Smith!"), "bob-smith");
+        assert_eq!(default_topic(""), "topic");
+        assert_eq!(default_topic("!!!"), "topic");
+        assert_eq!(default_topic("A_B.C-D"), "a_b.c-d");
+        assert!(default_topic("x".repeat(200).as_str()).len() <= 63);
+        for handle in [
+            "Ada",
+            "x-y_z.9",
+            "UPPER lower",
+            "a/b\\c",
+            "@@@",
+            ".dots.",
+            "--dash--",
+            "münchen",
+        ] {
+            let topic = default_topic(handle);
+            assert!(
+                valid_component(&topic),
+                "default_topic({handle:?}) = {topic:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn push_options_parse_trail_and_title() {
+        let none = |_: usize| None;
+        assert_eq!(
+            parse_push_options(None, none).unwrap(),
+            PushOptions {
+                trail: None,
+                title: None
+            }
+        );
+        let get = |vars: Vec<String>| move |i: usize| vars.get(i).cloned();
+        let opts = parse_push_options(
+            Some("2"),
+            get(vec!["trail=4".into(), "title=Fix it".into()]),
+        )
+        .unwrap();
+        assert_eq!(
+            opts,
+            PushOptions {
+                trail: Some(4),
+                title: Some("Fix it".into())
+            }
+        );
+        // Unknown keys, missing '=', duplicates, and bad values reject the whole push.
+        for vars in [
+            vec!["bogus=1"],
+            vec!["trail"],
+            vec!["trail=1", "trail=2"],
+            vec!["title=a", "title=b"],
+            vec!["trail=0"],
+            vec!["trail=-3"],
+            vec!["trail=abc"],
+            vec!["trail="],
+            vec!["trail=12345678901234567890"],
+            vec!["title="],
+            vec!["title=   "],
+            vec!["title=a\nb"],
+            vec!["title=a\rb"],
+        ] {
+            let n = vars.len().to_string();
+            assert!(
+                parse_push_options(Some(&n), get(vars.into_iter().map(String::from).collect()))
+                    .is_err()
+            );
+        }
+        assert!(
+            parse_push_options(Some("1"), none).is_err(),
+            "missing var is an error"
+        );
+        assert!(parse_push_options(Some("many"), none).is_err());
+        let long = "t".repeat(201);
+        assert!(parse_push_options(Some("1"), get(vec![format!("title={long}")])).is_err());
+    }
+
+    #[test]
+    fn check_allowed_matrix() {
+        // Branches and tags never need an identity at hook level (the RPC layer owns the write gate).
+        assert!(check_allowed("refs/heads/main", None, false, "anyone_with_read").is_ok());
+        assert!(check_allowed("refs/tags/v1", None, false, "members").is_ok());
+        // Readers may push reviews where the repo allows it; anonymous never may.
+        assert!(check_allowed("refs/for/main/t", Some("read"), false, "anyone_with_read").is_ok());
+        assert!(check_allowed("refs/for/main", Some("triage"), false, "anyone_with_read").is_ok());
+        assert!(check_allowed("refs/for/main/t", None, false, "anyone_with_read").is_err());
+        assert!(check_allowed("refs/for/main/t", None, true, "anyone_with_read").is_err());
+        // members-only repos need an explicit grant; read collaborators count.
+        assert!(check_allowed("refs/for/main/t", Some("read"), true, "members").is_ok());
+        assert!(check_allowed("refs/for/main/t", Some("read"), false, "members").is_err());
+        assert!(check_allowed("refs/for/main/t", Some("write"), false, "members").is_err());
+        // Malformed refs and unknown modes fail closed.
+        assert!(
+            check_allowed("refs/for/main/..", Some("write"), true, "anyone_with_read").is_err()
+        );
+        assert!(check_allowed("refs/for/main/t", Some("write"), true, "everyone").is_err());
+        assert!(
+            check_allowed(
+                "refs/for/main/t",
+                Some("superuser"),
+                true,
+                "anyone_with_read"
+            )
+            .is_err()
+        );
+        // refs/trails/* stays server-only even for writers.
+        assert!(
+            check_allowed(
+                "refs/trails/1/changes/1/head",
+                Some("admin"),
+                true,
+                "anyone_with_read"
+            )
+            .is_err()
+        );
+        assert!(
+            check_allowed(
+                "refs/trails/1/changes/1/head",
+                None,
+                false,
+                "anyone_with_read"
+            )
+            .is_err()
+        );
+        assert!(check_allowed("refs/notes/x", Some("admin"), true, "anyone_with_read").is_err());
+    }
+
+    #[test]
+    fn oid_shapes() {
+        assert!(is_oid(&"a".repeat(40)));
+        assert!(is_oid(&"f".repeat(64)));
+        assert!(!is_oid(&"a".repeat(39)));
+        assert!(!is_oid("xyz"));
+        assert!(
+            !is_oid(&"0".repeat(40)),
+            "all-zero is a deletion marker, not an oid"
+        );
     }
 }
