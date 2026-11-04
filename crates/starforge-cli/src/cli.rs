@@ -119,7 +119,7 @@ impl CliError {
 /// Must not be called from inside a Tokio runtime (it blocks on one for the
 /// async device flow); async contexts use [`run_async`] instead.
 pub fn run(cli: Cli, paths: CliPaths) -> std::process::ExitCode {
-    if let Cmd::Auth { .. } | Cmd::Status = &cli.cmd {
+    if let Cmd::Auth { .. } | Cmd::Status | Cmd::Sync = &cli.cmd {
         // fall through to async dispatch below
     } else {
         return sync_stub(cli, paths);
@@ -149,7 +149,7 @@ fn sync_stub(cli: Cli, _paths: CliPaths) -> std::process::ExitCode {
         Cmd::HookPostCommit => run_hook_post_commit(),
         Cmd::HookPrePush => run_hook_pre_push(),
         Cmd::Doctor => stub_err(CliError::Unimplemented("doctor")),
-        Cmd::Sync => stub_err(CliError::Unimplemented("sync")),
+        Cmd::Sync => unreachable!("sync dispatches via run_async"),
         Cmd::Export => stub_err(CliError::Unimplemented("export")),
         Cmd::Import => stub_err(CliError::Unimplemented("import")),
         Cmd::Trail => stub_err(CliError::Unimplemented("trail")),
@@ -255,7 +255,7 @@ pub async fn run_async(cli: Cli, paths: CliPaths) -> std::process::ExitCode {
         Cmd::Disable => run_disable(dry_run),
         Cmd::Status => run_status(paths, dry_run).await,
         Cmd::Doctor => stub_err(CliError::Unimplemented("doctor")),
-        Cmd::Sync => stub_err(CliError::Unimplemented("sync")),
+        Cmd::Sync => run_sync(paths, dry_run).await,
         Cmd::Sessions { .. } => stub_err(CliError::Unimplemented("sessions")),
         Cmd::Export => stub_err(CliError::Unimplemented("export")),
         Cmd::Import => stub_err(CliError::Unimplemented("import")),
@@ -318,6 +318,100 @@ async fn run_status(paths: CliPaths, dry_run: bool) -> std::process::ExitCode {
         eprintln!("{out}");
     }
     std::process::ExitCode::from(code)
+}
+
+/// Host key for credential lookup from a server `api_url`: lowercased host
+/// plus an explicit port when present (mirrors [`crate::auth::normalize_server`]).
+fn sync_host_key(api_url: &str) -> Option<String> {
+    let url = url::Url::parse(api_url).ok()?;
+    let host = url.host_str()?.to_lowercase();
+    Some(match url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host,
+    })
+}
+
+/// `sync`: drain due queue entries to the resolved server. Exit 0 drained,
+/// 2 remainder, 1 operational error (including auth). `--dry-run` prints the
+/// plan without any HTTP or writes.
+async fn run_sync(paths: CliPaths, dry_run: bool) -> std::process::ExitCode {
+    let repo = match std::env::current_dir() {
+        Ok(dir) => dir,
+        Err(err) => {
+            eprintln!("error: cannot determine current directory: {err}");
+            return std::process::ExitCode::from(1);
+        }
+    };
+    let common = match crate::git::common_dir(&repo) {
+        Ok(common) => common,
+        Err(err) => {
+            eprintln!("error: not a git repo: {err}");
+            return std::process::ExitCode::from(1);
+        }
+    };
+    let spool = crate::spool::Spool::open(&common);
+    if dry_run {
+        return run_sync_dry_run(&spool);
+    }
+    let (server, owner_repo, _chosen) =
+        match crate::commands::status::resolve_server(&repo, &paths).await {
+            Ok(resolved) => resolved,
+            Err(err) => {
+                eprintln!("error: {err}");
+                return std::process::ExitCode::from(1);
+            }
+        };
+    let Some(host) = sync_host_key(&server.api_url) else {
+        eprintln!("error: cannot parse server api_url {:?}", server.api_url);
+        return std::process::ExitCode::from(1);
+    };
+    let token = match crate::auth::resolve_token(&paths, &host, |key| std::env::var(key).ok()) {
+        Ok(resolved) => resolved.token().to_string(),
+        Err(err) => {
+            eprintln!("error: {err}");
+            return std::process::ExitCode::from(1);
+        }
+    };
+    let now = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_default();
+    let sleeper = crate::queue::TokioSleeper;
+    match crate::commands::sync::sync(&spool, &server, &owner_repo, &token, &sleeper, &now, false)
+        .await
+    {
+        Ok(summary) => {
+            println!(
+                "sync: {} uploaded, {} skipped, {} remaining",
+                summary.uploaded, summary.skipped, summary.remaining
+            );
+            std::process::ExitCode::from(summary.exit_code())
+        }
+        Err(err) => {
+            eprintln!("error: {err}");
+            std::process::ExitCode::from(1)
+        }
+    }
+}
+
+/// `sync --dry-run`: print every due op, write nothing, exit 0. No server or
+/// token resolution, so no network happens.
+fn run_sync_dry_run(spool: &crate::spool::Spool) -> std::process::ExitCode {
+    let now = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_default();
+    let entries = match crate::queue::read_queue(spool) {
+        Ok(entries) => entries,
+        Err(err) => {
+            eprintln!("error: {err}");
+            return std::process::ExitCode::from(1);
+        }
+    };
+    for entry in &entries {
+        if crate::queue::backoff_due(entry, &now) {
+            println!("would {}", crate::commands::sync::describe(entry));
+        }
+    }
+    std::process::ExitCode::SUCCESS
 }
 
 fn stub_err(err: CliError) -> std::process::ExitCode {
