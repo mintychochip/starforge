@@ -29,7 +29,7 @@ use std::str::FromStr;
 use serde_json::Value;
 use starforge_format::{
     Agent, AgentName, AssistantMessage, CaptureInfo, CaptureMode, Compaction, Event, EventKind,
-    FORMAT_TAG, Reasoning, SessionMeta, ToolCall, ToolOutcome, ToolRef, ToolResult, Usage,
+    FORMAT_TAG, Reasoning, SessionMeta, System, ToolCall, ToolOutcome, ToolRef, ToolResult, Usage,
     UserMessage,
 };
 use time::format_description::well_known::Rfc3339;
@@ -130,15 +130,6 @@ fn edit_path(tool_name: &str, input: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Make `path` relative to `workdir` when it lies inside; else keep as-is.
-fn relativize(workdir: &str, path: &str) -> String {
-    let prefix = format!("{workdir}/");
-    match path.strip_prefix(&prefix) {
-        Some(rest) => rest.to_string(),
-        None => path.to_string(),
-    }
-}
-
 /// Decode `function_call` arguments: a JSON-encoded string (the native shape)
 /// or an already-structured object.
 fn decode_arguments(v: &Value) -> Value {
@@ -230,8 +221,9 @@ impl HeaderFold {
     }
 
     fn note_file(&mut self, workdir: &str, path: &str) {
-        let rel = relativize(workdir, path);
-        if !self.files_touched.iter().any(|f| f == &rel) {
+        if let Some(rel) = crate::repo_relative(std::path::Path::new(workdir), path)
+            && !self.files_touched.iter().any(|f| f == &rel)
+        {
             self.files_touched.push(rel);
         }
     }
@@ -252,9 +244,16 @@ fn record_ts(record: &Value, fallback_ts: &str) -> String {
 
 /// Map one parsed record to events (timestamps resolved, `seq` assigned by
 /// the caller). Mutates `fold` with header facts (models, usage, files).
-/// Every record maps in file order; unknown `type` values are
-/// forward-compatible skips (still consumed by the cursor).
-fn record_events(record: &Value, fold: &mut HeaderFold, workdir: &str) -> Vec<EventKind> {
+/// `raw` is the record's source line: unmapped `type` values fall back to
+/// `system { text: <raw JSON> }` so no record is ever dropped, and
+/// unrecognized blocks in a message-level `content` array each fall back to
+/// `system { text: <raw block JSON> }` the same way.
+fn record_events(
+    raw: &str,
+    record: &Value,
+    fold: &mut HeaderFold,
+    workdir: &str,
+) -> Vec<EventKind> {
     let mut kinds = Vec::new();
     let rtype = record.get("type").and_then(Value::as_str).unwrap_or("");
     let role = record.get("role").and_then(Value::as_str).unwrap_or("");
@@ -267,6 +266,7 @@ fn record_events(record: &Value, fold: &mut HeaderFold, workdir: &str) -> Vec<Ev
             {
                 kinds.push(EventKind::UserMessage(UserMessage { text }));
             }
+            kinds.extend(unknown_block_kinds(record));
         }
         "response" if role == "user" => {
             if let Some(text) = prompt_text(record)
@@ -274,6 +274,7 @@ fn record_events(record: &Value, fold: &mut HeaderFold, workdir: &str) -> Vec<Ev
             {
                 kinds.push(EventKind::UserMessage(UserMessage { text }));
             }
+            kinds.extend(unknown_block_kinds(record));
         }
         "response" => {
             let model = record.get("model").and_then(Value::as_str).unwrap_or("");
@@ -303,6 +304,7 @@ fn record_events(record: &Value, fold: &mut HeaderFold, workdir: &str) -> Vec<Ev
                     text: summary.to_string(),
                 }));
             }
+            kinds.extend(unknown_block_kinds(record));
         }
         "function_call" => {
             let name = record
@@ -369,8 +371,35 @@ fn record_events(record: &Value, fold: &mut HeaderFold, workdir: &str) -> Vec<Ev
             }));
         }
         _ => {
-            // Unknown record type: forward-compatible skip (still consumed).
+            // Unknown record type: raw JSON into `system`. Never dropped.
+            kinds.push(EventKind::System(System {
+                text: raw.to_string(),
+            }));
         }
+    }
+    kinds
+}
+
+/// `System` events for unrecognized blocks in a message-level `content`
+/// array. Text-ish blocks are already represented in the message text (see
+/// [`prompt_text`]); anything else is preserved as raw block JSON so no
+/// native shape is ever dropped.
+fn unknown_block_kinds(record: &Value) -> Vec<EventKind> {
+    let mut kinds = Vec::new();
+    let Some(Value::Array(blocks)) = record.get("content") else {
+        return kinds;
+    };
+    for b in blocks {
+        if b.is_string() {
+            continue;
+        }
+        let btype = b.get("type").and_then(Value::as_str).unwrap_or("");
+        if matches!(btype, "text" | "input_text" | "output_text") {
+            continue;
+        }
+        kinds.push(EventKind::System(System {
+            text: b.to_string(),
+        }));
     }
     kinds
 }
@@ -490,7 +519,7 @@ impl Adapter for CodexAdapter {
         // Header pass: fold every complete line so the header always reflects
         // the full session, even on incremental reads.
         let all = complete_lines(&bytes, 0);
-        let mut parsed: Vec<(String, Value)> = Vec::with_capacity(all.len());
+        let mut parsed: Vec<(String, String, Value)> = Vec::with_capacity(all.len());
         for span in &all {
             let text = line_text(&bytes, *span);
             if text.trim().is_empty() {
@@ -504,10 +533,10 @@ impl Adapter for CodexAdapter {
                 ));
             }
             let ts = record_ts(&record, fallback_ts);
-            parsed.push((ts, record));
+            parsed.push((ts, text.to_string(), record));
         }
         let mut fold = HeaderFold::default();
-        for (ts, record) in &parsed {
+        for (ts, _, record) in &parsed {
             fold.feed(record, ts);
         }
         let workdir = fold
@@ -517,8 +546,8 @@ impl Adapter for CodexAdapter {
         // Event pass: now that the fold has seen every record (workdir known
         // for relativizing), map each record to its kinds.
         let mut kinds: Vec<(String, Vec<EventKind>)> = Vec::with_capacity(parsed.len());
-        for (ts, record) in &parsed {
-            let ks = record_events(record, &mut fold, &workdir);
+        for (ts, raw, record) in &parsed {
+            let ks = record_events(raw, record, &mut fold, &workdir);
             kinds.push((ts.clone(), ks));
         }
 

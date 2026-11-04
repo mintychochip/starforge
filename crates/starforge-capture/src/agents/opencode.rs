@@ -187,15 +187,6 @@ fn edit_path(tool_name: &str, input: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Make `path` relative to `workdir` when it lies inside; else keep as-is.
-fn relativize(workdir: &str, path: &str) -> String {
-    let prefix = format!("{workdir}/");
-    match path.strip_prefix(&prefix) {
-        Some(rest) => rest.to_string(),
-        None => path.to_string(),
-    }
-}
-
 /// Fold one parsed row into the session header accumulator.
 #[derive(Default)]
 struct HeaderFold {
@@ -242,8 +233,9 @@ impl HeaderFold {
     }
 
     fn note_file(&mut self, workdir: &str, path: &str) {
-        let rel = relativize(workdir, path);
-        if !self.files_touched.iter().any(|f| f == &rel) {
+        if let Some(rel) = crate::repo_relative(std::path::Path::new(workdir), path)
+            && !self.files_touched.iter().any(|f| f == &rel)
+        {
             self.files_touched.push(rel);
         }
     }
@@ -317,15 +309,18 @@ fn row_events(row: &OcRow, raw: &str, fold: &mut HeaderFold, workdir: &str) -> V
                 fold.note_file(workdir, &path);
                 // A file-write part emits a second event after the call
                 // (the other multi-event row the incremental test covers).
-                kinds.push(EventKind::FileChange(FileChange {
-                    path: relativize(workdir, &path),
-                    change: if row.name == "Write" {
-                        FileChangeKind::Add
-                    } else {
-                        FileChangeKind::Modify
-                    },
-                    diff: None,
-                }));
+                // Paths outside the workdir stay out of the upload entirely.
+                if let Some(rel) = crate::repo_relative(std::path::Path::new(workdir), &path) {
+                    kinds.push(EventKind::FileChange(FileChange {
+                        path: rel,
+                        change: if row.name == "Write" {
+                            FileChangeKind::Add
+                        } else {
+                            FileChangeKind::Modify
+                        },
+                        diff: None,
+                    }));
+                }
             }
         }
         "tool_result" => {

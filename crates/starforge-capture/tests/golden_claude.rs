@@ -244,3 +244,126 @@ fn claude_multiblock_record_resume_keeps_seq_unique() {
     let joined = [first.events.clone(), tail.events.clone()].concat();
     assert_eq!(full.events, joined, "resumed concat equals a fresh read");
 }
+
+/// Installing over a foreign `settings.json` merges under the single
+/// `starforge` key: unrelated keys survive, the marker is present, and
+/// removal restores the foreign file (a second removal is a no-op).
+#[test]
+fn claude_install_merges_into_foreign_settings() {
+    let tmp = tempfile::tempdir().unwrap();
+    let roots = Roots {
+        config_dir: tmp.path().join("cfg"),
+        data_dir: tmp.path().join("data"),
+        worktree: PathBuf::from("/repo"),
+    };
+    let a = ClaudeAdapter;
+    let path = roots.config_dir.join("claude-code/settings.json");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let foreign = r#"{"hooks":{"PreToolUse":[{"matcher":"x","hooks":[{"type":"command","command":"echo hi"}]}]},"theme":"dark"}"#;
+    std::fs::write(&path, foreign).unwrap();
+
+    let written = a.install_hooks(&roots).unwrap();
+    assert_eq!(written, vec![path.clone()]);
+    let body = std::fs::read_to_string(&path).unwrap();
+    assert!(body.contains("starforge"), "hook file must carry marker");
+    let merged: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        merged.get("theme").and_then(|v| v.as_str()),
+        Some("dark"),
+        "unrelated keys preserved"
+    );
+    assert!(merged.get("hooks").is_some(), "unrelated keys preserved");
+    assert!(merged.get("starforge").is_some(), "dedicated starforge key");
+
+    // Removal drops only the `starforge` key and keeps the rest.
+    let removed = a.remove_hooks(&roots).unwrap();
+    assert_eq!(removed, vec![path.clone()]);
+    let after: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert!(after.get("starforge").is_none());
+    assert_eq!(after.get("theme").and_then(|v| v.as_str()), Some("dark"));
+    assert!(after.get("hooks").is_some());
+
+    // Second removal touches nothing.
+    let before = std::fs::read(&path).unwrap();
+    let removed_again = a.remove_hooks(&roots).unwrap();
+    assert!(removed_again.is_empty());
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+/// Installing over an unparseable (or non-object) hook file fails with
+/// `InvalidData` naming the path and leaves the bytes untouched.
+#[test]
+fn claude_install_rejects_non_object_hook_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let roots = Roots {
+        config_dir: tmp.path().join("cfg"),
+        data_dir: tmp.path().join("data"),
+        worktree: PathBuf::from("/repo"),
+    };
+    let a = ClaudeAdapter;
+    let path = roots.config_dir.join("claude-code/settings.json");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+    for bad in ["{not valid json", "[1, 2, 3]", "\"just a string\""] {
+        std::fs::write(&path, bad).unwrap();
+        let err = a.install_hooks(&roots).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains(&path.display().to_string()),
+            "error names the path: {err}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), bad);
+    }
+    // A foreign file with no `starforge` key is never removed.
+    let removed = a.remove_hooks(&roots).unwrap();
+    assert!(removed.is_empty());
+    assert!(path.exists());
+}
+
+/// Unknown record types and unknown content-block types each emit exactly
+/// one `system` event carrying the raw JSON; handled shapes are unchanged
+/// and `seq` stays contiguous.
+#[test]
+fn claude_unknown_record_and_block_emit_system() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = tmp.path().join("data/projects/repo");
+    std::fs::create_dir_all(&store).unwrap();
+    let lines = [
+        r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"hi"}]},"cwd":"/repo","sessionId":"01ARZ3NDEKTSV4RRFFQ69G5FAV","version":"1.2.3","timestamp":"2026-11-04T12:00:00Z"}"#.to_string(),
+        r#"{"type":"assistant","message":{"role":"assistant","model":"m","content":[{"type":"future_widget","data":{"x":1}}],"usage":{"input_tokens":1,"output_tokens":1}},"cwd":"/repo","sessionId":"01ARZ3NDEKTSV4RRFFQ69G5FAV","version":"1.2.3","timestamp":"2026-11-04T12:00:01Z"}"#.to_string(),
+        r#"{"type":"warp_jump","payload":{"where":"elsewhere"},"cwd":"/repo","sessionId":"01ARZ3NDEKTSV4RRFFQ69G5FAV","version":"1.2.3","timestamp":"2026-11-04T12:00:02Z"}"#.to_string(),
+    ];
+    let native = store.join(format!("{SESSION_ID}.jsonl"));
+    std::fs::write(&native, lines.join("\n") + "\n").unwrap();
+    let roots = Roots {
+        config_dir: tmp.path().join("cfg"),
+        data_dir: tmp.path().join("data"),
+        worktree: PathBuf::from("/repo"),
+    };
+    let a = ClaudeAdapter;
+    let found = a.discover(&roots, &HashMap::new());
+    assert_eq!(found.len(), 1);
+    let out = a.read(&found[0], &Cursor::start(), FALLBACK_TS).unwrap();
+    assert_eq!(out.events.len(), 3);
+    let kinds: Vec<&str> = out.events.iter().map(|e| kind_name(&e.kind)).collect();
+    assert_eq!(kinds, vec!["user_message", "system", "system"]);
+    for (i, e) in out.events.iter().enumerate() {
+        assert_eq!(e.seq, i as u64, "event {i} seq");
+    }
+    let texts: Vec<&str> = out
+        .events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            starforge_format::EventKind::System(s) => Some(s.text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(texts.len(), 2);
+    assert!(
+        texts[0].contains("future_widget"),
+        "block raw JSON: {}",
+        texts[0]
+    );
+    assert_eq!(texts[1], lines[2], "record raw JSON preserved exactly");
+}

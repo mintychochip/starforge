@@ -247,3 +247,55 @@ fn codex_append_and_multi_event_resume_keep_seq_contiguous() {
     known2.insert(found2[0].session_key.clone(), tail.next);
     assert!(a.discover(&roots, &known2).is_empty());
 }
+
+/// Unknown record types emit exactly one `system` event with the raw record
+/// JSON, and unknown blocks in a message-level `content` array each emit one
+/// `system` event with the raw block JSON; handled shapes keep their output
+/// and `seq` stays contiguous.
+#[test]
+fn codex_unknown_record_and_block_emit_system() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = tmp.path().join("data/sessions/2026/11/04");
+    std::fs::create_dir_all(&store).unwrap();
+    let lines = [
+        r#"{"type":"prompt","text":"hi","cwd":"/repo","session_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","version":"0.42.0","timestamp":"2026-11-04T12:00:00Z"}"#.to_string(),
+        r#"{"type":"prompt","content":[{"type":"text","text":"shown"},{"type":"future_block","blob":[1,2]}],"cwd":"/repo","session_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","version":"0.42.0","timestamp":"2026-11-04T12:00:01Z"}"#.to_string(),
+        r#"{"type":"time_ripple","payload":{"when":"later"},"cwd":"/repo","session_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","version":"0.42.0","timestamp":"2026-11-04T12:00:02Z"}"#.to_string(),
+    ];
+    let native = store.join(format!("rollout-{SESSION_ID}.jsonl"));
+    std::fs::write(&native, lines.join("\n") + "\n").unwrap();
+    let roots = Roots {
+        config_dir: tmp.path().join("cfg"),
+        data_dir: tmp.path().join("data"),
+        worktree: PathBuf::from("/repo"),
+    };
+    let a = CodexAdapter;
+    let found = a.discover(&roots, &HashMap::new());
+    assert_eq!(found.len(), 1);
+    let out = a.read(&found[0], &Cursor::start(), FALLBACK_TS).unwrap();
+    // Known prompt, then the rendered message plus one system event for the
+    // unknown block, then one system event for the unknown record.
+    let kinds: Vec<&str> = out.events.iter().map(|e| kind_name(&e.kind)).collect();
+    assert_eq!(
+        kinds,
+        vec!["user_message", "user_message", "system", "system"]
+    );
+    for (i, e) in out.events.iter().enumerate() {
+        assert_eq!(e.seq, i as u64, "event {i} seq");
+    }
+    let texts: Vec<&str> = out
+        .events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            starforge_format::EventKind::System(s) => Some(s.text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(texts.len(), 2);
+    assert!(
+        texts[0].contains("future_block"),
+        "block raw JSON: {}",
+        texts[0]
+    );
+    assert_eq!(texts[1], lines[2], "record raw JSON preserved exactly");
+}

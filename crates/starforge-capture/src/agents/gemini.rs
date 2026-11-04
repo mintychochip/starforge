@@ -109,15 +109,6 @@ fn edit_path(tool_name: &str, input: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Make `path` relative to `workdir` when it lies inside; else keep as-is.
-fn relativize(workdir: &str, path: &str) -> String {
-    let prefix = format!("{workdir}/");
-    match path.strip_prefix(&prefix) {
-        Some(rest) => rest.to_string(),
-        None => path.to_string(),
-    }
-}
-
 /// Fold one parsed message into the session header accumulator.
 #[derive(Default)]
 struct HeaderFold {
@@ -194,8 +185,9 @@ impl HeaderFold {
     }
 
     fn note_file(&mut self, workdir: &str, path: &str) {
-        let rel = relativize(workdir, path);
-        if !self.files_touched.iter().any(|f| f == &rel) {
+        if let Some(rel) = crate::repo_relative(std::path::Path::new(workdir), path)
+            && !self.files_touched.iter().any(|f| f == &rel)
+        {
             self.files_touched.push(rel);
         }
     }

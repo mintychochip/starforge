@@ -13,4 +13,5 @@ pub mod discover;
 
 pub use adapter::{Adapter, AdapterVersion, Candidate, CaptureError, ReadOutput, Roots};
 pub use cursor::Cursor;
+pub(crate) use discover::repo_relative;
 pub use discover::workdir_inside;

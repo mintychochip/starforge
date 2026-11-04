@@ -120,15 +120,6 @@ fn edit_path(tool_name: &str, input: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Make `path` relative to `workdir` when it lies inside; else keep as-is.
-fn relativize(workdir: &str, path: &str) -> String {
-    let prefix = format!("{workdir}/");
-    match path.strip_prefix(&prefix) {
-        Some(rest) => rest.to_string(),
-        None => path.to_string(),
-    }
-}
-
 /// Fold one parsed record into the session header accumulator.
 #[derive(Default)]
 struct HeaderFold {
@@ -183,8 +174,9 @@ impl HeaderFold {
     }
 
     fn note_file(&mut self, workdir: &str, path: &str) {
-        let rel = relativize(workdir, path);
-        if !self.files_touched.iter().any(|f| f == &rel) {
+        if let Some(rel) = crate::repo_relative(std::path::Path::new(workdir), path)
+            && !self.files_touched.iter().any(|f| f == &rel)
+        {
             self.files_touched.push(rel);
         }
     }
@@ -401,13 +393,17 @@ impl Adapter for PiAdapter {
             || roots.data_dir.join("omp/agent/sessions").is_dir()
     }
 
+    /// Merge starforge's hook fragment under the single top-level `starforge`
+    /// key, preserving every unrelated key. A missing file is created; a
+    /// present file must be a JSON object (anything else is an `InvalidData`
+    /// error and the file is left untouched).
     fn install_hooks(&self, roots: &Roots) -> io::Result<Vec<PathBuf>> {
         let path = roots.config_dir.join(HOOK_REL_PATH);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let body = serde_json::json!({
-            "_starforge": "starforge-managed extension-event hook; remove_hooks deletes this file",
+        let fragment = serde_json::json!({
+            "_note": "starforge-managed extension-event hook; remove_hooks deletes this key",
             "extensionEvents": {
                 "sessionEnd": [
                     {
@@ -419,19 +415,60 @@ impl Adapter for PiAdapter {
                 ]
             }
         });
-        std::fs::write(&path, serde_json::to_string_pretty(&body).unwrap())?;
-        Ok(vec![path])
-    }
-
-    fn remove_hooks(&self, roots: &Roots) -> io::Result<Vec<PathBuf>> {
-        let path = roots.config_dir.join(HOOK_REL_PATH);
-        match std::fs::read_to_string(&path) {
-            Ok(body) if body.contains(MARKER) => {
-                std::fs::remove_file(&path)?;
+        match std::fs::read(&path) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                let mut obj = serde_json::Map::new();
+                obj.insert(MARKER.to_string(), fragment);
+                std::fs::write(
+                    &path,
+                    serde_json::to_string_pretty(&Value::Object(obj)).unwrap(),
+                )?;
                 Ok(vec![path])
             }
-            _ => Ok(vec![]),
+            Err(e) => Err(e),
+            Ok(bytes) => {
+                let mut body: Value = serde_json::from_slice(&bytes).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("hook file is not valid JSON: {}", path.display()),
+                    )
+                })?;
+                let obj = body.as_object_mut().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("hook file is not a JSON object: {}", path.display()),
+                    )
+                })?;
+                obj.insert(MARKER.to_string(), fragment);
+                std::fs::write(&path, serde_json::to_string_pretty(&body).unwrap())?;
+                Ok(vec![path])
+            }
         }
+    }
+
+    /// Remove only the `starforge` key, preserving every unrelated key. An
+    /// emptied object deletes the file; a file without the key (or no file)
+    /// is left untouched and yields nothing.
+    fn remove_hooks(&self, roots: &Roots) -> io::Result<Vec<PathBuf>> {
+        let path = roots.config_dir.join(HOOK_REL_PATH);
+        let Ok(bytes) = std::fs::read(&path) else {
+            return Ok(vec![]);
+        };
+        let Ok(mut body) = serde_json::from_slice::<Value>(&bytes) else {
+            return Ok(vec![]);
+        };
+        let Some(obj) = body.as_object_mut() else {
+            return Ok(vec![]);
+        };
+        if obj.remove(MARKER).is_none() {
+            return Ok(vec![]);
+        }
+        if obj.is_empty() {
+            std::fs::remove_file(&path)?;
+        } else {
+            std::fs::write(&path, serde_json::to_string_pretty(&body).unwrap())?;
+        }
+        Ok(vec![path])
     }
 
     fn discover(&self, roots: &Roots, known: &HashMap<String, Cursor>) -> Vec<Candidate> {

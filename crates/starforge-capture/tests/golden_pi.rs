@@ -302,3 +302,82 @@ fn pi_hooks_never_touch_foreign_files() {
     assert!(removed.is_empty());
     assert!(foreign.exists());
 }
+
+/// Installing over a foreign hook file merges under the single `starforge`
+/// key: unrelated keys survive, the marker is present, and removal restores
+/// the foreign file (a second removal is a no-op).
+#[test]
+fn pi_install_merges_into_foreign_settings() {
+    let tmp = tempfile::tempdir().unwrap();
+    let roots = Roots {
+        config_dir: tmp.path().join("cfg"),
+        data_dir: tmp.path().join("data"),
+        worktree: PathBuf::from("/repo"),
+    };
+    let a = PiAdapter;
+    let path = roots.config_dir.join("pi/starforge.json");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let foreign = r#"{"extensionEvents":{"sessionStart":[]},"theme":"dark"}"#;
+    std::fs::write(&path, foreign).unwrap();
+
+    let written = a.install_hooks(&roots).unwrap();
+    assert_eq!(written, vec![path.clone()]);
+    let body = std::fs::read_to_string(&path).unwrap();
+    assert!(body.contains("starforge"), "hook file must carry marker");
+    let merged: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        merged.get("theme").and_then(|v| v.as_str()),
+        Some("dark"),
+        "unrelated keys preserved"
+    );
+    assert!(
+        merged.get("extensionEvents").is_some(),
+        "unrelated keys preserved"
+    );
+    assert!(merged.get("starforge").is_some(), "dedicated starforge key");
+
+    // Removal drops only the `starforge` key and keeps the rest.
+    let removed = a.remove_hooks(&roots).unwrap();
+    assert_eq!(removed, vec![path.clone()]);
+    let after: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert!(after.get("starforge").is_none());
+    assert_eq!(after.get("theme").and_then(|v| v.as_str()), Some("dark"));
+    assert!(after.get("extensionEvents").is_some());
+
+    // Second removal touches nothing.
+    let before = std::fs::read(&path).unwrap();
+    let removed_again = a.remove_hooks(&roots).unwrap();
+    assert!(removed_again.is_empty());
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+/// Installing over an unparseable (or non-object) hook file fails with
+/// `InvalidData` naming the path and leaves the bytes untouched.
+#[test]
+fn pi_install_rejects_non_object_hook_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let roots = Roots {
+        config_dir: tmp.path().join("cfg"),
+        data_dir: tmp.path().join("data"),
+        worktree: PathBuf::from("/repo"),
+    };
+    let a = PiAdapter;
+    let path = roots.config_dir.join("pi/starforge.json");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+    for bad in ["{not valid json", "[1, 2, 3]", "\"just a string\""] {
+        std::fs::write(&path, bad).unwrap();
+        let err = a.install_hooks(&roots).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains(&path.display().to_string()),
+            "error names the path: {err}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), bad);
+    }
+    // A foreign file with no `starforge` key is never removed.
+    let removed = a.remove_hooks(&roots).unwrap();
+    assert!(removed.is_empty());
+    assert!(path.exists());
+}
