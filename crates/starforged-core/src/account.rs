@@ -390,4 +390,45 @@ mod tests {
             Err(CoreError::Invalid(_))
         ));
     }
+
+    #[tokio::test]
+    async fn change_email_links_survive_an_address_conflict() {
+        let (core, fixture) = test_core_with(with_file_mail).await;
+        let alice = alice(&core).await;
+        assert_eq!(
+            core.change_email(&alice, "shared@example.com")
+                .await
+                .unwrap(),
+            EmailChange::ConfirmationSent
+        );
+        core.run_due_jobs().await.unwrap();
+        let mail = fixture.mail();
+        assert_eq!(mail.len(), 1);
+        let link = crate::mail::testing::find_link(&mail[0], "/verify/").unwrap();
+        let secret = link.rsplit('/').next().unwrap().to_owned();
+        core.create_user(CreateUser {
+            handle: "bob".into(),
+            email: Some("shared@example.com".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            core.verify_email(&secret).await,
+            Err(CoreError::Conflict(_))
+        ));
+        assert!(
+            core.email_link_valid(&secret).await.unwrap(),
+            "the link is still usable"
+        );
+        assert_eq!(
+            core.user_by_id(alice.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .email
+                .as_deref(),
+            Some("alice@example.com")
+        );
+    }
 }

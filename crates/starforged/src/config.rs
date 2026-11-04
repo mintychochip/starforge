@@ -61,7 +61,7 @@ pub struct SecurityConfig {
     pub secret_key: String,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MailConfig {
     /// Empty: no email. Otherwise `smtp://`, `smtps://`, or `file:///dir` (forge-basics design §3).
     #[serde(default)]
@@ -69,6 +69,16 @@ pub struct MailConfig {
     /// Sender mailbox, e.g. `Starforge <forge@example.com>`.
     #[serde(default)]
     pub from: String,
+}
+
+impl std::fmt::Debug for MailConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let url = if self.url.is_empty() { "" } else { "<set>" };
+        f.debug_struct("MailConfig")
+            .field("url", &url)
+            .field("from", &self.from)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -381,5 +391,14 @@ mod tests {
                 .to_string()
                 .contains("registration.mode")
         );
+    }
+
+    #[test]
+    fn debug_output_hides_mail_credentials() {
+        let mut config = sample();
+        config.mail.url = "smtps://mailuser:hunter2secret@mail.example.com".into();
+        let rendered = format!("{config:?}");
+        assert!(!rendered.contains("hunter2secret"), "{rendered}");
+        assert!(!rendered.contains("mailuser"), "{rendered}");
     }
 }

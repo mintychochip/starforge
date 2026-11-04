@@ -58,6 +58,13 @@ impl Core {
     /// `NotFound` for unknown, used, or expired links, and for links sent to an address the account
     /// no longer uses.
     pub async fn verify_email(&self, secret: &str) -> CoreResult<User> {
+        if let Some(token) = self.peek_email_token(secret, Purpose::ChangeEmail).await?
+            && users::by_email(self.db(), &token.email)
+                .await?
+                .is_some_and(|owner| owner.id != token.user_id)
+        {
+            return Err(crate::account::email_taken());
+        }
         if let Some(token) = self
             .consume_email_token(secret, Purpose::ChangeEmail)
             .await?

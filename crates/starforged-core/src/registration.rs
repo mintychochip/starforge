@@ -198,7 +198,7 @@ impl Core {
     /// For the sign-up form: the address a usable invite is bound to. `Invalid` when the code is unknown,
     /// used, revoked, or expired.
     pub async fn invite_email(&self, code: &str) -> CoreResult<Option<String>> {
-        let row = invites::by_code_hash(self.db(), &crypto::sha256_hex(code))
+        let row = invites::by_code_hash(self.db(), &crypto::sha256_hex(code.trim()))
             .await?
             .filter(|r| r.used_at.is_none() && r.revoked_at.is_none() && r.expires_at > now())
             .ok_or_else(unusable_invite)?;
@@ -370,5 +370,23 @@ mod tests {
                 .unwrap(),
             SignedUp::VerificationSent(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn invite_email_trims_the_code() {
+        let (core, _f) = test_core().await;
+        let root = admin(&core).await;
+        let invite = core
+            .create_invite(&root, Some("x@example.com"))
+            .await
+            .unwrap();
+        let code = code_of(&invite.link);
+        assert_eq!(
+            core.invite_email(&format!(" {code} "))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("x@example.com")
+        );
     }
 }
