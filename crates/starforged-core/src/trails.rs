@@ -5,8 +5,10 @@
 //! `NotFound` so nothing leaks; mutations check the action threshold and answer
 //! `Forbidden` above read but below it. `Write` gains no Trail powers in M2a
 //! (code-centric per §6.1); assignees need an explicit grant via
-//! [`Core::is_repo_member`]. Numbering retries unique violations (≤5 attempts,
-//! then `Conflict`). `merged` is never written here — the merge path owns it.
+//! [`Core::is_repo_member`]. Numbers come from the `trail_sequences` counter inside
+//! the insert transaction, so concurrent creates never collide; a `UNIQUE` violation
+//! below is only a defensive fallback (rows written behind the sequence's back).
+//! `merged` is never written here — the merge path owns it.
 //! Only open/close/reopen are audited; everything else is timeline-only.
 
 use starforged_db::now;
@@ -26,8 +28,6 @@ const MAX_LABEL_LEN: usize = 50;
 /// Max labels / assignees per trail.
 const MAX_LABELS: usize = 10;
 const MAX_ASSIGNEES: usize = 10;
-/// Number-allocation attempts before giving up with `Conflict`.
-const NUMBER_ATTEMPTS: usize = 5;
 
 /// Flat read shape shared by API and web.
 #[derive(Debug, Clone)]
@@ -224,31 +224,29 @@ impl Core {
         let access = self.repo_for(Some(user), owner, repo).await?;
         let title = check_title(title)?;
         check_intent(intent)?;
-        let mut row = None;
-        for _ in 0..NUMBER_ATTEMPTS {
-            match db_trails::insert_trail(
-                self.db(),
-                &db_trails::NewTrail {
-                    repo_id: access.repo.id,
-                    title: &title,
-                    intent,
-                    author_id: user.id,
-                },
-                now(),
-            )
-            .await
-            {
-                Ok(r) => {
-                    row = Some(r);
-                    break;
-                }
-                Err(e) if e.is_unique_violation() => continue,
-                Err(e) => return Err(e.into()),
+        // Single attempt: the sequence allocator inside `insert_trail` serializes
+        // concurrent creates, so a unique violation here means a row was written
+        // behind the sequence's back — report it, don't loop.
+        let row = match db_trails::insert_trail(
+            self.db(),
+            &db_trails::NewTrail {
+                repo_id: access.repo.id,
+                title: &title,
+                intent,
+                author_id: user.id,
+            },
+            now(),
+        )
+        .await
+        {
+            Ok(row) => row,
+            Err(e) if e.is_unique_violation() => {
+                return Err(CoreError::Conflict(
+                    "could not allocate a trail number; please retry".into(),
+                ));
             }
-        }
-        let row = row.ok_or_else(|| {
-            CoreError::Conflict("could not allocate a trail number; please retry".into())
-        })?;
+            Err(e) => return Err(e.into()),
+        };
         self.record_timeline(
             access.repo.id,
             row.id,

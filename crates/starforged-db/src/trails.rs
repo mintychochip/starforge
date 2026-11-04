@@ -1,8 +1,9 @@
 //! `trails`: issue-like discussion objects scoped to a repository.
 //!
 //! Numbering is per repository (`UNIQUE (repo_id, number)`): `insert_trail`
-//! allocates the next number with a single `INSERT … SELECT COALESCE(MAX(number), 0) + 1`
-//! statement and the caller retries on unique violation. The data-access layer stays
+//! allocates the next number from `trail_sequences` inside the same transaction
+//! that inserts the row, so concurrent creates never collide and a rolled-back
+//! insert returns its number. The data-access layer stays
 //! thin — no validation or permission checks here (those live in `starforged-core`).
 //! `merged` is admitted by the state `CHECK` but never written in M2a; the merge
 //! path owns it.
@@ -160,23 +161,38 @@ fn timeline_from_row(row: &AnyRow) -> DbResult<TimelineEventRow> {
     })
 }
 
-/// Inserts the trail, allocating the next per-repo number atomically: the aggregate
-/// over the repo's rows yields one row even when the repo has no trails yet, so this
-/// always inserts exactly one row. The caller retries on unique violation.
+/// Inserts the trail, allocating the next per-repo number from `trail_sequences`
+/// inside the same transaction that inserts the row: the upsert takes the sequence
+/// row lock, so concurrent creates serialize and never collide; rolling back
+/// returns the allocated number. A `UNIQUE (repo_id, number)` violation is still
+/// possible if rows were inserted behind the sequence's back — callers map it to
+/// `Conflict` as a defensive fallback and never retry it in a loop.
 pub async fn insert_trail(db: &Db, t: &NewTrail<'_>, now: i64) -> DbResult<TrailRow> {
+    let mut tx = db.pool().begin().await?;
+    let number: i64 = sqlx::query_scalar(
+        "INSERT INTO trail_sequences (repo_id, next_number) VALUES ($1, 2) \
+         ON CONFLICT (repo_id) DO UPDATE SET next_number = trail_sequences.next_number + 1 \
+         RETURNING next_number - 1",
+    )
+    .bind(t.repo_id)
+    .fetch_one(&mut *tx)
+    .await?;
     let row = sqlx::query(
         "INSERT INTO trails (repo_id, number, title, intent, state, ready, author_id, created_at, updated_at) \
-         SELECT $1, COALESCE(MAX(number), 0) + 1, $2, $3, 'open', 0, $4, $5, $5 FROM trails WHERE repo_id = $1 \
+         VALUES ($1, $2, $3, $4, 'open', 0, $5, $6, $6) \
          RETURNING id, repo_id, number, title, intent, state, ready, author_id, created_at, updated_at, closed_at, merged_at",
     )
     .bind(t.repo_id)
+    .bind(number)
     .bind(t.title)
     .bind(t.intent)
     .bind(t.author_id)
     .bind(now)
-    .fetch_one(db.pool())
+    .fetch_one(&mut *tx)
     .await?;
-    trail_from_row(&row)
+    let trail = trail_from_row(&row)?;
+    tx.commit().await?;
+    Ok(trail)
 }
 
 pub async fn trail_by_number(db: &Db, repo_id: i64, number: i64) -> DbResult<Option<TrailRow>> {
@@ -412,7 +428,6 @@ pub async fn timeline_of_trail(db: &Db, trail_id: i64) -> DbResult<Vec<TimelineE
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::DbError;
     use crate::repos::{self, NewRepo};
     use crate::testing::TestDb;
     use crate::users::{self, NewUser};
@@ -509,7 +524,70 @@ mod tests {
         .execute(t.db.pool())
         .await
         .expect_err("duplicate (repo_id, number) must fail");
-        assert!(DbError::from(err).is_unique_violation());
+        assert!(
+            err.as_database_error()
+                .map(|d| d.is_unique_violation())
+                .unwrap_or(false),
+            "expected a unique violation, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rolled_back_insert_does_not_consume_number() {
+        let (t, alice, _bob, repo_id) = setup().await;
+        let a = insert_trail(&t.db, &new_trail(repo_id, alice, "one"), 1_700_000_000)
+            .await
+            .unwrap();
+        assert_eq!(a.number, 1);
+        // A trail insert that fails after allocating (here: dangling author_id
+        // trips the FK) rolls the sequence back with it …
+        let err = insert_trail(
+            &t.db,
+            &NewTrail {
+                repo_id,
+                title: "bad",
+                intent: "bad",
+                author_id: 999_999,
+            },
+            1_700_000_001,
+        )
+        .await
+        .expect_err("dangling author must fail");
+        assert!(!err.is_unique_violation());
+        // … so the next create reuses the number instead of skipping it.
+        let b = insert_trail(&t.db, &new_trail(repo_id, alice, "two"), 1_700_000_002)
+            .await
+            .unwrap();
+        assert_eq!(b.number, 2);
+        // Same guarantee through the defensive path: a row written behind the
+        // sequence's back fails the insert, and clearing it frees the number.
+        sqlx::query(
+            "INSERT INTO trails (repo_id, number, title, intent, state, ready, author_id, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, 'open', 0, $5, $6, $6)",
+        )
+        .bind(repo_id)
+        .bind(3)
+        .bind("squat")
+        .bind("squat")
+        .bind(alice)
+        .bind(1_700_000_003)
+        .execute(t.db.pool())
+        .await
+        .unwrap();
+        let err = insert_trail(&t.db, &new_trail(repo_id, alice, "three"), 1_700_000_004)
+            .await
+            .expect_err("squatted number must fail");
+        assert!(err.is_unique_violation());
+        sqlx::query("DELETE FROM trails WHERE repo_id = $1 AND number = $2")
+            .bind(repo_id)
+            .bind(3)
+            .execute(t.db.pool())
+            .await
+            .unwrap();
+        let c = insert_trail(&t.db, &new_trail(repo_id, alice, "three"), 1_700_000_005)
+            .await
+            .unwrap();
+        assert_eq!(c.number, 3);
     }
 
     #[tokio::test]
