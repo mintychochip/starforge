@@ -13,11 +13,14 @@ workspace = true
 argon2.workspace = true
 getrandom.workspace = true
 hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 sha2.workspace = true
 starforged-db = { path = "../starforged-db" }
 starforged-git = { path = "../starforged-git" }
 thiserror.workspace = true
 tokio.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 sqlx.workspace = true

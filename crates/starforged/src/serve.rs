@@ -18,6 +18,9 @@ pub struct App {
     pub core: Core,
 }
 
+/// Background job workers per process (forge-basics design §8.2).
+const JOB_WORKERS: usize = 2;
+
 /// The whole application: `/healthz`, `/api/v1`, web pages, and git smart HTTP.
 pub async fn build(config: &Config, hook_exe: PathBuf) -> anyhow::Result<App> {
     let core = open_core(config, hook_exe).await?;
@@ -53,6 +56,7 @@ pub async fn serve_on(
 pub async fn run(config: Config) -> anyhow::Result<()> {
     let (major, minor) = starforged_git::command::check_version().await?;
     let app = build(&config, std::env::current_exe()?).await?;
+    starforged_core::jobs::start_workers(&app.core, JOB_WORKERS).await?;
     let listener = TcpListener::bind(&config.server.http_addr)
         .await
         .with_context(|| format!("binding {}", config.server.http_addr))?;

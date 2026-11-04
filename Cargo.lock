@@ -3693,6 +3693,8 @@ dependencies = [
  "argon2",
  "getrandom",
  "hex",
+ "serde",
+ "serde_json",
  "sha2 0.11.1",
  "sqlx",
  "starforged-db",
@@ -3700,6 +3702,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

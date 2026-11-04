@@ -15,6 +15,7 @@ use sqlx::any::AnyPoolOptions;
 
 pub mod audit;
 pub mod collaborators;
+pub mod jobs;
 pub mod repos;
 pub mod tokens;
 pub mod users;

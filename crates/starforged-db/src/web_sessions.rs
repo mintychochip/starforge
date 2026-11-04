@@ -69,3 +69,12 @@ pub async fn delete_by_hash(db: &Db, session_hash: &str) -> DbResult<()> {
         .await?;
     Ok(())
 }
+
+/// Deletes sessions whose expiry is at or before `now_ts`; returns how many.
+pub async fn delete_expired(db: &Db, now_ts: i64) -> DbResult<u64> {
+    let result = sqlx::query("DELETE FROM web_sessions WHERE expires_at <= $1")
+        .bind(now_ts)
+        .execute(db.pool())
+        .await?;
+    Ok(result.rows_affected())
+}

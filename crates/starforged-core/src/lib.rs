@@ -6,6 +6,7 @@ pub mod audit;
 pub mod content;
 pub mod crypto;
 pub mod error;
+pub mod jobs;
 pub mod permission;
 pub mod repos;
 pub mod sessions;
@@ -37,12 +38,18 @@ pub struct Core {
 struct Inner {
     db: Db,
     config: CoreConfig,
+    /// Wakes one idle job worker when a job is queued.
+    job_wakeup: tokio::sync::Notify,
 }
 
 impl Core {
     pub fn new(db: Db, config: CoreConfig) -> Core {
         Core {
-            inner: Arc::new(Inner { db, config }),
+            inner: Arc::new(Inner {
+                db,
+                config,
+                job_wakeup: tokio::sync::Notify::new(),
+            }),
         }
     }
 
