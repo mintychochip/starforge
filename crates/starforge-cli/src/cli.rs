@@ -114,7 +114,7 @@ impl CliError {
 /// Must not be called from inside a Tokio runtime (it blocks on one for the
 /// async device flow); async contexts use [`run_async`] instead.
 pub fn run(cli: Cli, paths: CliPaths) -> std::process::ExitCode {
-    if let Cmd::Auth { .. } = &cli.cmd {
+    if let Cmd::Auth { .. } | Cmd::Status = &cli.cmd {
         // fall through to async dispatch below
     } else {
         return sync_stub(cli, paths);
@@ -135,9 +135,9 @@ pub fn run(cli: Cli, paths: CliPaths) -> std::process::ExitCode {
 fn sync_stub(cli: Cli, _paths: CliPaths) -> std::process::ExitCode {
     let result: Result<(), CliError> = match cli.cmd {
         Cmd::Auth { .. } => unreachable!("auth dispatches via run_async"),
+        Cmd::Status => unreachable!("status dispatches via run_async"),
         Cmd::Enable => Err(CliError::Unimplemented("enable")),
         Cmd::Disable => Err(CliError::Unimplemented("disable")),
-        Cmd::Status => Err(CliError::Unimplemented("status")),
         Cmd::Doctor => Err(CliError::Unimplemented("doctor")),
         Cmd::Sync => Err(CliError::Unimplemented("sync")),
         Cmd::Sessions { .. } => Err(CliError::Unimplemented("sessions")),
@@ -164,7 +164,7 @@ pub async fn run_async(cli: Cli, paths: CliPaths) -> std::process::ExitCode {
         Cmd::Auth { cmd } => run_auth(cmd, paths, dry_run).await,
         Cmd::Enable => stub_err(CliError::Unimplemented("enable")),
         Cmd::Disable => stub_err(CliError::Unimplemented("disable")),
-        Cmd::Status => stub_err(CliError::Unimplemented("status")),
+        Cmd::Status => run_status(paths, dry_run).await,
         Cmd::Doctor => stub_err(CliError::Unimplemented("doctor")),
         Cmd::Sync => stub_err(CliError::Unimplemented("sync")),
         Cmd::Sessions { .. } => stub_err(CliError::Unimplemented("sessions")),
@@ -211,6 +211,24 @@ async fn run_auth(cmd: AuthCmd, paths: CliPaths, dry_run: bool) -> std::process:
             std::process::ExitCode::from(code)
         }
     }
+}
+
+/// `status`: resolve the server for the current directory and print it.
+async fn run_status(paths: CliPaths, dry_run: bool) -> std::process::ExitCode {
+    let repo = match std::env::current_dir() {
+        Ok(dir) => dir,
+        Err(err) => {
+            eprintln!("error: cannot determine current directory: {err}");
+            return std::process::ExitCode::from(1);
+        }
+    };
+    let (out, code) = crate::commands::status::status(&repo, &paths, dry_run).await;
+    if code == 0 {
+        println!("{out}");
+    } else {
+        eprintln!("{out}");
+    }
+    std::process::ExitCode::from(code)
 }
 
 fn stub_err(err: CliError) -> std::process::ExitCode {

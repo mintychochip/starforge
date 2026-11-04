@@ -8,6 +8,7 @@ pub mod cli;
 pub mod commands;
 pub mod config;
 pub mod discovery;
+pub mod git;
 pub mod queue;
 pub mod spool;
 pub mod upload;
