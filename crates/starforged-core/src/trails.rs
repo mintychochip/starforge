@@ -37,7 +37,7 @@ pub struct TrailView {
     pub intent: String,
     pub state: String,
     pub ready: bool,
-    pub author_id: i64,
+    pub author_id: Option<i64>,
     pub author_handle: String,
     pub labels: Vec<String>,
     pub assignees: Vec<String>,
@@ -68,6 +68,7 @@ pub struct ListPage {
 #[derive(Debug, Clone)]
 pub struct CommentView {
     pub id: i64,
+    pub author_id: Option<i64>,
     pub author_handle: String,
     pub body: String,
     pub created_at: i64,
@@ -141,11 +142,21 @@ pub fn normalize_label(name: &str) -> CoreResult<String> {
 }
 
 impl Core {
+    fn ensure_writable(repo: &crate::repos::Repo) -> CoreResult<()> {
+        if repo.archived_at.is_some() {
+            return Err(CoreError::Invalid("repository is archived".into()));
+        }
+        Ok(())
+    }
+
     async fn trail_view(&self, row: &TrailRow) -> CoreResult<TrailView> {
-        let author = self
-            .user_by_id(row.author_id)
-            .await?
-            .ok_or_else(|| CoreError::Internal("trail author missing".into()))?;
+        let (author_id, author_handle) = match row.author_id {
+            None => (None, "deleted user".to_owned()),
+            Some(id) => match self.user_by_id(id).await? {
+                Some(u) => (Some(id), u.handle),
+                None => (None, "deleted user".to_owned()),
+            },
+        };
         let labels = db_trails::labels_of(self.db(), row.id).await?;
         let mut assignees = Vec::new();
         for id in db_trails::assignees_of(self.db(), row.id).await? {
@@ -159,8 +170,8 @@ impl Core {
             intent: row.intent.clone(),
             state: row.state.clone(),
             ready: row.ready != 0,
-            author_id: row.author_id,
-            author_handle: author.handle,
+            author_id,
+            author_handle,
             labels,
             assignees,
             created_at: row.created_at,
@@ -171,13 +182,17 @@ impl Core {
     }
 
     async fn comment_view(&self, row: &TrailCommentRow) -> CoreResult<CommentView> {
-        let author = self
-            .user_by_id(row.author_id)
-            .await?
-            .ok_or_else(|| CoreError::Internal("comment author missing".into()))?;
+        let (author_id, author_handle) = match row.author_id {
+            None => (None, "deleted user".to_owned()),
+            Some(id) => match self.user_by_id(id).await? {
+                Some(u) => (Some(id), u.handle),
+                None => (None, "deleted user".to_owned()),
+            },
+        };
         Ok(CommentView {
             id: row.id,
-            author_handle: author.handle,
+            author_id,
+            author_handle,
             body: row.body.clone(),
             created_at: row.created_at,
             edited_at: row.edited_at,
@@ -222,6 +237,7 @@ impl Core {
     ) -> CoreResult<TrailView> {
         // `repo_for` guarantees ≥ Read; below that (or invisible) is `NotFound`.
         let access = self.repo_for(Some(user), owner, repo).await?;
+        Self::ensure_writable(&access.repo)?;
         let title = check_title(title)?;
         check_intent(intent)?;
         // Single attempt: the sequence allocator inside `insert_trail` serializes
@@ -283,7 +299,7 @@ impl Core {
             None => (false, false),
             Some(u) => {
                 let triage = access.permission >= Permission::Triage;
-                (triage || row.author_id == u.id, triage)
+                (triage || row.author_id == Some(u.id), triage)
             }
         };
         Ok(TrailDetail {
@@ -380,9 +396,10 @@ impl Core {
         ready: Option<bool>,
     ) -> CoreResult<TrailView> {
         let access = self.repo_for(Some(user), owner, repo).await?;
+        Self::ensure_writable(&access.repo)?;
         let row = self.trail_row(access.repo.id, number).await?;
         let triage = access.permission >= Permission::Triage;
-        let is_author = row.author_id == user.id;
+        let is_author = row.author_id == Some(user.id);
         if !is_author && !triage {
             return Err(CoreError::Forbidden);
         }
@@ -428,6 +445,59 @@ impl Core {
         self.trail_view(&self.trail_row(access.repo.id, number).await?)
             .await
     }
+    /// Pure validation for `PATCH`: checks every supplied field (shapes and
+    /// permissions) without writing anything, so the handler can reject
+    /// before either write lands.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn check_patch(
+        &self,
+        user: &User,
+        owner: &str,
+        repo: &str,
+        number: i64,
+        title: Option<&str>,
+        intent: Option<&str>,
+        ready: Option<bool>,
+        state: Option<&str>,
+    ) -> CoreResult<()> {
+        let access = self.repo_for(Some(user), owner, repo).await?;
+        Self::ensure_writable(&access.repo)?;
+        if state.is_none() && title.is_none() && intent.is_none() && ready.is_none() {
+            let _ = self.trail_row(access.repo.id, number).await?;
+            return Ok(());
+        }
+        if let Some(next) = state {
+            if access.permission < Permission::Triage {
+                return Err(CoreError::Forbidden);
+            }
+            if next == "merged" {
+                return Err(CoreError::Invalid("merged is set by the merge path".into()));
+            }
+            if !matches!(next, "open" | "closed") {
+                return Err(CoreError::Invalid(format!("invalid state '{next}'")));
+            }
+        }
+        if title.is_some() || intent.is_some() || ready.is_some() {
+            let row = self.trail_row(access.repo.id, number).await?;
+            let triage = access.permission >= Permission::Triage;
+            let is_author = row.author_id == Some(user.id);
+            if !is_author && !triage {
+                return Err(CoreError::Forbidden);
+            }
+            if ready.is_some() && !triage {
+                return Err(CoreError::Forbidden);
+            }
+            if let Some(t) = title {
+                check_title(t)?;
+            }
+            if let Some(i) = intent {
+                check_intent(i)?;
+            }
+        } else if state.is_some() {
+            let _ = self.trail_row(access.repo.id, number).await?;
+        }
+        Ok(())
+    }
 
     /// Only `open`/`closed`. `merged` is owned by the merge path.
     pub async fn set_trail_state(
@@ -439,6 +509,7 @@ impl Core {
         state: &str,
     ) -> CoreResult<TrailView> {
         let access = self.repo_for(Some(user), owner, repo).await?;
+        Self::ensure_writable(&access.repo)?;
         if access.permission < Permission::Triage {
             return Err(CoreError::Forbidden);
         }
@@ -487,6 +558,7 @@ impl Core {
         body: &str,
     ) -> CoreResult<CommentView> {
         let access = self.repo_for(Some(user), owner, repo).await?;
+        Self::ensure_writable(&access.repo)?;
         let row = self.trail_row(access.repo.id, number).await?;
         check_body(body)?;
         let at = now();
@@ -514,12 +586,13 @@ impl Core {
         body: &str,
     ) -> CoreResult<CommentView> {
         let access = self.repo_for(Some(user), owner, repo).await?;
+        Self::ensure_writable(&access.repo)?;
         let row = self.trail_row(access.repo.id, number).await?;
         let saved = db_trails::comment_by_id(self.db(), comment_id)
             .await?
             .filter(|c| c.trail_id == row.id)
             .ok_or(CoreError::NotFound)?;
-        if saved.author_id != user.id && access.permission < Permission::Admin {
+        if saved.author_id != Some(user.id) && access.permission < Permission::Admin {
             return Err(CoreError::Forbidden);
         }
         check_body(body)?;
@@ -549,6 +622,7 @@ impl Core {
         name: &str,
     ) -> CoreResult<TrailView> {
         let access = self.repo_for(Some(user), owner, repo).await?;
+        Self::ensure_writable(&access.repo)?;
         if access.permission < Permission::Triage {
             return Err(CoreError::Forbidden);
         }
@@ -583,6 +657,7 @@ impl Core {
         name: &str,
     ) -> CoreResult<TrailView> {
         let access = self.repo_for(Some(user), owner, repo).await?;
+        Self::ensure_writable(&access.repo)?;
         if access.permission < Permission::Triage {
             return Err(CoreError::Forbidden);
         }
@@ -613,6 +688,7 @@ impl Core {
         handle: &str,
     ) -> CoreResult<TrailView> {
         let access = self.repo_for(Some(user), owner, repo).await?;
+        Self::ensure_writable(&access.repo)?;
         if access.permission < Permission::Triage {
             return Err(CoreError::Forbidden);
         }
@@ -658,6 +734,7 @@ impl Core {
         handle: &str,
     ) -> CoreResult<TrailView> {
         let access = self.repo_for(Some(user), owner, repo).await?;
+        Self::ensure_writable(&access.repo)?;
         if access.permission < Permission::Triage {
             return Err(CoreError::Forbidden);
         }
@@ -774,8 +851,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(view.number, 1);
-        assert_ne!(view.author_id, 1, "author_id must not be the trail row id");
-        assert_eq!(view.author_id, bob.id);
+        assert_ne!(
+            view.author_id,
+            Some(1),
+            "author_id must not be the trail row id"
+        );
+        assert_eq!(view.author_id, Some(bob.id));
         assert_eq!(view.author_handle, "bob");
     }
 
@@ -1403,5 +1484,135 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(total, 2);
+    }
+    #[tokio::test]
+    async fn deleted_author_keeps_trail_readable_and_triages_can_close() {
+        let (core, _f) = test_core().await;
+        let alice = user(&core, "alice").await;
+        let bob = user(&core, "bob").await;
+        let carol = user(&core, "carol").await;
+        let dave = user(&core, "dave").await;
+        proj(&core, &alice, Visibility::Private).await;
+        for h in ["bob", "carol", "dave"] {
+            core.set_collaborator(&alice, "alice", "proj", h, Permission::Read)
+                .await
+                .unwrap();
+        }
+        core.create_trail(&bob, "alice", "proj", "T", "")
+            .await
+            .unwrap();
+        core.add_comment(&carol, "alice", "proj", 1, "hi")
+            .await
+            .unwrap();
+        starforged_db::users::delete(core.db(), bob.id)
+            .await
+            .unwrap();
+        starforged_db::users::delete(core.db(), carol.id)
+            .await
+            .unwrap();
+        let detail = core
+            .trail_by_number(Some(&dave), "alice", "proj", 1)
+            .await
+            .unwrap();
+        assert_eq!(detail.trail.author_id, None);
+        assert_eq!(detail.trail.author_handle, "deleted user");
+        assert_eq!(detail.comments.len(), 1);
+        assert_eq!(detail.comments[0].author_id, None);
+        assert_eq!(detail.comments[0].author_handle, "deleted user");
+        // A NULL author is never the actor: only triage/admin may edit.
+        let closed = core
+            .set_trail_state(&alice, "alice", "proj", 1, "closed")
+            .await
+            .unwrap();
+        assert_eq!(closed.state, "closed");
+        let edited = core
+            .update_trail(&alice, "alice", "proj", 1, Some("T2"), None, None)
+            .await
+            .unwrap();
+        assert_eq!(edited.title, "T2");
+    }
+
+    #[tokio::test]
+    async fn archived_repo_refuses_trail_mutations_but_keeps_reads() {
+        let (core, _f) = test_core().await;
+        let alice = user(&core, "alice").await;
+        let bob = user(&core, "bob").await;
+        proj(&core, &alice, Visibility::Private).await;
+        core.set_collaborator(&alice, "alice", "proj", "bob", Permission::Triage)
+            .await
+            .unwrap();
+        core.create_trail(&alice, "alice", "proj", "T", "")
+            .await
+            .unwrap();
+        core.add_comment(&alice, "alice", "proj", 1, "c")
+            .await
+            .unwrap();
+        // Active repo: create/comment/list still fine.
+        core.create_trail(&bob, "alice", "proj", "T2", "")
+            .await
+            .unwrap();
+        let list = core
+            .list_trails(Some(&bob), "alice", "proj", &TrailFilterInput::default())
+            .await
+            .unwrap();
+        assert_eq!(list.trails.len(), 2);
+        core.archive_repo(&alice, "alice", "proj").await.unwrap();
+        // Reads keep working.
+        let detail = core
+            .trail_by_number(Some(&bob), "alice", "proj", 1)
+            .await
+            .unwrap();
+        assert_eq!(detail.trail.title, "T");
+        let list = core
+            .list_trails(Some(&bob), "alice", "proj", &TrailFilterInput::default())
+            .await
+            .unwrap();
+        assert_eq!(list.trails.len(), 2);
+        // Every mutation refuses with the same message.
+        let err = core
+            .create_trail(&bob, "alice", "proj", "T3", "")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CoreError::Invalid(m) if m == "repository is archived"));
+        let err = core
+            .add_comment(&bob, "alice", "proj", 1, "x")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CoreError::Invalid(m) if m == "repository is archived"));
+        let err = core
+            .edit_comment(&alice, "alice", "proj", 1, 1, "x")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CoreError::Invalid(m) if m == "repository is archived"));
+        let err = core
+            .update_trail(&bob, "alice", "proj", 1, Some("x"), None, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CoreError::Invalid(m) if m == "repository is archived"));
+        let err = core
+            .set_trail_state(&bob, "alice", "proj", 1, "closed")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CoreError::Invalid(m) if m == "repository is archived"));
+        let err = core
+            .add_label(&bob, "alice", "proj", 1, "bug")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CoreError::Invalid(m) if m == "repository is archived"));
+        let err = core
+            .remove_label(&bob, "alice", "proj", 1, "bug")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CoreError::Invalid(m) if m == "repository is archived"));
+        let err = core
+            .add_assignee(&bob, "alice", "proj", 1, "bob")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CoreError::Invalid(m) if m == "repository is archived"));
+        let err = core
+            .remove_assignee(&bob, "alice", "proj", 1, "bob")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CoreError::Invalid(m) if m == "repository is archived"));
     }
 }

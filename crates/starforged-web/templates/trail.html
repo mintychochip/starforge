@@ -4,7 +4,7 @@
 {% include "repo_head.html" %}
 <h2>#{{ number }} {{ title }}</h2>
 <p><span class="badge">{{ state }}</span>{% if ready %} <span class="badge">ready</span>{% endif %}
-opened by <a href="/{{ author_handle }}">{{ author_handle }}</a> · <span class="muted">{{ created }}</span></p>
+opened by {% if author_handle == "deleted user" %}deleted user{% else %}<a href="/{{ author_handle }}">{{ author_handle }}</a>{% endif %} · <span class="muted">{{ created }}</span></p>
 {% if let Some(e) = error %}<p class="notice">{{ e }}</p>{% endif %}
 <div class="labels">
 {% for l in labels %}<span class="badge">{{ l }}</span>{% if can_triage %}
@@ -91,7 +91,7 @@ opened by <a href="/{{ author_handle }}">{{ author_handle }}</a> · <span class=
 <h3>Comments</h3>
 {% for c in comments %}
 <article id="comment-{{ c.id }}">
-  <p><a href="/{{ c.author_handle }}">{{ c.author_handle }}</a> · <span class="muted">{{ c.created }}</span>{% if let Some(e) = c.edited %} · <span class="muted">edited {{ e }}</span>{% endif %}</p>
+  <p>{% if c.author_handle == "deleted user" %}deleted user{% else %}<a href="/{{ c.author_handle }}">{{ c.author_handle }}</a>{% endif %} · <span class="muted">{{ c.created }}</span>{% if let Some(e) = c.edited %} · <span class="muted">edited {{ e }}</span>{% endif %}</p>
   <div class="comment-body">{{ c.body_html|safe }}</div>
 {% if c.can_edit %}
   <details>

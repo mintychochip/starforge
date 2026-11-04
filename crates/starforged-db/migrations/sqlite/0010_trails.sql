@@ -14,7 +14,7 @@ CREATE TABLE trails (
     intent TEXT NOT NULL DEFAULT '',
     state TEXT NOT NULL DEFAULT 'open' CHECK (state IN ('open', 'merged', 'closed')),
     ready INTEGER NOT NULL DEFAULT 0,
-    author_id INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    author_id INTEGER REFERENCES users (id) ON DELETE SET NULL,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
     closed_at INTEGER,
@@ -42,7 +42,7 @@ CREATE INDEX trail_assignees_trail ON trail_assignees (trail_id);
 CREATE TABLE trail_comments (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     trail_id INTEGER NOT NULL REFERENCES trails (id) ON DELETE CASCADE,
-    author_id INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    author_id INTEGER REFERENCES users (id) ON DELETE SET NULL,
     body TEXT NOT NULL DEFAULT '',
     created_at INTEGER NOT NULL,
     edited_at INTEGER

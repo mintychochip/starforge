@@ -679,3 +679,50 @@ async fn pagination_and_filters() {
         json!([])
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn patch_validates_before_writing() {
+    let c = Ctx::start().await;
+    let client = reqwest::Client::new();
+    c.create("untouched").await;
+
+    // An invalid title must not close the trail or leave a timeline row.
+    let rejected = client
+        .patch(c.trail(1))
+        .bearer_auth(&c.triage)
+        .json(&json!({"state": "closed", "title": ""}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), 422);
+    let after = client
+        .get(c.trail(1))
+        .bearer_auth(&c.read)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(after.status(), 200);
+    let after = after.json::<Value>().await.unwrap();
+    assert_eq!(after["title"], "untouched");
+    assert_eq!(after["state"], "open");
+    let kinds: Vec<&str> = after["timeline"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, vec!["trail.open"]);
+
+    // The valid combination applies both halves.
+    let both = client
+        .patch(c.trail(1))
+        .bearer_auth(&c.triage)
+        .json(&json!({"title": "ok", "state": "closed"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(both.status(), 200);
+    let both = both.json::<Value>().await.unwrap();
+    assert_eq!(both["title"], "ok");
+    assert_eq!(both["state"], "closed");
+}

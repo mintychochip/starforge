@@ -797,3 +797,113 @@ async fn concurrent_creates_number_without_gaps() {
     numbers.sort_unstable();
     assert_eq!(numbers, (1..=16).collect::<Vec<_>>());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pagination_clamped_at_1000() {
+    let c = Ctx::start().await;
+    for i in 1..=35 {
+        c.s.core
+            .create_trail(
+                &c.alice,
+                "alice",
+                "proj",
+                &format!("clamp-{i:02}"),
+                "intent",
+            )
+            .await
+            .unwrap();
+    }
+    let carol = c.login("carol").await;
+    let p2 = carol
+        .get(c.s.url("/alice/proj/trails?page=2"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(p2.status(), 200);
+    let body = p2.text().await.unwrap();
+    assert!(body.contains("clamp-35"), "page 2 still works");
+    for page in [1001, 100000] {
+        let res = carol
+            .get(c.s.url(&format!("/alice/proj/trails?page={page}")))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 404, "page {page} must 404");
+    }
+    // The strict CSP covers the list page.
+    let list = carol
+        .get(c.s.url("/alice/proj/trails"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(list.status(), 200);
+    let csp = list
+        .headers()
+        .get("content-security-policy")
+        .expect("list must set CSP")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert!(csp.contains("default-src 'none'"), "strict CSP: {csp}");
+    let new = carol
+        .get(c.s.url("/alice/proj/trails/new"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(new.status(), 200);
+    assert!(
+        new.headers()
+            .get("content-security-policy")
+            .expect("new form must set CSP")
+            .to_str()
+            .unwrap()
+            .contains("default-src 'none'")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn trail_prose_strips_images_but_keeps_markdown() {
+    let c = Ctx::start().await;
+    let intent = "**bold** intent ![x](https://attacker.example/t.png)\n\n<img src=\"https://attacker.example/t.svg\">";
+    let n =
+        c.s.core
+            .create_trail(&c.alice, "alice", "proj", "beacon", intent)
+            .await
+            .unwrap()
+            .number;
+    c.s.core
+        .add_comment(
+            &c.alice,
+            "alice",
+            "proj",
+            n,
+            "comment **bold** ![x](https://attacker.example/t.png)\n\n<img src=\"https://attacker.example/t.svg\">",
+        )
+        .await
+        .unwrap();
+    let carol = c.login("carol").await;
+    let detail = carol
+        .get(c.s.url(&format!("/alice/proj/trails/{n}")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(detail.status(), 200);
+    let csp = detail
+        .headers()
+        .get("content-security-policy")
+        .expect("detail must set CSP")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert!(csp.contains("default-src 'none'"), "strict CSP: {csp}");
+    let html = detail.text().await.unwrap();
+    assert!(!html.contains("<img"), "images must be stripped:\n{html}");
+    assert!(
+        !html.contains("attacker.example"),
+        "beacon host must not appear:\n{html}"
+    );
+    assert!(
+        html.contains("<strong>bold</strong>"),
+        "markdown still renders:\n{html}"
+    );
+}

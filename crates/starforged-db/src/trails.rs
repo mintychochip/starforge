@@ -17,7 +17,7 @@ pub struct TrailRow {
     pub intent: String,
     pub state: String,
     pub ready: i64,
-    pub author_id: i64,
+    pub author_id: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
     pub closed_at: Option<i64>,
@@ -40,7 +40,7 @@ pub struct TrailAssigneeRow {
 pub struct TrailCommentRow {
     pub id: i64,
     pub trail_id: i64,
-    pub author_id: i64,
+    pub author_id: Option<i64>,
     pub body: String,
     pub created_at: i64,
     pub edited_at: Option<i64>,
@@ -880,5 +880,35 @@ mod tests {
                 .unwrap();
         assert_eq!(row.0, None);
         assert_eq!(row.1, "repo.rename");
+    }
+    #[tokio::test]
+    async fn author_set_null_on_user_delete() {
+        let (t, alice, bob, repo_id) = setup().await;
+        let trail = insert_trail(&t.db, &new_trail(repo_id, alice, "one"), 1_700_000_000)
+            .await
+            .unwrap();
+        let comment = insert_comment(&t.db, trail.id, bob, "hello", 1_700_000_001)
+            .await
+            .unwrap();
+        assert_eq!(trail.author_id, Some(alice));
+        assert_eq!(comment.author_id, Some(bob));
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(alice)
+            .execute(t.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(bob)
+            .execute(t.db.pool())
+            .await
+            .unwrap();
+        let trail = trail_by_number(&t.db, repo_id, 1)
+            .await
+            .unwrap()
+            .expect("trail survives author delete");
+        assert_eq!(trail.author_id, None);
+        let comments = comments_of(&t.db, trail.id).await.unwrap();
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].author_id, None);
     }
 }

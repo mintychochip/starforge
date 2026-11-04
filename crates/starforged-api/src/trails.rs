@@ -65,6 +65,7 @@ pub struct TrailJson {
     pub state: String,
     pub ready: bool,
     pub author: String,
+    pub author_id: Option<i64>,
     pub labels: Vec<String>,
     pub assignees: Vec<String>,
     pub created_at: String,
@@ -81,6 +82,7 @@ fn trail_json(view: &TrailView) -> TrailJson {
         state: view.state.clone(),
         ready: view.ready,
         author: view.author_handle.clone(),
+        author_id: view.author_id,
         labels: view.labels.clone(),
         assignees: view.assignees.clone(),
         created_at: rfc3339(view.created_at),
@@ -94,6 +96,7 @@ fn trail_json(view: &TrailView) -> TrailJson {
 pub struct CommentJson {
     pub id: i64,
     pub author: String,
+    pub author_id: Option<i64>,
     pub body: String,
     pub created_at: String,
     pub edited_at: Option<String>,
@@ -103,6 +106,7 @@ fn comment_json(view: &CommentView) -> CommentJson {
     CommentJson {
         id: view.id,
         author: view.author_handle.clone(),
+        author_id: view.author_id,
         body: view.body.clone(),
         created_at: rfc3339(view.created_at),
         edited_at: opt_ts(view.edited_at),
@@ -239,9 +243,8 @@ pub struct PatchTrailBody {
 /// state transition. `{"state": "merged"}` answers `422` — the merge path owns
 /// that transition (the message surfaces verbatim).
 ///
-/// The state transition runs first: a rejected state must not leave field
-/// edits (or their timeline rows) behind, so an error truly means nothing
-/// changed.
+/// Every supplied field is validated before anything is written: a rejected
+/// patch leaves the trail and its timeline untouched.
 pub async fn patch_trail(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -250,6 +253,19 @@ pub async fn patch_trail(
 ) -> Result<Json<TrailJson>, ApiError> {
     let auth = auth.require(Scope::TrailWrite)?;
     let Json(body) = body.map_err(|e| ApiError::Invalid(e.body_text()))?;
+    state
+        .core
+        .check_patch(
+            &auth.user,
+            &owner,
+            &repo,
+            number,
+            body.title.as_deref(),
+            body.intent.as_deref(),
+            body.ready,
+            body.state.as_deref(),
+        )
+        .await?;
     if let Some(next) = body.state.as_deref() {
         state
             .core

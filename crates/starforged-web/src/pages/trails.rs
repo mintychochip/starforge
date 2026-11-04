@@ -2,7 +2,7 @@
 //! with discussion plus triage-gated controls. Reads 404 for non-readers
 //! so trail numbers stay undiscoverable; mutations answer 403 below their
 //! threshold. Intent and comment bodies render through
-//! [`crate::markdown::render`]; everything else relies on askama escaping.
+//! [`crate::markdown::render_prose`]; everything else relies on askama escaping.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -27,6 +27,8 @@ use crate::views::{NavUser, RepoHead, STRICT_CSP, format_age, format_time, nav};
 
 /// Trails per web page; the API stays keyset-based.
 const PAGE_SIZE: i64 = 30;
+/// `?page` beyond this 404s without walking cursors (DoS guard).
+const MAX_PAGE: i64 = 1000;
 
 fn unix_now() -> i64 {
     time::OffsetDateTime::now_utc().unix_timestamp()
@@ -39,7 +41,7 @@ fn noindex_headers() -> HeaderMap {
     headers
 }
 
-/// Noindex plus the strict CSP for the detail page, whose intent and
+/// Noindex plus the strict CSP for every trail page, whose intent and
 /// comments are attacker-influenced Markdown (same combination as the
 /// session viewer).
 fn detail_headers() -> HeaderMap {
@@ -102,6 +104,9 @@ pub async fn list(
     let filter_assignee = query.assignee.clone().filter(|s| !s.is_empty());
     let filter_author = query.author.clone().filter(|s| !s.is_empty());
     let page_no = query.page.unwrap_or(1).max(1);
+    if page_no > MAX_PAGE {
+        return Err(WebError::NotFound);
+    }
 
     // The service is keyset-paged; walk cursors to reach `?page=N`.
     let mut listed = fetch_page(
@@ -116,9 +121,12 @@ pub async fn list(
         None,
     )
     .await?;
+    if listed.trails.is_empty() && page_no > 1 {
+        return Err(WebError::NotFound);
+    }
     for _ in 1..page_no {
         let Some(cursor) = listed.next_after else {
-            break;
+            return Err(WebError::NotFound);
         };
         listed = fetch_page(
             &state,
@@ -132,6 +140,9 @@ pub async fn list(
             Some(cursor),
         )
         .await?;
+        if listed.trails.is_empty() {
+            return Err(WebError::NotFound);
+        }
     }
 
     let now = unix_now();
@@ -171,7 +182,7 @@ pub async fn list(
         )
     });
     Ok((
-        noindex_headers(),
+        detail_headers(),
         TrailsPage {
             nav_user: nav(session.as_ref()),
             head: RepoHead::new(&access, "trails", None),
@@ -274,7 +285,7 @@ pub async fn new_form(
         .repo_for(Some(&session.user), &owner, &repo)
         .await?;
     Ok((
-        noindex_headers(),
+        detail_headers(),
         TrailNewPage {
             nav_user: Some(NavUser::from_session(&session)),
             head: RepoHead::new(&access, "trails", None),
@@ -321,7 +332,7 @@ pub async fn create(
         .into_response()),
         Err(CoreError::Invalid(message)) => Ok((
             StatusCode::UNPROCESSABLE_ENTITY,
-            noindex_headers(),
+            detail_headers(),
             TrailNewPage {
                 nav_user: Some(NavUser::from_session(&session)),
                 head: RepoHead::new(&access, "trails", None),
@@ -426,12 +437,12 @@ async fn detail_view(
         .map(|c| CommentItem {
             id: c.id,
             author_handle: c.author_handle.clone(),
-            body_html: markdown::render(&c.body),
+            body_html: markdown::render_prose(&c.body),
             body_raw: c.body.clone(),
             created: format_time(c.created_at),
             edited: c.edited_at.map(format_time),
             can_edit: session.is_some_and(|s| {
-                c.author_handle == s.user.handle
+                c.author_id == Some(s.user.id)
                     || access.permission >= Permission::Admin
                     || s.user.is_admin
             }),
@@ -451,7 +462,7 @@ async fn detail_view(
         created: format_time(trail.created_at),
         updated: format_time(trail.updated_at),
         closed: trail.closed_at.map(format_time),
-        intent_html: markdown::render(&trail.intent),
+        intent_html: markdown::render_prose(&trail.intent),
         intent_raw: trail.intent.clone(),
         comments,
         timeline,
