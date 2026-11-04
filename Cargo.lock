@@ -4227,6 +4227,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "starforge-cli"
+version = "0.0.0"
+dependencies = [
+ "axum",
+ "clap",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "starforge-capture",
+ "starforge-format",
+ "starforge-redact",
+ "tempfile",
+ "thiserror",
+ "time",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "ulid",
+]
+
+[[package]]
 name = "starforge-format"
 version = "0.0.0"
 dependencies = [
