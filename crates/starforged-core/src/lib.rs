@@ -24,6 +24,7 @@ pub mod repos;
 pub mod rescan;
 pub mod sessions;
 pub mod tokens;
+pub mod trails;
 pub mod validate;
 pub mod verification;
 
