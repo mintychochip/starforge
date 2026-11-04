@@ -1,0 +1,13 @@
+SYNTHESIZED — no real OpenCode store was available on this machine.
+
+This fixture mimics the native shape of the older OpenCode file storage
+`<data_dir>/opencode-sessions/<session>.jsonl` (one JSON object per line,
+same logical columns as the SQLite `message` table: `role`, `name`,
+`content`, `reasoning`, token counters, `is_error`, plus `timestamp`,
+`session`, `version`, `cwd` on every record). Version `0.8.1` is not in the
+adapter's `COVERED` list, so the header ships `adapter_version_verified ==
+false` while the closest known parser still parses every record. The
+`plugin_event` row is an unmapped file-storage-era shape: it maps to
+`system { text: <raw JSON line> }` — never dropped, never an error — and the
+golden test asserts its kinds and payload. Session id, version, token
+counts, and prose are invented.

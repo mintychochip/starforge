@@ -1,0 +1,18 @@
+SYNTHESIZED — no real OpenCode store was available on this machine.
+
+This fixture mimics the native shape of the OpenCode SQLite session store
+`<data_dir>/opencode.db` as executed by the golden test with `rusqlite`
+(no committed binaries): a `session` table (one row per native session:
+`id`, `cwd`, `version`, `created_at`) plus a `message` table (one row per
+record: `id` rowid cursor key, `session_id`, `role`, `name`, `content`,
+`reasoning`, token counters, `is_error`, `ts`). Roles follow the brief's
+mapping contract — `user` records carry prompt text; `assistant` records
+carry model, text, optional reasoning, and token usage; `tool_call` rows
+carry the tool name with a JSON-encoded input object in `content`
+(`Edit`/`Write` inputs with `file_path` additionally yield `file_change`
+plus `files_touched`); `tool_result` rows carry the output text;
+`summary` rows carry compaction context. The assistant row's inline
+`reasoning` and the `Edit` row's file-write part each emit two events, so
+the fixture exercises the multi-event resume path. Session id, version,
+token counts, and prose are invented. It is not a captured production
+database.

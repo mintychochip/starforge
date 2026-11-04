@@ -1,0 +1,15 @@
+SYNTHESIZED — no real Antigravity transcript was available on this machine.
+
+This fixture mimics the Antigravity agent store as defined by the adapter
+(see `src/agents/gemini.rs`): `<data_dir>/antigravity/<version>/sessions/`
+holding per-session chat JSON documents with the same `messages`-array
+shape as Gemini CLI chats. The store is keyed by version directory because
+Antigravity ships its own forked layout that drifts per release; the
+adapter reports the version as `antigravity-<version>` from the directory
+name and ALWAYS ships `adapter_version_verified == false` (binding user
+decision, like omp). Records parse with the same mapper as Gemini CLI;
+the `agent_state` record is an Antigravity-only shape with no Gemini
+mapping, so it falls back to `system { text: <raw JSON> }` — never
+dropped, never an error — and the golden test asserts its kinds and
+payload. Session id, version, model name, token counts, and prose are
+invented.

@@ -1,0 +1,8 @@
+SYNTHESIZED — no real Gemini CLI transcript was available on this machine.
+
+Same synthesized messages as the `0.12.0` fixture (see its
+`SYNTHESIZED.txt`), but the document reports version `0.0.0-unknown`,
+which is not in the adapter's `COVERED` list. The closest known parser
+still parses every message, so `expected.jsonl` is byte-identical to the
+pinned fixture's; only the header differs (`agent.version`,
+`adapter_version_verified == false`).

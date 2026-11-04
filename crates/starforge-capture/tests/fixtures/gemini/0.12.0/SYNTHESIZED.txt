@@ -1,0 +1,14 @@
+SYNTHESIZED — no real Gemini CLI transcript was available on this machine.
+
+This fixture mimics the native shape of the Gemini CLI chat store
+`<data_dir>/tmp/<hash>/chats/<session>.json`: a single JSON document with
+`sessionId`, `version`, `cwd`, `startedAt`, and a `messages` array. Message
+records follow the brief's mapping contract — `user` records carry prompt
+text in `content`; `model` records carry response text plus `model`, token
+`usage`, and optional inline `reasoning` (which emits a second event, the
+multi-event record the incremental test resumes across); `tool_call`
+records carry `name` and `input` (`Edit`/`Write` inputs with `file_path`
+are noted in header `files_touched`); `tool_result` records carry `output`;
+`summary` records carry compaction context in `summary`. Session id,
+version, model name, token counts, and prose are invented. It is not a
+captured production transcript.
