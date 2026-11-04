@@ -147,6 +147,35 @@ Every command honors `--dry-run` (print, don't write) and `--verbose`;
 not in M1c and exit non-zero. Exit codes: `0` ok, `1` operational error,
 `2` `sync` finished with items still queued.
 
+## Session capture and ingest
+
+`starforge sync` uploads spooled sessions to `/api/v1/repos/{owner}/{repo}/sessions/{ulid}` with a
+`session:upload` token (`starforge auth login` prints a device code the browser approves at
+`/oauth/device`). The uploader needs write access to the repository; anything else answers `403`.
+Four calls make an upload: `PUT` metadata (Trace Format v1 JSON, path ULID matching `meta.id`),
+`PUT` each segment as zstd bytes with an `X-Starforge-Blake3` header naming their hex digest,
+`POST .../complete` with an empty `{}` body, and `POST .../links` with commit SHAs to claim.
+Re-sending identical bytes is a safe no-op (`200`); a changed segment at a taken number answers
+`409` with exactly `{"hash": "<stored hex>"}`, and new content on a completed session is `422`.
+Segments cap at 16 MiB (decompression is bounded at 256 MiB against bombs); quotas are
+500 MiB per user per hour, 5 GiB stored per user, and 20 GiB stored per repository.
+
+Every accepted segment is re-scanned server-side with `built_in < repo < site` rules (repo rules
+come from `.starforge/redact.toml`, site rules from `[sessions] site_redact_toml`). A
+high-confidence hit — private keys, cloud credentials, known tokens, repo literals — quarantines
+the session without rejecting the bytes; low-confidence counts merge into the session's
+`redaction_counts`, and the first hit wins. Quarantined sessions wait in the admin queue
+(`GET .../sessions?quarantined=true`) until a repo admin releases (`POST .../release`) or purges
+them (`POST .../purge`, which drops the session, its segments and links, and dereferences the
+blobs). Segment bytes live content-addressed under the blob directory (default `data/blobs`
+inside the data directory) at `<hash[0..2]>/<hash>`, refcounted across sessions; zero-ref files
+are swept by the hourly cleanup job. The CLI learns commit links from `Starforge-Session: <ULID>`
+trailers found by the post-push scan, merged with its own claims.
+
+Not yet: a session viewer (M1e), raw native-slice upload — the CLI spools raw slices but never
+sends them, so `raw_blob_hash` stays empty and adapter re-normalization has to wait for the M1f
+follow-up — refresh-token rotation (M3), and per-token rate limiting (M5).
+
 ## Development
 
 ```bash
