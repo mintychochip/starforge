@@ -233,13 +233,34 @@ async fn fetch_well_known(client: &reqwest::Client, url: &str) -> Option<ServerI
     None
 }
 
+/// Display/error base for a configured server URL: `scheme://host[:port]`
+/// with any `user:pass@` userinfo stripped, so credentials embedded in
+/// `starforge.server` never reach stderr, logs, or stored records. Fetching
+/// still uses the full configured URL.
+fn sanitized_base(server: &str) -> String {
+    if let Ok(parsed) = url::Url::parse(server)
+        && let Some(host) = parsed.host_str()
+    {
+        let authority = match parsed.port() {
+            Some(port) => format!("{host}:{port}"),
+            None => host.to_string(),
+        };
+        return format!("{}://{authority}", parsed.scheme());
+    }
+    // Unparseable input: hide any leading userinfo rather than echoing it.
+    match server.rsplit_once('@') {
+        Some((_, rest)) => rest.to_string(),
+        None => server.to_string(),
+    }
+}
+
 /// Full resolution: `starforge.server` git-config wins outright (remotes are
 /// never probed then); else per-remote well-known in [`order_candidates`]
 /// order; `starforge.repo` supplies the `owner/repo` path, else it is derived
 /// from the winning remote URL.
 ///
 /// Returns `(server, owner_repo, chosen_remote_url)`; the chosen URL is the
-/// configured server URL when `starforge.server` wins.
+/// sanitized configured server base (no userinfo) when `starforge.server` wins.
 pub async fn resolve_server(
     client: &reqwest::Client,
     repo: &Path,
@@ -247,18 +268,21 @@ pub async fn resolve_server(
     let (configured, configured_repo, candidates) = local_config(repo)?;
 
     if let Some(server) = configured {
-        let base = server.trim().trim_end_matches('/');
-        let base = if base.contains("://") {
-            base.to_string()
+        let trimmed = server.trim().trim_end_matches('/');
+        let full = if trimmed.contains("://") {
+            trimmed.to_string()
         } else {
-            format!("https://{base}")
+            format!("https://{trimmed}")
         };
-        let url = format!("{base}/.well-known/starforge.json");
+        // Fetch with the full configured URL, but never let userinfo reach
+        // errors, logs, or the returned chosen URL.
+        let display = sanitized_base(&full);
+        let url = format!("{full}/.well-known/starforge.json");
         if let Some(info) = fetch_well_known(client, &url).await {
             let owner_repo = configured_repo.unwrap_or_default();
-            return Ok((info, owner_repo, base));
+            return Ok((info, owner_repo, display));
         }
-        return Err(DiscoveryError::Unreachable(base));
+        return Err(DiscoveryError::Unreachable(display));
     }
 
     let mut tried = Vec::new();

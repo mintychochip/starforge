@@ -343,6 +343,31 @@ async fn bad_well_known_falls_through_to_unreachable() {
     }
 }
 
+// Fix round 1 (P2): userinfo embedded in `starforge.server` must never leak
+// into errors, logs, or the returned chosen URL.
+#[tokio::test]
+async fn config_server_userinfo_never_leaks() {
+    let port = closed_port();
+    let repo = init_repo();
+    git(
+        repo.path(),
+        &[
+            "config",
+            "starforge.server",
+            &format!("http://alice:s3cret@127.0.0.1:{port}"),
+        ],
+    );
+    let err = resolve_server(&client(), repo.path()).await.unwrap_err();
+    match err {
+        DiscoveryError::Unreachable(msg) => {
+            assert!(msg.contains("127.0.0.1"), "message: {msg}");
+            assert!(!msg.contains("alice"), "user leak: {msg}");
+            assert!(!msg.contains("s3cret"), "password leak: {msg}");
+        }
+        other => panic!("expected Unreachable, got {other:?}"),
+    }
+}
+
 // (e) file-only remote and no config: NoServer naming the repo.
 #[tokio::test]
 async fn file_only_remote_errors_no_server() {
