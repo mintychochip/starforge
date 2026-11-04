@@ -19,6 +19,7 @@ async-compression = { version = "0.4.52", features = ["tokio", "gzip"] }
 axum = "0.8.9"
 axum-extra = { version = "0.12.6", features = ["cookie", "form"] }
 base64 = "0.23.1"
+blake3 = "1.8.7"
 clap = { version = "4.6.7", features = ["derive", "env"] }
 comrak = "0.59.0"
 flate2 = "1.1.10"
@@ -28,6 +29,8 @@ gix = "0.90.0"
 hex = "0.4.3"
 lettre = { version = "0.11.23", default-features = false, features = ["builder", "file-transport", "hostname", "ring", "rustls-platform-verifier", "smtp-transport", "tokio1", "tokio1-rustls"] }
 percent-encoding = "2.3.2"
+proptest = "1.12.0"
+regex = "1.13.1"
 reqwest = { version = "0.13.5", default-features = false, features = ["cookies", "json", "form"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
@@ -44,7 +47,9 @@ toml = "1.1.8"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 two-face = { version = "0.5.2", default-features = false, features = ["syntect-default-fancy"] }
+ulid = { version = "1", features = ["serde"] }
 url = "2.5.8"
+zstd = "0.13"
 [workspace.lints.rust]
 unsafe_code = "forbid"
 

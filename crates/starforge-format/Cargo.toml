@@ -1,0 +1,21 @@
+[package]
+name = "starforge-format"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "MIT OR Apache-2.0"
+publish = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+ulid.workspace = true
+thiserror.workspace = true
+time.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tempfile.workspace = true
