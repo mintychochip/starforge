@@ -1,7 +1,7 @@
 {% extends "base.html" %}
-{% block title %}{{ path }} · {{ owner }}/{{ name }}{% endblock %}
+{% block title %}{{ path }} · {{ head.owner }}/{{ head.name }}{% endblock %}
 {% block content %}
-<h1><a href="/{{ owner }}">{{ owner }}</a> / <a href="/{{ owner }}/{{ name }}">{{ name }}</a></h1>
+{% include "repo_head.html" %}
 <p class="crumbs"><span class="badge">{{ ref_name }}</span>{% for c in crumbs %} / <a href="{{ c.href }}">{{ c.name }}</a>{% endfor %} / {{ file_name }} · <a href="{{ raw_href }}">Raw</a> · {{ size }} bytes</p>
 {% if let Some(n) = notice %}
 <p class="muted">{{ n }}</p>

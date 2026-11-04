@@ -111,14 +111,14 @@ async fn private_and_empty_repositories() {
     assert!(empty.contains("This repository is empty"));
     assert!(empty.contains(&format!("git remote add origin {}/alice/empty.git", s.base)));
     assert!(
-        !empty.contains("Collaborators"),
-        "only admins see the settings tab"
+        !empty.contains(r#"href="/alice/empty/settings""#),
+        "only maintainers and admins see the Settings tab"
     );
     let (owner, _) = s.login("alice").await;
     assert!(
         get_text(&owner, &s.url("/alice/hidden"))
             .await
-            .contains("Collaborators")
+            .contains(r#"href="/alice/hidden/settings""#)
     );
 }
 

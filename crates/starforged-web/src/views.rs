@@ -1,6 +1,7 @@
 //! View models shared by templates.
 
-use starforged_core::repos::Repo;
+use starforged_core::permission::Permission;
+use starforged_core::repos::{Repo, RepoAccess};
 use starforged_core::sessions::WebSession;
 
 /// What the page header needs: the signed-in handle and the CSRF token for its sign-out form.
@@ -20,6 +21,48 @@ impl NavUser {
 
 pub fn nav(session: Option<&WebSession>) -> Option<NavUser> {
     session.map(NavUser::from_session)
+}
+
+/// The header of every repository page (`repo_head.html`): owner and name, badges, description, and tabs.
+pub struct RepoHead {
+    pub owner: String,
+    pub name: String,
+    pub description: String,
+    pub visibility: &'static str,
+    /// The highlighted tab: `code`, `commits`, or `settings`; any other value highlights none.
+    pub tab: &'static str,
+    /// The Commits tab: the history of the ref being viewed, or `/{owner}/{repo}/commits`.
+    pub commits_href: String,
+    /// Maintainers and admins see the Settings tab.
+    pub can_maintain: bool,
+    /// Admins also see the admin-only settings.
+    pub can_admin: bool,
+}
+
+impl RepoHead {
+    /// `ref_name` is the branch, tag, or commit the page shows, when it shows one.
+    pub fn new(access: &RepoAccess, tab: &'static str, ref_name: Option<&str>) -> RepoHead {
+        let repo = &access.repo;
+        let commits_href = match ref_name {
+            Some(name) => format!(
+                "/{}/{}/commits/{}",
+                repo.owner,
+                repo.name,
+                encode_path(name)
+            ),
+            None => format!("/{}/{}/commits", repo.owner, repo.name),
+        };
+        RepoHead {
+            owner: repo.owner.clone(),
+            name: repo.name.clone(),
+            description: repo.description.clone(),
+            visibility: repo.visibility.as_str(),
+            tab,
+            commits_href,
+            can_maintain: access.permission >= Permission::Maintain,
+            can_admin: access.permission >= Permission::Admin,
+        }
+    }
 }
 
 pub struct RepoItem {

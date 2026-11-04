@@ -145,4 +145,47 @@ pub(crate) mod testing {
         .await
         .unwrap()
     }
+    /// Commits one file per branch in a scratch working copy (each branch starts from the previous one) and
+    /// fetches every branch into repository `repo_id`'s bare directory. Fetching runs no hooks.
+    pub(crate) fn seed_branches(core: &Core, repo_id: i64, branches: &[&str]) {
+        let work = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(["-c", "user.name=T", "-c", "user.email=t@example.com"])
+                .args(args)
+                .current_dir(work.path())
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q", "-b", branches[0], "."]);
+        for (i, branch) in branches.iter().enumerate() {
+            if i > 0 {
+                git(&["checkout", "-q", "-b", branch]);
+            }
+            std::fs::write(
+                work.path()
+                    .join(format!("{}.txt", branch.replace('/', "-"))),
+                branch,
+            )
+            .unwrap();
+            git(&["add", "-A"]);
+            git(&["commit", "-q", "-m", &format!("on {branch}")]);
+        }
+        let bare = core.repo_path(repo_id);
+        git(&[
+            "--git-dir",
+            bare.to_str().unwrap(),
+            "fetch",
+            "-q",
+            work.path().to_str().unwrap(),
+            "refs/heads/*:refs/heads/*",
+        ]);
+    }
 }

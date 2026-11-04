@@ -2,12 +2,15 @@ use askama::Template;
 use askama_web::WebTemplate;
 use axum::extract::{Path, Query, State};
 use serde::Deserialize;
+use starforged_core::repos::RepoAccess;
+use starforged_core::sessions::WebSession;
 use starforged_git::diff::{FileStatus, LineKind};
 
 use crate::AppState;
 use crate::auth::MaybeUser;
 use crate::error::WebError;
-use crate::views::{NavUser, format_time, nav};
+use crate::pages::code::default_ref;
+use crate::views::{NavUser, RepoHead, format_time, nav};
 
 pub const PER_PAGE: usize = 50;
 
@@ -28,8 +31,8 @@ pub struct CommitRow {
 #[template(path = "commits.html")]
 pub struct CommitsPage {
     nav_user: Option<NavUser>,
-    owner: String,
-    name: String,
+    head: RepoHead,
+    /// Empty when the repository has no commits yet.
     ref_name: String,
     commits: Vec<CommitRow>,
     page: usize,
@@ -59,8 +62,7 @@ pub struct FileView {
 #[template(path = "commit.html")]
 pub struct CommitPage {
     nav_user: Option<NavUser>,
-    owner: String,
-    name: String,
+    head: RepoHead,
     id: String,
     summary: String,
     body: String,
@@ -85,23 +87,72 @@ pub async fn commits(
     if !resolved.path.is_empty() {
         return Err(WebError::NotFound);
     }
-    let page = query.page.unwrap_or(1).max(1);
-    let mut commits = state
+    commits_page(
+        &state,
+        session.as_ref(),
+        &access,
+        Some((resolved.ref_name, resolved.commit_id)),
+        query.page,
+    )
+    .await
+}
+
+/// `/{owner}/{repo}/commits`: the default branch's history; an empty repository shows "No commits yet."
+pub async fn default_commits(
+    State(state): State<AppState>,
+    MaybeUser(session): MaybeUser,
+    Path((owner, repo)): Path<(String, String)>,
+    Query(query): Query<PageQuery>,
+) -> Result<CommitsPage, WebError> {
+    let access = state
         .core
-        .log(
-            &access,
-            &resolved.commit_id,
-            (page - 1).saturating_mul(PER_PAGE),
-            PER_PAGE + 1,
-        )
+        .repo_for(session.as_ref().map(|s| &s.user), &owner, &repo)
         .await?;
+    let target = match default_ref(&state, &access).await? {
+        Some(name) => {
+            let resolved = state.core.resolve(&access, &name).await?;
+            Some((resolved.ref_name, resolved.commit_id))
+        }
+        None => None,
+    };
+    commits_page(&state, session.as_ref(), &access, target, query.page).await
+}
+
+/// One page of the history of `target` (ref name, commit id); `None` lists nothing.
+async fn commits_page(
+    state: &AppState,
+    session: Option<&WebSession>,
+    access: &RepoAccess,
+    target: Option<(String, String)>,
+    page: Option<usize>,
+) -> Result<CommitsPage, WebError> {
+    let page = page.unwrap_or(1).max(1);
+    let (ref_name, mut commits) = match target {
+        Some((ref_name, commit_id)) => {
+            let commits = state
+                .core
+                .log(
+                    access,
+                    &commit_id,
+                    (page - 1).saturating_mul(PER_PAGE),
+                    PER_PAGE + 1,
+                )
+                .await?;
+            (ref_name, commits)
+        }
+        None => (String::new(), Vec::new()),
+    };
     let has_next = commits.len() > PER_PAGE;
     commits.truncate(PER_PAGE);
+    let head = RepoHead::new(
+        access,
+        "commits",
+        Some(ref_name.as_str()).filter(|r| !r.is_empty()),
+    );
     Ok(CommitsPage {
-        nav_user: nav(session.as_ref()),
-        owner: access.repo.owner,
-        name: access.repo.name,
-        ref_name: resolved.ref_name,
+        nav_user: nav(session),
+        head,
+        ref_name,
         commits: commits
             .into_iter()
             .map(|c| CommitRow {
@@ -126,6 +177,7 @@ pub async fn commit(
         .core
         .repo_for(session.as_ref().map(|s| &s.user), &owner, &repo)
         .await?;
+    let head = RepoHead::new(&access, "commits", None);
     let info = state.core.commit(&access, &id).await?;
     let diff = state.core.diff(&access, &info.id).await?;
     let files = diff
@@ -174,8 +226,7 @@ pub async fn commit(
         .unwrap_or_default();
     Ok(CommitPage {
         nav_user: nav(session.as_ref()),
-        owner: access.repo.owner,
-        name: access.repo.name,
+        head,
         summary: info.summary,
         body,
         author: info.author_name,

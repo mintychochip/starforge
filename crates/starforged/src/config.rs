@@ -55,10 +55,18 @@ pub struct StorageConfig {
     pub data_dir: PathBuf,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SecurityConfig {
     /// 64 hex characters (32 bytes). Losing it logs everyone out (spec §12).
     pub secret_key: String,
+}
+
+impl std::fmt::Debug for SecurityConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SecurityConfig")
+            .field("secret_key", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -400,5 +408,12 @@ mod tests {
         let rendered = format!("{config:?}");
         assert!(!rendered.contains("hunter2secret"), "{rendered}");
         assert!(!rendered.contains("mailuser"), "{rendered}");
+    }
+
+    #[test]
+    fn debug_output_hides_the_secret_key() {
+        let rendered = format!("{:?}", sample());
+        assert!(!rendered.contains(&"ab".repeat(32)), "{rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
     }
 }

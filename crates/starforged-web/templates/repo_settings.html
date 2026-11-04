@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block title %}Settings · {{ head.owner }}/{{ head.name }}{% endblock %}
+{% block content %}
+{% include "repo_head.html" %}
+{% include "repo_settings_nav.html" %}
+{% if let Some(e) = error %}<p class="error">{{ e }}</p>{% endif %}
+<h2>General</h2>
+<form method="post" action="/{{ head.owner }}/{{ head.name }}/settings" class="stack">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <label>Description <input name="description" maxlength="350" value="{{ description }}"></label>
+  {% if branches.is_empty() %}
+  <p class="muted">You can choose the default branch after the first push.</p>
+  {% else %}
+  <label>Default branch <select name="default_branch">{% for b in branches %}<option value="{{ b.name }}"{% if b.selected %} selected{% endif %}>{{ b.name }}</option>{% endfor %}</select></label>
+  {% endif %}
+  <button type="submit">Save</button>
+</form>
+{% if head.can_admin %}
+<h2>Visibility</h2>
+<form method="post" action="/{{ head.owner }}/{{ head.name }}/settings/visibility" class="stack">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <fieldset>
+    <legend>Who can read this repository</legend>
+    {% for v in visibility_choices %}<label class="check"><input type="radio" name="visibility" value="{{ v.value }}"{% if v.checked %} checked{% endif %}> {{ v.label }}</label>
+    {% endfor %}
+  </fieldset>
+  <button type="submit">Change visibility</button>
+</form>
+{% endif %}
+{% endblock %}

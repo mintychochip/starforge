@@ -1,16 +1,8 @@
 {% extends "base.html" %}
-{% block title %}{{ owner }}/{{ name }} · Starforge{% endblock %}
+{% block title %}{{ head.owner }}/{{ head.name }} · Starforge{% endblock %}
 {% block content %}
-<div class="repo-head">
-<h1><a href="/{{ owner }}">{{ owner }}</a> / <a href="/{{ owner }}/{{ name }}">{{ name }}</a> <span class="badge">{{ visibility }}</span></h1>
-{% if !description.is_empty() %}<p class="muted">{{ description }}</p>{% endif %}
-<nav class="tabs">
-<a href="/{{ owner }}/{{ name }}">Code</a>
-{% if !empty %}<a href="{{ commits_href }}">Commits</a>{% endif %}
-{% if can_admin %}<a href="/{{ owner }}/{{ name }}/settings/collaborators">Collaborators</a>{% endif %}
-</nav>
+{% include "repo_head.html" %}
 <p>Clone with <code>git clone {{ clone_url }}</code></p>
-</div>
 {% if empty %}
 <p>This repository is empty. Push an existing repository to it:</p>
 <pre>git remote add origin {{ clone_url }}

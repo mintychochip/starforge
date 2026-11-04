@@ -4,7 +4,6 @@ use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::{HeaderValue, header};
 use axum::response::{IntoResponse, Response};
-use starforged_core::permission::Permission;
 use starforged_core::repos::RepoAccess;
 use starforged_core::sessions::WebSession;
 use starforged_git::read::{Blob, EntryKind, TreeEntry, classify};
@@ -14,7 +13,7 @@ use crate::AppState;
 use crate::auth::MaybeUser;
 use crate::error::WebError;
 use crate::markdown;
-use crate::views::{Crumb, NavUser, content_href, crumbs, encode_path, nav};
+use crate::views::{Crumb, NavUser, RepoHead, content_href, crumbs, nav};
 
 const README_NAMES: [&str; 3] = ["readme.md", "readme.markdown", "readme"];
 
@@ -29,15 +28,10 @@ pub struct EntryRow {
 #[template(path = "tree.html")]
 pub struct TreePage {
     nav_user: Option<NavUser>,
-    owner: String,
-    name: String,
-    description: String,
-    visibility: &'static str,
+    head: RepoHead,
     clone_url: String,
-    can_admin: bool,
     empty: bool,
     ref_name: String,
-    commits_href: String,
     crumbs: Vec<Crumb>,
     entries: Vec<EntryRow>,
     readme_html: Option<String>,
@@ -47,8 +41,7 @@ pub struct TreePage {
 #[template(path = "blob.html")]
 pub struct BlobPage {
     nav_user: Option<NavUser>,
-    owner: String,
-    name: String,
+    head: RepoHead,
     ref_name: String,
     path: String,
     file_name: String,
@@ -57,6 +50,19 @@ pub struct BlobPage {
     size: usize,
     lines: Vec<String>,
     notice: Option<&'static str>,
+}
+
+/// The default branch when it exists, else the first branch by name; `None` for an empty repository.
+pub(crate) async fn default_ref(
+    state: &AppState,
+    access: &RepoAccess,
+) -> Result<Option<String>, WebError> {
+    let branches = state.core.branches(access).await?;
+    Ok(if branches.contains(&access.repo.default_branch) {
+        Some(access.repo.default_branch.clone())
+    } else {
+        branches.into_iter().next()
+    })
 }
 
 /// `/{owner}/{repo}`: the default branch's root directory, or push instructions for an empty repository.
@@ -69,13 +75,7 @@ pub async fn repo_home(
         .core
         .repo_for(session.as_ref().map(|s| &s.user), &owner, &repo)
         .await?;
-    let branches = state.core.branches(&access).await?;
-    let default = if branches.contains(&access.repo.default_branch) {
-        Some(access.repo.default_branch.clone())
-    } else {
-        branches.first().cloned()
-    };
-    let Some(default) = default else {
+    let Some(default) = default_ref(&state, &access).await? else {
         return Ok(tree_page(
             &state,
             session.as_ref(),
@@ -149,8 +149,7 @@ pub async fn blob(
         .unwrap_or(("", resolved.path.as_str()));
     Ok(BlobPage {
         nav_user: nav(session.as_ref()),
-        owner: repo.owner.clone(),
-        name: repo.name.clone(),
+        head: RepoHead::new(&access, "code", Some(&resolved.ref_name)),
         ref_name: resolved.ref_name.clone(),
         crumbs: crumbs(&repo.owner, &repo.name, &resolved.ref_name, dir),
         file_name: file_name.to_owned(),
@@ -290,27 +289,17 @@ fn tree_page(
     readme_html: Option<String>,
 ) -> TreePage {
     let repo = &access.repo;
-    let ref_name = ref_name.unwrap_or_default();
+    let current = ref_name.unwrap_or_default();
     TreePage {
         nav_user: nav(session),
-        owner: repo.owner.clone(),
-        name: repo.name.clone(),
-        description: repo.description.clone(),
-        visibility: repo.visibility.as_str(),
+        head: RepoHead::new(access, "code", ref_name),
         clone_url: format!(
             "{}/{}/{}.git",
             state.settings.base_url, repo.owner, repo.name
         ),
-        can_admin: access.permission >= Permission::Admin,
-        empty: ref_name.is_empty(),
-        ref_name: ref_name.to_owned(),
-        commits_href: format!(
-            "/{}/{}/commits/{}",
-            repo.owner,
-            repo.name,
-            encode_path(ref_name)
-        ),
-        crumbs: crumbs(&repo.owner, &repo.name, ref_name, dir),
+        empty: ref_name.is_none(),
+        ref_name: current.to_owned(),
+        crumbs: crumbs(&repo.owner, &repo.name, current, dir),
         entries,
         readme_html,
     }

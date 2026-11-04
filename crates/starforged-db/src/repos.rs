@@ -117,3 +117,33 @@ pub async fn delete(db: &Db, id: i64) -> DbResult<()> {
         .await?;
     Ok(())
 }
+
+pub async fn set_description(db: &Db, id: i64, description: &str) -> DbResult<()> {
+    sqlx::query("UPDATE repos SET description = $1, updated_at = $2 WHERE id = $3")
+        .bind(description)
+        .bind(now())
+        .bind(id)
+        .execute(db.pool())
+        .await?;
+    Ok(())
+}
+
+pub async fn set_default_branch(db: &Db, id: i64, branch: &str) -> DbResult<()> {
+    sqlx::query("UPDATE repos SET default_branch = $1, updated_at = $2 WHERE id = $3")
+        .bind(branch)
+        .bind(now())
+        .bind(id)
+        .execute(db.pool())
+        .await?;
+    Ok(())
+}
+
+pub async fn set_visibility(db: &Db, id: i64, visibility: &str) -> DbResult<()> {
+    sqlx::query("UPDATE repos SET visibility = $1, updated_at = $2 WHERE id = $3")
+        .bind(visibility)
+        .bind(now())
+        .bind(id)
+        .execute(db.pool())
+        .await?;
+    Ok(())
+}

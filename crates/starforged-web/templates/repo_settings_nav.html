@@ -1,0 +1,4 @@
+<nav class="tabs" aria-label="Repository settings">
+<a href="/{{ head.owner }}/{{ head.name }}/settings"{% if settings_page == "general" %} aria-current="page"{% endif %}>General</a>
+{% if head.can_admin %}<a href="/{{ head.owner }}/{{ head.name }}/settings/collaborators"{% if settings_page == "collaborators" %} aria-current="page"{% endif %}>Collaborators</a>{% endif %}
+</nav>

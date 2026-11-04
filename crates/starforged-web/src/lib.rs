@@ -93,6 +93,14 @@ fn page_routes() -> Router<AppState> {
         .route("/settings/tokens/{id}/revoke", post(pages::tokens::revoke))
         .route("/{owner}", get(pages::owner::show))
         .route(
+            "/{owner}/{repo}/settings",
+            get(pages::repo_settings::show).post(pages::repo_settings::save_general),
+        )
+        .route(
+            "/{owner}/{repo}/settings/visibility",
+            post(pages::repo_settings::change_visibility),
+        )
+        .route(
             "/{owner}/{repo}/settings/collaborators",
             get(pages::collaborators::list).post(pages::collaborators::add),
         )
@@ -104,6 +112,10 @@ fn page_routes() -> Router<AppState> {
         .route("/{owner}/{repo}/tree/{*rest}", get(pages::code::tree))
         .route("/{owner}/{repo}/blob/{*rest}", get(pages::code::blob))
         .route("/{owner}/{repo}/raw/{*rest}", get(pages::code::raw))
+        .route(
+            "/{owner}/{repo}/commits",
+            get(pages::history::default_commits),
+        )
         .route(
             "/{owner}/{repo}/commits/{*rest}",
             get(pages::history::commits),

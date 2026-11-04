@@ -12,7 +12,7 @@ use starforged_core::sessions::WebSession;
 use crate::AppState;
 use crate::auth::{CsrfForm, RequireUser, verify_csrf};
 use crate::error::WebError;
-use crate::views::NavUser;
+use crate::views::{NavUser, RepoHead};
 
 #[derive(Deserialize)]
 pub struct AddForm {
@@ -32,8 +32,8 @@ pub struct CollaboratorRow {
 pub struct CollaboratorsPage {
     nav_user: Option<NavUser>,
     csrf: String,
-    owner: String,
-    name: String,
+    head: RepoHead,
+    settings_page: &'static str,
     collaborators: Vec<CollaboratorRow>,
     permission_choices: Vec<&'static str>,
     error: Option<String>,
@@ -127,8 +127,8 @@ async fn page(
     Ok(CollaboratorsPage {
         nav_user: Some(NavUser::from_session(session)),
         csrf: session.csrf_token.clone(),
-        owner: access.repo.owner,
-        name: access.repo.name,
+        head: RepoHead::new(&access, "settings", None),
+        settings_page: "collaborators",
         collaborators,
         permission_choices: Permission::ALL
             .into_iter()

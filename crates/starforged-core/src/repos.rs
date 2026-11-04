@@ -71,20 +71,29 @@ fn viewer(user: Option<&User>) -> Option<Viewer> {
     })
 }
 
+/// Longest repository description, in characters.
+const MAX_DESCRIPTION_CHARS: usize = 350;
+
+/// Trims a description and checks its length.
+fn checked_description(input: &str) -> CoreResult<String> {
+    let description = input.trim();
+    if description.chars().count() > MAX_DESCRIPTION_CHARS {
+        return Err(CoreError::Invalid(
+            "descriptions are at most 350 characters".into(),
+        ));
+    }
+    Ok(description.to_owned())
+}
+
 impl Core {
     /// Creates a repository owned by `actor` (organizations arrive in M3) and its bare git directory.
     pub async fn create_repo(&self, actor: &User, input: CreateRepo) -> CoreResult<Repo> {
         let name = validate::repo_name(&input.name)?;
-        let description = input.description.trim();
-        if description.chars().count() > 350 {
-            return Err(CoreError::Invalid(
-                "descriptions are at most 350 characters".into(),
-            ));
-        }
+        let description = checked_description(&input.description)?;
         let new = NewRepo {
             owner_id: actor.id,
             name: &name,
-            description,
+            description: &description,
             visibility: input.visibility.as_str(),
             default_branch: "main",
         };
@@ -288,10 +297,97 @@ impl Core {
     }
 }
 
+impl Core {
+    /// Maintainers and up: replaces the description (forge-basics design §5.2).
+    pub async fn set_repo_description(
+        &self,
+        actor: &User,
+        owner: &str,
+        name: &str,
+        description: &str,
+    ) -> CoreResult<Repo> {
+        let access = self
+            .require_repo(Some(actor), owner, name, Permission::Maintain)
+            .await?;
+        let description = checked_description(description)?;
+        if description != access.repo.description {
+            db_repos::set_description(self.db(), access.repo.id, &description).await?;
+        }
+        self.reload_repo(access.repo.id).await
+    }
+
+    /// Maintainers and up: makes the existing branch `branch` the default and points the bare repository's
+    /// `HEAD` at it, so new clones check it out.
+    pub async fn set_default_branch(
+        &self,
+        actor: &User,
+        owner: &str,
+        name: &str,
+        branch: &str,
+    ) -> CoreResult<Repo> {
+        let access = self
+            .require_repo(Some(actor), owner, name, Permission::Maintain)
+            .await?;
+        if access.repo.default_branch == branch {
+            return Ok(access.repo);
+        }
+        if !self.branches(&access).await?.iter().any(|b| b == branch) {
+            return Err(CoreError::Invalid(format!(
+                "there is no branch named '{branch}'"
+            )));
+        }
+        starforged_git::write::set_head(&self.repo_path(access.repo.id), branch).await?;
+        db_repos::set_default_branch(self.db(), access.repo.id, branch).await?;
+        self.audit(
+            Some(actor.id),
+            "repo.default_branch",
+            &format!("repo:{}", access.repo.full_name()),
+            branch,
+        )
+        .await?;
+        self.reload_repo(access.repo.id).await
+    }
+
+    /// Admins: changes who can read the repository.
+    pub async fn set_visibility(
+        &self,
+        actor: &User,
+        owner: &str,
+        name: &str,
+        visibility: Visibility,
+    ) -> CoreResult<Repo> {
+        let access = self
+            .require_repo(Some(actor), owner, name, Permission::Admin)
+            .await?;
+        let old = access.repo.visibility;
+        if old == visibility {
+            return Ok(access.repo);
+        }
+        db_repos::set_visibility(self.db(), access.repo.id, visibility.as_str()).await?;
+        self.audit(
+            Some(actor.id),
+            "repo.visibility",
+            &format!("repo:{}", access.repo.full_name()),
+            &format!("{} -> {}", old.as_str(), visibility.as_str()),
+        )
+        .await?;
+        self.reload_repo(access.repo.id).await
+    }
+
+    /// The repository as stored now.
+    async fn reload_repo(&self, id: i64) -> CoreResult<Repo> {
+        to_repo(
+            db_repos::by_id(self.db(), id)
+                .await?
+                .ok_or(CoreError::NotFound)?,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{test_core, user};
+    use crate::testing::{seed_branches, test_core, user};
 
     fn new(name: &str, visibility: Visibility) -> CreateRepo {
         CreateRepo {
@@ -460,5 +556,106 @@ mod tests {
             core.repos_of(None, "nobody").await,
             Err(CoreError::NotFound)
         ));
+    }
+
+    #[tokio::test]
+    async fn settings_follow_maintain_and_admin_permissions() {
+        let (core, _f) = test_core().await;
+        let alice = user(&core, "alice").await;
+        let mia = user(&core, "mia").await;
+        let walt = user(&core, "walt").await;
+        let bob = user(&core, "bob").await;
+        core.create_repo(&alice, new("proj", Visibility::Private))
+            .await
+            .unwrap();
+        core.set_collaborator(&alice, "alice", "proj", "mia", Permission::Maintain)
+            .await
+            .unwrap();
+        core.set_collaborator(&alice, "alice", "proj", "walt", Permission::Write)
+            .await
+            .unwrap();
+
+        let repo = core
+            .set_repo_description(&mia, "alice", "proj", "  A demo  ")
+            .await
+            .unwrap();
+        assert_eq!(repo.description, "A demo");
+        assert!(matches!(
+            core.set_repo_description(&walt, "alice", "proj", "x").await,
+            Err(CoreError::Forbidden)
+        ));
+        assert!(
+            matches!(
+                core.set_repo_description(&bob, "alice", "proj", "x").await,
+                Err(CoreError::NotFound)
+            ),
+            "people who cannot read the repository learn nothing"
+        );
+        assert!(matches!(
+            core.set_repo_description(&mia, "alice", "proj", &"x".repeat(351))
+                .await,
+            Err(CoreError::Invalid(_))
+        ));
+        assert!(matches!(
+            core.set_visibility(&mia, "alice", "proj", Visibility::Public)
+                .await,
+            Err(CoreError::Forbidden)
+        ));
+        let repo = core
+            .set_visibility(&alice, "alice", "proj", Visibility::Public)
+            .await
+            .unwrap();
+        assert_eq!(repo.visibility, Visibility::Public);
+        core.set_visibility(&alice, "alice", "proj", Visibility::Public)
+            .await
+            .unwrap();
+        let audited: Vec<(String, String)> = starforged_db::audit::recent(core.db(), 20)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.action == "repo.visibility")
+            .map(|e| (e.target, e.detail))
+            .collect();
+        assert_eq!(
+            audited,
+            vec![("repo:alice/proj".to_owned(), "private -> public".to_owned())],
+            "a visibility that did not change is not audited"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_default_branch_must_exist_and_moves_head() {
+        let (core, _f) = test_core().await;
+        let alice = user(&core, "alice").await;
+        let repo = core
+            .create_repo(&alice, new("proj", Visibility::Public))
+            .await
+            .unwrap();
+        assert!(matches!(
+            core.set_default_branch(&alice, "alice", "proj", "dev")
+                .await,
+            Err(CoreError::Invalid(_))
+        ));
+        seed_branches(&core, repo.id, &["main", "dev"]);
+        let changed = core
+            .set_default_branch(&alice, "alice", "proj", "dev")
+            .await
+            .unwrap();
+        assert_eq!(changed.default_branch, "dev");
+        assert_eq!(
+            std::fs::read_to_string(core.repo_path(repo.id).join("HEAD")).unwrap(),
+            "ref: refs/heads/dev\n"
+        );
+        core.set_default_branch(&alice, "alice", "proj", "dev")
+            .await
+            .unwrap();
+        let audited: Vec<String> = starforged_db::audit::recent(core.db(), 20)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.action == "repo.default_branch")
+            .map(|e| e.detail)
+            .collect();
+        assert_eq!(audited, vec!["dev".to_owned()]);
     }
 }
