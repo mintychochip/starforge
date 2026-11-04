@@ -151,6 +151,11 @@ fn page_routes() -> Router<AppState> {
             get(pages::history::commits),
         )
         .route("/{owner}/{repo}/commit/{id}", get(pages::history::commit))
+        .route("/{owner}/{repo}/compare", get(pages::compare::pick))
+        .route(
+            "/{owner}/{repo}/compare/{*spec}",
+            get(pages::compare::compare),
+        )
         .route("/static/starforge.css", get(stylesheet))
 }
 

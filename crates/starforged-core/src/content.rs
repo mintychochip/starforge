@@ -137,3 +137,79 @@ impl Core {
         )
     }
 }
+
+/// Most commits a comparison lists; the rest are counted.
+pub const MAX_COMPARE_COMMITS: usize = 250;
+
+/// What `head` adds to `base` (forge-basics design §6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Comparison {
+    pub base: Resolved,
+    pub head: Resolved,
+    /// `None` when the refs share no history; `commits` and `diff` are then empty.
+    pub merge_base: Option<String>,
+    /// Newest first; at most [`MAX_COMPARE_COMMITS`].
+    pub commits: Vec<CommitInfo>,
+    /// Every commit reachable from `head` but not from `base`, listed or not.
+    pub total_commits: usize,
+    /// From the merge base to `head`, within [`MAX_DIFF_LINES`] and [`MAX_DIFF_BYTES`].
+    pub diff: CommitDiff,
+}
+
+impl Core {
+    /// Compares two refs (branch, tag, or full commit id) of one repository. Both are resolved to object ids
+    /// before git runs; a name that is not exactly a ref is `NotFound`.
+    pub async fn compare(
+        &self,
+        access: &RepoAccess,
+        base: &str,
+        head: &str,
+    ) -> CoreResult<Comparison> {
+        let base = self.resolve_exact(access, base).await?;
+        let head = self.resolve_exact(access, head).await?;
+        let repo = self.repo_path(access.repo.id);
+        let (probe, a, b) = (repo.clone(), base.commit_id.clone(), head.commit_id.clone());
+        let Some(merge_base) = blocking(move || read::merge_base(&probe, &a, &b)).await? else {
+            return Ok(Comparison {
+                base,
+                head,
+                merge_base: None,
+                commits: Vec::new(),
+                total_commits: 0,
+                diff: CommitDiff {
+                    files: Vec::new(),
+                    truncated: false,
+                },
+            });
+        };
+        let (probe, a, b) = (repo.clone(), base.commit_id.clone(), head.commit_id.clone());
+        let (commits, total_commits) =
+            blocking(move || read::range_log(&probe, &a, &b, MAX_COMPARE_COMMITS)).await?;
+        let diff = starforged_git::diff::range_diff(
+            &repo,
+            &merge_base,
+            &head.commit_id,
+            MAX_DIFF_LINES,
+            MAX_DIFF_BYTES,
+        )
+        .await?;
+        Ok(Comparison {
+            base,
+            head,
+            merge_base: Some(merge_base),
+            commits,
+            total_commits,
+            diff,
+        })
+    }
+
+    /// A branch, tag, or commit id with nothing after it.
+    async fn resolve_exact(&self, access: &RepoAccess, name: &str) -> CoreResult<Resolved> {
+        let resolved = self.resolve(access, name).await?;
+        if resolved.path.is_empty() {
+            Ok(resolved)
+        } else {
+            Err(CoreError::NotFound)
+        }
+    }
+}

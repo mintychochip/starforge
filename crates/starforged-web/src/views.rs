@@ -158,6 +158,92 @@ pub fn crumbs(owner: &str, repo: &str, ref_name: &str, dir: &str) -> Vec<Crumb> 
     out
 }
 
+use starforged_git::diff::{FileDiff, FileStatus, LineKind};
+use starforged_git::read::CommitInfo;
+
+/// One commit in a list (`commits.html`, `compare.html`).
+pub struct CommitRow {
+    pub id: String,
+    pub short_id: String,
+    pub summary: String,
+    pub author: String,
+    pub when: String,
+}
+
+impl From<CommitInfo> for CommitRow {
+    fn from(commit: CommitInfo) -> CommitRow {
+        let short_id = commit.short_id().to_owned();
+        CommitRow {
+            id: commit.id,
+            short_id,
+            summary: commit.summary,
+            author: commit.author_name,
+            when: format_time(commit.author_time),
+        }
+    }
+}
+
+pub struct LineView {
+    pub class: &'static str,
+    pub old: String,
+    pub new: String,
+    pub text: String,
+}
+
+pub struct HunkView {
+    pub header: String,
+    pub lines: Vec<LineView>,
+}
+
+pub struct FileView {
+    pub status: &'static str,
+    pub path: String,
+    pub binary: bool,
+    pub hunks: Vec<HunkView>,
+}
+
+/// Diff files as `diff_files.html` renders them.
+pub fn file_views(files: Vec<FileDiff>) -> Vec<FileView> {
+    files
+        .into_iter()
+        .map(|file| FileView {
+            status: match file.status {
+                FileStatus::Added => "added",
+                FileStatus::Deleted => "deleted",
+                FileStatus::Modified => "modified",
+                FileStatus::Renamed => "renamed",
+            },
+            path: match (file.status, &file.old_path) {
+                (FileStatus::Renamed, Some(old)) => format!("{old} → {}", file.display_path()),
+                _ => file.display_path().to_owned(),
+            },
+            binary: file.binary,
+            hunks: file
+                .hunks
+                .into_iter()
+                .map(|hunk| HunkView {
+                    header: hunk.header,
+                    lines: hunk
+                        .lines
+                        .into_iter()
+                        .map(|line| LineView {
+                            class: match line.kind {
+                                LineKind::Context => "ctx",
+                                LineKind::Added => "add",
+                                LineKind::Removed => "del",
+                                LineKind::NoNewline => "nonl",
+                            },
+                            old: line.old_line.map(|n| n.to_string()).unwrap_or_default(),
+                            new: line.new_line.map(|n| n.to_string()).unwrap_or_default(),
+                            text: line.text,
+                        })
+                        .collect(),
+                })
+                .collect(),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

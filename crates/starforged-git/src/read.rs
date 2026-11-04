@@ -328,6 +328,47 @@ fn commit_info(commit: &gix::Commit<'_>) -> Result<CommitInfo, GitError> {
     })
 }
 
+/// Commits reachable from `head_id` but not from `base_id`, newest first (by commit time): at most `limit`
+/// of them, and how many there are in all.
+pub fn range_log(
+    repo: &Path,
+    base_id: &str,
+    head_id: &str,
+    limit: usize,
+) -> Result<(Vec<CommitInfo>, usize), GitError> {
+    let r = open(repo)?;
+    let base = r.rev_parse_single(base_id).map_err(gix_err)?.detach();
+    let head = r.rev_parse_single(head_id).map_err(gix_err)?.detach();
+    let walk = r
+        .rev_walk([head])
+        .with_hidden([base])
+        .sorting(gix::revision::walk::Sorting::ByCommitTime(
+            Default::default(),
+        ))
+        .all()
+        .map_err(gix_err)?;
+    let mut commits = Vec::new();
+    let mut total = 0;
+    for info in walk {
+        let info = info.map_err(gix_err)?;
+        total += 1;
+        if commits.len() < limit {
+            commits.push(commit_info(&info.object().map_err(gix_err)?)?);
+        }
+    }
+    Ok((commits, total))
+}
+
+/// The best common ancestor of two commits; `None` when their histories are unrelated.
+pub fn merge_base(repo: &Path, a: &str, b: &str) -> Result<Option<String>, GitError> {
+    let r = open(repo)?;
+    let a = r.rev_parse_single(a).map_err(gix_err)?.detach();
+    let b = r.rev_parse_single(b).map_err(gix_err)?.detach();
+    Ok(r.merge_base(a, b)
+        .map_err(gix_err)?
+        .map(|id| id.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -539,5 +580,24 @@ mod tests {
         assert_eq!(found.short_id().len(), 10);
         assert!(commit(p, "not-an-id").unwrap().is_none());
         assert!(commit(p, &"0".repeat(40)).unwrap().is_none());
+    }
+    #[test]
+    fn range_logs_list_what_head_adds_to_base() {
+        let f = fixture();
+        let p = f.path();
+        let main = resolve(p, "main").unwrap().unwrap().commit_id;
+        let feature = resolve(p, "feature/x").unwrap().unwrap().commit_id;
+        let v1 = resolve(p, "v1").unwrap().unwrap().commit_id;
+        let (commits, total) = range_log(p, &main, &feature, 10).unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(commits[0].summary, "feature");
+        assert_eq!(range_log(p, &main, &feature, 0).unwrap(), (Vec::new(), 1));
+        assert_eq!(range_log(p, &feature, &main, 10).unwrap(), (Vec::new(), 0));
+        let (two, total) = range_log(p, &v1, &feature, 10).unwrap();
+        assert_eq!(total, 2);
+        let summaries: Vec<&str> = two.iter().map(|c| c.summary.as_str()).collect();
+        assert_eq!(summaries, vec!["feature", "second"], "newest first");
+        assert_eq!(merge_base(p, &main, &feature).unwrap(), Some(main.clone()));
+        assert_eq!(merge_base(p, &v1, &feature).unwrap(), Some(v1));
     }
 }

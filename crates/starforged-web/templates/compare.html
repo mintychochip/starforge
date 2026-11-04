@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block title %}Compare · {{ head.owner }}/{{ head.name }}{% endblock %}
+{% block content %}
+{% include "repo_head.html" %}
+<form method="get" action="/{{ head.owner }}/{{ head.name }}/compare" class="inline">
+  <label>Base <select name="base">{% for o in base_options %}<option value="{{ o.name }}"{% if o.selected %} selected{% endif %}>{{ o.name }}</option>{% endfor %}</select></label>
+  <label>Compare <select name="head">{% for o in head_options %}<option value="{{ o.name }}"{% if o.selected %} selected{% endif %}>{{ o.name }}</option>{% endfor %}</select></label>
+  <button type="submit">Compare</button>
+</form>
+{% if compared %}
+{% if !related %}
+<p class="notice">{{ base_ref }} and {{ head_ref }} share no history, so there is nothing to compare.</p>
+{% else if commits.is_empty() %}
+<p class="muted">{{ head_ref }} has no commits that {{ base_ref }} lacks.</p>
+{% else %}
+<h2>{{ total }} commit{% if total != 1 %}s{% endif %}</h2>
+<ol class="commits">
+{% for c in commits %}
+<li><a href="/{{ head.owner }}/{{ head.name }}/commit/{{ c.id }}"><code>{{ c.short_id }}</code></a> {{ c.summary }} <span class="muted">{{ c.author }} · {{ c.when }}</span></li>
+{% endfor %}
+</ol>
+{% if more > 0 %}<p class="muted">and {{ more }} more commit{% if more != 1 %}s{% endif %}</p>{% endif %}
+{% include "diff_files.html" %}
+{% endif %}
+{% endif %}
+{% endblock %}

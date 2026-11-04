@@ -5,21 +5,5 @@
 <h2>{{ summary }}</h2>
 {% if !body.is_empty() %}<pre class="message">{{ body }}</pre>{% endif %}
 <p class="muted">{{ author }} · {{ when }} · <code>{{ id }}</code>{% for p in parents %} · parent <a href="/{{ head.owner }}/{{ head.name }}/commit/{{ p }}"><code>{{ p }}</code></a>{% endfor %}</p>
-{% if truncated %}<p class="notice">This diff is large; only the first lines are shown.</p>{% endif %}
-{% for f in files %}
-<section class="file">
-<h3><span class="badge">{{ f.status }}</span> {{ f.path }}</h3>
-{% if f.binary %}
-<p class="muted">Binary file</p>
-{% else %}
-<table class="diff"><tbody>
-{% for h in f.hunks %}
-<tr class="hunk"><td colspan="3">{{ h.header }}</td></tr>
-{% for l in h.lines %}<tr class="{{ l.class }}"><td class="ln">{{ l.old }}</td><td class="ln">{{ l.new }}</td><td><pre>{{ l.text }}</pre></td></tr>
-{% endfor %}
-{% endfor %}
-</tbody></table>
-{% endif %}
-</section>
-{% endfor %}
+{% include "diff_files.html" %}
 {% endblock %}

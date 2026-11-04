@@ -93,18 +93,11 @@ pub async fn commit_diff(
     max_lines: usize,
     max_bytes: usize,
 ) -> Result<CommitDiff, GitError> {
-    if commit_id.is_empty() || !commit_id.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(GitError::Failed {
-            command: "show".into(),
-            stderr: format!("not an object id: {commit_id}"),
-        });
-    }
-    let mut child = git()
-        .args([
-            OsStr::new("-c"),
-            OsStr::new("core.quotePath=false"),
-            OsStr::new("--git-dir"),
-            repo.as_os_str(),
+    check_object_id("show", commit_id)?;
+    run_patch(
+        repo,
+        "show",
+        &[
             OsStr::new("show"),
             OsStr::new("--format="),
             OsStr::new("--patch"),
@@ -114,17 +107,80 @@ pub async fn commit_diff(
             OsStr::new("--no-ext-diff"),
             OsStr::new("--no-textconv"),
             OsStr::new(commit_id),
+        ],
+        max_lines,
+        max_bytes,
+    )
+    .await
+}
+
+/// Diff from `base_id` to `head_id` (compare passes the merge base as `base_id`), with the limits of
+/// [`commit_diff`].
+pub async fn range_diff(
+    repo: &Path,
+    base_id: &str,
+    head_id: &str,
+    max_lines: usize,
+    max_bytes: usize,
+) -> Result<CommitDiff, GitError> {
+    check_object_id("diff", base_id)?;
+    check_object_id("diff", head_id)?;
+    run_patch(
+        repo,
+        "diff",
+        &[
+            OsStr::new("diff"),
+            OsStr::new("--find-renames"),
+            OsStr::new("--no-color"),
+            OsStr::new("--no-ext-diff"),
+            OsStr::new("--no-textconv"),
+            OsStr::new(base_id),
+            OsStr::new(head_id),
+        ],
+        max_lines,
+        max_bytes,
+    )
+    .await
+}
+
+/// Only object ids reach git, so no argument can be read as an option.
+fn check_object_id(command: &str, id: &str) -> Result<(), GitError> {
+    if id.is_empty() || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(GitError::Failed {
+            command: command.into(),
+            stderr: format!("not an object id: {id}"),
+        });
+    }
+    Ok(())
+}
+
+/// Runs `git -c core.quotePath=false --git-dir <repo> <args>` and parses its patch output, reading at most
+/// `max_bytes` (then cut after the last complete line and marked `truncated`).
+async fn run_patch(
+    repo: &Path,
+    command: &str,
+    args: &[&OsStr],
+    max_lines: usize,
+    max_bytes: usize,
+) -> Result<CommitDiff, GitError> {
+    let mut child = git()
+        .args([
+            OsStr::new("-c"),
+            OsStr::new("core.quotePath=false"),
+            OsStr::new("--git-dir"),
+            repo.as_os_str(),
         ])
+        .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
     let mut stdout = child.stdout.take().ok_or_else(|| GitError::Failed {
-        command: "show".into(),
-        stderr: "git show produced no stdout".into(),
+        command: command.into(),
+        stderr: format!("git {command} produced no stdout"),
     })?;
     let stderr = child.stderr.take().ok_or_else(|| GitError::Failed {
-        command: "show".into(),
-        stderr: "git show produced no stderr".into(),
+        command: command.into(),
+        stderr: format!("git {command} produced no stderr"),
     })?;
     let stderr_text = tokio::spawn(drain_bounded(stderr));
     let mut kept = Vec::new();
@@ -158,7 +214,7 @@ pub async fn commit_diff(
     let stderr = stderr_text.await.unwrap_or_default();
     if !status.success() {
         return Err(GitError::Failed {
-            command: "show".into(),
+            command: command.into(),
             stderr: String::from_utf8_lossy(&stderr).trim().to_owned(),
         });
     }
@@ -451,6 +507,16 @@ Binary files /dev/null and b/img.png differ
             .await
             .unwrap();
         assert_eq!(first.files[0].status, FileStatus::Added);
+        let range = range_diff(&repo, &root, &head, 100, 4 * 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(range.files[0].status, FileStatus::Modified);
+        assert_eq!(range.files[0].hunks[0].lines.last().unwrap().text, "two");
+        assert!(
+            range_diff(&repo, "--cached", &head, 100, 4 * 1024 * 1024)
+                .await
+                .is_err()
+        );
         assert!(
             commit_diff(&repo, "--output=/tmp/x", 100, 4 * 1024 * 1024)
                 .await

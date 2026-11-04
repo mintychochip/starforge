@@ -4,27 +4,18 @@ use axum::extract::{Path, Query, State};
 use serde::Deserialize;
 use starforged_core::repos::RepoAccess;
 use starforged_core::sessions::WebSession;
-use starforged_git::diff::{FileStatus, LineKind};
 
 use crate::AppState;
 use crate::auth::MaybeUser;
 use crate::error::WebError;
 use crate::pages::code::default_ref;
-use crate::views::{NavUser, RepoHead, format_time, nav};
+use crate::views::{CommitRow, FileView, NavUser, RepoHead, file_views, format_time, nav};
 
 pub const PER_PAGE: usize = 50;
 
 #[derive(Deserialize)]
 pub struct PageQuery {
     page: Option<usize>,
-}
-
-pub struct CommitRow {
-    id: String,
-    short_id: String,
-    summary: String,
-    author: String,
-    when: String,
 }
 
 #[derive(Template, WebTemplate)]
@@ -37,25 +28,6 @@ pub struct CommitsPage {
     commits: Vec<CommitRow>,
     page: usize,
     has_next: bool,
-}
-
-pub struct LineView {
-    class: &'static str,
-    old: String,
-    new: String,
-    text: String,
-}
-
-pub struct HunkView {
-    header: String,
-    lines: Vec<LineView>,
-}
-
-pub struct FileView {
-    status: &'static str,
-    path: String,
-    binary: bool,
-    hunks: Vec<HunkView>,
 }
 
 #[derive(Template, WebTemplate)]
@@ -153,16 +125,7 @@ async fn commits_page(
         nav_user: nav(session),
         head,
         ref_name,
-        commits: commits
-            .into_iter()
-            .map(|c| CommitRow {
-                short_id: c.short_id().to_owned(),
-                author: c.author_name.clone(),
-                when: format_time(c.author_time),
-                summary: c.summary,
-                id: c.id,
-            })
-            .collect(),
+        commits: commits.into_iter().map(CommitRow::from).collect(),
         page,
         has_next,
     })
@@ -180,45 +143,7 @@ pub async fn commit(
     let head = RepoHead::new(&access, "commits", None);
     let info = state.core.commit(&access, &id).await?;
     let diff = state.core.diff(&access, &info.id).await?;
-    let files = diff
-        .files
-        .into_iter()
-        .map(|file| FileView {
-            status: match file.status {
-                FileStatus::Added => "added",
-                FileStatus::Deleted => "deleted",
-                FileStatus::Modified => "modified",
-                FileStatus::Renamed => "renamed",
-            },
-            path: match (file.status, &file.old_path) {
-                (FileStatus::Renamed, Some(old)) => format!("{old} → {}", file.display_path()),
-                _ => file.display_path().to_owned(),
-            },
-            binary: file.binary,
-            hunks: file
-                .hunks
-                .into_iter()
-                .map(|hunk| HunkView {
-                    header: hunk.header,
-                    lines: hunk
-                        .lines
-                        .into_iter()
-                        .map(|line| LineView {
-                            class: match line.kind {
-                                LineKind::Context => "ctx",
-                                LineKind::Added => "add",
-                                LineKind::Removed => "del",
-                                LineKind::NoNewline => "nonl",
-                            },
-                            old: line.old_line.map(|n| n.to_string()).unwrap_or_default(),
-                            new: line.new_line.map(|n| n.to_string()).unwrap_or_default(),
-                            text: line.text,
-                        })
-                        .collect(),
-                })
-                .collect(),
-        })
-        .collect();
+    let files = file_views(diff.files);
     let body = info
         .message
         .split_once('\n')

@@ -2,6 +2,7 @@
 
 pub mod code;
 pub mod collaborators;
+pub mod compare;
 pub mod dashboard;
 pub mod history;
 pub mod join;
