@@ -18,6 +18,10 @@ pub struct Config {
     pub registration: RegistrationConfig,
     #[serde(default)]
     pub mail: MailConfig,
+    /// Session ingest tuning (spec §5.3, §6.3). Missing section defaults cleanly so old
+    /// `starforged.toml` files keep working.
+    #[serde(default)]
+    pub sessions: SessionsConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,6 +116,34 @@ impl Default for RegistrationConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionsConfig {
+    /// Content-addressed blob root (spec §5.3). Relative paths resolve against the process
+    /// working directory; operators should set an absolute path.
+    #[serde(default = "default_blob_dir")]
+    pub blob_dir: PathBuf,
+    /// Rejects session segment bodies larger than this (spec §6.3).
+    #[serde(default = "default_max_segment_bytes")]
+    pub max_segment_bytes: u64,
+}
+
+fn default_blob_dir() -> PathBuf {
+    PathBuf::from("data/blobs")
+}
+
+fn default_max_segment_bytes() -> u64 {
+    starforged_core::DEFAULT_MAX_SEGMENT_BYTES
+}
+
+impl Default for SessionsConfig {
+    fn default() -> Self {
+        SessionsConfig {
+            blob_dir: default_blob_dir(),
+            max_segment_bytes: default_max_segment_bytes(),
+        }
+    }
+}
+
 impl Config {
     /// Reads `path`, applies environment overrides, and validates.
     pub fn load(path: &Path) -> anyhow::Result<Config> {
@@ -150,6 +182,12 @@ impl Config {
                         .filter(|d| !d.is_empty())
                         .map(str::to_owned)
                         .collect();
+                }
+                "sessions__blob_dir" => self.sessions.blob_dir = PathBuf::from(value),
+                "sessions__max_segment_bytes" => {
+                    self.sessions.max_segment_bytes = value
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("{key} must be a non-negative byte count"))?;
                 }
                 _ => bail!("unknown configuration override {key}"),
             }
@@ -258,6 +296,7 @@ mod tests {
             },
             registration: RegistrationConfig::default(),
             mail: MailConfig::default(),
+            sessions: SessionsConfig::default(),
         }
     }
 
@@ -419,5 +458,61 @@ mod tests {
         let rendered = format!("{:?}", sample());
         assert!(!rendered.contains(&"ab".repeat(32)), "{rendered}");
         assert!(rendered.contains("<redacted>"), "{rendered}");
+    }
+
+    #[test]
+    fn sessions_section_defaults_and_overrides() {
+        fn bare_toml() -> String {
+            format!(
+                "[server]\nhttp_addr = \"127.0.0.1:3000\"\nbase_url = \"http://127.0.0.1:3000\"\n\
+                 [storage]\ndata_dir = \"/srv/starforge\"\n\
+                 [security]\nsecret_key = \"{}\"\n",
+                "ab".repeat(32)
+            )
+        }
+        // A config file without `[sessions]` keeps working with defaults.
+        let without: Config = toml::from_str(&bare_toml()).unwrap();
+        assert_eq!(without.sessions, SessionsConfig::default());
+        assert_eq!(without.sessions.blob_dir, PathBuf::from("data/blobs"));
+        assert_eq!(
+            without.sessions.max_segment_bytes,
+            starforged_core::DEFAULT_MAX_SEGMENT_BYTES
+        );
+        assert_eq!(starforged_core::DEFAULT_MAX_SEGMENT_BYTES, 16 * 1024 * 1024);
+        assert!(without.validate().is_ok());
+
+        // Explicit values parse and validate.
+        let explicit: Config = toml::from_str(&format!(
+            "{bare}[sessions]\nblob_dir = \"/var/lib/blobs\"\nmax_segment_bytes = 1024\n",
+            bare = bare_toml()
+        ))
+        .unwrap();
+        assert_eq!(explicit.sessions.blob_dir, PathBuf::from("/var/lib/blobs"));
+        assert_eq!(explicit.sessions.max_segment_bytes, 1024);
+        assert!(explicit.validate().is_ok());
+
+        // Environment overrides apply, including rejection of a bad byte count.
+        let mut config = sample();
+        config
+            .apply_env([
+                (
+                    "STARFORGE__SESSIONS__BLOB_DIR".to_owned(),
+                    "/tmp/blobs".to_owned(),
+                ),
+                (
+                    "STARFORGE__SESSIONS__MAX_SEGMENT_BYTES".to_owned(),
+                    "2048".to_owned(),
+                ),
+            ])
+            .unwrap();
+        assert_eq!(config.sessions.blob_dir, PathBuf::from("/tmp/blobs"));
+        assert_eq!(config.sessions.max_segment_bytes, 2048);
+        let bad = sample()
+            .apply_env([(
+                "STARFORGE__SESSIONS__MAX_SEGMENT_BYTES".to_owned(),
+                "lots".to_owned(),
+            )])
+            .unwrap_err();
+        assert!(bad.to_string().contains("byte count"), "{bad:?}");
     }
 }

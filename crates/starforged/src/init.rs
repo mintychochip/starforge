@@ -6,7 +6,7 @@ use anyhow::{Context, bail};
 
 use crate::config::{
     Config, DatabaseConfig, MailConfig, RegistrationConfig, SecurityConfig, ServerConfig,
-    StorageConfig,
+    SessionsConfig, StorageConfig,
 };
 
 pub struct InitOptions<'a> {
@@ -42,6 +42,7 @@ pub fn run(opts: &InitOptions<'_>) -> anyhow::Result<Config> {
         },
         mail: MailConfig::default(),
         registration: RegistrationConfig::default(),
+        sessions: SessionsConfig::default(),
     };
     config.validate()?;
     write_private(opts.config_path, &toml::to_string_pretty(&config)?)?;

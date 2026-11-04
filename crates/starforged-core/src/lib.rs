@@ -28,6 +28,9 @@ use starforged_db::Db;
 
 pub use error::{CoreError, CoreResult};
 
+/// Default cap for one uploaded session segment body (spec §6.3).
+pub const DEFAULT_MAX_SEGMENT_BYTES: u64 = 16 * 1024 * 1024;
+
 #[derive(Debug, Clone)]
 pub struct CoreConfig {
     /// Directory holding bare repositories (`<data_dir>/repos`).
@@ -35,6 +38,12 @@ pub struct CoreConfig {
     /// Scratch space on the same filesystem as `repos_dir` (`<data_dir>/tmp`); purged repositories pass
     /// through it.
     pub tmp_dir: PathBuf,
+    /// Content-addressed blob root (`<blob_dir>/<hash[0..2]>/<hash>`, spec §5.3).
+    pub blob_dir: PathBuf,
+    /// Rejects segment bodies larger than this (spec §6.3).
+    pub max_segment_bytes: u64,
+    /// Content-addressed store behind segment/raw bytes; `FsBlobStore` on `blob_dir` in production.
+    pub blob_store: std::sync::Arc<dyn starforged_blob::BlobStore>,
     /// Program that repository hooks execute (`starforged`); tests point it at the built binary.
     pub hook_exe: PathBuf,
     /// Public URL without a trailing slash; links in emails start with it.
@@ -121,9 +130,13 @@ pub(crate) mod testing {
     ) -> (Core, Fixture) {
         let db = starforged_db::testing::TestDb::new().await;
         let dir = tempfile::tempdir().unwrap();
+        let blob_dir = dir.path().join("blobs");
         let mut config = CoreConfig {
             repos_dir: dir.path().join("repos"),
             tmp_dir: dir.path().join("tmp"),
+            blob_store: std::sync::Arc::new(starforged_blob::FsBlobStore::new(blob_dir.clone())),
+            blob_dir,
+            max_segment_bytes: DEFAULT_MAX_SEGMENT_BYTES,
             hook_exe: PathBuf::from("/bin/false"),
             base_url: "http://forge.test".into(),
             mailer: None,

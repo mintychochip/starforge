@@ -4431,6 +4431,7 @@ dependencies = [
  "serde_json",
  "sqlx",
  "starforged-api",
+ "starforged-blob",
  "starforged-core",
  "starforged-db",
  "starforged-git",
@@ -4454,6 +4455,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "starforged-blob"
+version = "0.0.0"
+dependencies = [
+ "blake3",
+ "tempfile",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "starforged-core"
 version = "0.0.0"
 dependencies = [
@@ -4467,6 +4478,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.1",
  "sqlx",
+ "starforged-blob",
  "starforged-db",
  "starforged-git",
  "tempfile",

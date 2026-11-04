@@ -2,6 +2,7 @@
 
 use std::io::Read;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::Context;
 use starforged_core::accounts::{CreateUser, User};
@@ -23,6 +24,11 @@ pub async fn open_core(config: &Config, hook_exe: PathBuf) -> anyhow::Result<Cor
         CoreConfig {
             repos_dir: config.repos_dir(),
             tmp_dir: config.tmp_dir(),
+            blob_dir: config.sessions.blob_dir.clone(),
+            max_segment_bytes: config.sessions.max_segment_bytes,
+            blob_store: Arc::new(starforged_blob::FsBlobStore::new(
+                config.sessions.blob_dir.clone(),
+            )),
             hook_exe,
             base_url: config.server.base_url.clone(),
             mailer: config.mailer()?,

@@ -17,6 +17,7 @@ getrandom.workspace = true
 hex.workspace = true
 serde.workspace = true
 starforged-api = { path = "../starforged-api" }
+starforged-blob = { path = "../starforged-blob" }
 starforged-core = { path = "../starforged-core" }
 starforged-db = { path = "../starforged-db" }
 starforged-git = { path = "../starforged-git" }
