@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block title %}Profile · Settings · Starforge{% endblock %}
+{% block content %}
+{% include "settings_nav.html" %}
+<h1>Profile</h1>
+{% if let Some(n) = notice %}<p class="notice">{{ n }}</p>{% endif %}
+{% if let Some(e) = error %}<p class="error">{{ e }}</p>{% endif %}
+<form method="post" action="/settings/profile" class="stack">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <label>Handle <input value="{{ handle }}" disabled></label>
+  <label>Display name <input name="display_name" maxlength="100" value="{{ display_name }}"></label>
+  <button type="submit">Save</button>
+</form>
+{% endblock %}

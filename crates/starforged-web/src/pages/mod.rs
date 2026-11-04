@@ -10,5 +10,6 @@ pub mod message;
 pub mod owner;
 pub mod password;
 pub mod repo_new;
+pub mod settings;
 pub mod tokens;
 pub mod verify;

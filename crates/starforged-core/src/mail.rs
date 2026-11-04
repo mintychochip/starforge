@@ -241,6 +241,22 @@ pub(crate) fn reset_email(to: &str, handle: &str, link: &str) -> CoreResult<Emai
     })
 }
 
+#[derive(Template)]
+#[template(path = "mail/confirm_email.txt")]
+struct ConfirmEmailText<'a> {
+    handle: &'a str,
+    link: &'a str,
+}
+
+/// Confirms a new address before it replaces the old one; the link is valid for 24 hours.
+pub(crate) fn confirm_email(to: &str, handle: &str, link: &str) -> CoreResult<Email> {
+    Ok(Email {
+        to: to.to_owned(),
+        subject: "Confirm your new email address".into(),
+        body: render(&ConfirmEmailText { handle, link })?,
+    })
+}
+
 impl Core {
     /// Whether this instance sends email (`[mail] url` is set).
     pub fn mail_enabled(&self) -> bool {

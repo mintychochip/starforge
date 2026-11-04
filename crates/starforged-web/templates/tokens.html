@@ -1,6 +1,7 @@
 {% extends "base.html" %}
 {% block title %}Tokens · Starforge{% endblock %}
 {% block content %}
+{% include "settings_nav.html" %}
 <h1>Personal access tokens</h1>
 {% if let Some(secret) = created %}
 <div class="notice">

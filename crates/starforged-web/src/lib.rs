@@ -64,6 +64,28 @@ fn page_routes() -> Router<AppState> {
             "/new",
             get(pages::repo_new::form).post(pages::repo_new::submit),
         )
+        .route("/settings", get(pages::settings::index))
+        .route(
+            "/settings/profile",
+            get(pages::settings::profile).post(pages::settings::save_profile),
+        )
+        .route(
+            "/settings/email",
+            get(pages::settings::email).post(pages::settings::change_email),
+        )
+        .route(
+            "/settings/password",
+            get(pages::settings::password).post(pages::settings::change_password),
+        )
+        .route("/settings/sessions", get(pages::settings::sessions))
+        .route(
+            "/settings/sessions/revoke-others",
+            post(pages::settings::revoke_other_sessions),
+        )
+        .route(
+            "/settings/sessions/{id}/revoke",
+            post(pages::settings::revoke_session),
+        )
         .route(
             "/settings/tokens",
             get(pages::tokens::list).post(pages::tokens::create),

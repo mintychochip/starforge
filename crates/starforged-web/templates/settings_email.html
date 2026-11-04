@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block title %}Email · Settings · Starforge{% endblock %}
+{% block content %}
+{% include "settings_nav.html" %}
+<h1>Email</h1>
+{% if let Some(n) = notice %}<p class="notice">{{ n }}</p>{% endif %}
+{% if let Some(e) = error %}<p class="error">{{ e }}</p>{% endif %}
+<p>Current address:
+{% if let Some(address) = email %}<strong>{{ address }}</strong> {% if verified %}<span class="badge">verified</span>{% else %}<span class="badge">unverified</span>{% endif %}{% else %}none{% endif %}
+</p>
+<form method="post" action="/settings/email" class="stack">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <label>New address <input name="email" type="email" autocomplete="email" required value="{{ new_email }}"></label>
+  <button type="submit">Change address</button>
+</form>
+{% endblock %}

@@ -40,6 +40,7 @@ pub struct TokenRow {
 pub struct TokensPage {
     nav_user: Option<NavUser>,
     csrf: String,
+    settings_tab: &'static str,
     tokens: Vec<TokenRow>,
     scope_choices: Vec<&'static str>,
     created: Option<String>,
@@ -127,6 +128,7 @@ async fn page(
     Ok(TokensPage {
         nav_user: Some(NavUser::from_session(session)),
         csrf: session.csrf_token.clone(),
+        settings_tab: "tokens",
         tokens: rows,
         scope_choices,
         created,

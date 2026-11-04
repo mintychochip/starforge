@@ -1,0 +1,7 @@
+Hello {{ handle }},
+
+You asked to change the email address of your Starforge account to this one. To confirm, open:
+
+{{ link }}
+
+The link works once and expires in 24 hours. Until then your account keeps its current address.

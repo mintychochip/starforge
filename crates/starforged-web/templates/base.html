@@ -12,7 +12,7 @@
   <nav>
   {% if let Some(u) = nav_user %}
     <a href="/new">New repository</a>
-    <a href="/settings/tokens">Tokens</a>
+    <a href="/settings/profile">Settings</a>
     <a href="/{{ u.handle }}">{{ u.handle }}</a>
     <form method="post" action="/logout" class="inline">
       <input type="hidden" name="_csrf" value="{{ u.csrf }}">

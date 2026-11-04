@@ -7,10 +7,15 @@ use crate::{Core, CoreError, CoreResult, crypto};
 
 pub const WEB_SESSION_TTL_SECS: i64 = 30 * 86_400;
 
+/// A session's last-activity time is written at most this often.
+const TOUCH_INTERVAL_SECS: i64 = 300;
+
 #[derive(Debug, Clone)]
 pub struct WebSession {
     pub user: User,
     pub csrf_token: String,
+    /// The `web_sessions` row, for the sessions page.
+    pub session_id: i64,
 }
 
 /// A session opened by [`Core::login`]. `cookie_value` goes to the browser and is never stored.
@@ -89,15 +94,20 @@ impl Core {
     /// The user behind a session cookie, if the session is unexpired and the user is active.
     pub async fn web_session(&self, cookie_value: &str) -> CoreResult<Option<WebSession>> {
         let hash = crypto::sha256_hex(cookie_value);
-        let Some(row) =
-            web_sessions::active_by_hash(self.db(), &hash, starforged_db::now()).await?
-        else {
+        let ts = starforged_db::now();
+        let Some(row) = web_sessions::active_by_hash(self.db(), &hash, ts).await? else {
             return Ok(None);
         };
-        let user = self.user_by_id(row.user_id).await?.filter(|u| u.active);
-        Ok(user.map(|user| WebSession {
+        let Some(user) = self.user_by_id(row.user_id).await?.filter(|u| u.active) else {
+            return Ok(None);
+        };
+        if ts - row.last_seen_at >= TOUCH_INTERVAL_SECS {
+            web_sessions::touch(self.db(), row.id, ts).await?;
+        }
+        Ok(Some(WebSession {
             user,
             csrf_token: row.csrf_token,
+            session_id: row.id,
         }))
     }
 

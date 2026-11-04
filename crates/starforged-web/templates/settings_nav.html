@@ -1,0 +1,7 @@
+<nav class="tabs" aria-label="Settings">
+  <a href="/settings/profile"{% if settings_tab == "profile" %} aria-current="page"{% endif %}>Profile</a>
+  <a href="/settings/email"{% if settings_tab == "email" %} aria-current="page"{% endif %}>Email</a>
+  <a href="/settings/password"{% if settings_tab == "password" %} aria-current="page"{% endif %}>Password</a>
+  <a href="/settings/sessions"{% if settings_tab == "sessions" %} aria-current="page"{% endif %}>Sessions</a>
+  <a href="/settings/tokens"{% if settings_tab == "tokens" %} aria-current="page"{% endif %}>Tokens</a>
+</nav>

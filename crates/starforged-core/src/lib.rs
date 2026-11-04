@@ -1,6 +1,7 @@
 //! starforged-core: domain rules and the service layer (spec §5.1). The web UI and the API call `Core`;
 //! nothing else reads or writes stored state.
 
+pub mod account;
 pub mod accounts;
 pub mod audit;
 pub mod content;

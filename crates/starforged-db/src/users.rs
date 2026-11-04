@@ -132,6 +132,26 @@ pub async fn set_password_hash(db: &Db, id: i64, password_hash: &str) -> DbResul
     Ok(())
 }
 
+pub async fn set_display_name(db: &Db, id: i64, display_name: &str) -> DbResult<()> {
+    sqlx::query("UPDATE users SET display_name = $1 WHERE id = $2")
+        .bind(display_name)
+        .bind(id)
+        .execute(db.pool())
+        .await?;
+    Ok(())
+}
+
+/// Sets the (lowercase) address and whether it is verified.
+pub async fn set_email(db: &Db, id: i64, email: Option<&str>, verified: bool) -> DbResult<()> {
+    sqlx::query("UPDATE users SET email = $1, email_verified = $2 WHERE id = $3")
+        .bind(email.map(str::to_owned))
+        .bind(i64::from(verified))
+        .bind(id)
+        .execute(db.pool())
+        .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

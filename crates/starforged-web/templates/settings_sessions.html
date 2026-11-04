@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block title %}Sessions · Settings · Starforge{% endblock %}
+{% block content %}
+{% include "settings_nav.html" %}
+<h1>Sessions</h1>
+<table class="list">
+<thead><tr><th>Browser</th><th>IP address</th><th>Signed in</th><th>Last active</th><th></th></tr></thead>
+<tbody>
+{% for s in sessions %}
+<tr>
+<td>{{ s.browser }}{% if s.current %} <span class="badge">this session</span>{% endif %}</td><td>{{ s.ip }}</td><td>{{ s.signed_in }}</td><td>{{ s.last_active }}</td>
+<td><form method="post" action="/settings/sessions/{{ s.id }}/revoke" class="inline"><input type="hidden" name="_csrf" value="{{ csrf }}"><button type="submit">{% if s.current %}Sign out{% else %}Revoke{% endif %}</button></form></td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+<form method="post" action="/settings/sessions/revoke-others" class="stack">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <button type="submit">Sign out everywhere else</button>
+</form>
+{% endblock %}

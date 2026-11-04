@@ -47,12 +47,43 @@ impl Core {
         Ok(self
             .peek_email_token(secret, Purpose::VerifyEmail)
             .await?
-            .is_some())
+            .is_some()
+            || self
+                .peek_email_token(secret, Purpose::ChangeEmail)
+                .await?
+                .is_some())
     }
 
-    /// Uses a link from a verification email; returns the now verified user. `NotFound` for unknown, used, or
-    /// expired links, and for links sent to an address the account no longer uses.
+    /// Uses a link from a verification or confirm-new-email email; returns the now verified user.
+    /// `NotFound` for unknown, used, or expired links, and for links sent to an address the account
+    /// no longer uses.
     pub async fn verify_email(&self, secret: &str) -> CoreResult<User> {
+        if let Some(token) = self
+            .consume_email_token(secret, Purpose::ChangeEmail)
+            .await?
+        {
+            let user = self
+                .user_by_id(token.user_id)
+                .await?
+                .ok_or(CoreError::NotFound)?;
+            users::set_email(self.db(), user.id, Some(&token.email), true)
+                .await
+                .map_err(|e| {
+                    if e.is_unique_violation() {
+                        crate::account::email_taken()
+                    } else {
+                        e.into()
+                    }
+                })?;
+            self.audit(
+                Some(user.id),
+                "account.email_change",
+                &format!("user:{}", user.handle),
+                "",
+            )
+            .await?;
+            return self.user_by_id(user.id).await?.ok_or(CoreError::NotFound);
+        }
         let token = self
             .consume_email_token(secret, Purpose::VerifyEmail)
             .await?
