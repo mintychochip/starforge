@@ -125,7 +125,7 @@ async fn maintainers_edit_general_settings_and_admins_change_visibility() {
         .post(s.url("/alice/proj/settings"))
         .form(&[
             ("_csrf", mia_csrf.as_str()),
-            ("description", "A demo"),
+            ("description", "Changed"),
             ("default_branch", "nope"),
         ])
         .send()
@@ -133,6 +133,12 @@ async fn maintainers_edit_general_settings_and_admins_change_visibility() {
         .unwrap();
     assert_eq!(unknown.status(), 422);
     assert!(unknown.text().await.unwrap().contains("no branch named"));
+    assert!(
+        !get_text(&mia, &s.url("/alice/proj"))
+            .await
+            .contains("Changed"),
+        "a refused branch leaves the description unchanged"
+    );
     let forbidden = mia
         .post(s.url("/alice/proj/settings/visibility"))
         .form(&[("_csrf", mia_csrf.as_str()), ("visibility", "public")])

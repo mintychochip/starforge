@@ -76,16 +76,20 @@ pub async fn save_general(
 ) -> Result<Response, WebError> {
     verify_csrf(&session.csrf_token, &form.csrf)?;
     let user = &session.user;
-    let result = match state
-        .core
-        .set_repo_description(user, &owner, &repo, &form.description)
-        .await
-    {
-        Ok(updated) if form.default_branch.is_empty() => Ok(updated),
-        Ok(_) => {
+    let branch = if form.default_branch.is_empty() {
+        Ok(())
+    } else {
+        state
+            .core
+            .set_default_branch(user, &owner, &repo, &form.default_branch)
+            .await
+            .map(|_| ())
+    };
+    let result = match branch {
+        Ok(()) => {
             state
                 .core
-                .set_default_branch(user, &owner, &repo, &form.default_branch)
+                .set_repo_description(user, &owner, &repo, &form.description)
                 .await
         }
         Err(err) => Err(err),

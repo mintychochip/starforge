@@ -91,6 +91,12 @@ const MAX_DESCRIPTION_CHARS: usize = 350;
 /// How long a deleted repository can be restored; the daily job purges it afterwards.
 pub const RESTORE_SECS: i64 = 7 * 86_400;
 
+/// Whether a repository deleted at `deleted_at` can still be restored at `now`. The daily purge takes exactly the
+/// deletions for which this is false.
+fn restorable(deleted_at: i64, now: i64) -> bool {
+    deleted_at > now - RESTORE_SECS
+}
+
 /// A deleted repository that its owner can still restore.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeletedRepo {
@@ -625,11 +631,11 @@ impl Core {
 
     /// The user's own deleted repositories that can still be restored, the most recently deleted first.
     pub async fn deleted_repos(&self, user: &User) -> CoreResult<Vec<DeletedRepo>> {
-        let cutoff = now() - RESTORE_SECS;
+        let now = now();
         let mut deleted = Vec::new();
         for row in db_repos::list_deleted_by_owner(self.db(), user.id).await? {
             if let Some(deleted_at) = row.deleted_at
-                && deleted_at > cutoff
+                && restorable(deleted_at, now)
             {
                 deleted.push(DeletedRepo {
                     id: row.id,
@@ -651,7 +657,7 @@ impl Core {
                 .ok_or(CoreError::NotFound)?,
         )?;
         let allowed = actor.active && (actor.id == repo.owner_id || actor.is_admin);
-        let restorable = repo.deleted_at.is_some_and(|at| at > now() - RESTORE_SECS);
+        let restorable = repo.deleted_at.is_some_and(|at| restorable(at, now()));
         if !allowed || !restorable {
             return Err(CoreError::NotFound);
         }
@@ -680,6 +686,13 @@ impl Core {
     /// (collaborators and redirects cascade), then the directory is removed. Every step is safe to repeat
     /// after a crash.
     pub(crate) async fn purge_repo(&self, repo: &Repo, actor_id: Option<i64>) -> CoreResult<()> {
+        // The caller's snapshot may be stale: purge only a repository that is still deleted.
+        let still_deleted = db_repos::by_id(self.db(), repo.id)
+            .await?
+            .is_some_and(|row| row.deleted_at.is_some());
+        if !still_deleted {
+            return Ok(());
+        }
         let path = self.repo_path(repo.id);
         let tmp = &self.config().tmp_dir;
         let parked = tmp.join(format!("purge-{}.git", repo.id));
@@ -1419,6 +1432,23 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn a_purge_leaves_a_repository_restored_since_it_was_listed() {
+        let (core, _f) = test_core().await;
+        let alice = user(&core, "alice").await;
+        core.create_repo(&alice, new("proj", Visibility::Public))
+            .await
+            .unwrap();
+        let listed = core
+            .delete_repo(&alice, "alice", "proj", "alice/proj")
+            .await
+            .unwrap();
+        core.restore_repo(&alice, listed.id).await.unwrap();
+        core.purge_repo(&listed, None).await.unwrap();
+        assert!(core.repo_path(listed.id).exists());
+        assert!(core.repo_for(Some(&alice), "alice", "proj").await.is_ok());
     }
 
     #[tokio::test]
