@@ -59,6 +59,11 @@ enum AdminCommand {
         #[command(subcommand)]
         command: AdminTokenCommand,
     },
+    /// Email.
+    Mail {
+        #[command(subcommand)]
+        command: AdminMailCommand,
+    },
 }
 
 #[derive(Subcommand)]
@@ -93,6 +98,15 @@ enum AdminTokenCommand {
         scopes: String,
         #[arg(long, default_value_t = 30)]
         expires_days: u32,
+    },
+}
+
+#[derive(Subcommand)]
+enum AdminMailCommand {
+    /// Send a test message directly (not through the job queue) to check the [mail] settings.
+    Test {
+        #[arg(long)]
+        to: String,
     },
 }
 
@@ -169,6 +183,12 @@ async fn main() -> anyhow::Result<()> {
                         "{}",
                         admin::create_token(&config, &user, &name, &scopes, expires_days).await?
                     );
+                }
+                AdminCommand::Mail {
+                    command: AdminMailCommand::Test { to },
+                } => {
+                    admin::mail_test(&config, &to).await?;
+                    println!("sent a test email to {to}");
                 }
             }
         }

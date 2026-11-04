@@ -4,7 +4,9 @@
 use std::path::{Path, PathBuf};
 use std::process::Output;
 
-use starforged::config::{Config, DatabaseConfig, SecurityConfig, ServerConfig, StorageConfig};
+use starforged::config::{
+    Config, DatabaseConfig, MailConfig, SecurityConfig, ServerConfig, StorageConfig,
+};
 use starforged_core::Core;
 use starforged_core::accounts::{CreateUser, User};
 use starforged_core::permission::Visibility;
@@ -21,13 +23,13 @@ pub struct TestServer {
 }
 
 impl TestServer {
-    pub async fn start() -> TestServer {
+    pub async fn start_with(configure: impl FnOnce(&mut Config)) -> TestServer {
         let db = starforged_db::testing::TestDb::new().await;
         let data = tempfile::tempdir().unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let base = format!("http://{addr}");
-        let config = Config {
+        let mut config = Config {
             server: ServerConfig {
                 http_addr: addr.to_string(),
                 base_url: base.clone(),
@@ -42,7 +44,9 @@ impl TestServer {
             security: SecurityConfig {
                 secret_key: "0".repeat(64),
             },
+            mail: MailConfig::default(),
         };
+        configure(&mut config);
         let app =
             starforged::serve::build(&config, PathBuf::from(env!("CARGO_BIN_EXE_starforged")))
                 .await
@@ -58,6 +62,52 @@ impl TestServer {
             data,
             _db: db,
         }
+    }
+
+    pub async fn start() -> TestServer {
+        TestServer::start_with(|_| {}).await
+    }
+
+    /// Starts a server whose email goes to [`TestServer::mail_dir`] as `.eml` files.
+    pub async fn start_with_mail(configure: impl FnOnce(&mut Config)) -> TestServer {
+        TestServer::start_with(|config| {
+            config.mail.url = format!("file://{}", config.storage.data_dir.join("mail").display());
+            config.mail.from = "Starforge <forge@example.test>".into();
+            configure(config);
+        })
+        .await
+    }
+
+    pub fn mail_dir(&self) -> PathBuf {
+        self.data.path().join("mail")
+    }
+
+    /// Runs queued jobs (delivering email), then returns every message so far, oldest first.
+    pub async fn inbox(&self) -> Vec<String> {
+        self.core.run_due_jobs().await.unwrap();
+        starforged_core::mail::testing::read_mailbox(&self.mail_dir())
+    }
+
+    /// The newest message to `to`, after running queued jobs.
+    pub async fn last_email_to(&self, to: &str) -> String {
+        self.inbox()
+            .await
+            .into_iter()
+            .rev()
+            .find(|m| m.contains(&format!("To: {to}")))
+            .unwrap_or_else(|| panic!("no email to {to}"))
+    }
+
+    /// The link in `message` whose path starts with `path_prefix`; it must point at this server.
+    pub fn link_in(&self, message: &str, path_prefix: &str) -> String {
+        let link = starforged_core::mail::testing::find_link(message, path_prefix)
+            .unwrap_or_else(|| panic!("no {path_prefix} link in:\n{message}"));
+        assert!(
+            link.starts_with(&self.base),
+            "{link} does not point at {}",
+            self.base
+        );
+        link
     }
 
     pub fn url(&self, path: &str) -> String {

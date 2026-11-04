@@ -29,5 +29,6 @@ tracing-subscriber.workspace = true
 [dev-dependencies]
 reqwest.workspace = true
 serde_json.workspace = true
+starforged-core = { path = "../starforged-core", features = ["testing"] }
 starforged-db = { path = "../starforged-db", features = ["testing"] }
 tempfile.workspace = true

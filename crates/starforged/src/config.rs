@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
+use starforged_core::mail::Mailer;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
@@ -12,6 +13,8 @@ pub struct Config {
     pub database: DatabaseConfig,
     pub storage: StorageConfig,
     pub security: SecurityConfig,
+    #[serde(default)]
+    pub mail: MailConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,6 +58,16 @@ pub struct SecurityConfig {
     pub secret_key: String,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MailConfig {
+    /// Empty: no email. Otherwise `smtp://`, `smtps://`, or `file:///dir` (forge-basics design §3).
+    #[serde(default)]
+    pub url: String,
+    /// Sender mailbox, e.g. `Starforge <forge@example.com>`.
+    #[serde(default)]
+    pub from: String,
+}
+
 impl Config {
     /// Reads `path`, applies environment overrides, and validates.
     pub fn load(path: &Path) -> anyhow::Result<Config> {
@@ -83,6 +96,8 @@ impl Config {
                 "database__auto_migrate" => self.database.auto_migrate = parse_bool(&key, &value)?,
                 "storage__data_dir" => self.storage.data_dir = PathBuf::from(value),
                 "security__secret_key" => self.security.secret_key = value,
+                "mail__url" => self.mail.url = value,
+                "mail__from" => self.mail.from = value,
                 _ => bail!("unknown configuration override {key}"),
             }
         }
@@ -97,6 +112,7 @@ impl Config {
         if self.server.base_url.ends_with('/') {
             bail!("server.base_url must not end with '/'");
         }
+        self.mailer()?;
         Ok(())
     }
 
@@ -118,6 +134,11 @@ impl Config {
     /// Cookies carry `Secure` when the public URL is HTTPS.
     pub fn secure_cookies(&self) -> bool {
         self.server.base_url.starts_with("https://")
+    }
+
+    /// The `[mail]` section as a mailer; `None` when `mail.url` is empty.
+    pub fn mailer(&self) -> anyhow::Result<Option<Mailer>> {
+        Ok(Mailer::from_config(&self.mail.url, &self.mail.from)?)
     }
 }
 
@@ -146,6 +167,7 @@ mod tests {
             security: SecurityConfig {
                 secret_key: "ab".repeat(32),
             },
+            mail: MailConfig::default(),
         }
     }
 
@@ -208,5 +230,35 @@ mod tests {
         https.server.base_url = "https://forge.example.com".into();
         assert!(https.secure_cookies());
         assert!(!sample().secure_cookies());
+    }
+
+    #[test]
+    fn mail_settings_are_validated() {
+        let mut config = sample();
+        assert!(config.mailer().unwrap().is_none());
+        config
+            .apply_env([
+                (
+                    "STARFORGE__MAIL__URL".to_owned(),
+                    "smtp://mail.example.com?tls=none".to_owned(),
+                ),
+                (
+                    "STARFORGE__MAIL__FROM".to_owned(),
+                    "Starforge <forge@example.com>".to_owned(),
+                ),
+            ])
+            .unwrap();
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("loopback")
+        );
+        config.mail.url = "smtps://user:pw@mail.example.com".into();
+        assert!(config.validate().is_ok());
+        assert!(config.mailer().unwrap().is_some());
+        config.mail.from = "not a mailbox".into();
+        assert!(config.validate().is_err());
     }
 }

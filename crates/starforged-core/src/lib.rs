@@ -7,6 +7,7 @@ pub mod content;
 pub mod crypto;
 pub mod error;
 pub mod jobs;
+pub mod mail;
 pub mod permission;
 pub mod repos;
 pub mod sessions;
@@ -26,6 +27,10 @@ pub struct CoreConfig {
     pub repos_dir: PathBuf,
     /// Program that repository hooks execute (`starforged`); tests point it at the built binary.
     pub hook_exe: PathBuf,
+    /// Public URL without a trailing slash; links in emails start with it.
+    pub base_url: String,
+    /// `None`: this instance sends no email.
+    pub mailer: Option<mail::Mailer>,
 }
 
 /// The service layer. Cheap to clone; share one per process.
@@ -75,25 +80,52 @@ impl Core {
 
 #[cfg(test)]
 pub(crate) mod testing {
+    use std::path::Path;
+
     use super::*;
     use crate::accounts::{CreateUser, User};
+    use crate::mail::Mailer;
 
     pub(crate) struct Fixture {
         _db: starforged_db::testing::TestDb,
-        _dir: tempfile::TempDir,
+        dir: tempfile::TempDir,
+    }
+
+    impl Fixture {
+        /// Messages sent through [`with_file_mail`] so far, oldest first. Run queued jobs first.
+        pub(crate) fn mail(&self) -> Vec<String> {
+            crate::mail::testing::read_mailbox(&self.dir.path().join("mail"))
+        }
     }
 
     pub(crate) async fn test_core() -> (Core, Fixture) {
+        test_core_with(|_, _| {}).await
+    }
+
+    /// Like [`test_core`], after `configure` adjusts the configuration. The path is the fixture's
+    /// temporary directory.
+    pub(crate) async fn test_core_with(
+        configure: impl FnOnce(&mut CoreConfig, &Path),
+    ) -> (Core, Fixture) {
         let db = starforged_db::testing::TestDb::new().await;
         let dir = tempfile::tempdir().unwrap();
-        let config = CoreConfig {
+        let mut config = CoreConfig {
             repos_dir: dir.path().join("repos"),
             hook_exe: PathBuf::from("/bin/false"),
+            base_url: "http://forge.test".into(),
+            mailer: None,
         };
-        (
-            Core::new(db.db.clone(), config),
-            Fixture { _db: db, _dir: dir },
+        configure(&mut config, dir.path());
+        (Core::new(db.db.clone(), config), Fixture { _db: db, dir })
+    }
+
+    /// Sends email as `.eml` files into `<dir>/mail`; read them with [`Fixture::mail`].
+    pub(crate) fn with_file_mail(config: &mut CoreConfig, dir: &Path) {
+        config.mailer = Mailer::from_config(
+            &format!("file://{}", dir.join("mail").display()),
+            "Starforge <forge@example.test>",
         )
+        .unwrap();
     }
 
     pub(crate) async fn user(core: &Core, handle: &str) -> User {

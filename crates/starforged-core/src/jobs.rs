@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use starforged_db::jobs::{self, NewJob};
 use starforged_db::{now, web_sessions};
 
+use crate::mail::Email;
 use crate::{Core, CoreError, CoreResult};
 
 /// A job is tried this many times before it is marked `failed`.
@@ -38,6 +39,12 @@ pub enum Job {
     HourlyCleanup,
     /// Daily: deletes `done` jobs after 7 days and `failed` jobs after 30.
     DailyPrune,
+    /// One email. The worker blanks `body` once it is sent: links in it carry secrets.
+    SendEmail {
+        to: String,
+        subject: String,
+        body: String,
+    },
 }
 
 impl Job {
@@ -46,6 +53,7 @@ impl Job {
         match self {
             Job::HourlyCleanup => "hourly_cleanup",
             Job::DailyPrune => "daily_prune",
+            Job::SendEmail { .. } => "send_email",
         }
     }
 
@@ -55,6 +63,7 @@ impl Job {
         match self {
             Job::HourlyCleanup => Some(HOUR),
             Job::DailyPrune => Some(DAY),
+            Job::SendEmail { .. } => None,
         }
     }
 }
@@ -101,7 +110,7 @@ impl Core {
         };
         let job = serde_json::from_str::<Job>(&row.payload);
         let outcome = match &job {
-            Ok(job) => self.execute(job).await,
+            Ok(job) => self.execute(row.id, job).await,
             Err(err) => Err(CoreError::Internal(format!(
                 "unreadable job payload: {err}"
             ))),
@@ -133,7 +142,7 @@ impl Core {
         Ok(true)
     }
 
-    async fn execute(&self, job: &Job) -> CoreResult<()> {
+    async fn execute(&self, id: i64, job: &Job) -> CoreResult<()> {
         match job {
             Job::HourlyCleanup => self.hourly_cleanup().await,
             Job::DailyPrune => {
@@ -141,11 +150,50 @@ impl Core {
                 jobs::prune(self.db(), ts - 7 * DAY, ts - 30 * DAY).await?;
                 Ok(())
             }
+            Job::SendEmail { to, subject, body } => {
+                let mailer = self
+                    .config()
+                    .mailer
+                    .as_ref()
+                    .ok_or_else(|| CoreError::Internal("mail is not configured".into()))?;
+                mailer
+                    .send(&Email {
+                        to: to.clone(),
+                        subject: subject.clone(),
+                        body: body.clone(),
+                    })
+                    .await?;
+                self.blank_email(id, to, subject).await
+            }
         }
     }
 
     async fn hourly_cleanup(&self) -> CoreResult<()> {
-        web_sessions::delete_expired(self.db(), now()).await?;
+        let ts = now();
+        web_sessions::delete_expired(self.db(), ts).await?;
+        // Every link in a message is dead 7 days after it was sent (invites live longest), so a failed
+        // message's body is kept no longer than that.
+        for row in jobs::failed_of_kind_before(self.db(), "send_email", ts - 7 * DAY).await? {
+            if let Ok(Job::SendEmail { to, subject, body }) =
+                serde_json::from_str::<Job>(&row.payload)
+                && !body.is_empty()
+            {
+                self.blank_email(row.id, &to, &subject).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Replaces a message's body with nothing, keeping the recipient and subject for the admin Jobs page.
+    async fn blank_email(&self, id: i64, to: &str, subject: &str) -> CoreResult<()> {
+        let blank = Job::SendEmail {
+            to: to.to_owned(),
+            subject: subject.to_owned(),
+            body: String::new(),
+        };
+        let payload =
+            serde_json::to_string(&blank).map_err(|e| CoreError::Internal(e.to_string()))?;
+        jobs::set_payload(self.db(), id, &payload).await?;
         Ok(())
     }
 
@@ -291,5 +339,44 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(30)).await;
         }
         panic!("the workers did not run the two recurring jobs");
+    }
+
+    #[tokio::test]
+    async fn hourly_cleanup_blanks_week_old_failed_mail() {
+        let (core, _f) = test_core().await;
+        let message = Job::SendEmail {
+            to: "a@example.com".into(),
+            subject: "Hello".into(),
+            body: "a secret link".into(),
+        };
+        core.enqueue(&message).await.unwrap();
+        core.enqueue(&message).await.unwrap();
+        let ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM jobs ORDER BY id")
+            .fetch_all(core.db().pool())
+            .await
+            .unwrap();
+        for (id, failed_at) in [(ids[0], now() - 8 * DAY), (ids[1], now() - DAY)] {
+            sqlx::query("UPDATE jobs SET state = 'failed', updated_at = $1 WHERE id = $2")
+                .bind(failed_at)
+                .bind(id)
+                .execute(core.db().pool())
+                .await
+                .unwrap();
+        }
+        core.enqueue(&Job::HourlyCleanup).await.unwrap();
+        core.run_due_jobs().await.unwrap();
+        let mut bodies = Vec::new();
+        for id in ids {
+            let payload: String = sqlx::query_scalar("SELECT payload FROM jobs WHERE id = $1")
+                .bind(id)
+                .fetch_one(core.db().pool())
+                .await
+                .unwrap();
+            match serde_json::from_str::<Job>(&payload).unwrap() {
+                Job::SendEmail { body, .. } => bodies.push(body),
+                other => panic!("unexpected job {other:?}"),
+            }
+        }
+        assert_eq!(bodies, vec![String::new(), "a secret link".to_owned()]);
     }
 }

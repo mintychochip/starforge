@@ -23,6 +23,8 @@ pub async fn open_core(config: &Config, hook_exe: PathBuf) -> anyhow::Result<Cor
         CoreConfig {
             repos_dir: config.repos_dir(),
             hook_exe,
+            base_url: config.server.base_url.clone(),
+            mailer: config.mailer()?,
         },
     ))
 }
@@ -83,4 +85,14 @@ pub async fn create_token(
         .create_token(&user, name, &scopes, expires_days)
         .await?
         .secret)
+}
+
+/// `starforged admin mail test`: sends one message directly, bypassing the job queue.
+pub async fn mail_test(config: &Config, to: &str) -> anyhow::Result<()> {
+    let mailer = config
+        .mailer()?
+        .context("mail.url is empty; configure [mail] in starforged.toml first")?;
+    let email = starforged_core::mail::test_email(to, &config.server.base_url)?;
+    mailer.send(&email).await?;
+    Ok(())
 }

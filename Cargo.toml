@@ -26,6 +26,7 @@ futures-util = "0.3.34"
 getrandom = "0.4.3"
 gix = "0.90.0"
 hex = "0.4.3"
+lettre = { version = "0.11.23", default-features = false, features = ["builder", "file-transport", "hostname", "ring", "rustls-platform-verifier", "smtp-transport", "tokio1", "tokio1-rustls"] }
 percent-encoding = "2.3.2"
 reqwest = { version = "0.13.5", default-features = false, features = ["cookies", "json", "form"] }
 serde = { version = "1.0.229", features = ["derive"] }
