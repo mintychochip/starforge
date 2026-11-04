@@ -259,3 +259,122 @@ async fn dumb_http_is_refused_and_challenges_use_basic_auth() {
         "ok"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn limited_scope_tokens_cannot_push_refs_for() {
+    use std::time::{Duration, Instant};
+
+    let s = TestServer::start().await;
+    let alice = s.user("alice").await;
+    let bob = s.user("bob").await;
+    s.repo(&alice, "proj", Visibility::Private).await;
+    s.core
+        .set_collaborator(&alice, "alice", "proj", "bob", Permission::Read)
+        .await
+        .unwrap();
+    let repo_id = s
+        .core
+        .repo_for(Some(&alice), "alice", "proj")
+        .await
+        .unwrap()
+        .repo
+        .id;
+    let tmp = tempfile::tempdir().unwrap();
+    let work = work_repo(tmp.path(), "work", &[("a.txt", "a\n")]).await;
+    let owner_url = s.git_url(
+        "alice",
+        "proj",
+        Some(&s.token(&alice, &[Scope::RepoWrite]).await),
+    );
+    git_ok(&work, &["push", "-q", &owner_url, "main"]).await;
+    commit_files(&work, &[("b.txt", b"b\n")], "proposal").await;
+
+    // A read-permission user with a `trail:write`-only token is rejected at
+    // the RPC read tier (403) and creates nothing.
+    let trail_write = s.token(&bob, &[Scope::TrailWrite]).await;
+    let denied = git(
+        &work,
+        &[
+            "push",
+            &s.git_url("alice", "proj", Some(&trail_write)),
+            "HEAD:refs/for/main/x",
+        ],
+    )
+    .await;
+    assert!(!denied.status.success());
+    assert!(
+        String::from_utf8_lossy(&denied.stderr).contains("403"),
+        "{}",
+        String::from_utf8_lossy(&denied.stderr)
+    );
+    // A `session:upload`-only token is rejected the same way.
+    let upload = s.token(&bob, &[Scope::SessionUpload]).await;
+    let denied = git(
+        &work,
+        &[
+            "push",
+            &s.git_url("alice", "proj", Some(&upload)),
+            "HEAD:refs/for/main/y",
+        ],
+    )
+    .await;
+    assert!(!denied.status.success());
+    assert!(
+        String::from_utf8_lossy(&denied.stderr).contains("403"),
+        "{}",
+        String::from_utf8_lossy(&denied.stderr)
+    );
+    // Rejections happen synchronously at the RPC: no scan ever runs, so no
+    // change rows may exist for bob's topics.
+    for topic in ["x", "y"] {
+        assert!(
+            starforged_db::changes::open_agit_change(
+                s.core.db(),
+                repo_id,
+                bob.id,
+                "main",
+                topic,
+                None
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "limited-scope push created a change for topic {topic}"
+        );
+    }
+
+    // The same user with `repo:read` is accepted and lands a change.
+    let read = s.token(&bob, &[Scope::RepoRead]).await;
+    git_ok(
+        &work,
+        &[
+            "push",
+            "-q",
+            &s.git_url("alice", "proj", Some(&read)),
+            "HEAD:refs/for/main/z",
+        ],
+    )
+    .await;
+    let start = Instant::now();
+    loop {
+        if let Some(change) = starforged_db::changes::open_agit_change(
+            s.core.db(),
+            repo_id,
+            bob.id,
+            "main",
+            "z",
+            None,
+        )
+        .await
+        .unwrap()
+        {
+            assert_eq!(change.creator_id, Some(bob.id));
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "repo:read refs/for push never ingested"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}

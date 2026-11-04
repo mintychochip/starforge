@@ -15,6 +15,13 @@
   {% endif %}
   <button type="submit">Save</button>
 </form>
+<h2>Refs/for access</h2>
+<form method="post" action="/{{ head.owner }}/{{ head.name }}/settings/refs-for-access" class="stack">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <label>Who may push <code>refs/for/*</code> <select name="refs_for_access">{% for c in refs_for_access_choices %}<option value="{{ c.value }}"{% if c.selected %} selected{% endif %}>{{ c.label }}</option>{% endfor %}</select></label>
+  <p class="muted">Members are collaborators with an explicit grant; anyone with read access includes public and internal readers.</p>
+  <button type="submit">Change refs/for access</button>
+</form>
 {% if head.can_admin %}
 <h2>Visibility</h2>
 <form method="post" action="/{{ head.owner }}/{{ head.name }}/settings/visibility" class="stack">

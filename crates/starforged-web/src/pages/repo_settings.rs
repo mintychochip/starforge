@@ -28,6 +28,11 @@ pub struct VisibilityChoice {
     label: &'static str,
     checked: bool,
 }
+pub struct RefsForAccessChoice {
+    value: &'static str,
+    label: &'static str,
+    selected: bool,
+}
 
 #[derive(Template, WebTemplate)]
 #[template(path = "repo_settings.html")]
@@ -39,6 +44,7 @@ pub struct RepoSettingsPage {
     description: String,
     branches: Vec<BranchOption>,
     visibility_choices: Vec<VisibilityChoice>,
+    refs_for_access_choices: Vec<RefsForAccessChoice>,
     error: Option<String>,
 }
 
@@ -110,6 +116,36 @@ pub async fn change_visibility(
         .core
         .set_visibility(&session.user, &owner, &repo, visibility)
         .await;
+    finish(&state, &session, &owner, &repo, result).await
+}
+#[derive(Deserialize)]
+pub struct RefsForAccessForm {
+    #[serde(rename = "_csrf")]
+    csrf: String,
+    refs_for_access: String,
+}
+
+/// Who may push `refs/for/*`: anyone with read access, or members only.
+/// Maintain+ (the page gate); unknown values answer 422 through `finish`.
+pub async fn change_refs_for_access(
+    State(state): State<AppState>,
+    RequireUser(session): RequireUser,
+    Path((owner, repo)): Path<(String, String)>,
+    Form(form): Form<RefsForAccessForm>,
+) -> Result<Response, WebError> {
+    verify_csrf(&session.csrf_token, &form.csrf)?;
+    let result = match state
+        .core
+        .set_refs_for_access(&session.user, &owner, &repo, &form.refs_for_access)
+        .await
+    {
+        Ok(_) => state
+            .core
+            .repo_for(Some(&session.user), &owner, &repo)
+            .await
+            .map(|access| access.repo),
+        Err(err) => Err(err),
+    };
     finish(&state, &session, &owner, &repo, result).await
 }
 
@@ -251,6 +287,18 @@ async fn page(
         checked: visibility == current,
     })
     .collect();
+    let current_access = state.core.refs_for_access(access.repo.id).await?;
+    let refs_for_access_choices = [
+        ("anyone_with_read", "Anyone with read access"),
+        ("members", "Repository members only"),
+    ]
+    .into_iter()
+    .map(|(value, label)| RefsForAccessChoice {
+        value,
+        label,
+        selected: value == current_access,
+    })
+    .collect();
     Ok(RepoSettingsPage {
         nav_user: Some(NavUser::from_session(session)),
         csrf: session.csrf_token.clone(),
@@ -259,6 +307,7 @@ async fn page(
         description: access.repo.description.clone(),
         branches,
         visibility_choices,
+        refs_for_access_choices,
         error,
     })
 }

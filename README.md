@@ -97,7 +97,9 @@ admin cannot be suspended, demoted, or deleted. Each admin action is recorded in
 ## API
 
 `/api/v1` accepts `Authorization: Bearer <token>`: `GET /user`, `POST /user/repos` (with `"readme": true` for a
-first commit), `GET /repos/{owner}/{repo}` (including `archived`), and
+first commit), `GET /repos/{owner}/{repo}` (including `archived`),
+`PATCH /repos/{owner}/{repo}` (`{"refs_for_access": "anyone_with_read" | "members"}` — who may
+push `refs/for/*`, maintain+), and
 `GET`/`PUT`/`DELETE /repos/{owner}/{repo}/collaborators[/{handle}]`. Reads of a renamed repository answer `301`
 with the new location.
 Errors use `{"error": {"code", "message"}}`.

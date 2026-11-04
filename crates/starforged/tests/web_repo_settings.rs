@@ -195,3 +195,87 @@ async fn the_commits_tab_works_before_the_first_push() {
     let commits = get_text(&client, &s.url("/alice/empty/commits")).await;
     assert!(commits.contains("No commits yet."), "{commits}");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn maintainers_control_refs_for_access_from_settings() {
+    let s = TestServer::start().await;
+    let alice = s.user("alice").await;
+    s.user("mia").await;
+    s.user("ted").await;
+    let repo = s.repo(&alice, "proj", Visibility::Private).await;
+    s.core
+        .set_collaborator(&alice, "alice", "proj", "mia", Permission::Maintain)
+        .await
+        .unwrap();
+    s.core
+        .set_collaborator(&alice, "alice", "proj", "ted", Permission::Triage)
+        .await
+        .unwrap();
+
+    // Triage is below the maintain gate: the page stays hidden and the POST
+    // is refused.
+    let (ted, ted_csrf) = s.login("ted").await;
+    assert_eq!(
+        ted.get(s.url("/alice/proj/settings"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+    let refused = ted
+        .post(s.url("/alice/proj/settings/refs-for-access"))
+        .form(&[("_csrf", ted_csrf.as_str()), ("refs_for_access", "members")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 403);
+    assert_eq!(
+        s.core.refs_for_access(repo.id).await.unwrap(),
+        "anyone_with_read",
+        "a refused change writes nothing"
+    );
+
+    // A maintainer sees the control defaulting to anyone-with-read.
+    let (mia, mia_csrf) = s.login("mia").await;
+    let settings = get_text(&mia, &s.url("/alice/proj/settings")).await;
+    assert!(settings.contains(r#"name="refs_for_access""#), "{settings}");
+    assert!(
+        settings.contains(r#"<option value="anyone_with_read" selected>"#),
+        "{settings}"
+    );
+
+    // The value round-trips through the page.
+    let saved = mia
+        .post(s.url("/alice/proj/settings/refs-for-access"))
+        .form(&[("_csrf", mia_csrf.as_str()), ("refs_for_access", "members")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(saved.status(), 303);
+    assert_eq!(saved.headers()["location"], "/alice/proj/settings");
+    assert_eq!(s.core.refs_for_access(repo.id).await.unwrap(), "members");
+    let settings = get_text(&mia, &s.url("/alice/proj/settings")).await;
+    assert!(
+        settings.contains(r#"<option value="members" selected>"#),
+        "{settings}"
+    );
+
+    // Unknown values are refused with the page again, not a silent no-op.
+    let bad = mia
+        .post(s.url("/alice/proj/settings/refs-for-access"))
+        .form(&[
+            ("_csrf", mia_csrf.as_str()),
+            ("refs_for_access", "everyone"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 422);
+    assert!(bad.text().await.unwrap().contains("refs_for_access"));
+    assert_eq!(
+        s.core.refs_for_access(repo.id).await.unwrap(),
+        "members",
+        "a refused value keeps the old mode"
+    );
+}

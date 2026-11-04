@@ -167,6 +167,10 @@ fn page_routes() -> Router<AppState> {
             post(pages::repo_settings::change_visibility),
         )
         .route(
+            "/{owner}/{repo}/settings/refs-for-access",
+            post(pages::repo_settings::change_refs_for_access),
+        )
+        .route(
             "/{owner}/{repo}/settings/rename",
             post(pages::repo_settings::rename),
         )

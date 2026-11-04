@@ -350,9 +350,7 @@ pub async fn get_revision(
     State(state): State<ApiState>,
     auth: ApiAuth,
     Path((owner, repo, n, k, r)): Path<(String, String, i64, i64, i64)>,
-    Query(query): Query<LimitQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    let _ = query;
     let viewer = auth.reader()?;
     let views = state
         .core

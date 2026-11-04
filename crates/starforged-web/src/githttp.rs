@@ -189,6 +189,14 @@ async fn authorize(
             Err(e) => return Err(map_repo_error(e)),
         }
     } else {
+        // Read tier needs an explicit `repo:read` grant on the token: without
+        // it, any limited-scope token (`trail:write`, `session:upload`, …)
+        // belonging to a repo reader could push `refs/for` and create
+        // changes, violating least privilege (upload-pack and the API read
+        // paths all enforce the scope; receive-pack must too).
+        if !read_path {
+            return Err(GitHttpError::Forbidden);
+        }
         let access = map_repo_access(
             state
                 .core
