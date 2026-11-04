@@ -163,6 +163,7 @@ fn claude_incremental_read_resumes() {
     let mid = Cursor {
         offset: off,
         lines: 3,
+        events: 3,
     };
     let tail = a.read(&found[0], &mid, FALLBACK_TS).unwrap();
     assert_eq!(tail.events.len(), 5);
@@ -179,6 +180,7 @@ fn claude_incremental_read_resumes() {
     let bad = Cursor {
         offset: file_len + 1,
         lines: 99,
+        events: 99,
     };
     let err = a.read(&found[0], &bad, FALLBACK_TS).unwrap_err();
     assert!(
@@ -194,4 +196,51 @@ fn claude_incremental_read_resumes() {
         matches!(err, starforge_capture::CaptureError::BadTimestamp(_)),
         "unexpected error: {err:?}"
     );
+}
+
+/// A native record carrying several content blocks emits several events, so
+/// the resume counter must count events, not records: `seq` stays unique and
+/// contiguous across the boundary.
+#[test]
+fn claude_multiblock_record_resume_keeps_seq_unique() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = tmp.path().join("data/projects/repo");
+    std::fs::create_dir_all(&store).unwrap();
+    let native = store.join(format!("{SESSION_ID}.jsonl"));
+    let user = r#"{"cwd":"/repo","sessionId":"01ARZ3NDEKTSV4RRFFQ69G5FAV","version":"1.2.3","type":"user","message":{"role":"user","content":[{"type":"text","text":"go"}]},"timestamp":"2026-11-04T12:00:00Z"}"#;
+    let multi = r#"{"cwd":"/repo","sessionId":"01ARZ3NDEKTSV4RRFFQ69G5FAV","version":"1.2.3","type":"assistant","message":{"role":"assistant","model":"claude-sonnet-4-5","content":[{"type":"thinking","thinking":"hmm"},{"type":"text","text":"done"},{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"/repo/a.rs"}}],"usage":{"input_tokens":10,"output_tokens":5}},"timestamp":"2026-11-04T12:00:01Z"}"#;
+    let extra = r#"{"cwd":"/repo","sessionId":"01ARZ3NDEKTSV4RRFFQ69G5FAV","version":"1.2.3","type":"user","message":{"role":"user","content":[{"type":"text","text":"next"}]},"timestamp":"2026-11-04T12:00:02Z"}"#;
+    std::fs::write(&native, format!("{user}\n{multi}\n")).unwrap();
+    let roots = Roots {
+        config_dir: tmp.path().join("cfg"),
+        data_dir: tmp.path().join("data"),
+        worktree: PathBuf::from("/repo"),
+    };
+    let a = ClaudeAdapter;
+    let found = a.discover(&roots, &HashMap::new());
+    assert_eq!(found.len(), 1);
+    let first = a.read(&found[0], &Cursor::start(), FALLBACK_TS).unwrap();
+    assert_eq!(first.events.len(), 4, "one user event + three blocks");
+    assert_eq!(first.next.lines, 2);
+    assert_eq!(first.next.events, 4);
+    assert_eq!(first.next.next_seq(), 4);
+
+    let mut more = std::fs::read_to_string(&native).unwrap();
+    more.push_str(extra);
+    more.push('\n');
+    std::fs::write(&native, more).unwrap();
+    let tail = a.read(&found[0], &first.next, FALLBACK_TS).unwrap();
+    assert_eq!(tail.events.len(), 1);
+    assert_eq!(tail.events[0].seq, 4, "resume must continue at 4, not 2");
+    let seqs: Vec<u64> = first
+        .events
+        .iter()
+        .chain(tail.events.iter())
+        .map(|e| e.seq)
+        .collect();
+    assert_eq!(seqs, vec![0, 1, 2, 3, 4], "seq stays unique and contiguous");
+
+    let full = a.read(&found[0], &Cursor::start(), FALLBACK_TS).unwrap();
+    let joined = [first.events.clone(), tail.events.clone()].concat();
+    assert_eq!(full.events, joined, "resumed concat equals a fresh read");
 }

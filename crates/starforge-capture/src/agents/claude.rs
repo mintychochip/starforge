@@ -24,7 +24,7 @@ use ulid::Ulid;
 
 use crate::{Adapter, Candidate, CaptureError, Cursor, ReadOutput, Roots, workdir_inside};
 
-/// Claude Code adapter (unit struct; the [`Adapter`] trait is not object-safe).
+/// Claude Code adapter (unit struct implementing [`Adapter`]).
 pub struct ClaudeAdapter;
 
 /// Hook snippet path relative to `Roots.config_dir`.
@@ -549,6 +549,7 @@ impl Adapter for ClaudeAdapter {
             Cursor {
                 offset: advanced,
                 lines: cursor.lines + fresh,
+                events: cursor.events + events.len() as u64,
             }
         };
         let version = fold.version.clone().unwrap_or_default();
