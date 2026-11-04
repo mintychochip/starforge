@@ -1,5 +1,6 @@
 //! One module per page or page group.
 
+pub mod admin;
 pub mod code;
 pub mod collaborators;
 pub mod compare;

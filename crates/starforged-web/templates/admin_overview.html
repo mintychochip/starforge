@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}Site administration{% endblock %}
+{% block content %}
+<h1>Site administration</h1>
+{% include "admin_nav.html" %}
+<section>
+  <h2>Overview</h2>
+  <dl>
+    <dt>Users</dt><dd>{{ overview.user_count }}</dd>
+    <dt>Repositories</dt><dd>{{ overview.repo_count }}</dd>
+    <dt>Queued jobs</dt><dd>{{ overview.queued_jobs }}</dd>
+    <dt>Running jobs</dt><dd>{{ overview.running_jobs }}</dd>
+    <dt>Failed jobs</dt><dd>{{ overview.failed_jobs }}</dd>
+    <dt>Registration mode</dt><dd>{{ overview.registration_mode }}</dd>
+    {% if overview.allowed_domains.len() > 0 %}
+    <dt>Allowed domains</dt><dd>{% for d in overview.allowed_domains %}{{ d }}{% if !loop.last %}, {% endif %}{% endfor %}</dd>
+    {% endif %}
+    <dt>Email</dt><dd>{% if overview.mail_enabled %}configured{% else %}not configured{% endif %}</dd>
+    <dt>Git version</dt><dd>{{ git_version }}</dd>
+    <dt>Starforge version</dt><dd>{{ app_version }}</dd>
+  </dl>
+</section>
+{% endblock %}

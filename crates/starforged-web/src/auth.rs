@@ -54,6 +54,22 @@ impl FromRequestParts<AppState> for RequireUser {
     }
 }
 
+/// A site administrator. Anyone else — anonymous or signed-in — gets `NotFound`,
+/// so the admin area is indistinguishable from a missing page (spec §12).
+pub struct RequireAdmin(pub WebSession);
+
+impl FromRequestParts<AppState> for RequireAdmin {
+    type Rejection = WebError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, WebError> {
+        let session = MaybeUser::from_request_parts(parts, state).await?.0;
+        match session {
+            Some(session) if session.user.is_admin => Ok(RequireAdmin(session)),
+            _ => Err(WebError::NotFound),
+        }
+    }
+}
+
 /// A form body carrying only the CSRF token.
 #[derive(Deserialize)]
 pub struct CsrfForm {
