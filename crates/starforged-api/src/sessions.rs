@@ -54,21 +54,21 @@ pub async fn put_meta(
 }
 
 /// `PUT /repos/{owner}/{repo}/sessions/{ulid}/segments/{n}`: stores one
-/// compressed segment body. Identical re-uploads succeed idempotently (200);
-/// different bytes at the same number answer `409 {"hash": "<stored hex>"}` —
-/// exactly that shape, not the error envelope, so the CLI can tell the cases
-/// apart. Bodies over the configured cap answer `413`.
+/// compressed segment body. `X-Starforge-Blake3` must carry the lowercase
+/// BLAKE3 hex of the body (missing → 400, mismatch → 422). Identical
+/// re-uploads succeed idempotently (200); different bytes at the same number
+/// answer `409 {"hash": "<stored hex>"}` — exactly that shape, not the error
+/// envelope, so the CLI can tell the cases apart. Bodies over the configured
+/// cap answer `413`.
 pub async fn put_segment(
     State(state): State<ApiState>,
     auth: ApiAuth,
     Path((owner, repo, ulid, n)): Path<(String, String, String, i64)>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let token = auth.require(Scope::SessionUpload)?;
     let ingest = state.core.authorize_upload(token, &owner, &repo).await?;
-    // D4 validates the `X-Starforge-Blake3` header against the stored bytes;
-    // D3 deliberately ignores it and addresses content by what was stored.
     let cap = state.core.config().max_segment_bytes;
     if body.len() as u64 > cap {
         return Err(ApiError::PayloadTooLarge(format!(
@@ -77,7 +77,22 @@ pub async fn put_segment(
             cap
         )));
     }
-    match state.core.put_segment(&ingest, &ulid, n, &body).await? {
+    let claimed = match headers.get("x-starforge-blake3") {
+        None => {
+            return Err(ApiError::BadRequest(
+                "missing X-Starforge-Blake3 header".into(),
+            ));
+        }
+        Some(value) => value
+            .to_str()
+            .map_err(|_| ApiError::BadRequest("invalid X-Starforge-Blake3 header".into()))?
+            .to_owned(),
+    };
+    match state
+        .core
+        .put_segment(&ingest, &ulid, n, &body, Some(claimed))
+        .await?
+    {
         SegmentPut::Stored(session) | SegmentPut::Unchanged(session) => Ok((
             StatusCode::OK,
             Json(session_json(session.id, &session.ulid, &session.lifecycle)),

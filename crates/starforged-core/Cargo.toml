@@ -19,6 +19,7 @@ percent-encoding.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+starforge-format = { path = "../starforge-format" }
 starforged-blob = { path = "../starforged-blob" }
 starforged-db = { path = "../starforged-db" }
 starforged-git = { path = "../starforged-git" }
@@ -26,6 +27,7 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 url.workspace = true
+ulid.workspace = true
 
 [features]
 # Exposes `mail::testing` (reading `.eml` files) to other crates' tests.

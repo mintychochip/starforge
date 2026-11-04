@@ -5,7 +5,11 @@
 //! D3 lands the auth seam, the storage plumbing, and shape validation. D4 adds
 //! hash/size/sequence validation, D5 the quarantine re-scan.
 
+use std::collections::HashSet;
+
+use starforge_format::{SessionMeta, blake3_hex, decompress, parse_event};
 use starforged_db::sessions::{self as db_sessions, NewSession, SessionRow};
+use ulid::Ulid;
 
 use crate::accounts::User;
 use crate::permission::Permission;
@@ -66,15 +70,30 @@ impl Core {
     }
 
     /// Creates the session row for `ulid`, or refreshes its metadata when the
-    /// CLI re-PUTs it. Returns the row and whether it was created. The
-    /// lifecycle is preserved on re-PUT (a `complete` session stays complete).
-    /// Hash/size/sequence validation lands in D4; D3 stores the provided meta.
+    /// CLI re-PUTs it. Returns the row and whether it was created. The body
+    /// must parse as Trace Format v1 metadata: the path ULID must equal
+    /// `meta.id`, and the format tag, agent, ULIDs, and timestamps must be
+    /// known shapes. A re-PUT by a different user requires repo-admin
+    /// permission; uploader ownership stays pinned to the creator. The
+    /// lifecycle and quarantine are preserved on re-PUT (a `complete` session
+    /// stays complete).
     pub async fn upsert_session_meta(
         &self,
         auth: &IngestAuth,
         ulid: &str,
         meta: &serde_json::Value,
     ) -> CoreResult<(SessionRow, bool)> {
+        let raw = serde_json::to_string(meta)
+            .map_err(|_| CoreError::Invalid("session metadata must be a JSON object".into()))?;
+        let parsed = SessionMeta::parse(&raw)
+            .map_err(|e| CoreError::Invalid(format!("invalid session metadata: {e}")))?;
+        let path_ulid = Ulid::from_string(ulid)
+            .map_err(|_| CoreError::Invalid("invalid session ULID".into()))?;
+        if path_ulid != parsed.id {
+            return Err(CoreError::Invalid(
+                "session id in body must match the URL".into(),
+            ));
+        }
         let repo_id = auth.access.repo.id;
         let models = stringify(meta.get("models"));
         let files_touched = stringify(meta.get("files_touched"));
@@ -99,6 +118,11 @@ impl Core {
                 Ok((row, true))
             }
             Some(existing) => {
+                if existing.uploader_id != auth.user.id
+                    && auth.access.permission < Permission::Admin
+                {
+                    return Err(CoreError::Forbidden);
+                }
                 let mut updated = session_from_meta(
                     repo_id,
                     existing.uploader_id,
@@ -109,7 +133,7 @@ impl Core {
                     &files_touched,
                     &redaction_counts,
                 );
-                // D3 never moves quarantine or uploader ownership on re-PUT.
+                // Re-PUT never moves quarantine or uploader ownership.
                 updated.quarantine = existing.quarantine.as_str();
                 db_sessions::update_session_meta(self.db(), existing.id, &updated).await?;
                 let row = db_sessions::session_by_ulid(self.db(), repo_id, ulid)
@@ -139,15 +163,19 @@ impl Core {
         })
     }
 
-    /// Records segment `n` of `ulid`: stores the bytes, enforces quotas, and
-    /// inserts the segment row. An identical re-upload is a no-op success;
-    /// different bytes at the same number report the stored hash.
+    /// Records segment `n` of `ulid`: checks append-only numbering, quotas, the
+    /// claimed BLAKE3, and the event content, then stores the compressed bytes
+    /// in the blob store (refcounted) and inserts the segment row with the
+    /// event sequence range. An identical re-upload of a stored number is a
+    /// no-op success (no quota, blob, or row changes); different bytes at the
+    /// same number report the stored hash.
     pub async fn put_segment(
         &self,
         auth: &IngestAuth,
         ulid: &str,
         n: i64,
         bytes: &[u8],
+        claimed_hex: Option<String>,
     ) -> CoreResult<SegmentPut> {
         if n < 0 {
             return Err(CoreError::Invalid("segment numbers start at 0".into()));
@@ -156,44 +184,66 @@ impl Core {
         let session = db_sessions::session_by_ulid(self.db(), repo_id, ulid)
             .await?
             .ok_or(CoreError::NotFound)?;
-        quota::check_rate_limit()?;
-        quota::check_storage_quotas(self, auth.user.id, repo_id, bytes.len() as u64).await?;
-        quota::check_hourly_volume(self, auth.user.id, bytes.len() as u64).await?;
-        // A finished session only accepts re-syncs of identical bytes (spec §6.3).
-        if session.lifecycle == "complete" {
-            if let Some(existing) = db_sessions::segment_by_n(self.db(), session.id, n).await? {
-                if existing.byte_size == bytes.len() as i64 {
-                    let stored = self.store_segment_no_ref(bytes).await?;
-                    if stored == existing.blob_hash {
-                        return Ok(SegmentPut::Unchanged(session));
-                    }
-                }
-                return Ok(SegmentPut::Conflict {
-                    session,
-                    stored_hash: existing.blob_hash,
-                });
-            }
-            return Err(CoreError::Invalid("session is complete".into()));
-        }
-        if let Some(existing) = db_sessions::segment_by_n(self.db(), session.id, n).await? {
-            if existing.byte_size == bytes.len() as i64 {
-                let hash = self.store_segment_no_ref(bytes).await?;
-                if hash == existing.blob_hash {
-                    return Ok(SegmentPut::Unchanged(session));
-                }
+        let stored_segments = db_sessions::segments_of(self.db(), session.id).await?;
+        let expected = stored_segments.len() as i64;
+        let actual_hex = blake3_hex(bytes);
+        if n < expected {
+            // Idempotency territory: identical bytes are a no-op (reads only,
+            // so quota pressure never breaks a re-sync); different bytes
+            // report the stored hash. This also covers `complete` sessions.
+            let existing = db_sessions::segment_by_n(self.db(), session.id, n)
+                .await?
+                .ok_or_else(|| CoreError::Internal("segment row vanished".into()))?;
+            if actual_hex == existing.blob_hash {
+                return Ok(SegmentPut::Unchanged(session));
             }
             return Ok(SegmentPut::Conflict {
                 session,
                 stored_hash: existing.blob_hash,
             });
         }
+        if n > expected {
+            return Err(CoreError::Invalid(format!(
+                "segment {n} is out of order: next expected segment is {expected}"
+            )));
+        }
+        // A finished session only accepts re-syncs of identical bytes (handled
+        // above); new content is rejected.
+        if session.lifecycle == "complete" {
+            return Err(CoreError::Invalid("session is complete".into()));
+        }
+        quota::check_rate_limit()?;
+        quota::check_storage_quotas(self, auth.user.id, repo_id, bytes.len() as u64).await?;
+        quota::check_hourly_volume(self, auth.user.id, bytes.len() as u64).await?;
+        match claimed_hex {
+            Some(claimed) if claimed == actual_hex => {}
+            Some(_) => {
+                return Err(CoreError::Invalid(
+                    "X-Starforge-Blake3 does not match the request body".into(),
+                ));
+            }
+            None => {
+                return Err(CoreError::Invalid(
+                    "missing X-Starforge-Blake3 header".into(),
+                ));
+            }
+        }
+        let (seq_start, seq_end) = segment_seq_range(bytes)?;
+        if let Some(prev_end) = stored_segments.iter().map(|s| s.seq_end).max()
+            && seq_start <= prev_end
+        {
+            return Err(CoreError::Invalid(format!(
+                "segment sequence range {seq_start}..={seq_end} overlaps stored events ending at {prev_end}"
+            )));
+        }
         let stored = self.store_segment(bytes).await?;
+        debug_assert_eq!(stored.hash, actual_hex);
         match db_sessions::insert_segment(
             self.db(),
             session.id,
             n,
-            0,
-            0,
+            seq_start,
+            seq_end,
             &stored.hash,
             i64::try_from(bytes.len()).unwrap_or(i64::MAX),
         )
@@ -201,7 +251,10 @@ impl Core {
         {
             Ok(_) => Ok(SegmentPut::Stored(session)),
             Err(e) if e.is_unique_violation() => {
-                // A concurrent upload won the race; report what is stored now.
+                // A concurrent upload won the race: drop our extra refcount so
+                // exactly one ref is held per accepted segment, then report
+                // what is stored now.
+                db_sessions::blob_decref(self.db(), &stored.hash).await?;
                 let current = db_sessions::segment_by_n(self.db(), session.id, n)
                     .await?
                     .ok_or(CoreError::Internal(
@@ -210,7 +263,6 @@ impl Core {
                 if current.blob_hash == stored.hash {
                     Ok(SegmentPut::Stored(session))
                 } else {
-                    self.unstore_segment(&stored.hash).await;
                     Ok(SegmentPut::Conflict {
                         session,
                         stored_hash: current.blob_hash,
@@ -218,7 +270,7 @@ impl Core {
                 }
             }
             Err(e) => {
-                self.unstore_segment(&stored.hash).await;
+                db_sessions::blob_decref(self.db(), &stored.hash).await?;
                 Err(e.into())
             }
         }
@@ -238,8 +290,11 @@ impl Core {
     }
 
     /// Records the CLI's commit claims through D1's `upsert_claim_link`.
-    /// Entries carry `sha` (the CLI's `LinkEntry.commit` arrives under the same
-    /// key); confidence defaults to `heuristic`. Returns accepted count.
+    /// Every entry is validated up front (`sha` is 40 hexadecimal characters
+    /// under `sha` or the CLI's `commit` key, confidence is known, the
+    /// sequence range is sane), so a bad entry rejects the whole batch with
+    /// no partial insert. Duplicate SHAs in one payload dedupe to a single
+    /// row; re-posts merge idempotently. Returns the accepted count.
     pub async fn claim_links(
         &self,
         auth: &IngestAuth,
@@ -249,15 +304,18 @@ impl Core {
         let session = db_sessions::session_by_ulid(self.db(), auth.access.repo.id, ulid)
             .await?
             .ok_or(CoreError::NotFound)?;
-        let mut accepted = 0;
+        let mut seen = HashSet::new();
+        let mut valid = Vec::with_capacity(links.len());
         for link in links {
             let sha = link
                 .get("sha")
                 .or_else(|| link.get("commit"))
                 .and_then(serde_json::Value::as_str)
                 .ok_or_else(|| CoreError::Invalid("link entries need a sha".into()))?;
-            if sha.trim().is_empty() {
-                return Err(CoreError::Invalid("link entries need a sha".into()));
+            if sha.len() != 40 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(CoreError::Invalid(
+                    "link sha must be 40 hexadecimal characters".into(),
+                ));
             }
             let confidence = link
                 .get("confidence")
@@ -268,46 +326,38 @@ impl Core {
                     "unknown link confidence '{confidence}'"
                 )));
             }
-            let seq_start = link.get("seq_start").and_then(number_as_i64);
-            let seq_end = link.get("seq_end").and_then(number_as_i64);
+            let seq_start = link_seq(link, "seq_start")?;
+            let seq_end = link_seq(link, "seq_end")?;
+            if let (Some(start), Some(end)) = (seq_start, seq_end)
+                && start > end
+            {
+                return Err(CoreError::Invalid(
+                    "link seq_start must not exceed seq_end".into(),
+                ));
+            }
+            if seen.insert(sha.to_owned()) {
+                valid.push(ValidatedLink {
+                    sha: sha.to_owned(),
+                    confidence: confidence.to_owned(),
+                    seq_start,
+                    seq_end,
+                });
+            }
+        }
+        for entry in &valid {
             db_sessions::upsert_claim_link(
                 self.db(),
                 auth.access.repo.id,
                 session.id,
                 ulid,
-                sha,
-                confidence,
-                seq_start,
-                seq_end,
+                &entry.sha,
+                &entry.confidence,
+                entry.seq_start,
+                entry.seq_end,
             )
             .await?;
-            accepted += 1;
         }
-        Ok(accepted)
-    }
-
-    /// Hashes bytes through the blob store without recording a blob row
-    /// (idempotent re-upload compare). D4 replaces this with header validation.
-    async fn store_segment_no_ref(&self, bytes: &[u8]) -> CoreResult<String> {
-        let stored = self
-            .config()
-            .blob_store
-            .put(bytes)
-            .await
-            .map_err(|e| CoreError::Internal(format!("hashing segment bytes: {e}")))?;
-        Ok(stored.hash)
-    }
-
-    /// Best-effort cleanup of bytes stored for a losing racer. The blob row was
-    /// never increfed, so only the file needs removing; failures are ignored
-    /// (the GC sweep reaps unreferenced files).
-    async fn unstore_segment(&self, hash: &str) {
-        let blob = starforged_blob::BlobRef {
-            hash: hash.to_owned(),
-            size: 0,
-            key: hash.to_owned(),
-        };
-        let _ = self.config().blob_store.delete(&blob).await;
+        Ok(valid.len())
     }
 }
 
@@ -316,6 +366,56 @@ fn number_as_i64(value: &serde_json::Value) -> Option<i64> {
         .as_u64()
         .and_then(|n| i64::try_from(n).ok())
         .or_else(|| value.as_i64())
+}
+
+/// One link entry that passed whole-batch validation, ready to upsert.
+struct ValidatedLink {
+    sha: String,
+    confidence: String,
+    seq_start: Option<i64>,
+    seq_end: Option<i64>,
+}
+
+/// Reads one optional link sequence bound: absent or null means unbounded;
+/// anything present must be a non-negative integer.
+fn link_seq(link: &serde_json::Value, key: &str) -> CoreResult<Option<i64>> {
+    match link.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(value) => match number_as_i64(value).filter(|bound| *bound >= 0) {
+            Some(bound) => Ok(Some(bound)),
+            None => Err(CoreError::Invalid(format!(
+                "link {key} must be a non-negative integer"
+            ))),
+        },
+    }
+}
+
+/// Validates that `bytes` are a zstd-compressed JSONL transcript of `v:1`
+/// events and returns the `(min, max)` event sequence numbers. Validation
+/// only: the stored form stays the compressed bytes.
+fn segment_seq_range(bytes: &[u8]) -> CoreResult<(i64, i64)> {
+    let decompressed =
+        decompress(bytes).map_err(|e| CoreError::Invalid(format!("invalid segment body: {e}")))?;
+    let text = String::from_utf8(decompressed)
+        .map_err(|_| CoreError::Invalid("segment payload is not valid UTF-8".into()))?;
+    let mut seqs: Vec<u64> = Vec::new();
+    for (index, line) in text.split('\n').enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let event = parse_event(line).map_err(|e| {
+            CoreError::Invalid(format!("invalid event on segment line {}: {e}", index + 1))
+        })?;
+        seqs.push(event.seq);
+    }
+    let (Some(min), Some(max)) = (seqs.iter().min(), seqs.iter().max()) else {
+        return Err(CoreError::Invalid("segment has no events".into()));
+    };
+    let start = i64::try_from(*min)
+        .map_err(|_| CoreError::Invalid(format!("event seq {min} is out of range")))?;
+    let end = i64::try_from(*max)
+        .map_err(|_| CoreError::Invalid(format!("event seq {max} is out of range")))?;
+    Ok((start, end))
 }
 
 /// Builds a [`NewSession`] from the CLI's `SessionMeta` JSON. D3 extracts what

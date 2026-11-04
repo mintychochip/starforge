@@ -11,6 +11,7 @@ pub enum ApiError {
     Unauthenticated,
     Forbidden(String),
     NotFound,
+    BadRequest(String),
     Invalid(String),
     Conflict(String),
     PayloadTooLarge(String),
@@ -41,6 +42,7 @@ impl IntoResponse for ApiError {
             ),
             ApiError::Forbidden(message) => (StatusCode::FORBIDDEN, "forbidden", message),
             ApiError::NotFound => (StatusCode::NOT_FOUND, "not_found", "not found".to_owned()),
+            ApiError::BadRequest(message) => (StatusCode::BAD_REQUEST, "bad_request", message),
             ApiError::Invalid(message) => (StatusCode::UNPROCESSABLE_ENTITY, "invalid", message),
             ApiError::Conflict(message) => (StatusCode::CONFLICT, "conflict", message),
             ApiError::PayloadTooLarge(message) => {
