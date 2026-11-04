@@ -115,6 +115,18 @@ with `.starforge/redact.toml`. The rule-set fingerprint travels with each sessio
 high-confidence hit on the server's re-scan quarantines the upload until a repo admin
 releases or purges it.
 
+## Capture adapters
+
+`starforge-capture` (MIT OR Apache-2.0) reads native agent transcripts into normalized
+Trace Format v1 events without redaction: five adapters cover Claude Code, Codex CLI, Pi,
+OpenCode (SQLite `opencode.db` plus file-storage layouts), and Gemini CLI. omp transcripts
+parse through the Pi adapter and Antigravity stores through the Gemini adapter, both
+best-effort and always reported `unverified` (`adapter_version_verified == false`).
+Adapters take explicit root paths (no `$HOME`, no clock), resume with stable cursors, and
+preserve unmapped native fields so re-normalization stays lossless; raw-transcript storage
+defaults ON for new repos. Test fixtures are synthesized in the native shape — each fixture
+directory carries a `SYNTHESIZED.txt` noting the native source it mimics.
+
 ## Development
 
 ```bash
