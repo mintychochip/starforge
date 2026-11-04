@@ -92,6 +92,14 @@ impl Core {
     /// permission; uploader ownership stays pinned to the creator. The
     /// lifecycle and quarantine are preserved on re-PUT (a `complete` session
     /// stays complete).
+    /// The viewer renders the title and file list, and adapters often derive
+    /// the title from the first user message, so the metadata strings
+    /// (`title`, `models`, `files_touched`, `repo.remote_urls`,
+    /// `repo.branch`, `agent.version`) are scanned with the same compiled
+    /// rule set as the segment path and the redacted values are stored: a
+    /// high-confidence hit quarantines the session (reason + `meta.<field>`
+    /// detail, audited as `session.quarantine`), a low-confidence hit only
+    /// merges into `redaction_counts`.
     pub async fn upsert_session_meta(
         &self,
         auth: &IngestAuth,
@@ -110,9 +118,25 @@ impl Core {
             ));
         }
         let repo_id = auth.access.repo.id;
-        let models = stringify(meta.get("models"));
-        let files_touched = stringify(meta.get("files_touched"));
-        let redaction_counts = stringify(meta_lookup(meta, &["redaction", "counts"]));
+        // Scan the viewer-rendered metadata strings with the same compiled
+        // rule set as the segment path; the redacted values are what get
+        // stored below, never the raw secrets.
+        let compiled = self.scan_rules_for(repo_id).await?;
+        let meta_scan = crate::rescan::scan_session_meta(&compiled, meta);
+        let models = match meta.get("models") {
+            None | Some(serde_json::Value::Null) => String::new(),
+            Some(_) => serde_json::to_string(&meta_scan.models).unwrap_or_default(),
+        };
+        let files_touched = match meta.get("files_touched") {
+            None | Some(serde_json::Value::Null) => String::new(),
+            Some(_) => serde_json::to_string(&meta_scan.files_touched).unwrap_or_default(),
+        };
+        // Max-merge the client-reported counts with the server-found metadata
+        // counts: re-PUTs re-report both, so max keeps the upsert idempotent.
+        let redaction_counts = merge_counts(
+            &stringify(meta_lookup(meta, &["redaction", "counts"])),
+            &serde_json::to_string(&meta_scan.counts).unwrap_or_else(|_| "{}".to_owned()),
+        );
         let started_at = meta_ts_unix(meta, &["started_at"])?;
         let ended_at = meta_ts_unix_opt(meta, &["ended_at"])?;
         let new = session_from_meta(
@@ -121,6 +145,9 @@ impl Core {
             ulid,
             meta,
             "receiving",
+            &meta_scan.title,
+            &meta_scan.agent_version,
+            &meta_scan.branch,
             &models,
             &files_touched,
             &redaction_counts,
@@ -139,10 +166,21 @@ impl Core {
                 // Trailers may have arrived before the upload (push first, sync later):
                 // point those rows at the session now that it exists.
                 db_sessions::backfill_trailer_session_id(self.db(), repo_id, ulid, id).await?;
-                let row = db_sessions::session_by_ulid(self.db(), repo_id, ulid)
+                let mut row = db_sessions::session_by_ulid(self.db(), repo_id, ulid)
                     .await?
                     .ok_or_else(|| CoreError::Internal("session vanished after insert".into()))?;
                 debug_assert_eq!(row.id, id);
+                // A metadata hit quarantines here (same audit string as the
+                // segment path); the redacted values are already stored.
+                if let Some(hit) = &meta_scan.first_hit {
+                    self.apply_quarantine_hit(Some(auth.user.id), &row, hit)
+                        .await?;
+                    row = db_sessions::session_by_ulid(self.db(), repo_id, ulid)
+                        .await?
+                        .ok_or_else(|| {
+                            CoreError::Internal("session vanished after insert".into())
+                        })?;
+                }
                 Ok((row, true))
             }
             Some(existing) => {
@@ -153,6 +191,9 @@ impl Core {
                     ulid,
                     meta,
                     &existing.lifecycle,
+                    &meta_scan.title,
+                    &meta_scan.agent_version,
+                    &meta_scan.branch,
                     &models,
                     &files_touched,
                     &redaction_counts,
@@ -186,9 +227,21 @@ impl Core {
                 db_sessions::update_session_meta(self.db(), existing.id, &updated).await?;
                 db_sessions::backfill_trailer_session_id(self.db(), repo_id, ulid, existing.id)
                     .await?;
-                let row = db_sessions::session_by_ulid(self.db(), repo_id, ulid)
+                let mut row = db_sessions::session_by_ulid(self.db(), repo_id, ulid)
                     .await?
                     .ok_or_else(|| CoreError::Internal("session vanished after update".into()))?;
+                // A fresh metadata hit quarantines a clean session; on an
+                // already-quarantined one this is a no-op, so the stored
+                // verdict (and its single audit row) stands.
+                if let Some(hit) = &meta_scan.first_hit {
+                    self.apply_quarantine_hit(Some(auth.user.id), &row, hit)
+                        .await?;
+                    row = db_sessions::session_by_ulid(self.db(), repo_id, ulid)
+                        .await?
+                        .ok_or_else(|| {
+                            CoreError::Internal("session vanished after update".into())
+                        })?;
+                }
                 Ok((row, false))
             }
         }
@@ -798,7 +851,9 @@ fn segment_seq_range(text: &str) -> CoreResult<(i64, i64)> {
 /// wire shape (`meta.repo.branch`, `meta.usage.input`, `meta.redaction.counts`,
 /// `meta.capture.cli_version`, …); timestamps and counters arrive
 /// pre-converted from the caller. The CLI owns usage numbers at creation; the
-/// stats job owns them afterwards (re-PUT preserves them).
+/// stats job owns them afterwards (re-PUT preserves them). `title`,
+/// `agent_version`, `branch`, `models`, and `files_touched` arrive already
+/// redacted from the metadata scan — pass the scrubbed values, never raw meta.
 #[allow(clippy::too_many_arguments)]
 fn session_from_meta<'a>(
     repo_id: i64,
@@ -806,6 +861,9 @@ fn session_from_meta<'a>(
     ulid: &'a str,
     meta: &'a serde_json::Value,
     lifecycle: &'a str,
+    title: &'a str,
+    agent_version: &'a str,
+    branch: &'a str,
     models: &'a str,
     files_touched: &'a str,
     redaction_counts: &'a str,
@@ -823,10 +881,10 @@ fn session_from_meta<'a>(
         ulid,
         uploader_id,
         agent_name: meta_str(meta, &["agent", "name"]),
-        agent_version: meta_str(meta, &["agent", "version"]),
+        agent_version,
         models,
-        title: meta_str(meta, &["title"]),
-        branch: meta_str(meta, &["repo", "branch"]),
+        title,
+        branch,
         head_sha: meta_str(meta, &["repo", "head_at_start"]),
         started_at,
         ended_at,

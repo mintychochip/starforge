@@ -56,6 +56,163 @@ pub struct ScanHit {
     pub detail: String,
 }
 
+/// Scrubbed metadata strings plus the first high-confidence hit, if any.
+/// `remote_urls` is scanned for the verdict and the counts but has no
+/// session column, so only the other fields are returned for storage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetaScan {
+    pub title: String,
+    pub agent_version: String,
+    pub branch: String,
+    pub models: Vec<String>,
+    pub files_touched: Vec<String>,
+    pub counts: BTreeMap<String, u64>,
+    pub first_hit: Option<ScanHit>,
+}
+
+/// Scans one metadata string value: returns the redacted text, accumulating
+/// counts and recording the first high-confidence hit (in rule-priority
+/// order, mirroring [`scan_segment_text`]).
+fn scan_meta_value(
+    compiled: &Compiled,
+    high_confidence: &[&str],
+    value: &str,
+    detail: &str,
+    counts: &mut BTreeMap<String, u64>,
+    first_hit: &mut Option<ScanHit>,
+) -> String {
+    let (redacted, value_counts) = redact_text(compiled, value);
+    for (id, n) in &value_counts {
+        *counts.entry(id.clone()).or_insert(0) += n;
+    }
+    if first_hit.is_none()
+        && let Some(reason) = high_confidence
+            .iter()
+            .find(|id| value_counts.contains_key(**id))
+    {
+        *first_hit = Some(ScanHit {
+            reason: (*reason).to_owned(),
+            detail: detail.to_owned(),
+        });
+    }
+    redacted
+}
+
+/// String at `path` in session metadata (`None` when absent or not a string).
+fn meta_str_at<'m>(meta: &'m serde_json::Value, path: &[&str]) -> Option<&'m str> {
+    let mut value = meta;
+    for key in path {
+        value = value.get(*key)?;
+    }
+    value.as_str()
+}
+
+/// String elements of the array at `path` (`[]` when absent or not an array).
+fn meta_list_at<'m>(meta: &'m serde_json::Value, path: &[&str]) -> Vec<&'m str> {
+    let mut value = meta;
+    for key in path {
+        match value.get(*key) {
+            Some(next) => value = next,
+            None => return Vec::new(),
+        }
+    }
+    match value.as_array() {
+        Some(items) => items.iter().filter_map(serde_json::Value::as_str).collect(),
+        None => Vec::new(),
+    }
+}
+
+/// Scans the viewer-rendered session metadata strings with the same compiled
+/// rule set as the segment path: `title`, each `models` / `files_touched` /
+/// `repo.remote_urls` element, `repo.branch`, and `agent.version`. Values
+/// come back redacted (store those, never the raw meta); a high-confidence
+/// hit carries `meta.<field>` (or `meta.<field>[<i>]` for list items) as its
+/// detail. Fields are scanned in that order, so the first hit wins.
+/// Already-redacted values (`[redacted:<id>]`) match nothing and contribute
+/// no counts, so re-scanning them never double-counts.
+pub fn scan_session_meta(compiled: &Compiled, meta: &serde_json::Value) -> MetaScan {
+    let ids = compiled.rule_ids();
+    let mut high_confidence: Vec<&str> = Vec::new();
+    for (index, id) in ids.iter().enumerate() {
+        if compiled.is_high_confidence(index) == Some(true) && !high_confidence.contains(id) {
+            high_confidence.push(id);
+        }
+    }
+    let mut counts: BTreeMap<String, u64> = BTreeMap::new();
+    let mut first_hit: Option<ScanHit> = None;
+    let title = scan_meta_value(
+        compiled,
+        &high_confidence,
+        meta_str_at(meta, &["title"]).unwrap_or(""),
+        "meta.title",
+        &mut counts,
+        &mut first_hit,
+    );
+    let mut models = Vec::new();
+    for (i, item) in meta_list_at(meta, &["models"]).into_iter().enumerate() {
+        models.push(scan_meta_value(
+            compiled,
+            &high_confidence,
+            item,
+            &format!("meta.models[{i}]"),
+            &mut counts,
+            &mut first_hit,
+        ));
+    }
+    let mut files_touched = Vec::new();
+    for (i, item) in meta_list_at(meta, &["files_touched"])
+        .into_iter()
+        .enumerate()
+    {
+        files_touched.push(scan_meta_value(
+            compiled,
+            &high_confidence,
+            item,
+            &format!("meta.files_touched[{i}]"),
+            &mut counts,
+            &mut first_hit,
+        ));
+    }
+    for (i, item) in meta_list_at(meta, &["repo", "remote_urls"])
+        .into_iter()
+        .enumerate()
+    {
+        scan_meta_value(
+            compiled,
+            &high_confidence,
+            item,
+            &format!("meta.repo.remote_urls[{i}]"),
+            &mut counts,
+            &mut first_hit,
+        );
+    }
+    let branch = scan_meta_value(
+        compiled,
+        &high_confidence,
+        meta_str_at(meta, &["repo", "branch"]).unwrap_or(""),
+        "meta.repo.branch",
+        &mut counts,
+        &mut first_hit,
+    );
+    let agent_version = scan_meta_value(
+        compiled,
+        &high_confidence,
+        meta_str_at(meta, &["agent", "version"]).unwrap_or(""),
+        "meta.agent.version",
+        &mut counts,
+        &mut first_hit,
+    );
+    MetaScan {
+        title,
+        agent_version,
+        branch,
+        models,
+        files_touched,
+        counts,
+        first_hit,
+    }
+}
+
 /// Counts plus the first high-confidence hit for one segment's text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScanOutcome {
@@ -368,5 +525,26 @@ mod tests {
             Some("literal")
         );
         assert_eq!(outcome.counts.get("literal"), Some(&1));
+    }
+
+    #[test]
+    fn meta_scan_reports_files_touched_hit_with_redacted_value() {
+        let rules = compile_scan_rules("", None).unwrap();
+        let meta = serde_json::json!({
+            "title": "test session",
+            "models": ["opus"],
+            "files_touched": ["src/file with ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 inside.rs"],
+            "repo": {"branch": "feature/widget", "remote_urls": []},
+            "agent": {"name": "claude-code", "version": "1.0"},
+        });
+        let scan = scan_session_meta(&rules, &meta);
+        assert_eq!(
+            scan.first_hit,
+            Some(ScanHit {
+                reason: "known-token".to_owned(),
+                detail: "meta.files_touched[0]".to_owned(),
+            })
+        );
+        assert!(scan.files_touched[0].contains("[redacted:known-token]"));
     }
 }

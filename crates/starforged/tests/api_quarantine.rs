@@ -62,6 +62,7 @@ fn segment_payload(lines: &[String]) -> (Vec<u8>, String) {
 struct Ctx {
     s: TestServer,
     upload: String,
+    read: String,
     bob_upload: String,
     carol_upload: String,
 }
@@ -87,11 +88,13 @@ impl Ctx {
             .await
             .unwrap();
         let upload = s.token(&alice, &[Scope::SessionUpload]).await;
+        let read = s.token(&alice, &[Scope::RepoRead]).await;
         let bob_upload = s.token(&bob, &[Scope::SessionUpload]).await;
         let carol_upload = s.token(&carol, &[Scope::SessionUpload]).await;
         Ctx {
             s,
             upload,
+            read,
             bob_upload,
             carol_upload,
         }
@@ -873,4 +876,185 @@ async fn reput_preserves_quarantine_evidence() {
     assert_eq!(row.quarantine, "released");
     assert_eq!(row.quarantine_reason, "private-key");
     assert_eq!(row.quarantine_detail, "segment 0 line 1");
+}
+
+const PQ_META_TITLE: &str = "01ARZ3NDEKTSV4RRFFQ69G5FC1";
+const PQ_META_FILES: &str = "01ARZ3NDEKTSV4RRFFQ69G5FC2";
+const PQ_META_EMAIL: &str = "01ARZ3NDEKTSV4RRFFQ69G5FC3";
+const PQ_META_REPUT: &str = "01ARZ3NDEKTSV4RRFFQ69G5FC4";
+
+/// A `ghp_` token (36+ alnum chars) the `known-token` detector catches.
+const META_TOKEN: &str = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn meta_title_token_quarantines_and_redacts() {
+    let c = Ctx::start().await;
+    let mut body = meta_body(PQ_META_TITLE);
+    body["title"] = json!(format!("help me debug {META_TOKEN}"));
+    let client = reqwest::Client::new();
+    let put = client
+        .put(c.meta_url(PQ_META_TITLE))
+        .bearer_auth(&c.upload)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(put.status(), 201);
+
+    let row = c.session_row(PQ_META_TITLE).await;
+    assert_eq!(row.quarantine, "quarantined");
+    assert_eq!(row.quarantine_reason, "known-token");
+    assert_eq!(row.quarantine_detail, "meta.title");
+    assert!(
+        row.title.contains("[redacted:known-token]"),
+        "title: {}",
+        row.title
+    );
+    assert!(!row.title.contains(META_TOKEN), "title: {}", row.title);
+
+    // Exactly one quarantine audit row for this session.
+    let audits = starforged_db::audit::recent(c.s.core.db(), 100)
+        .await
+        .unwrap();
+    let hits: Vec<_> = audits
+        .iter()
+        .filter(|r| {
+            r.action == "session.quarantine" && r.target == format!("session:{PQ_META_TITLE}")
+        })
+        .collect();
+    assert_eq!(hits.len(), 1, "{audits:?}");
+
+    // Neither the admin queue nor the session read response leaks the secret.
+    let queue = client
+        .get(c.s.url("/api/v1/repos/alice/proj/sessions?quarantined=true"))
+        .bearer_auth(&c.upload)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(queue.status(), 200);
+    let queue_body: Value = queue.json().await.unwrap();
+    assert!(
+        !serde_json::to_string(&queue_body)
+            .unwrap()
+            .contains(META_TOKEN),
+        "{queue_body}"
+    );
+    let get = client
+        .get(c.s.url(&format!(
+            "/api/v1/repos/alice/proj/sessions/{PQ_META_TITLE}"
+        )))
+        .bearer_auth(&c.read)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(get.status(), 200);
+    let get_body: Value = get.json().await.unwrap();
+    assert!(
+        !serde_json::to_string(&get_body)
+            .unwrap()
+            .contains(META_TOKEN),
+        "{get_body}"
+    );
+    assert_eq!(get_body["title"], Value::String(row.title));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn meta_files_touched_token_quarantines_and_redacts() {
+    let c = Ctx::start().await;
+    let mut body = meta_body(PQ_META_FILES);
+    body["files_touched"] = json!([format!("src/file with {META_TOKEN} inside.rs")]);
+    let client = reqwest::Client::new();
+    let put = client
+        .put(c.meta_url(PQ_META_FILES))
+        .bearer_auth(&c.upload)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(put.status(), 201);
+
+    let row = c.session_row(PQ_META_FILES).await;
+    assert_eq!(row.quarantine, "quarantined");
+    assert_eq!(row.quarantine_reason, "known-token");
+    assert_eq!(row.quarantine_detail, "meta.files_touched[0]");
+    assert!(
+        row.files_touched.contains("[redacted:known-token]"),
+        "files_touched: {}",
+        row.files_touched
+    );
+    assert!(
+        !row.files_touched.contains(META_TOKEN),
+        "files_touched: {}",
+        row.files_touched
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn meta_email_without_pii_is_untouched() {
+    let c = Ctx::start().await;
+    let mut body = meta_body(PQ_META_EMAIL);
+    body["title"] = json!("contact alice@example.com for help");
+    let client = reqwest::Client::new();
+    let put = client
+        .put(c.meta_url(PQ_META_EMAIL))
+        .bearer_auth(&c.upload)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(put.status(), 201);
+
+    // PII email detection is off by default: no quarantine, value verbatim.
+    let row = c.session_row(PQ_META_EMAIL).await;
+    assert_eq!(row.quarantine, "none");
+    assert_eq!(row.quarantine_reason, "");
+    assert_eq!(row.title, "contact alice@example.com for help");
+    assert!(row.redaction_counts.is_empty() || row.redaction_counts == "{}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn meta_reput_is_idempotent() {
+    let c = Ctx::start().await;
+    let mut body = meta_body(PQ_META_REPUT);
+    body["title"] = json!(format!("rotate {META_TOKEN} now"));
+    let client = reqwest::Client::new();
+    let put = client
+        .put(c.meta_url(PQ_META_REPUT))
+        .bearer_auth(&c.upload)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(put.status(), 201);
+    let before = c.session_row(PQ_META_REPUT).await;
+    assert_eq!(before.quarantine, "quarantined");
+    assert_eq!(before.quarantine_detail, "meta.title");
+
+    // Re-PUT the identical metadata: 200, verdict preserved, counts stable,
+    // and no second quarantine audit row.
+    let again = client
+        .put(c.meta_url(PQ_META_REPUT))
+        .bearer_auth(&c.upload)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(again.status(), 200);
+    let after = c.session_row(PQ_META_REPUT).await;
+    assert_eq!(after.quarantine, "quarantined");
+    assert_eq!(after.quarantine_reason, "known-token");
+    assert_eq!(after.quarantine_detail, "meta.title");
+    assert_eq!(after.redaction_counts, before.redaction_counts);
+    assert_eq!(after.title, before.title);
+
+    let audits = starforged_db::audit::recent(c.s.core.db(), 100)
+        .await
+        .unwrap();
+    let hits: Vec<_> = audits
+        .iter()
+        .filter(|r| {
+            r.action == "session.quarantine" && r.target == format!("session:{PQ_META_REPUT}")
+        })
+        .collect();
+    assert_eq!(hits.len(), 1, "{audits:?}");
 }
