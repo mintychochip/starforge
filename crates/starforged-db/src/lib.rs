@@ -20,6 +20,7 @@ pub mod invites;
 pub mod jobs;
 pub mod redirects;
 pub mod repos;
+pub mod sessions;
 pub mod tokens;
 pub mod users;
 pub mod web_sessions;
