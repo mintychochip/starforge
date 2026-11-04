@@ -130,12 +130,67 @@ pub async fn record_poll(
     Ok(())
 }
 
-pub async fn mark_consumed(db: &Db, device_code_hash: &str) -> DbResult<()> {
-    sqlx::query("UPDATE device_codes SET status = 'consumed' WHERE device_code_hash = $1")
-        .bind(device_code_hash)
-        .execute(db.pool())
+/// One token of the pair minted when an approved device code is redeemed.
+pub struct GrantedToken<'a> {
+    pub user_id: i64,
+    pub name: &'a str,
+    pub token_hash: &'a str,
+    pub token_hint: &'a str,
+    pub scopes: &'a str,
+    pub expires_at: i64,
+}
+
+/// Atomically consumes an `approved` code and records its access + refresh
+/// token pair with their `token.create` audit rows, all in one transaction.
+/// Returns the two token ids, or `None` when the code was already spent: the
+/// loser of a concurrent-grant race mints nothing (single-use consumption).
+pub async fn grant_device_tokens(
+    db: &Db,
+    device_code_hash: &str,
+    access: &GrantedToken<'_>,
+    refresh: &GrantedToken<'_>,
+) -> DbResult<Option<(i64, i64)>> {
+    let mut tx = db.pool().begin().await?;
+    let consumed = sqlx::query(
+        "UPDATE device_codes SET status = 'consumed' \
+         WHERE device_code_hash = $1 AND status = 'approved'",
+    )
+    .bind(device_code_hash)
+    .execute(&mut *tx)
+    .await?;
+    if consumed.rows_affected() != 1 {
+        return Ok(None);
+    }
+    let ts = now();
+    let mut ids = [0_i64; 2];
+    for (slot, token) in [access, refresh].into_iter().enumerate() {
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO access_tokens (user_id, name, token_hash, token_hint, scopes, created_at, expires_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id",
+        )
+        .bind(token.user_id)
+        .bind(token.name)
+        .bind(token.token_hash)
+        .bind(token.token_hint)
+        .bind(token.scopes)
+        .bind(ts)
+        .bind(token.expires_at)
+        .fetch_one(&mut *tx)
         .await?;
-    Ok(())
+        sqlx::query(
+            "INSERT INTO audit_log (actor_id, action, target, detail, ip, user_agent, created_at) \
+             VALUES ($1, 'token.create', $2, $3, '', '', $4)",
+        )
+        .bind(token.user_id)
+        .bind(format!("token:{id}"))
+        .bind(token.name)
+        .bind(ts)
+        .execute(&mut *tx)
+        .await?;
+        ids[slot] = id;
+    }
+    tx.commit().await?;
+    Ok(Some((ids[0], ids[1])))
 }
 
 pub async fn delete_device_code(db: &Db, device_code_hash: &str) -> DbResult<()> {

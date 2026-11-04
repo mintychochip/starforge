@@ -9,7 +9,7 @@ const ULID_OAUTH: &str = "01ARZ3NDEKTSV4RRFFQ69G5FA0";
 
 fn meta_body(ulid: &str) -> Value {
     serde_json::json!({
-        "format": "starforge-session/v1",
+        "format": "starforge.session/v1",
         "id": ulid,
         "agent": {"name": "claude-code", "version": "1.0"},
         "models": ["opus"],
@@ -21,7 +21,7 @@ fn meta_body(ulid: &str) -> Value {
         "usage": {},
         "files_touched": [],
         "redaction": {},
-        "capture": {},
+        "capture": {"mode": "discovery"},
     })
 }
 
@@ -289,8 +289,13 @@ async fn read_only_token_cannot_upload() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn segment_streaming_cap_is_413() {
+    // Build a valid segment first so the at-cap PUT exercises the cap gate only.
+    let jsonl = "{\"v\":1,\"seq\":0,\"ts\":\"2026-11-04T00:00:00Z\",\"kind\":\"user_message\",\"text\":\"hi\"}\n";
+    let bytes = starforge_format::compress(jsonl.as_bytes());
+    let hash = starforge_format::blake3_hex(&bytes);
+    let cap = bytes.len() as u64;
     let s = TestServer::start_with(|config| {
-        config.sessions.max_segment_bytes = 64;
+        config.sessions.max_segment_bytes = cap;
     })
     .await;
     let alice = s.user("alice").await;
@@ -313,13 +318,15 @@ async fn segment_streaming_cap_is_413() {
             "/api/v1/repos/alice/proj/sessions/{ULID_OAUTH}/segments/0"
         )))
         .bearer_auth(&upload)
-        .body(vec![9u8; 64])
+        .header("X-Starforge-Blake3", &hash)
+        .body(bytes)
         .send()
         .await
         .unwrap();
     assert_eq!(exact.status(), 200);
 
-    // Far over the cap is rejected mid-stream with 413.
+    // Far over the cap is rejected mid-stream with 413 (the cap gate runs
+    // before header and content validation).
     let big = client
         .put(s.url(&format!(
             "/api/v1/repos/alice/proj/sessions/{ULID_OAUTH}/segments/1"

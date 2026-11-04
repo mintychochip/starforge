@@ -5,8 +5,7 @@
 //! code on the web approval page. Only the SHA-256 hash of the `device_code`
 //! is stored; the `user_code` is short and looked up case-insensitively.
 
-use starforged_db::oauth::{self as db_oauth, NewDeviceCode};
-use starforged_db::tokens::{self as db_tokens, NewToken};
+use starforged_db::oauth::{self as db_oauth, GrantedToken, NewDeviceCode};
 
 use crate::accounts::User;
 use crate::tokens::parse_scopes;
@@ -199,7 +198,9 @@ impl Core {
     }
 
     /// Mints the access (1 h) + refresh (90 d) pair for an approved code and
-    /// consumes the code so it can never grant twice.
+    /// consumes the code so it can never grant twice. Consumption is a
+    /// compare-and-swap inside the same transaction as the token inserts, so
+    /// concurrent polls cannot double-mint: the loser sees a spent code.
     async fn grant_device_tokens(
         &self,
         row: &db_oauth::DeviceCodeRow,
@@ -215,36 +216,115 @@ impl Core {
             .ok_or(CoreError::Unauthenticated)?;
         let access_secret = format!("sfp_{}", crypto::random_hex(32));
         let refresh_secret = format!("sfp_{}", crypto::random_hex(32));
-        for (secret, name, expires_at) in [
-            (&access_secret, "device flow", now + DEVICE_ACCESS_TTL),
-            (
-                &refresh_secret,
-                "device flow refresh",
-                now + DEVICE_REFRESH_TTL,
-            ),
-        ] {
-            let hint = &secret[secret.len() - 4..];
-            let id = db_tokens::insert(
-                self.db(),
-                &NewToken {
-                    user_id: user.id,
-                    name,
-                    token_hash: &crypto::sha256_hex(secret),
-                    token_hint: hint,
-                    scopes: &row.scope,
-                    expires_at,
-                },
-            )
-            .await?;
-            self.audit(Some(user.id), "token.create", &format!("token:{id}"), name)
+        let access_hash = crypto::sha256_hex(&access_secret);
+        let refresh_hash = crypto::sha256_hex(&refresh_secret);
+        let access = GrantedToken {
+            user_id: user.id,
+            name: "device flow",
+            token_hash: &access_hash,
+            token_hint: &access_secret[access_secret.len() - 4..],
+            scopes: &row.scope,
+            expires_at: now + DEVICE_ACCESS_TTL,
+        };
+        let refresh = GrantedToken {
+            user_id: user.id,
+            name: "device flow refresh",
+            token_hash: &refresh_hash,
+            token_hint: &refresh_secret[refresh_secret.len() - 4..],
+            scopes: &row.scope,
+            expires_at: now + DEVICE_REFRESH_TTL,
+        };
+        let granted =
+            db_oauth::grant_device_tokens(self.db(), &row.device_code_hash, &access, &refresh)
                 .await?;
+        if granted.is_none() {
+            return Ok(PollOutcome::Expired);
         }
-        db_oauth::mark_consumed(self.db(), &row.device_code_hash).await?;
         Ok(PollOutcome::Granted {
             access_token: access_secret,
             refresh_token: refresh_secret,
             expires_in: DEVICE_ACCESS_TTL,
             scope: row.scope.clone(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing::{test_core, user};
+
+    async fn approved_request(core: &Core, handle: &str) -> DeviceAuthRequest {
+        let alice = user(core, handle).await;
+        let request = core
+            .create_device_code(DEVICE_CLIENT_ID, "session:upload")
+            .await
+            .unwrap();
+        core.approve_device_code(&alice, &request.user_code, true)
+            .await
+            .unwrap();
+        request
+    }
+
+    async fn token_count(core: &Core) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM access_tokens")
+            .fetch_one(core.db().pool())
+            .await
+            .unwrap()
+    }
+
+    async fn grant_audit_count(core: &Core) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM audit_log WHERE action = 'token.create'")
+            .fetch_one(core.db().pool())
+            .await
+            .unwrap()
+    }
+
+    /// Two sequential redemptions of one approved code mint exactly one pair:
+    /// the second hits the compare-and-swap and sees a spent code.
+    #[tokio::test]
+    async fn double_grant_mints_exactly_one_pair() {
+        let (core, _f) = test_core().await;
+        let request = approved_request(&core, "alice").await;
+        let row =
+            db_oauth::device_code_by_hash(core.db(), &crypto::sha256_hex(&request.device_code))
+                .await
+                .unwrap()
+                .unwrap();
+        let now = starforged_db::now();
+        assert!(matches!(
+            core.grant_device_tokens(&row, now).await.unwrap(),
+            PollOutcome::Granted { .. }
+        ));
+        assert_eq!(
+            core.grant_device_tokens(&row, now).await.unwrap(),
+            PollOutcome::Expired
+        );
+        assert_eq!(token_count(&core).await, 2);
+        assert_eq!(grant_audit_count(&core).await, 2);
+    }
+
+    /// Two polls racing the same approved code: exactly one mints the pair,
+    /// the other gets the spent-code error, with no extra tokens or audits.
+    #[tokio::test]
+    async fn concurrent_grant_mints_exactly_one_pair() {
+        let (core, _f) = test_core().await;
+        let request = approved_request(&core, "alice").await;
+        let (first, second) = tokio::join!(
+            core.poll_device_code(&request.device_code, DEVICE_CLIENT_ID),
+            core.poll_device_code(&request.device_code, DEVICE_CLIENT_ID),
+        );
+        let mut granted = 0;
+        let mut spent = 0;
+        for outcome in [first.unwrap(), second.unwrap()] {
+            match outcome {
+                PollOutcome::Granted { .. } => granted += 1,
+                PollOutcome::Expired => spent += 1,
+                other => panic!("unexpected poll outcome: {other:?}"),
+            }
+        }
+        assert_eq!((granted, spent), (1, 1));
+        assert_eq!(token_count(&core).await, 2);
+        assert_eq!(grant_audit_count(&core).await, 2);
     }
 }
