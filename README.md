@@ -105,8 +105,8 @@ Errors use `{"error": {"code", "message"}}`.
 ## Trace format and redaction
 
 `docs/format/` is the normative spec for Trace Format v1: session metadata, normalized
-events, segmentation, and the JSON Schemas uploads are validated against. Two crates
-implement it: `starforge-format` (encoding, segments, agent-output delimiters) and
+events, and the JSON Schemas uploads are validated against. Two crates implement it:
+`starforge-format` (encoding, segmentation, agent-output delimiters) and
 `starforge-redact` (secret scrubbing), both MIT OR Apache-2.0.
 Redaction replaces matches with `[redacted:<detector>]` using the built-in detectors
 (private-key, cloud-credential, known-token, credentialed-url, connection-string,

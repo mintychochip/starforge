@@ -4,6 +4,9 @@
 //! and [`UNTRUSTED_ENDS`], each on its own line. Any content line starting
 //! with `<<<STARFORGE-` gains one leading space so injected markers cannot
 //! close or forge the frame; stripping one such space restores the content.
+//! A content line that already began with a space before the marker is
+//! indistinguishable from an escaped line, so unwrapping is line-exact
+//! except for such pre-spaced lines.
 /// Marker opening an untrusted block, emitted on its own line.
 pub const UNTRUSTED_BEGINS: &str = "<<<STARFORGE-UNTRUSTED-BEGINS>>>";
 /// Marker closing an untrusted block, emitted on its own line.
