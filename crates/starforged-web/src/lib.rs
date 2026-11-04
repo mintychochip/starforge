@@ -156,6 +156,8 @@ fn page_routes() -> Router<AppState> {
             "/{owner}/{repo}/compare/{*spec}",
             get(pages::compare::compare),
         )
+        .route("/{owner}/{repo}/branches", get(pages::refs::branches))
+        .route("/{owner}/{repo}/tags", get(pages::refs::tags))
         .route("/static/starforge.css", get(stylesheet))
 }
 

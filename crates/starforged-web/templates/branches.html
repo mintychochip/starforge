@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block title %}Branches · {{ head.owner }}/{{ head.name }}{% endblock %}
+{% block content %}
+{% include "repo_head.html" %}
+{% if branches.is_empty() %}
+<p class="muted">No branches yet.</p>
+{% else %}
+<table class="list"><tbody>
+{% for b in branches %}
+<tr><td><a href="{{ b.tree_href }}">{{ b.name }}</a>{% if b.is_default %} <span class="badge">default</span>{% endif %}</td>
+<td>{{ b.summary }} <span class="muted">{{ b.author }} · <span title="{{ b.when }}">{{ b.age }}</span></span></td>
+<td>{% if !b.compare_href.is_empty() %}<a href="{{ b.compare_href }}">Compare</a>{% endif %}</td></tr>
+{% endfor %}
+</tbody></table>
+{% endif %}
+{% endblock %}

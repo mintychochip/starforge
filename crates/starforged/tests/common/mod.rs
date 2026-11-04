@@ -164,8 +164,17 @@ impl TestServer {
 /// Runs `git` in `dir` on a blocking thread, isolated from the developer's configuration.
 /// Defaults to protocol v2; pass `-c protocol.version=0` to override.
 pub async fn git(dir: &Path, args: &[&str]) -> Output {
+    git_with_env(dir, args, &[]).await
+}
+
+/// [`git`] with extra environment variables.
+pub async fn git_with_env(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
     let dir = dir.to_path_buf();
     let args: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
+    let env: Vec<(String, String)> = env
+        .iter()
+        .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+        .collect();
     tokio::task::spawn_blocking(move || {
         std::process::Command::new("git")
             .args([
@@ -183,11 +192,32 @@ pub async fn git(dir: &Path, args: &[&str]) -> Output {
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GIT_ASKPASS", "/bin/false")
+            .envs(env)
             .output()
             .unwrap()
     })
     .await
     .unwrap()
+}
+
+/// [`git_ok`] with the author and committer (and tagger) dates set to `unix_time`.
+pub async fn git_dated(dir: &Path, args: &[&str], unix_time: i64) -> String {
+    let date = format!("@{unix_time} +0000");
+    let out = git_with_env(
+        dir,
+        args,
+        &[
+            ("GIT_AUTHOR_DATE", date.as_str()),
+            ("GIT_COMMITTER_DATE", date.as_str()),
+        ],
+    )
+    .await;
+    assert!(
+        out.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).unwrap()
 }
 
 /// [`git`] that must succeed; returns stdout.

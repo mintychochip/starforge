@@ -2,7 +2,7 @@
 
 use starforged_git::GitError;
 use starforged_git::diff::CommitDiff;
-use starforged_git::read::{self, CommitInfo, Resolved, TreeEntry};
+use starforged_git::read::{self, BranchInfo, CommitInfo, Resolved, TagInfo, TreeEntry};
 
 use crate::repos::RepoAccess;
 use crate::{Core, CoreError, CoreResult};
@@ -35,6 +35,18 @@ impl Core {
     pub async fn branches(&self, access: &RepoAccess) -> CoreResult<Vec<String>> {
         let repo = self.repo_path(access.repo.id);
         blocking(move || read::branches(&repo)).await
+    }
+
+    /// Branches with their tip commits, the newest tip first.
+    pub async fn branch_list(&self, access: &RepoAccess) -> CoreResult<Vec<BranchInfo>> {
+        let repo = self.repo_path(access.repo.id);
+        blocking(move || read::branch_list(&repo)).await
+    }
+
+    /// Tags with their commits, the newest first.
+    pub async fn tag_list(&self, access: &RepoAccess) -> CoreResult<Vec<TagInfo>> {
+        let repo = self.repo_path(access.repo.id);
+        blocking(move || read::tag_list(&repo)).await
     }
 
     /// Resolves a `<ref>/<path>` URL suffix; `NotFound` when no branch, tag, or commit matches.

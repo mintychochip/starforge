@@ -31,7 +31,7 @@ pub struct RepoHead {
     pub visibility: &'static str,
     /// The repository is archived: read-only, pushes refused.
     pub archived: bool,
-    /// The highlighted tab: `code`, `commits`, or `settings`; any other value highlights none.
+    /// The highlighted tab: `code`, `commits`, `branches`, `tags`, or `settings`; any other value highlights none.
     pub tab: &'static str,
     /// The Commits tab: the history of the ref being viewed, or `/{owner}/{repo}/commits`.
     pub commits_href: String,
@@ -97,6 +97,30 @@ pub fn format_time(unix: i64) -> String {
             .ok()
         })
         .unwrap_or_default()
+}
+
+/// How long ago `then` was, seen at `now` (unix seconds): "just now", "5 minutes ago", "1 day ago", …
+/// Times in the future read "just now".
+pub fn format_age(now: i64, then: i64) -> String {
+    const MINUTE: i64 = 60;
+    const HOUR: i64 = 60 * MINUTE;
+    const DAY: i64 = 24 * HOUR;
+    let secs = (now - then).max(0);
+    let (count, unit) = if secs < MINUTE {
+        return "just now".to_owned();
+    } else if secs < HOUR {
+        (secs / MINUTE, "minute")
+    } else if secs < DAY {
+        (secs / HOUR, "hour")
+    } else if secs < 30 * DAY {
+        (secs / DAY, "day")
+    } else if secs < 365 * DAY {
+        (secs / (30 * DAY), "month")
+    } else {
+        (secs / (365 * DAY), "year")
+    };
+    let plural = if count == 1 { "" } else { "s" };
+    format!("{count} {unit}{plural} ago")
 }
 
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
@@ -272,5 +296,23 @@ mod tests {
             hrefs,
             vec!["/alice/proj/tree/main/src", "/alice/proj/tree/main/src/bin"]
         );
+    }
+    #[test]
+    fn ages_read_naturally() {
+        let now = 1_700_000_000;
+        let cases = [
+            (now, "just now"),
+            (now - 59, "just now"),
+            (now - 60, "1 minute ago"),
+            (now - 5 * 60, "5 minutes ago"),
+            (now - 3_600, "1 hour ago"),
+            (now - 2 * 86_400, "2 days ago"),
+            (now - 45 * 86_400, "1 month ago"),
+            (now - 800 * 86_400, "2 years ago"),
+            (now + 30, "just now"),
+        ];
+        for (then, expected) in cases {
+            assert_eq!(format_age(now, then), expected, "{then}");
+        }
     }
 }

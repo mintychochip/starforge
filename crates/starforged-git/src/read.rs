@@ -45,6 +45,26 @@ pub struct Resolved {
     pub path: String,
 }
 
+/// A branch and the commit at its tip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchInfo {
+    pub name: String,
+    pub tip: CommitInfo,
+    /// Committer time of the tip, unix seconds.
+    pub committed_at: i64,
+}
+
+/// A tag and the commit it leads to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TagInfo {
+    pub name: String,
+    pub commit_id: String,
+    /// The tagger's time for an annotated tag, the commit's otherwise; unix seconds.
+    pub date: i64,
+    /// The first line of an annotated tag's message.
+    pub annotation: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Blob {
     Text(String),
@@ -369,6 +389,77 @@ pub fn merge_base(repo: &Path, a: &str, b: &str) -> Result<Option<String>, GitEr
         .map(|id| id.to_string()))
 }
 
+/// Local branches, the most recently committed tip first, then by name. Branches whose tip is not a
+/// commit are skipped.
+pub fn branch_list(repo: &Path) -> Result<Vec<BranchInfo>, GitError> {
+    let r = open(repo)?;
+    let platform = r.references().map_err(gix_err)?;
+    let mut branches = Vec::new();
+    for reference in platform.local_branches().map_err(gix_err)? {
+        let mut reference = reference.map_err(gix_err)?;
+        let name = reference.name().shorten().to_string();
+        let Ok(commit) = reference.peel_to_commit() else {
+            continue;
+        };
+        branches.push(BranchInfo {
+            name,
+            committed_at: commit.time().map_err(gix_err)?.seconds,
+            tip: commit_info(&commit)?,
+        });
+    }
+    branches.sort_by(|a, b| {
+        b.committed_at
+            .cmp(&a.committed_at)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    Ok(branches)
+}
+
+/// Tags, newest first, then by name. Tags that do not lead to a commit are skipped.
+pub fn tag_list(repo: &Path) -> Result<Vec<TagInfo>, GitError> {
+    let r = open(repo)?;
+    let platform = r.references().map_err(gix_err)?;
+    let mut tags = Vec::new();
+    for reference in platform.tags().map_err(gix_err)? {
+        let mut reference = reference.map_err(gix_err)?;
+        let name = reference.name().shorten().to_string();
+        // The object the tag names directly: a tag object for annotated tags, the commit otherwise.
+        let target = reference.id().detach();
+        let Ok(commit) = reference.peel_to_commit() else {
+            continue;
+        };
+        let commit_time = commit.time().map_err(gix_err)?.seconds;
+        let object = r.find_object(target).map_err(gix_err)?;
+        let (date, annotation) = if object.kind == gix::object::Kind::Tag {
+            let tag = object.into_tag();
+            let decoded = tag.decode().map_err(gix_err)?;
+            let date = match decoded.tagger().map_err(gix_err)? {
+                Some(tagger) => tagger.time().map_err(gix_err)?.seconds,
+                None => commit_time,
+            };
+            let first_line = decoded
+                .message
+                .to_string()
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_owned();
+            (date, Some(first_line).filter(|line| !line.is_empty()))
+        } else {
+            (commit_time, None)
+        };
+        tags.push(TagInfo {
+            name,
+            commit_id: commit.id.to_string(),
+            date,
+            annotation,
+        });
+    }
+    tags.sort_by(|a, b| b.date.cmp(&a.date).then_with(|| a.name.cmp(&b.name)));
+    Ok(tags)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -599,5 +690,46 @@ mod tests {
         assert_eq!(summaries, vec!["feature", "second"], "newest first");
         assert_eq!(merge_base(p, &main, &feature).unwrap(), Some(main.clone()));
         assert_eq!(merge_base(p, &v1, &feature).unwrap(), Some(v1));
+    }
+    #[test]
+    fn branches_list_the_newest_tip_first() {
+        let f = fixture();
+        let branches = branch_list(f.path()).unwrap();
+        let names: Vec<&str> = branches.iter().map(|b| b.name.as_str()).collect();
+        assert_eq!(names, vec!["feature/x", "main"]);
+        assert_eq!(branches[0].tip.summary, "feature");
+        assert_eq!(
+            branches[0].committed_at, 1_704_240_000,
+            "2024-01-03T00:00:00Z"
+        );
+        assert_eq!(branches[1].tip.author_name, "T");
+    }
+
+    #[test]
+    fn tags_are_dated_by_tagger_or_commit() {
+        let f = fixture();
+        let p = f.path();
+        git(
+            p,
+            &["tag", "-a", "v2", "-m", "Second release\n\nWith notes"],
+            Some("2024-02-01T00:00:00Z"),
+        );
+        let tags = tag_list(p).unwrap();
+        let summary: Vec<(&str, i64, Option<&str>)> = tags
+            .iter()
+            .map(|t| (t.name.as_str(), t.date, t.annotation.as_deref()))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("v2", 1_706_745_600, Some("Second release")),
+                ("v1", 1_704_067_200, None),
+            ]
+        );
+        let main = resolve(p, "main").unwrap().unwrap().commit_id;
+        assert_eq!(
+            tags[0].commit_id, main,
+            "an annotated tag leads to its commit"
+        );
     }
 }

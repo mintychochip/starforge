@@ -10,6 +10,7 @@ pub mod login;
 pub mod message;
 pub mod owner;
 pub mod password;
+pub mod refs;
 pub mod repo_new;
 pub mod repo_settings;
 pub mod settings;

@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block title %}Tags · {{ head.owner }}/{{ head.name }}{% endblock %}
+{% block content %}
+{% include "repo_head.html" %}
+{% if tags.is_empty() %}
+<p class="muted">No tags yet.</p>
+{% else %}
+<table class="list"><tbody>
+{% for t in tags %}
+<tr><td><a href="{{ t.tree_href }}">{{ t.name }}</a></td>
+<td><a href="/{{ head.owner }}/{{ head.name }}/commit/{{ t.commit_id }}"><code>{{ t.short_id }}</code></a></td>
+<td>{{ t.annotation }}</td>
+<td class="muted">{{ t.when }}</td></tr>
+{% endfor %}
+</tbody></table>
+{% endif %}
+{% endblock %}

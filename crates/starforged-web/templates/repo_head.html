@@ -5,6 +5,8 @@
 <nav class="tabs" aria-label="Repository">
 <a href="/{{ head.owner }}/{{ head.name }}"{% if head.tab == "code" %} aria-current="page"{% endif %}>Code</a>
 <a href="{{ head.commits_href }}"{% if head.tab == "commits" %} aria-current="page"{% endif %}>Commits</a>
+<a href="/{{ head.owner }}/{{ head.name }}/branches"{% if head.tab == "branches" %} aria-current="page"{% endif %}>Branches</a>
+<a href="/{{ head.owner }}/{{ head.name }}/tags"{% if head.tab == "tags" %} aria-current="page"{% endif %}>Tags</a>
 {% if head.can_maintain %}<a href="/{{ head.owner }}/{{ head.name }}/settings"{% if head.tab == "settings" %} aria-current="page"{% endif %}>Settings</a>{% endif %}
 </nav>
 </div>
