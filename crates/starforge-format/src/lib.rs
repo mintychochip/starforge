@@ -3,10 +3,12 @@
 //! Implements the Trace Format v1 spec (plan M1a): session metadata
 //! ([`SessionMeta`]), normalized events ([`Event`]), and version handling.
 
+pub mod agent;
 pub mod events;
 pub mod segments;
 pub mod session;
 
+pub use agent::{UNTRUSTED_BEGINS, UNTRUSTED_ENDS, wrap_untrusted};
 pub use events::{
     AssistantMessage, Compaction, Event, EventKind, FileChange, FileChangeKind, Reasoning,
     SubagentBoundary, System, ToolCall, ToolOutcome, ToolRef, ToolResult, UserMessage, kind_name,
