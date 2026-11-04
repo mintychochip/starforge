@@ -159,7 +159,7 @@ impl Core {
             intent: row.intent.clone(),
             state: row.state.clone(),
             ready: row.ready != 0,
-            author_id: row.id,
+            author_id: row.author_id,
             author_handle: author.handle,
             labels,
             assignees,
@@ -440,15 +440,15 @@ impl Core {
         number: i64,
         state: &str,
     ) -> CoreResult<TrailView> {
+        let access = self.repo_for(Some(user), owner, repo).await?;
+        if access.permission < Permission::Triage {
+            return Err(CoreError::Forbidden);
+        }
         if state == "merged" {
             return Err(CoreError::Invalid("merged is set by the merge path".into()));
         }
         if !matches!(state, "open" | "closed") {
             return Err(CoreError::Invalid(format!("invalid state '{state}'")));
-        }
-        let access = self.repo_for(Some(user), owner, repo).await?;
-        if access.permission < Permission::Triage {
-            return Err(CoreError::Forbidden);
         }
         let row = self.trail_row(access.repo.id, number).await?;
         if row.state == state {
@@ -765,6 +765,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn trail_view_reports_the_author_id_not_the_row_id() {
+        let (core, _f) = test_core().await;
+        let alice = user(&core, "alice").await;
+        let bob = user(&core, "bob").await;
+        proj(&core, &alice, Visibility::Private).await;
+        // Bob is a collaborator, so trail id (1) differs from his user id (2).
+        core.set_collaborator(&alice, "alice", "proj", "bob", Permission::Read)
+            .await
+            .unwrap();
+        let view = core
+            .create_trail(&bob, "alice", "proj", "Bob's trail", "")
+            .await
+            .unwrap();
+        assert_eq!(view.number, 1);
+        assert_ne!(view.author_id, 1, "author_id must not be the trail row id");
+        assert_eq!(view.author_id, bob.id);
+        assert_eq!(view.author_handle, "bob");
+    }
+
+    #[tokio::test]
     async fn missing_and_invisible_are_not_found() {
         let (core, _f) = test_core().await;
         let alice = user(&core, "alice").await;
@@ -864,6 +884,50 @@ mod tests {
         assert_eq!(p["from"], "open");
         assert_eq!(p["to"], "closed");
         assert_eq!(p["state"], "closed");
+    }
+
+    #[tokio::test]
+    async fn state_validation_runs_after_the_permission_gate() {
+        let (core, _f) = test_core().await;
+        let alice = user(&core, "alice").await;
+        let bob = user(&core, "bob").await;
+        let stranger = user(&core, "stranger").await;
+        proj(&core, &alice, Visibility::Private).await;
+        core.create_trail(&alice, "alice", "proj", "T", "")
+            .await
+            .unwrap();
+        core.set_collaborator(&alice, "alice", "proj", "bob", Permission::Read)
+            .await
+            .unwrap();
+        // Non-reader asking for `merged` learns nothing: NotFound, not Invalid.
+        assert!(matches!(
+            core.set_trail_state(&stranger, "alice", "proj", 1, "merged")
+                .await,
+            Err(CoreError::NotFound)
+        ));
+        // Read-only member gets Forbidden before any state validation.
+        assert!(matches!(
+            core.set_trail_state(&bob, "alice", "proj", 1, "merged")
+                .await,
+            Err(CoreError::Forbidden)
+        ));
+        assert!(matches!(
+            core.set_trail_state(&bob, "alice", "proj", 1, "bogus")
+                .await,
+            Err(CoreError::Forbidden)
+        ));
+        // Unknown repo is NotFound even for a bogus state.
+        assert!(matches!(
+            core.set_trail_state(&alice, "alice", "nope", 1, "merged")
+                .await,
+            Err(CoreError::NotFound)
+        ));
+        // Triage+ still gets the merge-path message.
+        let err = core
+            .set_trail_state(&alice, "alice", "proj", 1, "merged")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CoreError::Invalid(m) if m.contains("merge path")));
     }
 
     #[tokio::test]
