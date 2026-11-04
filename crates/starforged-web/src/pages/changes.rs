@@ -301,23 +301,23 @@ pub async fn create_branch(
     Path((owner, repo, number)): Path<(String, String, i64)>,
     Form(form): Form<BranchChangeForm>,
 ) -> Result<Response, WebError> {
+    // Non-readers 404 before the CSRF check, matching the trail pages: a
+    // forged POST must not distinguish "exists" from "missing".
+    let access = state
+        .core
+        .repo_for(Some(&session.user), &owner, &repo)
+        .await?;
     verify_csrf(&session.csrf_token, &form.csrf)?;
     match state
         .core
         .create_branch_change(&session.user, &owner, &repo, number, &form.head, &form.base)
         .await
     {
-        Ok(saved) => {
-            let access = state
-                .core
-                .repo_for(Some(&session.user), &owner, &repo)
-                .await?;
-            Ok(Redirect::to(&format!(
-                "/{}/{}/trails/{number}/changes/{}",
-                access.repo.owner, access.repo.name, saved.k
-            ))
-            .into_response())
-        }
+        Ok(saved) => Ok(Redirect::to(&format!(
+            "/{}/{}/trails/{number}/changes/{}",
+            access.repo.owner, access.repo.name, saved.k
+        ))
+        .into_response()),
         Err(starforged_core::CoreError::Invalid(message)) => {
             let page = crate::pages::trails::detail_view(
                 &state,
@@ -356,6 +356,12 @@ pub async fn submit_review(
     Path((owner, repo, number, k)): Path<(String, String, i64, i64)>,
     Form(form): Form<ReviewForm>,
 ) -> Result<Response, WebError> {
+    // Non-readers 404 before the CSRF check, matching the trail pages: a
+    // forged POST must not distinguish "exists" from "missing".
+    let access = state
+        .core
+        .repo_for(Some(&session.user), &owner, &repo)
+        .await?;
     verify_csrf(&session.csrf_token, &form.csrf)?;
     let session_ulid = form.session.filter(|s| !s.trim().is_empty());
     match state
@@ -373,17 +379,11 @@ pub async fn submit_review(
         )
         .await
     {
-        Ok(saved) => {
-            let access = state
-                .core
-                .repo_for(Some(&session.user), &owner, &repo)
-                .await?;
-            Ok(Redirect::to(&format!(
-                "/{}/{}/trails/{number}/changes/{k}#review-{}",
-                access.repo.owner, access.repo.name, saved.id
-            ))
-            .into_response())
-        }
+        Ok(saved) => Ok(Redirect::to(&format!(
+            "/{}/{}/trails/{number}/changes/{k}#review-{}",
+            access.repo.owner, access.repo.name, saved.id
+        ))
+        .into_response()),
         Err(starforged_core::CoreError::Invalid(message)) => {
             let page = change_view(
                 &state,
@@ -415,14 +415,16 @@ pub async fn dismiss_review(
     Path((owner, repo, number, k, id)): Path<(String, String, i64, i64, i64)>,
     Form(form): Form<DismissForm>,
 ) -> Result<Response, WebError> {
+    // Non-readers 404 before the CSRF check, matching the trail pages: a
+    // forged POST must not distinguish "exists" from "missing".
+    let access = state
+        .core
+        .repo_for(Some(&session.user), &owner, &repo)
+        .await?;
     verify_csrf(&session.csrf_token, &form.csrf)?;
     state
         .core
         .dismiss_review(&session.user, &owner, &repo, number, k, id)
-        .await?;
-    let access = state
-        .core
-        .repo_for(Some(&session.user), &owner, &repo)
         .await?;
     Ok(Redirect::to(&format!(
         "/{}/{}/trails/{number}/changes/{k}#review-{id}",
@@ -457,6 +459,12 @@ pub async fn create_thread(
     Path((owner, repo, number, k)): Path<(String, String, i64, i64)>,
     Form(form): Form<ThreadForm>,
 ) -> Result<Response, WebError> {
+    // Non-readers 404 before the CSRF check, matching the trail pages: a
+    // forged POST must not distinguish "exists" from "missing".
+    let access = state
+        .core
+        .repo_for(Some(&session.user), &owner, &repo)
+        .await?;
     verify_csrf(&session.csrf_token, &form.csrf)?;
     let (start, end) = (form.start.unwrap_or(0), form.end.unwrap_or(0));
     match state
@@ -476,17 +484,11 @@ pub async fn create_thread(
         )
         .await
     {
-        Ok(saved) => {
-            let access = state
-                .core
-                .repo_for(Some(&session.user), &owner, &repo)
-                .await?;
-            Ok(Redirect::to(&format!(
-                "/{}/{}/trails/{number}/changes/{k}#thread-{}",
-                access.repo.owner, access.repo.name, saved.id
-            ))
-            .into_response())
-        }
+        Ok(saved) => Ok(Redirect::to(&format!(
+            "/{}/{}/trails/{number}/changes/{k}#thread-{}",
+            access.repo.owner, access.repo.name, saved.id
+        ))
+        .into_response()),
         Err(starforged_core::CoreError::Invalid(message)) => {
             let page = change_view(
                 &state,
@@ -521,6 +523,12 @@ pub async fn resolve_thread(
     Path((owner, repo, number, k, id)): Path<(String, String, i64, i64, i64)>,
     Form(form): Form<ResolveForm>,
 ) -> Result<Response, WebError> {
+    // Non-readers 404 before the CSRF check, matching the trail pages: a
+    // forged POST must not distinguish "exists" from "missing".
+    let access = state
+        .core
+        .repo_for(Some(&session.user), &owner, &repo)
+        .await?;
     verify_csrf(&session.csrf_token, &form.csrf)?;
     state
         .core
@@ -533,10 +541,6 @@ pub async fn resolve_thread(
             id,
             form.action == "resolve",
         )
-        .await?;
-    let access = state
-        .core
-        .repo_for(Some(&session.user), &owner, &repo)
         .await?;
     Ok(Redirect::to(&format!(
         "/{}/{}/trails/{number}/changes/{k}#thread-{id}",
@@ -561,6 +565,12 @@ pub async fn add_thread_comment(
     Path((owner, repo, number, k, id)): Path<(String, String, i64, i64, i64)>,
     Form(form): Form<ThreadCommentForm>,
 ) -> Result<Response, WebError> {
+    // Non-readers 404 before the CSRF check, matching the trail pages: a
+    // forged POST must not distinguish "exists" from "missing".
+    let access = state
+        .core
+        .repo_for(Some(&session.user), &owner, &repo)
+        .await?;
     verify_csrf(&session.csrf_token, &form.csrf)?;
     match state
         .core
@@ -576,17 +586,11 @@ pub async fn add_thread_comment(
         )
         .await
     {
-        Ok(_) => {
-            let access = state
-                .core
-                .repo_for(Some(&session.user), &owner, &repo)
-                .await?;
-            Ok(Redirect::to(&format!(
-                "/{}/{}/trails/{number}/changes/{k}#thread-{id}",
-                access.repo.owner, access.repo.name
-            ))
-            .into_response())
-        }
+        Ok(_) => Ok(Redirect::to(&format!(
+            "/{}/{}/trails/{number}/changes/{k}#thread-{id}",
+            access.repo.owner, access.repo.name
+        ))
+        .into_response()),
         Err(starforged_core::CoreError::Invalid(message)) => {
             let page = change_view(
                 &state,
@@ -621,14 +625,16 @@ pub async fn set_state(
     Path((owner, repo, number, k)): Path<(String, String, i64, i64)>,
     Form(form): Form<StateForm>,
 ) -> Result<Response, WebError> {
+    // Non-readers 404 before the CSRF check, matching the trail pages: a
+    // forged POST must not distinguish "exists" from "missing".
+    let access = state
+        .core
+        .repo_for(Some(&session.user), &owner, &repo)
+        .await?;
     verify_csrf(&session.csrf_token, &form.csrf)?;
     state
         .core
         .set_change_state(&session.user, &owner, &repo, number, k, &form.state)
-        .await?;
-    let access = state
-        .core
-        .repo_for(Some(&session.user), &owner, &repo)
         .await?;
     Ok(Redirect::to(&format!(
         "/{}/{}/trails/{number}/changes/{k}",

@@ -228,8 +228,42 @@ state; `merged` is refused — only the merge path may set it), `GET`/`POST
 mutation needs `trail:write` on top, so a curator token carries `"repo:read trail:write"`.
 Errors use the shared `{"error": {"code", "message"}}` envelope.
 
-Not yet: changes, revisions, and the `refs/for` push flow (M2b); reviews, checks, gate rules,
-and server-side merge (M2c); `trail` CLI commands (M2d); trail deletion (close covers M2a).
+Not yet: checks, gate rules, and server-side merge (M2c); `trail` CLI commands (M2d);
+trail deletion (close covers M2a).
+
+## Changes and reviews
+
+Push to `refs/for/<branch>` to propose work without moving the branch — the `refs/for`
+ref itself is never stored. `refs/for/<branch>/<topic>` names the thread; without a topic
+the pusher's handle is used, so re-pushing the same `<branch>/<topic>` appends a revision
+to your open change (re-pushing the same SHA is a no-op), while another user or topic
+starts a fresh change:
+
+```bash
+git push origin HEAD:refs/for/main/feature-x
+git push -o trail=3 -o title="Faster sync" origin HEAD:refs/for/main
+```
+
+`-o trail=<n>` files the change under that trail (default: a new trail titled from the
+tip subject). Duplicate, unknown, or malformed options reject the whole push, and
+anonymous pushes are rejected everywhere. Triage can also track an existing branch as a
+change from the trail page.
+
+Every change keeps its revisions with diffs (same line- and byte-caps as the compare
+page) and a mergeability verdict — `clean`, or `conflict` with the conflicting paths —
+recomputed on each revision and each base-branch move. Any reader may review (approve,
+request changes, comment) and open file/line threads, but only reviews from writers and
+above count toward merge; triage dismisses reviews, the thread author or triage resolves
+them, and the creator or triage closes and reopens. Threads anchored at older revisions
+are marked outdated. The change page (`/{owner}/{repo}/trails/{n}/changes/{k}`, `?rev=`
+selects the revision) shows all of this with role-gated controls; the Merge button stays
+disabled — merging lands in M2c.
+
+The JSON API mirrors the page: `GET`/`POST .../trails/{n}/changes` (triage to track a
+branch), `GET`/`PATCH .../changes/{k}` (close/reopen; `merged` is refused), `.../state`,
+`.../diff`, `.../revisions[/{r}]`, `.../reviews` (`POST .../{id}/dismiss` for triage),
+and `.../threads` (`POST .../{t}/resolve`, `.../{t}/comments`). Reads need `repo:read`,
+mutations need `trail:write`; strangers get `404` so change numbers stay undiscoverable.
 
 ## Development
 
