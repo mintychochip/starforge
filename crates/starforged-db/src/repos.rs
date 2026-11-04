@@ -230,6 +230,24 @@ pub async fn list_deleted_by_owner(db: &Db, owner_id: i64) -> DbResult<Vec<RepoR
     rows.iter().map(from_row).collect()
 }
 
+/// Every soft-deleted repository, the most recently deleted first, at most `limit`.
+pub async fn list_all_deleted(db: &Db, limit: i64) -> DbResult<Vec<RepoRow>> {
+    let rows = sqlx::query(select_repo!(
+        "WHERE r.deleted_at IS NOT NULL ORDER BY r.deleted_at DESC LIMIT $1"
+    ))
+    .bind(limit)
+    .fetch_all(db.pool())
+    .await?;
+    rows.iter().map(from_row).collect()
+}
+
+/// Live plus deleted repositories, for the admin overview.
+pub async fn count_all(db: &Db) -> DbResult<i64> {
+    Ok(sqlx::query_scalar("SELECT COUNT(*) FROM repos")
+        .fetch_one(db.pool())
+        .await?)
+}
+
 /// Repositories deleted at or before `cutoff`, the oldest deletion first.
 pub async fn deleted_before(db: &Db, cutoff: i64) -> DbResult<Vec<RepoRow>> {
     let rows = sqlx::query(select_repo!(
@@ -262,4 +280,62 @@ pub async fn deleted_name_exists(db: &Db, owner_id: i64, name: &str) -> DbResult
     .fetch_one(db.pool())
     .await?;
     Ok(count > 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing::TestDb;
+    use crate::users::{self, NewUser};
+
+    fn user(handle: &str) -> NewUser<'_> {
+        NewUser {
+            handle,
+            display_name: "",
+            email: None,
+            email_verified: false,
+            password_hash: None,
+            is_admin: false,
+        }
+    }
+
+    fn repo(owner_id: i64, name: &str) -> NewRepo<'_> {
+        NewRepo {
+            owner_id,
+            name,
+            description: "",
+            visibility: "public",
+            default_branch: "main",
+        }
+    }
+
+    #[tokio::test]
+    async fn all_deleted_lists_every_owner() {
+        let t = TestDb::new().await;
+        let alice = users::insert(&t.db, &user("alice")).await.unwrap();
+        let bob = users::insert(&t.db, &user("bob")).await.unwrap();
+        insert(&t.db, &repo(alice, "live")).await.unwrap();
+        let alice_deleted = insert(&t.db, &repo(alice, "gone")).await.unwrap();
+        let bob_deleted = insert(&t.db, &repo(bob, "vanished")).await.unwrap();
+        let base = now();
+        set_deleted(&t.db, alice_deleted, Some(base - 10))
+            .await
+            .unwrap();
+        set_deleted(&t.db, bob_deleted, Some(base)).await.unwrap();
+        let all = list_all_deleted(&t.db, 200).await.unwrap();
+        assert_eq!(
+            all.iter().map(|row| row.id).collect::<Vec<_>>(),
+            vec![bob_deleted, alice_deleted],
+            "every owner's deleted repos, most recently deleted first"
+        );
+        assert_eq!(all[0].owner_handle, "bob");
+        assert_eq!(all[0].name, "vanished");
+        assert_eq!(all[1].owner_handle, "alice");
+        assert_eq!(all[1].name, "gone");
+        assert_eq!(
+            count_all(&t.db).await.unwrap(),
+            3,
+            "count_all counts live plus deleted"
+        );
+    }
 }
