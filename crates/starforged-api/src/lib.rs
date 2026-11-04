@@ -1,6 +1,7 @@
 //! starforged-api: the JSON REST API under `/api/v1` (spec §10.4). A thin layer over `starforged-core`.
 
 pub mod auth;
+mod changes;
 pub mod error;
 mod moved;
 mod oauth;
@@ -47,7 +48,10 @@ pub fn router(core: Core, base_url: String) -> Router {
         .route("/user/repos", post(repos::create))
         .route("/oauth/device/code", post(oauth::device_code))
         .route("/oauth/token", post(oauth::token))
-        .route("/repos/{owner}/{repo}", get(repos::show))
+        .route(
+            "/repos/{owner}/{repo}",
+            get(repos::show).patch(repos::patch),
+        )
         .route(
             "/repos/{owner}/{repo}/collaborators",
             get(repos::list_collaborators),
@@ -126,6 +130,50 @@ pub fn router(core: Core, base_url: String) -> Router {
         .route(
             "/repos/{owner}/{repo}/trails/{n}/assignees",
             post(trails::add_assignee).delete(trails::remove_assignee),
+        )
+        .route(
+            "/repos/{owner}/{repo}/trails/{n}/changes",
+            get(changes::list_changes).post(changes::create_change),
+        )
+        .route(
+            "/repos/{owner}/{repo}/trails/{n}/changes/{k}",
+            get(changes::get_change).patch(changes::patch_change),
+        )
+        .route(
+            "/repos/{owner}/{repo}/trails/{n}/changes/{k}/state",
+            post(changes::post_state),
+        )
+        .route(
+            "/repos/{owner}/{repo}/trails/{n}/changes/{k}/diff",
+            get(changes::get_diff),
+        )
+        .route(
+            "/repos/{owner}/{repo}/trails/{n}/changes/{k}/revisions",
+            get(changes::list_revisions),
+        )
+        .route(
+            "/repos/{owner}/{repo}/trails/{n}/changes/{k}/revisions/{r}",
+            get(changes::get_revision),
+        )
+        .route(
+            "/repos/{owner}/{repo}/trails/{n}/changes/{k}/reviews",
+            get(changes::list_reviews).post(changes::submit_review),
+        )
+        .route(
+            "/repos/{owner}/{repo}/trails/{n}/changes/{k}/reviews/{id}/dismiss",
+            post(changes::dismiss_review),
+        )
+        .route(
+            "/repos/{owner}/{repo}/trails/{n}/changes/{k}/threads",
+            get(changes::list_threads).post(changes::create_thread),
+        )
+        .route(
+            "/repos/{owner}/{repo}/trails/{n}/changes/{k}/threads/{t}/resolve",
+            post(changes::resolve_thread),
+        )
+        .route(
+            "/repos/{owner}/{repo}/trails/{n}/changes/{k}/threads/{t}/comments",
+            post(changes::add_comment),
         )
         .fallback(|| async { ApiError::NotFound })
         .layer(axum::middleware::from_fn_with_state(

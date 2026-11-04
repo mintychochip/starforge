@@ -161,3 +161,28 @@ pub async fn remove_collaborator(
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
+#[derive(Deserialize)]
+pub struct PatchRepoBody {
+    pub refs_for_access: Option<String>,
+}
+
+/// `PATCH /repos/{owner}/{repo}` (`{"refs_for_access": …}`): flips the
+/// `refs/for` push policy between `anyone_with_read` and `members`.
+/// Maintain+ via the repo-settings power; anything else in the body is 422.
+pub async fn patch(
+    State(state): State<ApiState>,
+    auth: ApiAuth,
+    Path((owner, repo)): Path<(String, String)>,
+    body: Result<Json<PatchRepoBody>, JsonRejection>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let auth = auth.require(Scope::RepoWrite)?;
+    let Json(body) = body.map_err(|e| ApiError::Invalid(e.body_text()))?;
+    let Some(value) = body.refs_for_access else {
+        return Err(ApiError::Invalid("refs_for_access is required".into()));
+    };
+    let value = state
+        .core
+        .set_refs_for_access(&auth.user, &owner, &repo, &value)
+        .await?;
+    Ok(Json(serde_json::json!({ "refs_for_access": value })))
+}
