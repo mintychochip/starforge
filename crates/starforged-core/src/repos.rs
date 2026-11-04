@@ -21,6 +21,8 @@ pub struct Repo {
     pub description: String,
     pub visibility: Visibility,
     pub default_branch: String,
+    /// When the repository was archived; an archived repository refuses pushes (forge-basics design §5.4).
+    pub archived_at: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -65,6 +67,7 @@ fn to_repo(row: RepoRow) -> CoreResult<Repo> {
         description: row.description,
         visibility,
         default_branch: row.default_branch,
+        archived_at: row.archived_at,
         created_at: row.created_at,
         updated_at: row.updated_at,
     })
@@ -482,6 +485,45 @@ impl Core {
         )
         .await?;
         Ok(repo)
+    }
+
+    /// Admins: archives the repository; it stays readable and refuses pushes until it is unarchived.
+    pub async fn archive_repo(&self, actor: &User, owner: &str, name: &str) -> CoreResult<Repo> {
+        self.set_archived(actor, owner, name, true).await
+    }
+
+    /// Admins: lifts the archive.
+    pub async fn unarchive_repo(&self, actor: &User, owner: &str, name: &str) -> CoreResult<Repo> {
+        self.set_archived(actor, owner, name, false).await
+    }
+
+    async fn set_archived(
+        &self,
+        actor: &User,
+        owner: &str,
+        name: &str,
+        archived: bool,
+    ) -> CoreResult<Repo> {
+        let access = self
+            .require_repo(Some(actor), owner, name, Permission::Admin)
+            .await?;
+        if access.repo.archived_at.is_some() == archived {
+            return Ok(access.repo);
+        }
+        db_repos::set_archived(self.db(), access.repo.id, archived.then(now)).await?;
+        let action = if archived {
+            "repo.archive"
+        } else {
+            "repo.unarchive"
+        };
+        self.audit(
+            Some(actor.id),
+            action,
+            &format!("repo:{}", access.repo.full_name()),
+            "",
+        )
+        .await?;
+        self.reload_repo(access.repo.id).await
     }
 
     /// The repository that `owner/name` was renamed to, when `user` can read it. `None` when a repository has
@@ -976,5 +1018,44 @@ mod tests {
             ),
             ("repo.rename", "repo:alice/Renamed", "proj")
         );
+    }
+
+    #[tokio::test]
+    async fn archiving_needs_admin_and_is_audited_once() {
+        let (core, _f) = test_core().await;
+        let alice = user(&core, "alice").await;
+        let mia = user(&core, "mia").await;
+        core.create_repo(&alice, new("proj", Visibility::Public))
+            .await
+            .unwrap();
+        core.set_collaborator(&alice, "alice", "proj", "mia", Permission::Maintain)
+            .await
+            .unwrap();
+        assert!(matches!(
+            core.archive_repo(&mia, "alice", "proj").await,
+            Err(CoreError::Forbidden)
+        ));
+        let archived = core.archive_repo(&alice, "alice", "proj").await.unwrap();
+        assert!(archived.archived_at.is_some());
+        core.archive_repo(&alice, "alice", "proj").await.unwrap();
+        assert!(
+            core.repo_for(None, "alice", "proj")
+                .await
+                .unwrap()
+                .repo
+                .archived_at
+                .is_some(),
+            "archived repositories stay readable"
+        );
+        let restored = core.unarchive_repo(&alice, "alice", "proj").await.unwrap();
+        assert_eq!(restored.archived_at, None);
+        let actions: Vec<String> = starforged_db::audit::recent(core.db(), 20)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.action)
+            .filter(|a| a.ends_with("archive"))
+            .collect();
+        assert_eq!(actions, vec!["repo.unarchive", "repo.archive"]);
     }
 }

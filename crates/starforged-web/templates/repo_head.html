@@ -1,5 +1,6 @@
 <div class="repo-head">
-<h1><a href="/{{ head.owner }}">{{ head.owner }}</a> / <a href="/{{ head.owner }}/{{ head.name }}">{{ head.name }}</a> <span class="badge">{{ head.visibility }}</span></h1>
+<h1><a href="/{{ head.owner }}">{{ head.owner }}</a> / <a href="/{{ head.owner }}/{{ head.name }}">{{ head.name }}</a> <span class="badge">{{ head.visibility }}</span>{% if head.archived %} <span class="badge">archived</span>{% endif %}</h1>
+{% if head.archived %}<p class="notice">This repository is archived. It is read-only: pushes are refused.</p>{% endif %}
 {% if !head.description.is_empty() %}<p class="muted">{{ head.description }}</p>{% endif %}
 <nav class="tabs" aria-label="Repository">
 <a href="/{{ head.owner }}/{{ head.name }}"{% if head.tab == "code" %} aria-current="page"{% endif %}>Code</a>

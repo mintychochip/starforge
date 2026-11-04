@@ -29,6 +29,8 @@ pub struct RepoHead {
     pub name: String,
     pub description: String,
     pub visibility: &'static str,
+    /// The repository is archived: read-only, pushes refused.
+    pub archived: bool,
     /// The highlighted tab: `code`, `commits`, or `settings`; any other value highlights none.
     pub tab: &'static str,
     /// The Commits tab: the history of the ref being viewed, or `/{owner}/{repo}/commits`.
@@ -57,6 +59,7 @@ impl RepoHead {
             name: repo.name.clone(),
             description: repo.description.clone(),
             visibility: repo.visibility.as_str(),
+            archived: repo.archived_at.is_some(),
             tab,
             commits_href,
             can_maintain: access.permission >= Permission::Maintain,

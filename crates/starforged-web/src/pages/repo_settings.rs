@@ -14,7 +14,7 @@ use starforged_core::sessions::WebSession;
 use starforged_core::{CoreError, CoreResult};
 
 use crate::AppState;
-use crate::auth::{RequireUser, verify_csrf};
+use crate::auth::{CsrfForm, RequireUser, verify_csrf};
 use crate::error::WebError;
 use crate::views::{NavUser, RepoHead};
 
@@ -126,6 +126,31 @@ pub async fn rename(
     let result = state
         .core
         .rename_repo(&session.user, &owner, &repo, &form.new_name)
+        .await;
+    finish(&state, &session, &owner, &repo, result).await
+}
+
+pub async fn archive(
+    State(state): State<AppState>,
+    RequireUser(session): RequireUser,
+    Path((owner, repo)): Path<(String, String)>,
+    Form(form): Form<CsrfForm>,
+) -> Result<Response, WebError> {
+    verify_csrf(&session.csrf_token, &form.csrf)?;
+    let result = state.core.archive_repo(&session.user, &owner, &repo).await;
+    finish(&state, &session, &owner, &repo, result).await
+}
+
+pub async fn unarchive(
+    State(state): State<AppState>,
+    RequireUser(session): RequireUser,
+    Path((owner, repo)): Path<(String, String)>,
+    Form(form): Form<CsrfForm>,
+) -> Result<Response, WebError> {
+    verify_csrf(&session.csrf_token, &form.csrf)?;
+    let result = state
+        .core
+        .unarchive_repo(&session.user, &owner, &repo)
         .await;
     finish(&state, &session, &owner, &repo, result).await
 }

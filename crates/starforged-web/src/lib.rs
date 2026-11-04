@@ -110,6 +110,14 @@ fn page_routes() -> Router<AppState> {
             post(pages::repo_settings::rename),
         )
         .route(
+            "/{owner}/{repo}/settings/archive",
+            post(pages::repo_settings::archive),
+        )
+        .route(
+            "/{owner}/{repo}/settings/unarchive",
+            post(pages::repo_settings::unarchive),
+        )
+        .route(
             "/{owner}/{repo}/settings/collaborators",
             get(pages::collaborators::list).post(pages::collaborators::add),
         )

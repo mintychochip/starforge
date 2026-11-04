@@ -33,5 +33,19 @@
   <p class="muted">Links, clones, and API calls that use the old name are redirected to the new one.</p>
   <button type="submit">Rename</button>
 </form>
+<h2>Archive</h2>
+{% if head.archived %}
+<form method="post" action="/{{ head.owner }}/{{ head.name }}/settings/unarchive" class="stack">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <p>This repository is archived: it is read-only and refuses pushes.</p>
+  <button type="submit">Unarchive this repository</button>
+</form>
+{% else %}
+<form method="post" action="/{{ head.owner }}/{{ head.name }}/settings/archive" class="stack">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <p>Archiving makes the repository read-only: pushes are refused until it is unarchived. Settings stay editable.</p>
+  <button type="submit">Archive this repository</button>
+</form>
+{% endif %}
 {% endif %}
 {% endblock %}

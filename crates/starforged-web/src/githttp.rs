@@ -23,6 +23,7 @@ use crate::AppState;
 pub enum GitHttpError {
     Unauthorized,
     Forbidden,
+    Archived,
     NotFound,
     BadRequest(&'static str),
     Internal(String),
@@ -43,6 +44,11 @@ impl IntoResponse for GitHttpError {
             GitHttpError::Forbidden => {
                 (StatusCode::FORBIDDEN, "permission denied\n").into_response()
             }
+            GitHttpError::Archived => (
+                StatusCode::FORBIDDEN,
+                "This repository is archived; pushes are disabled.\n",
+            )
+                .into_response(),
             GitHttpError::NotFound => {
                 (StatusCode::NOT_FOUND, "repository not found\n").into_response()
             }
@@ -112,6 +118,9 @@ async fn authorize(
     }
     let user: Option<&User> = auth.as_ref().map(|a| &a.user);
     match state.core.require_repo(user, owner, name, needed).await {
+        Ok(access) if service == Service::ReceivePack && access.repo.archived_at.is_some() => {
+            Err(GitHttpError::Archived)
+        }
         Ok(access) => Ok(access),
         Err(CoreError::NotFound | CoreError::Unauthenticated) if user.is_none() => {
             Err(GitHttpError::Unauthorized)

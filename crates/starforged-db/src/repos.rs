@@ -14,6 +14,7 @@ pub struct RepoRow {
     pub description: String,
     pub visibility: String,
     pub default_branch: String,
+    pub archived_at: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -30,7 +31,7 @@ macro_rules! select_repo {
     ($tail:literal) => {
         concat!(
             "SELECT r.id, r.owner_id, o.handle AS owner_handle, r.name, r.description, r.visibility, ",
-            "r.default_branch, r.created_at, r.updated_at FROM repos r JOIN owners o ON o.id = r.owner_id ",
+            "r.default_branch, r.archived_at, r.created_at, r.updated_at FROM repos r JOIN owners o ON o.id = r.owner_id ",
             $tail
         )
     };
@@ -45,6 +46,7 @@ fn from_row(row: &AnyRow) -> DbResult<RepoRow> {
         description: row.try_get("description")?,
         visibility: row.try_get("visibility")?,
         default_branch: row.try_get("default_branch")?,
+        archived_at: row.try_get("archived_at")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })
@@ -194,5 +196,16 @@ pub async fn rename(db: &Db, id: i64, new_name: &str) -> DbResult<()> {
         .await?;
     }
     tx.commit().await?;
+    Ok(())
+}
+
+/// Archives the repository (`Some(time)`) or lifts the archive (`None`).
+pub async fn set_archived(db: &Db, id: i64, archived_at: Option<i64>) -> DbResult<()> {
+    sqlx::query("UPDATE repos SET archived_at = $1, updated_at = $2 WHERE id = $3")
+        .bind(archived_at)
+        .bind(now())
+        .bind(id)
+        .execute(db.pool())
+        .await?;
     Ok(())
 }
