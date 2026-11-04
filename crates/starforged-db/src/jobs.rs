@@ -213,6 +213,47 @@ pub async fn failed_of_kind_before(db: &Db, kind: &str, before: i64) -> DbResult
     rows.iter().map(from_row).collect()
 }
 
+/// The newest jobs first, capped; callers filter states in Rust to keep one static query.
+pub async fn list_recent(db: &Db, limit: i64) -> DbResult<Vec<JobRow>> {
+    let rows = sqlx::query(select_job!("ORDER BY run_at DESC, id DESC LIMIT $1"))
+        .bind(limit)
+        .fetch_all(db.pool())
+        .await?;
+    rows.iter().map(from_row).collect()
+}
+
+/// Re-queues a failed job now; false when the job is missing or not failed.
+pub async fn retry_failed(db: &Db, id: i64, now_ts: i64) -> DbResult<bool> {
+    let changed = sqlx::query(
+        "UPDATE jobs SET state = 'queued', run_at = $1, locked_until = NULL, updated_at = $1 WHERE id = $2 AND state = 'failed'",
+    )
+    .bind(now_ts)
+    .bind(id)
+    .execute(db.pool())
+    .await?
+    .rows_affected();
+    Ok(changed > 0)
+}
+
+/// Deletes a failed job; false when the job is missing or not failed.
+pub async fn delete_job(db: &Db, id: i64) -> DbResult<bool> {
+    let removed = sqlx::query("DELETE FROM jobs WHERE id = $1 AND state = 'failed'")
+        .bind(id)
+        .execute(db.pool())
+        .await?
+        .rows_affected();
+    Ok(removed > 0)
+}
+
+pub async fn count_by_state(db: &Db, state: &str) -> DbResult<i64> {
+    Ok(
+        sqlx::query_scalar("SELECT COUNT(*) FROM jobs WHERE state = $1")
+            .bind(state)
+            .fetch_one(db.pool())
+            .await?,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -361,5 +402,44 @@ mod tests {
             by_id(&t.db, queued).await.unwrap().is_some(),
             "queued jobs are never pruned"
         );
+    }
+    #[tokio::test]
+    async fn retry_and_delete_only_touch_failed_jobs() {
+        let t = TestDb::new().await;
+        let now = now();
+        let failed = insert(
+            &t.db,
+            &NewJob {
+                kind: "send_email",
+                payload: "{}",
+                dedupe_key: None,
+                run_at: now,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        fail(&t.db, failed, "boom", None).await.unwrap();
+        let queued = insert(
+            &t.db,
+            &NewJob {
+                kind: "send_email",
+                payload: "{}",
+                dedupe_key: None,
+                run_at: now,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!retry_failed(&t.db, queued, now).await.unwrap());
+        assert!(retry_failed(&t.db, failed, now).await.unwrap());
+        assert_eq!(by_id(&t.db, failed).await.unwrap().unwrap().state, "queued");
+        assert!(!delete_job(&t.db, queued).await.unwrap());
+        // Re-fail it, then delete.
+        fail(&t.db, failed, "again", None).await.unwrap();
+        assert!(delete_job(&t.db, failed).await.unwrap());
+        assert!(by_id(&t.db, failed).await.unwrap().is_none());
+        assert_eq!(count_by_state(&t.db, "queued").await.unwrap(), 1);
     }
 }

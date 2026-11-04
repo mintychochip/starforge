@@ -4,16 +4,27 @@
 //! Demoting, suspending, or deleting the last active site admin is refused so the site is never
 //! left without an administrator.
 
-use starforged_db::{repos as db_repos, users, web_sessions};
-
 use crate::accounts::{CreateUser, User};
 use crate::{Core, CoreError, CoreResult};
+use starforged_db::{jobs as db_jobs, now, repos as db_repos, users, web_sessions};
 
 /// A user plus how many live repositories they own, for the admin detail page.
 #[derive(Debug, Clone)]
 pub struct UserSummary {
     pub user: User,
     pub repo_count: i64,
+}
+
+/// A background job for the admin Jobs page; `done` jobs are never listed.
+#[derive(Debug, Clone)]
+pub struct JobInfo {
+    pub id: i64,
+    pub kind: String,
+    pub state: String,
+    pub attempts: i64,
+    pub last_error: String,
+    pub run_at: i64,
+    pub created_at: i64,
 }
 
 fn forbidden_unless_admin(admin: &User) -> CoreResult<()> {
@@ -192,6 +203,47 @@ impl Core {
         )
         .await?;
         users::delete(self.db(), target.id).await?;
+        Ok(())
+    }
+
+    /// Newest queued, running, or failed jobs first, capped at 200.
+    pub async fn admin_list_jobs(&self, admin: &User) -> CoreResult<Vec<JobInfo>> {
+        forbidden_unless_admin(admin)?;
+        let rows = db_jobs::list_recent(self.db(), 200).await?;
+        Ok(rows
+            .into_iter()
+            .filter(|row| row.state != "done")
+            .map(|row| JobInfo {
+                id: row.id,
+                kind: row.kind,
+                state: row.state,
+                attempts: row.attempts,
+                last_error: row.last_error,
+                run_at: row.run_at,
+                created_at: row.created_at,
+            })
+            .collect())
+    }
+
+    /// Re-queues a failed job now; `NotFound` when it is missing or not failed.
+    pub async fn retry_job(&self, admin: &User, id: i64) -> CoreResult<()> {
+        forbidden_unless_admin(admin)?;
+        if !db_jobs::retry_failed(self.db(), id, now()).await? {
+            return Err(CoreError::NotFound);
+        }
+        self.audit(Some(admin.id), "job.retry", &format!("job:{id}"), "")
+            .await?;
+        Ok(())
+    }
+
+    /// Deletes a failed job; `NotFound` when it is missing or not failed.
+    pub async fn delete_job(&self, admin: &User, id: i64) -> CoreResult<()> {
+        forbidden_unless_admin(admin)?;
+        if !db_jobs::delete_job(self.db(), id).await? {
+            return Err(CoreError::NotFound);
+        }
+        self.audit(Some(admin.id), "job.delete", &format!("job:{id}"), "")
+            .await?;
         Ok(())
     }
 }
@@ -467,5 +519,81 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+    #[tokio::test]
+    async fn failed_jobs_retry_and_delete() {
+        use crate::jobs::Job;
+        use starforged_db::{audit, jobs as db_jobs};
+        let (core, root, _) = two_admins().await;
+        let bob = plain_user(&core, "bob").await;
+        assert!(matches!(
+            core.admin_list_jobs(&bob).await,
+            Err(CoreError::Forbidden)
+        ));
+        assert!(matches!(
+            core.retry_job(&bob, 1).await,
+            Err(CoreError::Forbidden)
+        ));
+        assert!(matches!(
+            core.delete_job(&bob, 1).await,
+            Err(CoreError::Forbidden)
+        ));
+        // Seed through the queue, then fail directly via the db fail path.
+        core.enqueue(&Job::SendEmail {
+            to: "x@example.com".into(),
+            subject: "s".into(),
+            body: "b".into(),
+        })
+        .await
+        .unwrap();
+        let id: i64 = sqlx::query_scalar("SELECT id FROM jobs")
+            .fetch_one(core.db().pool())
+            .await
+            .unwrap();
+        db_jobs::fail(core.db(), id, "boom", None).await.unwrap();
+        // A done job is hidden from the admin list.
+        core.enqueue(&Job::HourlyCleanup).await.unwrap();
+        let done_id: i64 = sqlx::query_scalar("SELECT id FROM jobs WHERE kind = 'hourly_cleanup'")
+            .fetch_one(core.db().pool())
+            .await
+            .unwrap();
+        db_jobs::complete(core.db(), done_id).await.unwrap();
+        let listed = core.admin_list_jobs(&root).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, id);
+        assert_eq!(listed[0].kind, "send_email");
+        assert_eq!(listed[0].state, "failed");
+        assert_eq!(listed[0].last_error, "boom");
+        // Retry re-queues; retrying a queued or missing job is NotFound.
+        core.retry_job(&root, id).await.unwrap();
+        assert_eq!(
+            db_jobs::by_id(core.db(), id).await.unwrap().unwrap().state,
+            "queued"
+        );
+        assert!(matches!(
+            core.retry_job(&root, id).await,
+            Err(CoreError::NotFound)
+        ));
+        assert!(matches!(
+            core.retry_job(&root, 999_999).await,
+            Err(CoreError::NotFound)
+        ));
+        // Re-fail, then delete; deleting twice is NotFound.
+        db_jobs::fail(core.db(), id, "again", None).await.unwrap();
+        core.delete_job(&root, id).await.unwrap();
+        assert!(db_jobs::by_id(core.db(), id).await.unwrap().is_none());
+        assert!(matches!(
+            core.delete_job(&root, id).await,
+            Err(CoreError::NotFound)
+        ));
+        let entries = audit::recent(core.db(), 100).await.unwrap();
+        for action in ["job.retry", "job.delete"] {
+            assert!(
+                entries
+                    .iter()
+                    .any(|e| e.action == action && e.target == format!("job:{id}")),
+                "missing audit {action} for job:{id}"
+            );
+        }
     }
 }
