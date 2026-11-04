@@ -109,7 +109,7 @@ impl Core {
     }
 }
 
-async fn hash_password(password: String) -> CoreResult<String> {
+pub(crate) async fn hash_password(password: String) -> CoreResult<String> {
     tokio::task::spawn_blocking(move || {
         Argon2::default()
             .hash_password(password.as_bytes())

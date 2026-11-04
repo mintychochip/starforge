@@ -53,6 +53,14 @@ fn page_routes() -> Router<AppState> {
             get(pages::verify::confirm_form).post(pages::verify::confirm),
         )
         .route(
+            "/forgot",
+            get(pages::password::forgot_form).post(pages::password::forgot),
+        )
+        .route(
+            "/reset/{token}",
+            get(pages::password::reset_form).post(pages::password::reset),
+        )
+        .route(
             "/new",
             get(pages::repo_new::form).post(pages::repo_new::submit),
         )

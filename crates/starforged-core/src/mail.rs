@@ -225,6 +225,22 @@ pub(crate) fn invite_email(to: &str, inviter: &str, link: &str) -> CoreResult<Em
     })
 }
 
+#[derive(Template)]
+#[template(path = "mail/reset_password.txt")]
+struct ResetPasswordText<'a> {
+    handle: &'a str,
+    link: &'a str,
+}
+
+/// A password-reset link valid for 1 hour.
+pub(crate) fn reset_email(to: &str, handle: &str, link: &str) -> CoreResult<Email> {
+    Ok(Email {
+        to: to.to_owned(),
+        subject: "Reset your Starforge password".into(),
+        body: render(&ResetPasswordText { handle, link })?,
+    })
+}
+
 impl Core {
     /// Whether this instance sends email (`[mail] url` is set).
     pub fn mail_enabled(&self) -> bool {

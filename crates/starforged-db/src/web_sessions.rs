@@ -78,3 +78,12 @@ pub async fn delete_expired(db: &Db, now_ts: i64) -> DbResult<u64> {
         .await?;
     Ok(result.rows_affected())
 }
+
+/// Signs a user out everywhere; returns how many sessions ended.
+pub async fn delete_for_user(db: &Db, user_id: i64) -> DbResult<u64> {
+    let result = sqlx::query("DELETE FROM web_sessions WHERE user_id = $1")
+        .bind(user_id)
+        .execute(db.pool())
+        .await?;
+    Ok(result.rows_affected())
+}

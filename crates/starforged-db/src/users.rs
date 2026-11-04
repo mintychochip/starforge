@@ -123,6 +123,14 @@ pub async fn set_email_verified(db: &Db, id: i64, verified: bool) -> DbResult<()
         .await?;
     Ok(())
 }
+pub async fn set_password_hash(db: &Db, id: i64, password_hash: &str) -> DbResult<()> {
+    sqlx::query("UPDATE users SET password_hash = $1 WHERE id = $2")
+        .bind(password_hash)
+        .bind(id)
+        .execute(db.pool())
+        .await?;
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {

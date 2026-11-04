@@ -8,6 +8,7 @@ pub mod join;
 pub mod login;
 pub mod message;
 pub mod owner;
+pub mod password;
 pub mod repo_new;
 pub mod tokens;
 pub mod verify;

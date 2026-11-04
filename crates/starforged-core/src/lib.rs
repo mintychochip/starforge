@@ -10,6 +10,7 @@ pub mod error;
 pub mod invites;
 pub mod jobs;
 pub mod mail;
+pub mod passwords;
 pub mod permission;
 pub mod registration;
 pub mod repos;

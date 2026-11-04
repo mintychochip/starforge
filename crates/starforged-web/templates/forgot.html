@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block title %}Forgot password · Starforge{% endblock %}
+{% block content %}
+<h1>Forgot your password?</h1>
+<p>Enter the email address of your account, and we will send you a link to choose a new password.</p>
+<form method="post" action="/forgot" class="stack">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <label>Email <input name="email" type="email" autocomplete="email" required></label>
+  <button type="submit">Send the link</button>
+</form>
+{% endblock %}
