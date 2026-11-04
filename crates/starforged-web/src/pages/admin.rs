@@ -9,6 +9,7 @@ use axum_extra::extract::Form;
 use serde::Deserialize;
 use starforged_core::CoreError;
 use starforged_core::CoreResult;
+use starforged_core::accounts::CreateUser;
 use starforged_core::accounts::User;
 use starforged_core::admin::{AdminOverview, UserSummary};
 use starforged_core::passwords::AdminReset;
@@ -59,6 +60,7 @@ pub struct UsersPage {
     admin_tab: &'static str,
     query: String,
     users: Vec<User>,
+    error: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -66,23 +68,75 @@ pub struct ListParams {
     q: Option<String>,
 }
 
-pub async fn users(
-    State(state): State<AppState>,
-    RequireAdmin(session): RequireAdmin,
-    Query(params): Query<ListParams>,
+async fn users_page(
+    state: &AppState,
+    session: &WebSession,
+    query: String,
+    error: Option<String>,
 ) -> Result<UsersPage, WebError> {
-    let query = params.q.unwrap_or_default();
     let list = state
         .core
         .admin_list_users(&session.user, &query.to_lowercase(), 200)
         .await?;
     Ok(UsersPage {
-        nav_user: Some(NavUser::from_session(&session)),
+        nav_user: Some(NavUser::from_session(session)),
         csrf: session.csrf_token.clone(),
         admin_tab: "users",
         query,
         users: list,
+        error,
     })
+}
+
+pub async fn users(
+    State(state): State<AppState>,
+    RequireAdmin(session): RequireAdmin,
+    Query(params): Query<ListParams>,
+) -> Result<UsersPage, WebError> {
+    users_page(&state, &session, params.q.unwrap_or_default(), None).await
+}
+
+#[derive(Deserialize)]
+pub struct CreateUserForm {
+    #[serde(rename = "_csrf")]
+    csrf: String,
+    handle: String,
+    display_name: String,
+    email: String,
+    password: String,
+    admin: Option<String>, // Checkbox: `Some("on")` when ticked.
+}
+
+/// Creates an account directly: the address is trusted, so it starts verified.
+/// Success lands on the new account's detail page; refused input re-renders the
+/// users list (422) with the message and a pointer at invites.
+pub async fn create_user(
+    State(state): State<AppState>,
+    RequireAdmin(session): RequireAdmin,
+    Form(form): Form<CreateUserForm>,
+) -> Result<Response, WebError> {
+    verify_csrf(&session.csrf_token, &form.csrf)?;
+    let email = form.email.trim();
+    let input = CreateUser {
+        handle: form.handle.trim().to_owned(),
+        display_name: form.display_name.trim().to_owned(),
+        email: if email.is_empty() {
+            None
+        } else {
+            Some(email.to_owned())
+        },
+        email_verified: false, // `admin_create_user` vouches for the address.
+        password: Some(form.password.clone()),
+        is_admin: form.admin.is_some(),
+    };
+    match state.core.admin_create_user(&session.user, input).await {
+        Ok(user) => Ok(Redirect::to(&format!("/admin/users/{}", user.handle)).into_response()),
+        Err(CoreError::Invalid(message) | CoreError::Conflict(message)) => {
+            let page = users_page(&state, &session, String::new(), Some(message)).await?;
+            Ok((StatusCode::UNPROCESSABLE_ENTITY, page).into_response())
+        }
+        Err(other) => Err(other.into()),
+    }
 }
 
 #[derive(Template, WebTemplate)]
@@ -304,6 +358,113 @@ pub async fn reset_password(
             let page = detail_page(&state, &session, &handle, Some(message), None).await?;
             Ok((StatusCode::UNPROCESSABLE_ENTITY, page).into_response())
         }
+        Err(other) => Err(other.into()),
+    }
+}
+
+/// One invite row for the list: the status is the lowercase `InviteStatus` name.
+pub struct InviteRow {
+    id: i64,
+    email: Option<String>,
+    status: String,
+    created: String,
+    expires: String,
+}
+
+#[derive(Template, WebTemplate)]
+#[template(path = "admin_invites.html")]
+pub struct InvitesPage {
+    nav_user: Option<NavUser>,
+    csrf: String,
+    admin_tab: &'static str,
+    invites: Vec<InviteRow>,
+    created_link: Option<String>,
+    emailed: bool,
+    error: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct CreateInviteForm {
+    #[serde(rename = "_csrf")]
+    csrf: String,
+    #[serde(default)]
+    email: String,
+}
+
+async fn invites_page(
+    state: &AppState,
+    session: &WebSession,
+    created_link: Option<String>,
+    emailed: bool,
+    error: Option<String>,
+) -> Result<InvitesPage, WebError> {
+    let invites = state
+        .core
+        .list_invites(&session.user)
+        .await?
+        .into_iter()
+        .map(|info| InviteRow {
+            id: info.id,
+            email: info.email,
+            status: info.status.as_str().to_owned(),
+            created: crate::views::format_time(info.created_at),
+            expires: crate::views::format_time(info.expires_at),
+        })
+        .collect();
+    Ok(InvitesPage {
+        nav_user: Some(NavUser::from_session(session)),
+        csrf: session.csrf_token.clone(),
+        admin_tab: "invites",
+        invites,
+        created_link,
+        emailed,
+        error,
+    })
+}
+
+pub async fn invites(
+    State(state): State<AppState>,
+    RequireAdmin(session): RequireAdmin,
+) -> Result<InvitesPage, WebError> {
+    invites_page(&state, &session, None, false, None).await
+}
+
+/// Issues an invite and shows the one-time link: it is rendered only in this
+/// response, never in the list.
+pub async fn create_invite(
+    State(state): State<AppState>,
+    RequireAdmin(session): RequireAdmin,
+    Form(form): Form<CreateInviteForm>,
+) -> Result<Response, WebError> {
+    verify_csrf(&session.csrf_token, &form.csrf)?;
+    let email = form.email.trim();
+    let email = if email.is_empty() { None } else { Some(email) };
+    match state.core.create_invite(&session.user, email).await {
+        Ok(created) => {
+            Ok(
+                invites_page(&state, &session, Some(created.link), created.emailed, None)
+                    .await?
+                    .into_response(),
+            )
+        }
+        Err(CoreError::Invalid(message) | CoreError::Conflict(message)) => {
+            let page = invites_page(&state, &session, None, false, Some(message)).await?;
+            Ok((StatusCode::UNPROCESSABLE_ENTITY, page).into_response())
+        }
+        Err(other) => Err(other.into()),
+    }
+}
+
+pub async fn revoke_invite(
+    State(state): State<AppState>,
+    RequireAdmin(session): RequireAdmin,
+    Path(id): Path<i64>,
+    Form(form): Form<CsrfForm>,
+) -> Result<Response, WebError> {
+    verify_csrf(&session.csrf_token, &form.csrf)?;
+    match state.core.revoke_invite(&session.user, id).await {
+        Ok(()) => Ok(Redirect::to("/admin/invites").into_response()),
+        Err(CoreError::NotFound) => Err(WebError::NotFound),
         Err(other) => Err(other.into()),
     }
 }

@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block title %}Invites · Site administration{% endblock %}
+{% block content %}
+<h1>Site administration</h1>
+{% include "admin_nav.html" %}
+<section>
+  <h2>Create invite</h2>
+  {% if let Some(link) = created_link %}
+  <div class="notice">
+    <p>Share this one-time link{% if emailed %} (also emailed){% endif %}. It will not be shown again.</p>
+    <pre><code>{{ link }}</code></pre>
+  </div>
+  {% endif %}
+  {% if let Some(e) = error %}<p class="error">{{ e }}</p>{% endif %}
+  <form method="post" action="/admin/invites" class="stack">
+    <input type="hidden" name="_csrf" value="{{ csrf }}">
+    <label>Email (optional) <input name="email" type="email" autocomplete="off"></label>
+    <button type="submit">Create invite</button>
+  </form>
+</section>
+<section>
+  <h2>Invites</h2>
+  {% if invites.is_empty() %}
+  <p>No invites yet.</p>
+  {% else %}
+  <table>
+    <thead>
+      <tr><th>ID</th><th>Email</th><th>Status</th><th>Created</th><th>Expires</th><th></th></tr>
+    </thead>
+    <tbody>
+      {% for inv in invites %}
+      <tr>
+        <td>{{ inv.id }}</td>
+        <td>{% if let Some(email) = inv.email %}{{ email }}{% else %}any{% endif %}</td>
+        <td>{{ inv.status }}</td>
+        <td>{{ inv.created }}</td>
+        <td>{{ inv.expires }}</td>
+        <td>{% if inv.status == "pending" %}<form method="post" action="/admin/invites/{{ inv.id }}/revoke" class="inline"><input type="hidden" name="_csrf" value="{{ csrf }}"><button type="submit">Revoke</button></form>{% endif %}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+</section>
+{% endblock %}

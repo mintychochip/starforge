@@ -108,7 +108,10 @@ fn page_routes() -> Router<AppState> {
             get(pages::settings::delete_account_form).post(pages::settings::delete_account),
         )
         .route("/admin", get(pages::admin::overview))
-        .route("/admin/users", get(pages::admin::users))
+        .route(
+            "/admin/users",
+            get(pages::admin::users).post(pages::admin::create_user),
+        )
         .route("/admin/users/{handle}", get(pages::admin::user_detail))
         .route("/admin/users/{handle}/suspend", post(pages::admin::suspend))
         .route(
@@ -130,6 +133,14 @@ fn page_routes() -> Router<AppState> {
         .route(
             "/admin/users/{handle}/reset-password",
             post(pages::admin::reset_password),
+        )
+        .route(
+            "/admin/invites",
+            get(pages::admin::invites).post(pages::admin::create_invite),
+        )
+        .route(
+            "/admin/invites/{id}/revoke",
+            post(pages::admin::revoke_invite),
         )
         .route("/{owner}", get(pages::owner::show))
         .route(

@@ -255,3 +255,42 @@ async fn reset_password_shows_link_without_mail() {
     assert!(done.text().await.unwrap().contains("Password changed"));
     assert_eq!(s.try_login("bob", NEW_PASSWORD).await.1.status(), 303);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admins_create_users_directly_with_verified_addresses() {
+    let s = TestServer::start().await;
+    let (admin, csrf) = root_client(&s).await;
+    let created = admin
+        .post(s.url("/admin/users"))
+        .form(&[
+            ("_csrf", csrf.as_str()),
+            ("handle", "carol"),
+            ("display_name", "Carol"),
+            ("email", "carol@example.com"),
+            ("password", "correct horse battery staple extra"),
+            ("admin", "on"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 303);
+    assert_eq!(
+        created.headers().get("location").unwrap(),
+        "/admin/users/carol"
+    );
+    let carol = s.core.user_by_handle("carol").await.unwrap().unwrap();
+    assert!(carol.email_verified && carol.is_admin);
+    let dup = admin
+        .post(s.url("/admin/users"))
+        .form(&[
+            ("_csrf", csrf.as_str()),
+            ("handle", "carol"),
+            ("display_name", "Carol Again"),
+            ("email", "carol2@example.com"),
+            ("password", "correct horse battery staple extra"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(dup.status(), 422);
+}
