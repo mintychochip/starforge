@@ -82,9 +82,12 @@ handles; passwords of 10–1024 characters). The handle and email must be unused
 
 | Mode | Who can sign up |
 |---|---|
-| `invite` | Holders of a valid invite link `/join?invite=<code>`. The nav shows no "Sign up" link. |
+| `invite` | Holders of a valid invite link `/join?invite=<code>`. |
 | `open` | Anyone. |
 | `domains` | Anyone whose email address is at one of `allowed_domains`. |
+
+Only `open` and `domains` modes link to sign-up, from the sign-in page and the signed-out home page. An invite link
+lets its holder sign up in every mode, because invites are issued by site admins.
 
 Invites are single-use, expire after 7 days, and may be bound to one email address. An email-bound invite only
 accepts that address. Codes are 256-bit random values stored as SHA-256 hashes.
@@ -265,7 +268,7 @@ the affected row count. This works identically on SQLite and Postgres, and two w
 | Outcome | Next state |
 |---|---|
 | Success | `done`; deleted after 7 days |
-| Failure, attempts left | `queued`, due after 1 min, 5 min, 30 min, 2 h, then 6 h |
+| Failure, attempts left | `queued`, due after 1 min, 5 min, 30 min, then 2 h |
 | Fifth failure | `failed`; kept for 30 days for the admin Jobs page |
 
 ### 8.4 Scheduled work
@@ -274,7 +277,7 @@ the affected row count. This works identically on SQLite and Postgres, and two w
 |---|---|
 | Purge deletions older than 7 days | Daily |
 | Delete old `done` and `failed` jobs | Daily |
-| Remove expired web sessions, email tokens, and invites | Hourly |
+| Remove expired web sessions and email tokens, and invites that expired more than 30 days ago | Hourly |
 | `git maintenance run --auto` for one repository | After each successful push to it |
 
 Scheduled kinds set a deduplication key covered by a partial unique index over pending jobs
@@ -304,7 +307,9 @@ Scheduled kinds set a deduplication key covered by a partial unique index over p
 The new top-level path segments `join`, `verify`, `forgot`, and `reset` join the reserved handles (`admin` and
 `settings` are already reserved).
 
-## 11. Data model (migration 0002, both engines)
+## 11. Data model (migrations 0002 onward, both engines)
+
+M0.5 is built in three implementation plans; each adds its own numbered migration files, in the order the plans run.
 
 | Table | Change |
 |---|---|
