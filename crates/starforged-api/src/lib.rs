@@ -6,12 +6,13 @@ mod moved;
 mod oauth;
 mod repos;
 mod sessions;
+mod trails;
 mod user;
 
 use std::sync::Arc;
 
 use axum::Router;
-use axum::routing::{get, post, put};
+use axum::routing::{get, patch, post, put};
 use starforged_core::Core;
 
 use crate::error::ApiError;
@@ -101,6 +102,30 @@ pub fn router(core: Core, base_url: String) -> Router {
         .route(
             "/repos/{owner}/{repo}/sessions/{ulid}/rescan",
             post(sessions::rescan_session),
+        )
+        .route(
+            "/repos/{owner}/{repo}/trails",
+            get(trails::list_trails).post(trails::create_trail),
+        )
+        .route(
+            "/repos/{owner}/{repo}/trails/{n}",
+            get(trails::get_trail).patch(trails::patch_trail),
+        )
+        .route(
+            "/repos/{owner}/{repo}/trails/{n}/comments",
+            get(trails::list_comments).post(trails::post_comment),
+        )
+        .route(
+            "/repos/{owner}/{repo}/trails/{n}/comments/{id}",
+            patch(trails::patch_comment),
+        )
+        .route(
+            "/repos/{owner}/{repo}/trails/{n}/labels",
+            post(trails::add_label).delete(trails::remove_label),
+        )
+        .route(
+            "/repos/{owner}/{repo}/trails/{n}/assignees",
+            post(trails::add_assignee).delete(trails::remove_assignee),
         )
         .fallback(|| async { ApiError::NotFound })
         .layer(axum::middleware::from_fn_with_state(
