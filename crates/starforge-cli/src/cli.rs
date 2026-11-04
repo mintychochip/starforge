@@ -139,28 +139,90 @@ pub fn run(cli: Cli, paths: CliPaths) -> std::process::ExitCode {
 
 fn sync_stub(cli: Cli, _paths: CliPaths) -> std::process::ExitCode {
     let dry_run = cli.dry_run;
-    let result: Result<(), CliError> = match cli.cmd {
+    match cli.cmd {
         Cmd::Auth { .. } => unreachable!("auth dispatches via run_async"),
         Cmd::Status => unreachable!("status dispatches via run_async"),
-        Cmd::Enable => Err(CliError::Unimplemented("enable")),
-        Cmd::Disable => Err(CliError::Unimplemented("disable")),
-        Cmd::Doctor => Err(CliError::Unimplemented("doctor")),
-        Cmd::Sync => Err(CliError::Unimplemented("sync")),
-        Cmd::Sessions { cmd } => return run_sessions(cmd, dry_run),
-        Cmd::Export => Err(CliError::Unimplemented("export")),
-        Cmd::Import => Err(CliError::Unimplemented("import")),
-        Cmd::Trail => Err(CliError::Unimplemented("trail")),
-        Cmd::HookPrepare { .. } => Err(CliError::Unimplemented("_hook-prepare-commit-msg")),
-        Cmd::HookPostCommit => Err(CliError::Unimplemented("_hook-post-commit")),
-        Cmd::HookPrePush => Err(CliError::Unimplemented("_hook-pre-push")),
-    };
-    match result {
-        Ok(()) => std::process::ExitCode::SUCCESS,
+        Cmd::Enable => run_enable(dry_run),
+        Cmd::Disable => run_disable(dry_run),
+        Cmd::Sessions { cmd } => run_sessions(cmd, dry_run),
+        Cmd::HookPrepare { msg_file } => run_hook_prepare(msg_file),
+        Cmd::HookPostCommit => run_hook_post_commit(),
+        Cmd::HookPrePush => run_hook_pre_push(),
+        Cmd::Doctor => stub_err(CliError::Unimplemented("doctor")),
+        Cmd::Sync => stub_err(CliError::Unimplemented("sync")),
+        Cmd::Export => stub_err(CliError::Unimplemented("export")),
+        Cmd::Import => stub_err(CliError::Unimplemented("import")),
+        Cmd::Trail => stub_err(CliError::Unimplemented("trail")),
+    }
+}
+
+/// Current directory as the repo root, or `None` after reporting the error.
+fn cwd_repo() -> Option<std::path::PathBuf> {
+    match std::env::current_dir() {
+        Ok(dir) => Some(dir),
         Err(err) => {
-            eprintln!("error: {err} (not implemented yet)");
-            std::process::ExitCode::from(err.exit_code())
+            eprintln!("error: cannot determine current directory: {err}");
+            None
         }
     }
+}
+
+/// `enable`: install dispatchers, print every file changed.
+fn run_enable(dry_run: bool) -> std::process::ExitCode {
+    let Some(repo) = cwd_repo() else {
+        return std::process::ExitCode::from(1);
+    };
+    let (out, code) = crate::commands::hooks::enable(&repo, dry_run);
+    if code == 0 {
+        if !out.is_empty() {
+            println!("{out}");
+        }
+        std::process::ExitCode::SUCCESS
+    } else {
+        eprintln!("{out}");
+        std::process::ExitCode::from(code)
+    }
+}
+
+/// `disable`: remove dispatchers, restore originals.
+fn run_disable(dry_run: bool) -> std::process::ExitCode {
+    let Some(repo) = cwd_repo() else {
+        return std::process::ExitCode::from(1);
+    };
+    let (out, code) = crate::commands::hooks::disable(&repo, dry_run);
+    if code == 0 {
+        if !out.is_empty() {
+            println!("{out}");
+        }
+        std::process::ExitCode::SUCCESS
+    } else {
+        eprintln!("{out}");
+        std::process::ExitCode::from(code)
+    }
+}
+
+/// Hidden `_hook-prepare-commit-msg`: never fails the commit.
+fn run_hook_prepare(msg_file: std::path::PathBuf) -> std::process::ExitCode {
+    let Some(repo) = cwd_repo() else {
+        return std::process::ExitCode::SUCCESS;
+    };
+    std::process::ExitCode::from(crate::commands::hooks::hook_prepare(&repo, &msg_file))
+}
+
+/// Hidden `_hook-post-commit`: records trailer links, never fails.
+fn run_hook_post_commit() -> std::process::ExitCode {
+    let Some(repo) = cwd_repo() else {
+        return std::process::ExitCode::SUCCESS;
+    };
+    std::process::ExitCode::from(crate::commands::hooks::hook_post_commit(&repo))
+}
+
+/// Hidden `_hook-pre-push`: enqueues uploads, never fails the push.
+fn run_hook_pre_push() -> std::process::ExitCode {
+    let Some(repo) = cwd_repo() else {
+        return std::process::ExitCode::SUCCESS;
+    };
+    std::process::ExitCode::from(crate::commands::hooks::hook_pre_push(&repo))
 }
 
 /// `sessions list` / `sessions show`: read-only spool views (C4).
@@ -189,8 +251,8 @@ pub async fn run_async(cli: Cli, paths: CliPaths) -> std::process::ExitCode {
     let dry_run = cli.dry_run;
     match cli.cmd {
         Cmd::Auth { cmd } => run_auth(cmd, paths, dry_run).await,
-        Cmd::Enable => stub_err(CliError::Unimplemented("enable")),
-        Cmd::Disable => stub_err(CliError::Unimplemented("disable")),
+        Cmd::Enable => run_enable(dry_run),
+        Cmd::Disable => run_disable(dry_run),
         Cmd::Status => run_status(paths, dry_run).await,
         Cmd::Doctor => stub_err(CliError::Unimplemented("doctor")),
         Cmd::Sync => stub_err(CliError::Unimplemented("sync")),
@@ -198,9 +260,9 @@ pub async fn run_async(cli: Cli, paths: CliPaths) -> std::process::ExitCode {
         Cmd::Export => stub_err(CliError::Unimplemented("export")),
         Cmd::Import => stub_err(CliError::Unimplemented("import")),
         Cmd::Trail => stub_err(CliError::Unimplemented("trail")),
-        Cmd::HookPrepare { .. } => stub_err(CliError::Unimplemented("_hook-prepare-commit-msg")),
-        Cmd::HookPostCommit => stub_err(CliError::Unimplemented("_hook-post-commit")),
-        Cmd::HookPrePush => stub_err(CliError::Unimplemented("_hook-pre-push")),
+        Cmd::HookPrepare { msg_file } => run_hook_prepare(msg_file),
+        Cmd::HookPostCommit => run_hook_post_commit(),
+        Cmd::HookPrePush => run_hook_pre_push(),
     }
 }
 

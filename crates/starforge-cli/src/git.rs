@@ -55,6 +55,38 @@ pub fn common_dir(repo: &Path) -> Result<std::path::PathBuf, GitError> {
     })
 }
 
+/// `git diff --cached --name-only`: repo-relative paths with staged changes.
+/// Empty when nothing is staged; never fails on an unborn HEAD (exit status
+/// is still success with empty output for `--cached` against no HEAD? no:
+/// git handles it, and any real failure is an `Err`).
+pub fn staged_files(repo: &Path) -> Result<Vec<String>, GitError> {
+    let output = git_output(repo, &["diff", "--cached", "--name-only", "--no-renames"])?;
+    if !output.status.success() {
+        return Err(GitError::Failed(format!(
+            "git diff --cached --name-only failed in {}",
+            repo.display()
+        )));
+    }
+    Ok(stdout_utf8(output, "staged files")?
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// `git rev-parse HEAD`: the current commit SHA.
+pub fn head_commit(repo: &Path) -> Result<String, GitError> {
+    let output = git_output(repo, &["rev-parse", "HEAD"])?;
+    if !output.status.success() {
+        return Err(GitError::Failed(format!(
+            "git rev-parse HEAD failed in {}",
+            repo.display()
+        )));
+    }
+    Ok(stdout_utf8(output, "HEAD")?.trim().to_string())
+}
+
 /// `git config --get <key>`: `Ok(None)` when the key is unset (exit status 1),
 /// `Err` only when git itself fails.
 pub fn config_get(repo: &Path, key: &str) -> Result<Option<String>, GitError> {
