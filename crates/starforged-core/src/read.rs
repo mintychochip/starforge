@@ -366,8 +366,12 @@ pub fn can_read_session(
         // Rows 2, 5, 6: anyone holding repo read (implicit or explicit).
         return repo_readable(viewer, repo, is_member);
     }
-    // Rows 3, 4, 5, 6, 7: unpublished sessions follow the repo: explicit
-    // members only (implicit public/internal read does not count).
+    // §6.4: an unpublished session is readable when the repo is not public and
+    // the viewer can read the repo (rows 5, 6, 7); on public repos only
+    // explicit members (rows 3, 4) — implicit public read does not count.
+    if repo.visibility != crate::permission::Visibility::Public {
+        return repo_readable(viewer, repo, is_member);
+    }
     is_member
 }
 
@@ -582,10 +586,22 @@ mod tests {
                 false,
                 true,
             ),
-            // Row 5b: internal + inherit + signed-in non-member → deny.
+            // Row 5b: internal + inherit + signed-in non-member → allow (repo
+            // is not public, viewer holds repo read).
             (
                 Visibility::Internal,
                 signed(STRANGER),
+                "inherit",
+                "none",
+                OWNER,
+                false,
+                false,
+                true,
+            ),
+            // Internal + inherit + anonymous → deny (no repo read).
+            (
+                Visibility::Internal,
+                anon(),
                 "inherit",
                 "none",
                 OWNER,
@@ -921,7 +937,7 @@ mod tests {
             s.check(None, &s.pub_repo, &sess).await,
             Err(CoreError::NotFound)
         ));
-        // Row 5: internal + published → signed-in Ok; inherit + member Ok; inherit + stranger denied.
+        // Row 5: internal + published → signed-in Ok; inherit + member Ok; inherit + signed-in non-member Ok.
         let sess = s
             .session(&s.int_repo, "01E5P", &s.alice, "published", "none")
             .await;
@@ -938,8 +954,13 @@ mod tests {
             .session(&s.int_repo, "01E5I", &s.alice, "inherit", "none")
             .await;
         assert!(s.check(as_viewer(&s.bob), &s.int_repo, &sess).await.is_ok());
+        assert!(
+            s.check(as_viewer(&s.carol), &s.int_repo, &sess)
+                .await
+                .is_ok()
+        );
         assert!(matches!(
-            s.check(as_viewer(&s.carol), &s.int_repo, &sess).await,
+            s.check(None, &s.int_repo, &sess).await,
             Err(CoreError::NotFound)
         ));
         // Rows 6/7: private + inherit → member Ok, stranger denied.

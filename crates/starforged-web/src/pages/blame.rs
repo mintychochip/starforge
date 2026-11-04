@@ -115,7 +115,7 @@ pub async fn show(
     let mut groups = Vec::new();
     for block in &view.blocks {
         let block_first = block.start;
-        let block_last = block.start + block.lines.len();
+        let block_last = block.start + block.lines.len() - 1;
         if block_last < first || block_first > last {
             continue;
         }

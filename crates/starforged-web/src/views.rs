@@ -5,14 +5,15 @@ use starforged_core::repos::{Repo, RepoAccess};
 use starforged_core::sessions::WebSession;
 
 /// Content-Security-Policy for pages rendered from attacker-influenced
-/// content (session viewer, session download, blame with session chips).
-/// Stricter than the site default: nothing loads from anywhere except the
-/// page's own origin for images/styles/scripts, and there are no inline
-/// scripts at all (this codebase has no CSP-nonce mechanism because no page
-/// needs one). Handlers set this header themselves so it wins over the
-/// `security_headers` middleware default (`or_insert` keeps ours).
-pub const STRICT_CSP: &str =
-    "default-src 'none'; img-src 'self'; style-src 'self'; script-src 'self'";
+/// content (session viewer, session download, blame with session chips). A
+/// superset of the site default: `default-src` tightened to `'none'` with
+/// same-origin `img-src`/`style-src`/`script-src`, keeping the site-wide
+/// `frame-ancestors`, `base-uri`, and `form-action` directives (the viewer
+/// has POST forms). There are no inline scripts at all (this codebase has
+/// no CSP-nonce mechanism because no page needs one). Handlers set this
+/// header themselves so it wins over the `security_headers` middleware
+/// default (`or_insert` keeps ours).
+pub const STRICT_CSP: &str = "default-src 'none'; img-src 'self'; style-src 'self'; script-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
 
 /// What the page header needs: the signed-in handle and the CSRF token for its sign-out form.
 pub struct NavUser {

@@ -225,6 +225,9 @@ fn assert_strict_csp(headers: &reqwest::header::HeaderMap, surface: &str) {
         "img-src 'self'",
         "style-src 'self'",
         "script-src 'self'",
+        "frame-ancestors 'none'",
+        "base-uri 'none'",
+        "form-action 'self'",
     ] {
         assert!(
             csp.contains(directive),
