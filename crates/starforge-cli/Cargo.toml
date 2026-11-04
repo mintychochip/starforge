@@ -15,7 +15,7 @@ workspace = true
 
 [dependencies]
 clap.workspace = true
-reqwest.workspace = true
+reqwest = { workspace = true, features = ["rustls"] }
 serde.workspace = true
 serde_json.workspace = true
 starforge-capture = { path = "../starforge-capture" }

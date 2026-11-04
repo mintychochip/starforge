@@ -10,6 +10,7 @@ pub mod config;
 pub mod discovery;
 pub mod git;
 pub mod hooks;
+pub mod ingest;
 pub mod queue;
 pub mod spool;
 pub mod upload;

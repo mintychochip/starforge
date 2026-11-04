@@ -501,8 +501,11 @@ async fn second_sync_after_drain_performs_zero_calls() {
 #[tokio::test]
 async fn conflict_with_different_hash_keeps_entry_queued() {
     let (_tmp, spool) = open_spool();
-    let (meta, _blobs) = seed_session(&spool, true, 1);
+    let (meta, _blobs) = seed_session(&spool, false, 1);
     let ulid = meta.id.to_string();
+    // Open session with metadata already recorded: only the segment op runs.
+    let meta_hash = starforge_format::blake3_hex(&serde_json::to_vec(&meta).unwrap());
+    spool.mark_meta_uploaded(&ulid, meta_hash).unwrap();
     seed_entry(&spool, QueueOp::Segment, &ulid, Some(0));
 
     let stub = start_stub(StubConfig {
@@ -540,10 +543,13 @@ async fn conflict_with_different_hash_keeps_entry_queued() {
 #[tokio::test]
 async fn transient_500_retries_once_with_backoff_then_drains() {
     let (_tmp, spool) = open_spool();
-    let (meta, blobs) = seed_session(&spool, true, 1);
+    let (meta, blobs) = seed_session(&spool, false, 1);
     let ulid = meta.id.to_string();
+    // Open session with metadata already recorded: `sync` derives nothing, so
+    // this test exercises exactly one segment op (500 then success).
+    let meta_hash = starforge_format::blake3_hex(&serde_json::to_vec(&meta).unwrap());
+    spool.mark_meta_uploaded(&ulid, meta_hash).unwrap();
     seed_entry(&spool, QueueOp::Segment, &ulid, Some(0));
-
     let stub = start_stub(StubConfig {
         fail_first_segment_500: true,
         ..StubConfig::ok()
@@ -577,10 +583,11 @@ async fn transient_500_retries_once_with_backoff_then_drains() {
 #[tokio::test]
 async fn auth_failure_reports_login_and_keeps_entry_queued() {
     let (_tmp, spool) = open_spool();
-    let (meta, _blobs) = seed_session(&spool, true, 1);
+    let (meta, _blobs) = seed_session(&spool, false, 1);
     let ulid = meta.id.to_string();
+    // Segment already recorded: only the Meta op runs (and fails auth).
+    spool.mark_segment_uploaded(&ulid, 0).unwrap();
     seed_entry(&spool, QueueOp::Meta, &ulid, None);
-
     let stub = start_stub(StubConfig::ok()).await;
     let server = stub.server_info();
     let sleeper = FakeSleeper::default();
@@ -707,8 +714,11 @@ async fn best_effort_returns_with_stub_down() {
 #[tokio::test]
 async fn already_uploaded_segment_is_skipped_without_http() {
     let (_tmp, spool) = open_spool();
-    let (meta, blobs) = seed_session(&spool, true, 1);
+    let (meta, blobs) = seed_session(&spool, false, 1);
     let ulid = meta.id.to_string();
+    // Everything already recorded: `sync` derives nothing, zero HTTP.
+    let meta_hash = starforge_format::blake3_hex(&serde_json::to_vec(&meta).unwrap());
+    spool.mark_meta_uploaded(&ulid, meta_hash).unwrap();
     spool.mark_segment_uploaded(&ulid, 0).unwrap();
     assert_eq!(
         spool.read_upload(&ulid).unwrap().uploaded_segments[&0],
@@ -727,4 +737,74 @@ async fn already_uploaded_segment_is_skipped_without_http() {
     assert_eq!(summary.skipped, 1);
     assert!(read_queue(&spool).unwrap().is_empty());
     assert_eq!(stub.requests().len(), 0, "no HTTP for recorded segments");
+}
+// ---------------------------------------------------------------------------
+// Fix round 1: `sync` derives work from spool state. A session with meta + two
+// segments + one link and an EMPTY queue still uploads everything in canonical
+// order, records it in `upload.json`, and goes quiet on the second run.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn sync_derives_missing_work_from_spool_state() {
+    let (_tmp, spool) = open_spool();
+    let (meta, blobs) = seed_session(&spool, true, 2);
+    let ulid = meta.id.to_string();
+    seed_link(&spool, &ulid);
+    assert!(
+        read_queue(&spool).unwrap().is_empty(),
+        "no queue entries seeded"
+    );
+
+    let stub = start_stub(StubConfig::ok()).await;
+    let server = stub.server_info();
+    let sleeper = FakeSleeper::default();
+    let summary = run_sync(&spool, &server, TOKEN, &sleeper, false)
+        .await
+        .unwrap();
+
+    assert_eq!(summary.uploaded, 5, "meta + 2 segments + complete + links");
+    assert_eq!(summary.exit_code(), 0, "drained");
+    assert!(read_queue(&spool).unwrap().is_empty(), "queue drained");
+
+    let session = format!("/api/v1/repos/{OWNER_REPO}/sessions/{ulid}");
+    let reqs = stub.requests();
+    assert_eq!(
+        reqs.iter().map(|r| r.path.as_str()).collect::<Vec<_>>(),
+        vec![
+            session.as_str(),
+            format!("{session}/segments/0").as_str(),
+            format!("{session}/segments/1").as_str(),
+            format!("{session}/complete").as_str(),
+            format!("{session}/links").as_str(),
+        ],
+        "canonical order without any pre-seeded queue"
+    );
+
+    let state = spool.read_upload(&ulid).unwrap();
+    let expected_meta = starforge_format::blake3_hex(
+        &serde_json::to_vec(&spool.read_meta(&ulid).unwrap()).unwrap(),
+    );
+    assert_eq!(state.meta_hash.as_deref(), Some(expected_meta.as_str()));
+    assert_eq!(
+        state.uploaded_segments.get(&0).unwrap(),
+        &starforge_format::blake3_hex(&blobs[0])
+    );
+    assert_eq!(
+        state.uploaded_segments.get(&1).unwrap(),
+        &starforge_format::blake3_hex(&blobs[1])
+    );
+    assert!(state.complete, "complete recorded");
+    assert_eq!(state.sent_links.len(), 1, "one links line recorded as sent");
+
+    let before = stub.requests().len();
+    let summary2 = run_sync(&spool, &server, TOKEN, &sleeper, false)
+        .await
+        .unwrap();
+    assert_eq!(summary2.uploaded, 0, "nothing left to upload");
+    assert_eq!(summary2.exit_code(), 0);
+    assert_eq!(
+        stub.requests().len(),
+        before,
+        "second sync makes zero requests"
+    );
 }

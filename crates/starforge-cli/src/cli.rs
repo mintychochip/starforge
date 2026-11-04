@@ -81,18 +81,49 @@ pub enum AuthCmd {
     Status,
 }
 
-/// `sessions` subcommands (`list`/`show` land C4; the rest lands C5/C7).
+/// `sessions` subcommands: `list`/`show`/`link`/`unlink` are real (C4/C7);
+/// `publish`/`unpublish`/`delete` remain stubs (out of scope for M1c).
 #[derive(Debug, Subcommand)]
 pub enum SessionsCmd {
     /// List local sessions.
     List,
     /// Show a session's metadata.
     Show {
+        /// Session ULID (unambiguous prefix also works).
+        ulid: String,
+    },
+    /// Explicitly link a session to a commit (default: HEAD).
+    Link {
+        /// Session ULID (unambiguous prefix also works).
+        ulid: String,
+        /// Commit SHA to link. Defaults to HEAD.
+        #[arg(long)]
+        commit: Option<String>,
+    },
+    /// Remove a session's link to a commit.
+    Unlink {
+        /// Session ULID (unambiguous prefix also works).
+        ulid: String,
+        /// Commit SHA to unlink.
+        #[arg(long)]
+        commit: String,
+    },
+    /// Publish a session (not in M1c).
+    Publish {
+        /// Session ULID.
+        ulid: String,
+    },
+    /// Unpublish a session (not in M1c).
+    Unpublish {
+        /// Session ULID.
+        ulid: String,
+    },
+    /// Delete a session (not in M1c).
+    Delete {
         /// Session ULID.
         ulid: String,
     },
 }
-
 /// CLI errors. Every non-root cause maps to an exit code (0/1/2).
 #[derive(Debug, thiserror::Error)]
 pub enum CliError {
@@ -119,7 +150,7 @@ impl CliError {
 /// Must not be called from inside a Tokio runtime (it blocks on one for the
 /// async device flow); async contexts use [`run_async`] instead.
 pub fn run(cli: Cli, paths: CliPaths) -> std::process::ExitCode {
-    if let Cmd::Auth { .. } | Cmd::Status | Cmd::Sync = &cli.cmd {
+    if let Cmd::Auth { .. } | Cmd::Status | Cmd::Sync | Cmd::Doctor | Cmd::HookPrePush = &cli.cmd {
         // fall through to async dispatch below
     } else {
         return sync_stub(cli, paths);
@@ -137,18 +168,18 @@ pub fn run(cli: Cli, paths: CliPaths) -> std::process::ExitCode {
     runtime.block_on(run_async(cli, paths))
 }
 
-fn sync_stub(cli: Cli, _paths: CliPaths) -> std::process::ExitCode {
+fn sync_stub(cli: Cli, paths: CliPaths) -> std::process::ExitCode {
     let dry_run = cli.dry_run;
     match cli.cmd {
         Cmd::Auth { .. } => unreachable!("auth dispatches via run_async"),
         Cmd::Status => unreachable!("status dispatches via run_async"),
-        Cmd::Enable => run_enable(dry_run),
-        Cmd::Disable => run_disable(dry_run),
+        Cmd::Doctor => unreachable!("doctor dispatches via run_async"),
+        Cmd::Enable => run_enable(paths, dry_run),
+        Cmd::Disable => run_disable(paths, dry_run),
         Cmd::Sessions { cmd } => run_sessions(cmd, dry_run),
-        Cmd::HookPrepare { msg_file } => run_hook_prepare(msg_file),
-        Cmd::HookPostCommit => run_hook_post_commit(),
-        Cmd::HookPrePush => run_hook_pre_push(),
-        Cmd::Doctor => stub_err(CliError::Unimplemented("doctor")),
+        Cmd::HookPrepare { msg_file } => run_hook_prepare(paths, msg_file),
+        Cmd::HookPostCommit => run_hook_post_commit(paths),
+        Cmd::HookPrePush => unreachable!("pre-push dispatches via run_async"),
         Cmd::Sync => unreachable!("sync dispatches via run_async"),
         Cmd::Export => stub_err(CliError::Unimplemented("export")),
         Cmd::Import => stub_err(CliError::Unimplemented("import")),
@@ -167,12 +198,12 @@ fn cwd_repo() -> Option<std::path::PathBuf> {
     }
 }
 
-/// `enable`: install dispatchers, print every file changed.
-fn run_enable(dry_run: bool) -> std::process::ExitCode {
+/// `enable`: install dispatchers + agent hooks, print every file changed.
+fn run_enable(paths: CliPaths, dry_run: bool) -> std::process::ExitCode {
     let Some(repo) = cwd_repo() else {
         return std::process::ExitCode::from(1);
     };
-    let (out, code) = crate::commands::hooks::enable(&repo, dry_run);
+    let (out, code) = crate::commands::hooks::enable(&repo, &paths, dry_run);
     if code == 0 {
         if !out.is_empty() {
             println!("{out}");
@@ -184,12 +215,12 @@ fn run_enable(dry_run: bool) -> std::process::ExitCode {
     }
 }
 
-/// `disable`: remove dispatchers, restore originals.
-fn run_disable(dry_run: bool) -> std::process::ExitCode {
+/// `disable`: remove dispatchers + agent hooks, restore originals.
+fn run_disable(paths: CliPaths, dry_run: bool) -> std::process::ExitCode {
     let Some(repo) = cwd_repo() else {
         return std::process::ExitCode::from(1);
     };
-    let (out, code) = crate::commands::hooks::disable(&repo, dry_run);
+    let (out, code) = crate::commands::hooks::disable(&repo, &paths, dry_run);
     if code == 0 {
         if !out.is_empty() {
             println!("{out}");
@@ -202,30 +233,35 @@ fn run_disable(dry_run: bool) -> std::process::ExitCode {
 }
 
 /// Hidden `_hook-prepare-commit-msg`: never fails the commit.
-fn run_hook_prepare(msg_file: std::path::PathBuf) -> std::process::ExitCode {
+fn run_hook_prepare(paths: CliPaths, msg_file: std::path::PathBuf) -> std::process::ExitCode {
     let Some(repo) = cwd_repo() else {
         return std::process::ExitCode::SUCCESS;
     };
-    std::process::ExitCode::from(crate::commands::hooks::hook_prepare(&repo, &msg_file))
+    std::process::ExitCode::from(crate::commands::hooks::hook_prepare(
+        &repo, &msg_file, &paths,
+    ))
 }
 
 /// Hidden `_hook-post-commit`: records trailer links, never fails.
-fn run_hook_post_commit() -> std::process::ExitCode {
+fn run_hook_post_commit(paths: CliPaths) -> std::process::ExitCode {
     let Some(repo) = cwd_repo() else {
         return std::process::ExitCode::SUCCESS;
     };
-    std::process::ExitCode::from(crate::commands::hooks::hook_post_commit(&repo))
+    std::process::ExitCode::from(crate::commands::hooks::hook_post_commit(&repo, &paths))
 }
 
-/// Hidden `_hook-pre-push`: enqueues uploads, never fails the push.
-fn run_hook_pre_push() -> std::process::ExitCode {
+/// Hidden `_hook-pre-push`: enqueue + best-effort upload, never fails the push.
+async fn run_hook_pre_push_async(paths: CliPaths) -> std::process::ExitCode {
     let Some(repo) = cwd_repo() else {
         return std::process::ExitCode::SUCCESS;
     };
-    std::process::ExitCode::from(crate::commands::hooks::hook_pre_push(&repo))
+    let code =
+        crate::commands::hooks::hook_pre_push_full(&repo, &paths, |key| std::env::var(key).ok())
+            .await;
+    std::process::ExitCode::from(code)
 }
 
-/// `sessions list` / `sessions show`: read-only spool views (C4).
+/// `sessions` subcommands: list/show/link/unlink are real; the rest are stubs.
 fn run_sessions(cmd: SessionsCmd, dry_run: bool) -> std::process::ExitCode {
     let repo = match std::env::current_dir() {
         Ok(dir) => dir,
@@ -237,6 +273,21 @@ fn run_sessions(cmd: SessionsCmd, dry_run: bool) -> std::process::ExitCode {
     let (out, code) = match cmd {
         SessionsCmd::List => crate::commands::sessions::list(&repo, dry_run),
         SessionsCmd::Show { ulid } => crate::commands::sessions::show(&repo, &ulid, dry_run),
+        SessionsCmd::Link { ulid, commit } => {
+            crate::commands::sessions::link(&repo, &ulid, commit.as_deref(), dry_run)
+        }
+        SessionsCmd::Unlink { ulid, commit } => {
+            crate::commands::sessions::unlink(&repo, &ulid, &commit, dry_run)
+        }
+        SessionsCmd::Publish { .. } => {
+            return stub_err(CliError::Unimplemented("sessions publish"));
+        }
+        SessionsCmd::Unpublish { .. } => {
+            return stub_err(CliError::Unimplemented("sessions unpublish"));
+        }
+        SessionsCmd::Delete { .. } => {
+            return stub_err(CliError::Unimplemented("sessions delete"));
+        }
     };
     if code == 0 {
         println!("{out}");
@@ -246,26 +297,44 @@ fn run_sessions(cmd: SessionsCmd, dry_run: bool) -> std::process::ExitCode {
     std::process::ExitCode::from(code)
 }
 
-/// Async dispatch (auth handlers live here; other commands stay stubs).
+/// Async dispatch (auth/status/sync/doctor/pre-push live here; the rest are
+/// sync or stubs).
 pub async fn run_async(cli: Cli, paths: CliPaths) -> std::process::ExitCode {
     let dry_run = cli.dry_run;
     match cli.cmd {
         Cmd::Auth { cmd } => run_auth(cmd, paths, dry_run).await,
-        Cmd::Enable => run_enable(dry_run),
-        Cmd::Disable => run_disable(dry_run),
+        Cmd::Enable => run_enable(paths, dry_run),
+        Cmd::Disable => run_disable(paths, dry_run),
         Cmd::Status => run_status(paths, dry_run).await,
-        Cmd::Doctor => stub_err(CliError::Unimplemented("doctor")),
+        Cmd::Doctor => run_doctor(paths, dry_run).await,
         Cmd::Sync => run_sync(paths, dry_run).await,
-        Cmd::Sessions { .. } => stub_err(CliError::Unimplemented("sessions")),
+        Cmd::Sessions { cmd } => run_sessions(cmd, dry_run),
         Cmd::Export => stub_err(CliError::Unimplemented("export")),
         Cmd::Import => stub_err(CliError::Unimplemented("import")),
         Cmd::Trail => stub_err(CliError::Unimplemented("trail")),
-        Cmd::HookPrepare { msg_file } => run_hook_prepare(msg_file),
-        Cmd::HookPostCommit => run_hook_post_commit(),
-        Cmd::HookPrePush => run_hook_pre_push(),
+        Cmd::HookPrepare { msg_file } => run_hook_prepare(paths, msg_file),
+        Cmd::HookPostCommit => run_hook_post_commit(paths),
+        Cmd::HookPrePush => run_hook_pre_push_async(paths).await,
     }
 }
 
+/// `doctor`: environment, config, and connectivity checks.
+async fn run_doctor(paths: CliPaths, dry_run: bool) -> std::process::ExitCode {
+    let repo = match std::env::current_dir() {
+        Ok(dir) => dir,
+        Err(err) => {
+            eprintln!("error: cannot determine current directory: {err}");
+            return std::process::ExitCode::from(1);
+        }
+    };
+    let (out, code) = crate::commands::doctor::doctor(&repo, &paths, dry_run).await;
+    if code == 0 {
+        println!("{out}");
+    } else {
+        eprintln!("{out}");
+    }
+    std::process::ExitCode::from(code)
+}
 async fn run_auth(cmd: AuthCmd, paths: CliPaths, dry_run: bool) -> std::process::ExitCode {
     match cmd {
         AuthCmd::Login { server } => {
@@ -322,7 +391,7 @@ async fn run_status(paths: CliPaths, dry_run: bool) -> std::process::ExitCode {
 
 /// Host key for credential lookup from a server `api_url`: lowercased host
 /// plus an explicit port when present (mirrors [`crate::auth::normalize_server`]).
-fn sync_host_key(api_url: &str) -> Option<String> {
+pub(crate) fn sync_host_key(api_url: &str) -> Option<String> {
     let url = url::Url::parse(api_url).ok()?;
     let host = url.host_str()?.to_lowercase();
     Some(match url.port() {
@@ -352,6 +421,22 @@ async fn run_sync(paths: CliPaths, dry_run: bool) -> std::process::ExitCode {
     let spool = crate::spool::Spool::open(&common);
     if dry_run {
         return run_sync_dry_run(&spool);
+    }
+    // Ingest before draining so `sync` uploads fresh native sessions even when
+    // nothing was ever queued; an ingest failure surfaces as exit 1.
+    {
+        let roots = crate::commands::hooks::adapter_roots(&paths, &repo);
+        match crate::ingest::ingest(&spool, &roots, &repo, time::OffsetDateTime::now_utc()) {
+            Ok(stats) => tracing::debug!(
+                "sync ingest: {} session(s), {} new event(s)",
+                stats.sessions,
+                stats.new_events
+            ),
+            Err(err) => {
+                eprintln!("error: ingest failed: {err}");
+                return std::process::ExitCode::from(1);
+            }
+        }
     }
     let (server, owner_repo, _chosen) =
         match crate::commands::status::resolve_server(&repo, &paths).await {
@@ -399,19 +484,18 @@ fn run_sync_dry_run(spool: &crate::spool::Spool) -> std::process::ExitCode {
     let now = time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_default();
-    let entries = match crate::queue::read_queue(spool) {
-        Ok(entries) => entries,
+    match crate::commands::sync::dry_run_plan(spool, &now) {
+        Ok(planned) => {
+            for line in &planned {
+                println!("would {line}");
+            }
+            std::process::ExitCode::SUCCESS
+        }
         Err(err) => {
             eprintln!("error: {err}");
-            return std::process::ExitCode::from(1);
-        }
-    };
-    for entry in &entries {
-        if crate::queue::backoff_due(entry, &now) {
-            println!("would {}", crate::commands::sync::describe(entry));
+            std::process::ExitCode::from(1)
         }
     }
-    std::process::ExitCode::SUCCESS
 }
 
 fn stub_err(err: CliError) -> std::process::ExitCode {

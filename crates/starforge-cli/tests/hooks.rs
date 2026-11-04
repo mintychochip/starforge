@@ -10,6 +10,7 @@ use std::process::Command;
 use starforge_cli::commands::hooks::{
     disable, enable, hook_post_commit, hook_pre_push, hook_prepare,
 };
+use starforge_cli::config::CliPaths;
 use starforge_cli::git::common_dir;
 use starforge_cli::hooks::{
     HOOKS, MANAGED_MARKER, SessionCandidate, append_trailers, dispatcher_body,
@@ -51,7 +52,12 @@ fn init_repo() -> (TempDir, PathBuf) {
     git_ok(&repo, &["commit", "--allow-empty", "-m", "init"]);
     (dir, repo)
 }
-
+/// Isolated home for `enable`/`disable` (agent adapter hooks install under it).
+fn test_paths() -> (TempDir, CliPaths) {
+    let home = TempDir::new().unwrap();
+    let paths = CliPaths::from_home(home.path().to_path_buf());
+    (home, paths)
+}
 fn hooks_dir(repo: &Path) -> PathBuf {
     common_dir(repo).unwrap().join("hooks")
 }
@@ -138,7 +144,8 @@ fn path_with(shim_dir: &Path) -> String {
 #[test]
 fn enable_installs_three_marked_dispatchers_and_prints_them() {
     let (_dir, repo) = init_repo();
-    let (out, code) = enable(&repo, false);
+    let (_home, paths) = test_paths();
+    let (out, code) = enable(&repo, &paths, false);
     assert_eq!(code, 0, "enable output: {out}");
 
     let dir = hooks_dir(&repo);
@@ -172,6 +179,7 @@ fn enable_installs_three_marked_dispatchers_and_prints_them() {
 #[test]
 fn orig_hook_chains_and_exact_trailer_is_appended_on_real_commit() {
     let (_dir, repo) = init_repo();
+    let (home, paths) = test_paths();
     let dir = hooks_dir(&repo);
 
     let orig = "#!/bin/sh\necho ORIG-LINE >> \"$1\"\n";
@@ -183,7 +191,7 @@ fn orig_hook_chains_and_exact_trailer_is_appended_on_real_commit() {
         std::fs::set_permissions(&orig_path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
-    let (out, code) = enable(&repo, false);
+    let (out, code) = enable(&repo, &paths, false);
     assert_eq!(code, 0, "{out}");
     assert!(dir.join("prepare-commit-msg.starforge-orig").is_file());
 
@@ -203,6 +211,7 @@ fn orig_hook_chains_and_exact_trailer_is_appended_on_real_commit() {
         .arg(&repo)
         .args(["commit", "-m", "add tracked"])
         .env("PATH", path_with(&shim_dir))
+        .env("STARFORGE_HOME", home.path())
         .output()
         .unwrap();
     assert!(
@@ -240,7 +249,8 @@ fn orig_hook_chains_and_exact_trailer_is_appended_on_real_commit() {
 #[test]
 fn enable_twice_is_idempotent() {
     let (_dir, repo) = init_repo();
-    let (out1, code1) = enable(&repo, false);
+    let (_home, paths) = test_paths();
+    let (out1, code1) = enable(&repo, &paths, false);
     assert_eq!(code1, 0, "{out1}");
     let dir = hooks_dir(&repo);
     let before: Vec<(String, Vec<u8>)> = HOOKS
@@ -248,7 +258,7 @@ fn enable_twice_is_idempotent() {
         .map(|h| (h.to_string(), std::fs::read(dir.join(h)).unwrap()))
         .collect();
 
-    let (_out2, code2) = enable(&repo, false);
+    let (_out2, code2) = enable(&repo, &paths, false);
     assert_eq!(code2, 0);
     for (hook, bytes) in &before {
         assert_eq!(
@@ -269,14 +279,15 @@ fn enable_twice_is_idempotent() {
 #[test]
 fn disable_restores_original_and_second_is_noop() {
     let (_dir, repo) = init_repo();
+    let (_home, paths) = test_paths();
     let dir = hooks_dir(&repo);
     let orig = "#!/bin/sh\necho ORIG-LINE >> \"$1\"\n";
     std::fs::write(dir.join("prepare-commit-msg"), orig).unwrap();
 
-    let (_, code) = enable(&repo, false);
+    let (_, code) = enable(&repo, &paths, false);
     assert_eq!(code, 0);
 
-    let (out, code) = disable(&repo, false);
+    let (out, code) = disable(&repo, &paths, false);
     assert_eq!(code, 0, "{out}");
     assert_eq!(
         std::fs::read_to_string(dir.join("prepare-commit-msg")).unwrap(),
@@ -294,7 +305,7 @@ fn disable_restores_original_and_second_is_noop() {
         .unwrap()
         .map(|e| e.unwrap().path())
         .collect();
-    let (out2, code2) = disable(&repo, false);
+    let (out2, code2) = disable(&repo, &paths, false);
     assert_eq!(code2, 0);
     assert!(out2.trim().is_empty(), "second disable prints nothing");
     let after: Vec<PathBuf> = std::fs::read_dir(&dir)
@@ -309,7 +320,8 @@ fn disable_restores_original_and_second_is_noop() {
 #[test]
 fn untouched_session_yields_no_trailer() {
     let (_dir, repo) = init_repo();
-    let (_, code) = enable(&repo, false);
+    let (_home, paths) = test_paths();
+    let (_, code) = enable(&repo, &paths, false);
     assert_eq!(code, 0);
 
     let ulid = "01J9KQXF1T3NP2R8A5B6C7D9E2";
@@ -344,7 +356,8 @@ fn untouched_session_yields_no_trailer() {
 #[test]
 fn hook_failure_never_blocks_commit() {
     let (_dir, repo) = init_repo();
-    let (_, code) = enable(&repo, false);
+    let (_home, paths) = test_paths();
+    let (_, code) = enable(&repo, &paths, false);
     assert_eq!(code, 0);
 
     let ulid = "01J9KQXF1T3NP2R8A5B6C7D9E3";
@@ -386,7 +399,8 @@ fn hook_failure_never_blocks_commit() {
 #[test]
 fn heuristic_trailer_when_no_overlap_but_session_has_data() {
     let (_dir, repo) = init_repo();
-    let (_, code) = enable(&repo, false);
+    let (_home, paths) = test_paths();
+    let (_, code) = enable(&repo, &paths, false);
     assert_eq!(code, 0);
 
     let ulid = "01J9KQXF1T3NP2R8A5B6C7D9E4";
@@ -401,14 +415,14 @@ fn heuristic_trailer_when_no_overlap_but_session_has_data() {
 
     let msg = repo.join("COMMIT_MSG");
     std::fs::write(&msg, "subject\n").unwrap();
-    assert_eq!(hook_prepare(&repo, &msg), 0);
+    assert_eq!(hook_prepare(&repo, &msg, &paths), 0);
     let body = std::fs::read_to_string(&msg).unwrap();
     assert!(
         body.contains(&format!("Starforge-Session: {ulid}")),
         "heuristic trailer present; body:\n{body}"
     );
 
-    assert_eq!(hook_post_commit(&repo), 0);
+    assert_eq!(hook_post_commit(&repo, &paths), 0);
     let links = spool.links().unwrap();
     assert_eq!(links.len(), 1);
     assert_eq!(links[0].confidence, LinkConfidence::Heuristic);
@@ -419,7 +433,8 @@ fn heuristic_trailer_when_no_overlap_but_session_has_data() {
 #[test]
 fn pre_push_enqueues_unwritten_segments_and_always_succeeds() {
     let (_dir, repo) = init_repo();
-    let (_, code) = enable(&repo, false);
+    let (_home, paths) = test_paths();
+    let (_, code) = enable(&repo, &paths, false);
     assert_eq!(code, 0);
 
     let ulid = "01J9KQXF1T3NP2R8A5B6C7D9E5";
@@ -429,7 +444,7 @@ fn pre_push_enqueues_unwritten_segments_and_always_succeeds() {
     let events = format!("{}\n", tool_event(0, "Write", "new.txt"));
     seed_session(&spool, ulid, &["new.txt"], &events);
 
-    assert_eq!(hook_pre_push(&repo), 0);
+    assert_eq!(hook_pre_push(&repo, &paths), 0);
     let queue = read_queue(&spool).unwrap();
     assert!(
         queue
@@ -439,7 +454,7 @@ fn pre_push_enqueues_unwritten_segments_and_always_succeeds() {
     );
 
     // Second pre-push does not duplicate entries.
-    assert_eq!(hook_pre_push(&repo), 0);
+    assert_eq!(hook_pre_push(&repo, &paths), 0);
     let queue2 = read_queue(&spool).unwrap();
     assert_eq!(queue, queue2, "no duplicate queue entries");
 }

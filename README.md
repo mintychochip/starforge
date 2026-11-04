@@ -127,6 +127,26 @@ preserve unmapped native fields so re-normalization stays lossless; raw-transcri
 defaults ON for new repos. Test fixtures are synthesized in the native shape — each fixture
 directory carries a `SYNTHESIZED.txt` noting the native source it mimics.
 
+## CLI
+
+`starforge` (in `crates/starforge-cli`, MIT OR Apache-2.0) links local agent
+sessions to commits and uploads them. `starforge enable` installs git-hook
+dispatchers plus the Claude Code and Pi agent hooks and prints every file it
+touches (`disable` removes them); `status` shows the resolved server, hook
+markers, spooled sessions, queue depth, and credential hosts; `doctor` checks
+git, hooks, spool, credentials, adapters, and server reachability, one
+`ok`/`fail` line each. `sessions list`/`show`/`link`/`unlink` manage the
+local spool (prefixes resolve when unambiguous); `sync` drains queued uploads.
+Spool layout is `<git common dir>/starforge` (`sessions/<ULID>/`, `links.jsonl`,
+`queue.jsonl`); linked commits gain a `Starforge-Session: <ULID>` trailer, and
+heuristic linking fires once per batch of new session activity. Auth is
+`STARFORGE_TOKEN` when set, else `starforge auth login` (device flow) storing
+per-host tokens in `~/.config/starforge/credentials.toml` (mode `0600`).
+Every command honors `--dry-run` (print, don't write) and `--verbose`;
+`sessions publish`/`unpublish`/`delete`, `export`/`import`, and `trail` are
+not in M1c and exit non-zero. Exit codes: `0` ok, `1` operational error,
+`2` `sync` finished with items still queued.
+
 ## Development
 
 ```bash

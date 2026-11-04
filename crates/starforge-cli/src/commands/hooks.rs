@@ -1,16 +1,38 @@
-//! `enable`/`disable` + hidden `_hook-*` handlers (C5).
+//! `enable`/`disable` + hidden `_hook-*` handlers (C5/C7).
 //!
 //! `enable` installs the three POSIX `sh` dispatchers (see [`crate::hooks`])
 //! and prints every file it changes, one path per line. `disable` removes
 //! only marker-bearing dispatchers and restores `.starforge-orig` backups.
 //!
+//! Agent adapter hooks (C7): `enable` also calls every `starforge_capture`
+//! adapter's `install_hooks` (and `disable` their `remove_hooks`), printing
+//! every touched path. The [`Roots`](starforge_capture::Roots) mapping is:
+//!
+//! - `config_dir = <home>/.config` (each adapter appends its own subdir:
+//!   `claude-code/`, `pi/`),
+//! - `data_dir = <home>` (each adapter resolves its own store subpaths),
+//! - `worktree = <repo root>` (adapters keep sessions whose workdir is inside).
+//!
+//! A non-existent agent store is not an error: adapters decide via `detect`
+//! what to do, and the no-hook-surface adapters (codex, gemini, opencode)
+//! report no paths in either direction.
+//!
 //! The `prepare-commit-msg` handler appends one `Starforge-Session: <ULID>`
 //! trailer per linked session (never rewriting existing trailers) and
 //! records the pending selection for `post-commit`, which turns it into
-//! `links.jsonl` entries. `pre-push` enqueues uploads for sessions with
-//! unwritten segments (actual upload is C6). Hook handlers never fail the
-//! git operation: every error becomes a `warning:` on stderr with exit `0`.
-
+//! `links.jsonl` entries plus a per-session `link-watermark.json` (so a
+//! session with no new events since its last link is inactive and gains no
+//! further heuristic trailers). `pre-push` enqueues segment uploads for
+//! sessions with unwritten segments and then runs one best-effort sync pass
+//! (no retries); every failure stays queued with a `warning:` on stderr and
+//! the push is never blocked. Hook handlers never fail the git operation:
+//! every error becomes a `warning:` on stderr with exit `0`.
+//!
+//! Accepted limitations (documented, not fixed in M1c): the pending-trailer
+//! sidecar is a single shared `pending-trailer.json` (concurrent commits in
+//! one repo can race); `core.hooksPath` is ignored (hooks install into the
+//! common dir's `hooks/`); the installed dispatchers resolve the `starforge`
+//! binary via `PATH`.
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -37,9 +59,68 @@ struct PendingRecord {
     seq_end: u64,
 }
 
-/// Install all three dispatchers (+ spool layout). Returns the human-readable
-/// output (one changed path per line) and the exit code.
-pub fn enable(repo: &Path, dry_run: bool) -> (String, u8) {
+/// Roots for the capture adapters: agent hook files live under
+/// `<home>/.config` (adapters append `claude-code/`, `pi/`, …), native
+/// stores resolve under `<home>`, and discovery is scoped to the repo root.
+pub fn adapter_roots(paths: &crate::config::CliPaths, repo: &Path) -> starforge_capture::Roots {
+    starforge_capture::Roots {
+        config_dir: paths.home.join(".config"),
+        data_dir: paths.home.clone(),
+        worktree: repo.to_path_buf(),
+    }
+}
+
+/// Every capture adapter, in stable order.
+fn all_adapters() -> Vec<Box<dyn DynAdapter>> {
+    vec![
+        Box::new(starforge_capture::agents::ClaudeAdapter),
+        Box::new(starforge_capture::agents::CodexAdapter),
+        Box::new(starforge_capture::agents::PiAdapter),
+        Box::new(starforge_capture::agents::OpencodeAdapter),
+        Box::new(starforge_capture::agents::GeminiAdapter),
+    ]
+}
+
+/// Object-safe slice of [`Adapter`](starforge_capture::Adapter) used for
+/// hook wiring (discovery/reading stay on the concrete types).
+trait DynAdapter {
+    fn id(&self) -> &'static str;
+    fn install_hooks(&self, roots: &starforge_capture::Roots) -> std::io::Result<Vec<PathBuf>>;
+    fn remove_hooks(&self, roots: &starforge_capture::Roots) -> std::io::Result<Vec<PathBuf>>;
+}
+
+macro_rules! dyn_adapter {
+    ($t:ty, $name:literal) => {
+        impl DynAdapter for $t {
+            fn id(&self) -> &'static str {
+                $name
+            }
+            fn install_hooks(
+                &self,
+                roots: &starforge_capture::Roots,
+            ) -> std::io::Result<Vec<PathBuf>> {
+                <Self as starforge_capture::Adapter>::install_hooks(self, roots)
+            }
+            fn remove_hooks(
+                &self,
+                roots: &starforge_capture::Roots,
+            ) -> std::io::Result<Vec<PathBuf>> {
+                <Self as starforge_capture::Adapter>::remove_hooks(self, roots)
+            }
+        }
+    };
+}
+
+dyn_adapter!(starforge_capture::agents::ClaudeAdapter, "claude-code");
+dyn_adapter!(starforge_capture::agents::CodexAdapter, "codex");
+dyn_adapter!(starforge_capture::agents::PiAdapter, "pi");
+dyn_adapter!(starforge_capture::agents::OpencodeAdapter, "opencode");
+dyn_adapter!(starforge_capture::agents::GeminiAdapter, "gemini");
+
+/// Install all three dispatchers (+ spool layout) and every agent adapter's
+/// hooks. Returns the human-readable output (one changed path per line) and
+/// the exit code.
+pub fn enable(repo: &Path, paths: &crate::config::CliPaths, dry_run: bool) -> (String, u8) {
     let common = match common_dir(repo) {
         Ok(common) => common,
         Err(err) => return (format!("error: {err}"), 1),
@@ -52,6 +133,10 @@ pub fn enable(repo: &Path, dry_run: bool) -> (String, u8) {
                 common.join("hooks").join(hook).display()
             ));
         }
+        lines.push(format!(
+            "would install agent hooks for claude-code, codex, pi, opencode, gemini under {}",
+            paths.home.join(".config").display()
+        ));
         return (lines.join("\n"), 0);
     }
     let spool = Spool::open(&common);
@@ -78,13 +163,37 @@ pub fn enable(repo: &Path, dry_run: bool) -> (String, u8) {
             Err(err) => return (format!("error: cannot install {hook}: {err}"), 1),
         }
     }
+    let roots = adapter_roots(paths, repo);
+    for adapter in all_adapters() {
+        match adapter.install_hooks(&roots) {
+            Ok(written) => {
+                tracing::debug!(
+                    "enable: {} installed {} hook file(s)",
+                    adapter.id(),
+                    written.len()
+                );
+                for path in written {
+                    changed.push(path.display().to_string());
+                }
+            }
+            Err(err) => {
+                tracing::warn!("enable: {} hooks skipped: {err}", adapter.id());
+            }
+        }
+    }
+    tracing::debug!(
+        "enable: {} path(s) changed in {}",
+        changed.len(),
+        repo.display()
+    );
     (changed.join("\n"), 0)
 }
 
-/// Remove installed dispatchers and restore originals. Returns the
-/// human-readable output (one changed path per line; empty when nothing
-/// changed) and the exit code (always `0` once the repo resolves).
-pub fn disable(repo: &Path, dry_run: bool) -> (String, u8) {
+/// Remove installed dispatchers and restore originals, plus every agent
+/// adapter's hooks. Returns the human-readable output (one changed path per
+/// line; empty when nothing changed) and the exit code (always `0` once the
+/// repo resolves).
+pub fn disable(repo: &Path, paths: &crate::config::CliPaths, dry_run: bool) -> (String, u8) {
     let common = match common_dir(repo) {
         Ok(common) => common,
         Err(err) => return (format!("error: {err}"), 1),
@@ -97,6 +206,10 @@ pub fn disable(repo: &Path, dry_run: bool) -> (String, u8) {
                 common.join("hooks").join(hook).display()
             ));
         }
+        lines.push(format!(
+            "would remove agent hooks for claude-code, codex, pi, opencode, gemini under {}",
+            paths.home.join(".config").display()
+        ));
         return (lines.join("\n"), 0);
     }
     let mut changed = Vec::new();
@@ -106,31 +219,141 @@ pub fn disable(repo: &Path, dry_run: bool) -> (String, u8) {
             Err(err) => return (format!("error: cannot remove {hook}: {err}"), 1),
         }
     }
+    let roots = adapter_roots(paths, repo);
+    for adapter in all_adapters() {
+        match adapter.remove_hooks(&roots) {
+            Ok(removed) => {
+                tracing::debug!(
+                    "disable: {} removed {} hook file(s)",
+                    adapter.id(),
+                    removed.len()
+                );
+                for path in removed {
+                    changed.push(path.display().to_string());
+                }
+            }
+            Err(err) => {
+                tracing::warn!("disable: {} hooks skipped: {err}", adapter.id());
+            }
+        }
+    }
+    tracing::debug!(
+        "disable: {} path(s) changed in {}",
+        changed.len(),
+        repo.display()
+    );
     (changed.join("\n"), 0)
 }
 
-/// Hidden `_hook-prepare-commit-msg`: append session trailers. Always `0`.
-pub fn hook_prepare(repo: &Path, msg_file: &Path) -> u8 {
-    if let Err(err) = prepare_inner(repo, msg_file) {
+/// Hidden `_hook-prepare-commit-msg`: ingest, then append trailers. Always `0`.
+pub fn hook_prepare(repo: &Path, msg_file: &Path, paths: &crate::config::CliPaths) -> u8 {
+    if let Err(err) = prepare_inner(repo, msg_file, paths) {
         eprintln!("warning: starforge prepare-commit-msg skipped: {err}");
     }
     0
 }
 
-/// Hidden `_hook-post-commit`: record the pending trailers as links. Always `0`.
-pub fn hook_post_commit(repo: &Path) -> u8 {
-    if let Err(err) = post_commit_inner(repo) {
+/// Hidden `_hook-post-commit`: ingest, then record trailer links. Always `0`.
+pub fn hook_post_commit(repo: &Path, paths: &crate::config::CliPaths) -> u8 {
+    if let Err(err) = post_commit_inner(repo, paths) {
         eprintln!("warning: starforge post-commit skipped: {err}");
     }
     0
 }
 
-/// Hidden `_hook-pre-push`: enqueue uploads for unwritten segments. Always `0`.
-pub fn hook_pre_push(repo: &Path) -> u8 {
+/// Hidden `_hook-pre-push`: ingest + enqueue uploads. Always `0`.
+///
+/// Sync (enqueue-only) entry point kept for contexts without a runtime; the
+/// installed hook runs [`hook_pre_push_full`], which additionally attempts a
+/// bounded best-effort upload after enqueueing.
+pub fn hook_pre_push(repo: &Path, paths: &crate::config::CliPaths) -> u8 {
     if let Err(err) = pre_push_inner(repo) {
         eprintln!("warning: starforge pre-push skipped: {err}");
     }
+    if let Err(err) = run_ingest(repo, paths) {
+        eprintln!("warning: starforge pre-push ingest skipped: {err}");
+    }
     0
+}
+
+/// Full `_hook-pre-push` body (C7 carry-in 3): enqueue, then attempt the
+/// queued uploads without blocking the push.
+///
+/// Best-effort budget is one pass with no retries
+/// ([`sync_best_effort`](crate::commands::sync::sync_best_effort) caps the
+/// whole attempt at 10 s and swallows every failure). Server resolution,
+/// token, and upload failures all degrade to a `warning:` on stderr; the
+/// return is always `0` so a push never fails because of session upload.
+/// Entries that did not make it stay queued for the next `sync`.
+pub async fn hook_pre_push_full(
+    repo: &Path,
+    paths: &crate::config::CliPaths,
+    token_lookup: impl Fn(&str) -> Option<String>,
+) -> u8 {
+    // Same enqueue + ingest as the sync body, then one best-effort pass.
+    let _ = hook_pre_push(repo, paths);
+    if let Err(err) = pre_push_best_effort(repo, paths, token_lookup).await {
+        eprintln!("warning: starforge pre-push upload skipped: {err}");
+    }
+    0
+}
+
+/// Run capture ingest for `repo` (GAP A): discover → read → redact → spool.
+/// Warnings name the failure; the return is the ingest stats.
+fn run_ingest(
+    repo: &Path,
+    paths: &crate::config::CliPaths,
+) -> Result<crate::ingest::IngestStats, String> {
+    let common = common_dir(repo).map_err(|err| err.to_string())?;
+    let spool = Spool::open(&common);
+    spool
+        .ensure_layout()
+        .map_err(|err| format!("cannot set up spool: {err}"))?;
+    let roots = adapter_roots(paths, repo);
+    let now = time::OffsetDateTime::now_utc();
+    let stats = crate::ingest::ingest(&spool, &roots, repo, now)
+        .map_err(|err| format!("ingest failed: {err}"))?;
+    tracing::debug!(
+        "ingest: {} session(s), {} new event(s), {} new segment(s), {} queued",
+        stats.sessions,
+        stats.new_events,
+        stats.new_segments,
+        stats.enqueued
+    );
+    Ok(stats)
+}
+
+/// One best-effort upload pass over the entries [`pre_push_inner`] just
+/// enqueued. `Ok` in both the uploaded and the skipped case; `Err` only when
+/// the pass could not even start (no server, no token).
+async fn pre_push_best_effort(
+    repo: &Path,
+    paths: &crate::config::CliPaths,
+    token_lookup: impl Fn(&str) -> Option<String>,
+) -> Result<(), String> {
+    let common = common_dir(repo).map_err(|err| err.to_string())?;
+    let spool = Spool::open(&common);
+    let (server, owner_repo, _chosen) = crate::commands::status::resolve_server(repo, paths)
+        .await
+        .map_err(|err| err.to_string())?;
+    let host = crate::cli::sync_host_key(&server.api_url)
+        .ok_or_else(|| format!("cannot parse server api_url {:?}", server.api_url))?;
+    let token =
+        crate::auth::resolve_token(paths, &host, token_lookup).map_err(|err| err.to_string())?;
+    let now = time::OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .map_err(|err| format!("cannot format time: {err}"))?;
+    let sleeper = crate::queue::TokioSleeper;
+    crate::commands::sync::sync_best_effort(
+        &spool,
+        &server,
+        &owner_repo,
+        token.token(),
+        &sleeper,
+        &now,
+    )
+    .await;
+    Ok(())
 }
 
 /// One candidate plus the event `seq` range the link will cover.
@@ -140,12 +363,21 @@ struct CandidateData {
     seq_end: u64,
 }
 
-fn prepare_inner(repo: &Path, msg_file: &Path) -> Result<(), String> {
+fn prepare_inner(
+    repo: &Path,
+    msg_file: &Path,
+    paths: &crate::config::CliPaths,
+) -> Result<(), String> {
     let common = common_dir(repo).map_err(|err| err.to_string())?;
     let spool = Spool::open(&common);
     spool
         .ensure_layout()
         .map_err(|err| format!("cannot set up spool: {err}"))?;
+    // Ingest first so trailer selection sees fresh `files_touched`; an ingest
+    // failure warns but never blocks the commit.
+    if let Err(err) = run_ingest(repo, paths) {
+        eprintln!("warning: starforge ingest skipped: {err}");
+    }
     let staged = staged_files(repo).map_err(|err| err.to_string())?;
     let data = collect_candidates(&spool)?;
     let candidates: Vec<SessionCandidate> = data.iter().map(|d| d.candidate.clone()).collect();
@@ -186,12 +418,15 @@ fn prepare_inner(repo: &Path, msg_file: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn post_commit_inner(repo: &Path) -> Result<(), String> {
+fn post_commit_inner(repo: &Path, paths: &crate::config::CliPaths) -> Result<(), String> {
     let common = common_dir(repo).map_err(|err| err.to_string())?;
     let spool = Spool::open(&common);
     spool
         .ensure_layout()
         .map_err(|err| format!("cannot set up spool: {err}"))?;
+    if let Err(err) = run_ingest(repo, paths) {
+        eprintln!("warning: starforge ingest skipped: {err}");
+    }
     let bytes = match std::fs::read(pending_path(&spool)) {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -204,6 +439,9 @@ fn post_commit_inner(repo: &Path) -> Result<(), String> {
         return Ok(());
     }
     let commit = head_commit(repo).map_err(|err| err.to_string())?;
+    let now = time::OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .map_err(|err| format!("cannot format time: {err}"))?;
     for record in &pending {
         spool
             .record_link(&LinkEntry {
@@ -215,11 +453,19 @@ fn post_commit_inner(repo: &Path) -> Result<(), String> {
                 seq_end: record.seq_end,
             })
             .map_err(|err| format!("cannot record link: {err}"))?;
+        spool
+            .write_link_watermark(
+                &record.ulid,
+                &crate::spool::LinkWatermark {
+                    last_linked_seq: record.seq_end,
+                    last_linked_at: now.clone(),
+                },
+            )
+            .map_err(|err| format!("cannot write link watermark: {err}"))?;
     }
     std::fs::remove_file(pending_path(&spool)).ok();
     Ok(())
 }
-
 fn pre_push_inner(repo: &Path) -> Result<(), String> {
     let common = common_dir(repo).map_err(|err| err.to_string())?;
     let spool = Spool::open(&common);
@@ -355,7 +601,16 @@ fn collect_candidates(spool: &Spool) -> Result<Vec<CandidateData>, String> {
             })
             .unwrap_or_default();
 
-        let floor = cursors.get(&ulid).copied().unwrap_or(0);
+        // The link watermark is the link's `seq_end`: only events at or past
+        // it are new since the last link. A session that was already linked
+        // and has no newer events is inactive, so heuristic linking fires
+        // once per batch of activity instead of on every commit.
+        let watermark = spool
+            .read_link_watermark(&ulid)
+            .map_err(|err| format!("cannot read link watermark for {ulid}: {err}"))?
+            .map(|w| w.last_linked_seq)
+            .unwrap_or(0);
+        let floor = cursors.get(&ulid).copied().unwrap_or(0).max(watermark);
         let mut new_seqs: Vec<u64> = Vec::new();
         let mut all_seqs: Vec<u64> = Vec::new();
         for n in segment_numbers(spool, &ulid) {
@@ -393,7 +648,9 @@ fn collect_candidates(spool: &Spool) -> Result<Vec<CandidateData>, String> {
         }
         files.sort();
         files.dedup();
-        let active = !new_seqs.is_empty() || !files.is_empty();
+        // `files_touched` alone only counts for never-linked sessions: once a
+        // session has a watermark, only newer events reactivate it.
+        let active = !new_seqs.is_empty() || (watermark == 0 && !files.is_empty());
         let (seq_start, seq_end) = match (new_seqs.iter().min(), new_seqs.iter().max()) {
             (Some(&lo), Some(&hi)) => (lo, hi + 1),
             _ => match (all_seqs.iter().min(), all_seqs.iter().max()) {

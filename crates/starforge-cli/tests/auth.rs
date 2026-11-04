@@ -152,7 +152,12 @@ async fn device_flow_polls_then_returns_tokens() {
         params.get("client_id").map(String::as_str),
         Some("starforge-cli")
     );
-    assert!(params.contains_key("scope"), "body: {}", bodies[0]);
+    assert_eq!(
+        params.get("scope").map(String::as_str),
+        Some("session:upload"),
+        "scope must be the server's Scope::SessionUpload string, body: {}",
+        bodies[0]
+    );
 
     // Token poll bodies pin the RFC 8628 grant + device_code echo.
     let bodies = stub.token_bodies.lock().unwrap();

@@ -117,6 +117,21 @@ pub struct LinkEntry {
     pub seq_end: u64,
 }
 
+/// Per-session heuristic-link watermark: `sessions/<ULID>/link-watermark.json`.
+///
+/// Written atomically by `post-commit` (and `sessions link`) after a link is
+/// recorded. `last_linked_seq` is the link's `seq_end`: one past the last
+/// covered event. The prepare-commit-msg handler treats a session with no
+/// events at or past this watermark as inactive, so heuristic linking fires
+/// once per batch of new activity instead of on every commit.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LinkWatermark {
+    /// One past the last linked event `seq`.
+    pub last_linked_seq: u64,
+    /// RFC 3339 time the watermark was written.
+    pub last_linked_at: String,
+}
+
 /// `upload.json`: idempotent re-upload progress (never uploaded itself).
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct UploadState {
@@ -126,6 +141,12 @@ pub struct UploadState {
     /// The session is fully uploaded.
     #[serde(default)]
     pub complete: bool,
+    /// Blake3 of the last successfully uploaded metadata JSON (`None` = never).
+    #[serde(default)]
+    pub meta_hash: Option<String>,
+    /// Blake3 hashes of raw `links.jsonl` lines already POSTed.
+    #[serde(default)]
+    pub sent_links: Vec<String>,
 }
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -386,6 +407,61 @@ impl Spool {
         Ok(hash)
     }
 
+    /// Record the metadata body hash as uploaded in `upload.json`.
+    pub fn mark_meta_uploaded(&self, ulid: &str, hash: String) -> Result<(), SpoolError> {
+        let dir = self.known_session_dir(ulid)?;
+        let mut state = self.read_upload(ulid)?;
+        state.meta_hash = Some(hash);
+        atomic_write(
+            &dir.join("upload.json"),
+            serde_json::to_vec_pretty(&state)
+                .expect("UploadState serializes")
+                .as_slice(),
+        )?;
+        Ok(())
+    }
+
+    /// Record raw `links.jsonl` line hashes as sent in `upload.json`.
+    pub fn mark_links_sent(&self, ulid: &str, hashes: &[String]) -> Result<(), SpoolError> {
+        let dir = self.known_session_dir(ulid)?;
+        let mut state = self.read_upload(ulid)?;
+        for hash in hashes {
+            if !state.sent_links.contains(hash) {
+                state.sent_links.push(hash.clone());
+            }
+        }
+        atomic_write(
+            &dir.join("upload.json"),
+            serde_json::to_vec_pretty(&state)
+                .expect("UploadState serializes")
+                .as_slice(),
+        )?;
+        Ok(())
+    }
+
+    /// Raw `links.jsonl` lines for `ulid` with the blake3 hash of each line.
+    /// Hashing raw lines (not re-serialized values) keeps the record stable
+    /// no matter how the JSON maps order keys.
+    pub fn link_line_hashes(&self, ulid: &str) -> Result<Vec<(String, LinkEntry)>, SpoolError> {
+        let text = match std::fs::read_to_string(self.root.join("links.jsonl")) {
+            Ok(text) => text,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(SpoolError::Io(e)),
+        };
+        let mut out = Vec::new();
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let entry: LinkEntry = serde_json::from_str(line).map_err(SpoolError::Json)?;
+            if entry.ulid == ulid {
+                out.push((blake3_hex(line.as_bytes()), entry));
+            }
+        }
+        Ok(out)
+    }
+
     fn read_cursors(&self) -> Result<CursorsFile, SpoolError> {
         match std::fs::read_to_string(self.root.join("cursors.json")) {
             Ok(text) => Ok(serde_json::from_str(&text)?),
@@ -427,6 +503,11 @@ impl Spool {
         Ok(())
     }
 
+    /// All cursor records keyed by `"<agent>/<session_key>"` (missing file = empty).
+    pub fn cursor_records(&self) -> Result<BTreeMap<String, CursorRecord>, SpoolError> {
+        Ok(self.read_cursors()?.sessions)
+    }
+
     /// Append one [`LinkEntry`] object to `links.jsonl` (append-only).
     pub fn record_link(&self, entry: &LinkEntry) -> Result<(), SpoolError> {
         use std::io::Write as _;
@@ -454,5 +535,32 @@ impl Spool {
             .filter(|line| !line.trim().is_empty())
             .map(|line| serde_json::from_str(line).map_err(SpoolError::Json))
             .collect()
+    }
+
+    /// Read `sessions/<ulid>/link-watermark.json`; `Ok(None)` when the session
+    /// was never linked.
+    pub fn read_link_watermark(&self, ulid: &str) -> Result<Option<LinkWatermark>, SpoolError> {
+        let path = self.known_session_dir(ulid)?.join("link-watermark.json");
+        match std::fs::read(&path) {
+            Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(SpoolError::Io(e)),
+        }
+    }
+
+    /// Write `sessions/<ulid>/link-watermark.json` atomically (temp + rename).
+    pub fn write_link_watermark(
+        &self,
+        ulid: &str,
+        watermark: &LinkWatermark,
+    ) -> Result<(), SpoolError> {
+        let path = self.known_session_dir(ulid)?.join("link-watermark.json");
+        atomic_write(
+            &path,
+            serde_json::to_vec_pretty(watermark)
+                .expect("LinkWatermark serializes")
+                .as_slice(),
+        )?;
+        Ok(())
     }
 }

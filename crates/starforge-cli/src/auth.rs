@@ -328,10 +328,7 @@ impl DeviceFlow {
         let resp = self
             .client
             .post(&url)
-            .form(&[
-                ("client_id", "starforge-cli"),
-                ("scope", "sessions:read sessions:write"),
-            ])
+            .form(&[("client_id", "starforge-cli"), ("scope", "session:upload")])
             .send()
             .await
             .map_err(|err| AuthError::Http(err.to_string()))?;

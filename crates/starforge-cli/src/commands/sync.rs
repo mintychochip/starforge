@@ -26,7 +26,7 @@ use std::time::Duration;
 use time::format_description::well_known::Rfc3339;
 
 use crate::discovery::ServerInfo;
-use crate::queue::{QueueEntry, QueueOp, Sleeper, backoff_due, read_queue, rewrite_queue};
+use crate::queue::{QueueEntry, QueueOp, Sleeper, backoff_due, enqueue, read_queue, rewrite_queue};
 use crate::spool::Spool;
 use crate::upload::{UploadClient, UploadError};
 
@@ -68,6 +68,14 @@ impl SyncSummary {
 /// v0.1: complete only when the spool session's meta has ended_at set, else
 /// leave uncompleted and succeed). Failures bump attempts + not_before
 /// (`2^attempts` s, cap 300) via injected now; exit 0 drained / 2 remainder.
+/// Drain due queue entries, deriving missing work from spool state first:
+/// every session with no recorded metadata PUT gets `Meta`, every segment on
+/// disk whose hash is not in `upload.json` gets `Segment`, `Complete` when
+/// `meta.ended_at` is set and `upload.json.complete` is false, and `Links`
+/// for links not yet recorded as sent. The queue stays the retry record:
+/// reconcile only appends entries no queued entry already covers, failures
+/// keep their bumped entries and backoff, and `sync_best_effort` (pre-push)
+/// keeps draining whatever is queued without reconciling.
 pub async fn sync(
     spool: &Spool,
     server: &ServerInfo,
@@ -77,6 +85,10 @@ pub async fn sync(
     now_rfc3339: &str,
     dry_run: bool,
 ) -> Result<SyncSummary, UploadError> {
+    if dry_run {
+        return dry_run_summary(spool, now_rfc3339);
+    }
+    reconcile_queue(spool, now_rfc3339)?;
     sync_with_retries(
         spool,
         server,
@@ -84,10 +96,195 @@ pub async fn sync(
         token,
         sleeper,
         now_rfc3339,
-        dry_run,
+        false,
         MAX_RETRIES,
     )
     .await
+}
+
+/// Blake3 of the canonical metadata JSON: the identity `upload.json.meta_hash`
+/// is compared against.
+fn meta_body_hash(meta: &starforge_format::SessionMeta) -> Result<String, UploadError> {
+    let bytes = serde_json::to_vec(meta).map_err(crate::spool::SpoolError::Json)?;
+    Ok(starforge_format::blake3_hex(&bytes))
+}
+
+/// Queue identity for dedupe: op plus `(ulid, segment)`.
+fn entry_key(op: QueueOp, ulid: &str, segment: Option<u64>) -> (u8, String, Option<u64>) {
+    let disc = match op {
+        QueueOp::Meta => 0,
+        QueueOp::Segment => 1,
+        QueueOp::Complete => 2,
+        QueueOp::Links => 3,
+    };
+    (disc, ulid.to_string(), segment)
+}
+
+/// Sorted ULIDs present under `sessions/`.
+fn session_ulids(spool: &Spool) -> Vec<String> {
+    let mut out = Vec::new();
+    let entries = match std::fs::read_dir(spool.root.join("sessions")) {
+        Ok(entries) => entries,
+        Err(_) => return out,
+    };
+    for entry in entries.flatten() {
+        if !entry.path().is_dir() {
+            continue;
+        }
+        if let Some(name) = entry.file_name().to_str()
+            && name.parse::<ulid::Ulid>().is_ok()
+        {
+            out.push(name.to_string());
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Sorted segment numbers present for `ulid`.
+fn present_segments(spool: &Spool, ulid: &str) -> Vec<u64> {
+    let mut out = Vec::new();
+    let dir = spool.root.join("sessions").join(ulid).join("segments");
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(_) => return out,
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if let Some(n) = name
+            .strip_suffix(".jsonl.zst")
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            out.push(n);
+        }
+    }
+    out.sort_unstable();
+    out
+}
+
+/// The full canonical upload list for every spooled session, in upload order
+/// (`Meta` → segments → `Complete` → `Links` per session, sessions sorted):
+/// entries whose work `upload.json` already records are omitted.
+fn desired_entries(spool: &Spool, now_rfc3339: &str) -> Result<Vec<QueueEntry>, UploadError> {
+    let mut out = Vec::new();
+    for ulid in session_ulids(spool) {
+        let meta = match spool.read_meta(&ulid) {
+            Ok(meta) => meta,
+            Err(err) => {
+                tracing::warn!("sync: cannot read meta for `{ulid}`: {err}");
+                continue;
+            }
+        };
+        let state = spool.read_upload(&ulid)?;
+        let hash = meta_body_hash(&meta)?;
+        if state.meta_hash.as_deref() != Some(hash.as_str()) {
+            out.push(QueueEntry {
+                op: QueueOp::Meta,
+                ulid: ulid.clone(),
+                repo: String::new(),
+                segment: None,
+                attempts: 0,
+                not_before: now_rfc3339.to_string(),
+            });
+        }
+        for n in present_segments(spool, &ulid) {
+            let bytes = match spool.segment_bytes(&ulid, n) {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    tracing::warn!("sync: cannot read segment {n} for `{ulid}`: {err}");
+                    continue;
+                }
+            };
+            let hash = starforge_format::blake3_hex(&bytes);
+            if state.uploaded_segments.get(&n) != Some(&hash) {
+                out.push(QueueEntry {
+                    op: QueueOp::Segment,
+                    ulid: ulid.clone(),
+                    repo: String::new(),
+                    segment: Some(n),
+                    attempts: 0,
+                    not_before: now_rfc3339.to_string(),
+                });
+            }
+        }
+        if meta.ended_at.is_some() && !state.complete {
+            out.push(QueueEntry {
+                op: QueueOp::Complete,
+                ulid: ulid.clone(),
+                repo: String::new(),
+                segment: None,
+                attempts: 0,
+                not_before: now_rfc3339.to_string(),
+            });
+        }
+        let pairs = spool.link_line_hashes(&ulid)?;
+        if pairs
+            .iter()
+            .any(|(hash, _)| !state.sent_links.contains(hash))
+        {
+            out.push(QueueEntry {
+                op: QueueOp::Links,
+                ulid: ulid.clone(),
+                repo: String::new(),
+                segment: None,
+                attempts: 0,
+                not_before: now_rfc3339.to_string(),
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Append every [`desired_entries`] row no queued entry already covers.
+/// Returns the number of entries added. The queue file is only appended to,
+/// never rewritten, so existing attempts/backoff survive a reconcile.
+pub fn reconcile_queue(spool: &Spool, now_rfc3339: &str) -> Result<usize, UploadError> {
+    use std::collections::HashSet;
+    let have: HashSet<(u8, String, Option<u64>)> = read_queue(spool)?
+        .iter()
+        .map(|e| entry_key(e.op, &e.ulid, e.segment))
+        .collect();
+    let mut added = 0;
+    for entry in desired_entries(spool, now_rfc3339)? {
+        if !have.contains(&entry_key(entry.op, &entry.ulid, entry.segment)) {
+            enqueue(spool, entry)?;
+            added += 1;
+        }
+    }
+    if added > 0 {
+        tracing::debug!("sync: reconciled {added} missing queue entries from spool state");
+    }
+    Ok(added)
+}
+
+/// Dry-run plan: due queued entries plus derived-but-unqueued work. Writes nothing.
+pub fn dry_run_plan(spool: &Spool, now_rfc3339: &str) -> Result<Vec<String>, UploadError> {
+    use std::collections::HashSet;
+    let queued = read_queue(spool)?;
+    let mut planned = Vec::new();
+    for entry in &queued {
+        if backoff_due(entry, now_rfc3339) {
+            planned.push(describe(entry));
+        }
+    }
+    let have: HashSet<(u8, String, Option<u64>)> = queued
+        .iter()
+        .map(|e| entry_key(e.op, &e.ulid, e.segment))
+        .collect();
+    for entry in desired_entries(spool, now_rfc3339)? {
+        if !have.contains(&entry_key(entry.op, &entry.ulid, entry.segment)) {
+            planned.push(describe(&entry));
+        }
+    }
+    Ok(planned)
+}
+
+/// Dry-run summary over queued + derived work. Writes nothing.
+fn dry_run_summary(spool: &Spool, now_rfc3339: &str) -> Result<SyncSummary, UploadError> {
+    Ok(SyncSummary {
+        planned: dry_run_plan(spool, now_rfc3339)?,
+        ..SyncSummary::default()
+    })
 }
 
 /// Best-effort upload for the `pre-push` path: at most one attempt per entry,
@@ -252,7 +449,11 @@ async fn settle_entry(
             })
             .await?
             {
-                Driven::Done => Ok(EntryStats::uploaded()),
+                Driven::Done => {
+                    let hash = meta_body_hash(&meta)?;
+                    spool.mark_meta_uploaded(&entry.ulid, hash)?;
+                    Ok(EntryStats::uploaded())
+                }
                 Driven::Kept { conflict } => Ok(conflict_stats(conflict)),
             }
         }
@@ -316,27 +517,30 @@ async fn settle_entry(
             }
         }
         QueueOp::Links => {
-            let links = match spool.links() {
-                Ok(links) => links,
+            let pairs = match spool.link_line_hashes(&entry.ulid) {
+                Ok(pairs) => pairs,
                 Err(err) => {
                     tracing::warn!("sync: cannot read links: {err}");
                     return Ok(EntryStats::kept());
                 }
             };
-            let ours: Vec<serde_json::Value> = links
-                .iter()
-                .filter(|link| link.ulid == entry.ulid)
-                .map(|link| serde_json::to_value(link).expect("LinkEntry serializes"))
-                .collect();
-            if ours.is_empty() {
+            if pairs.is_empty() {
                 return Ok(EntryStats::skipped());
             }
+            let ours: Vec<serde_json::Value> = pairs
+                .iter()
+                .map(|(_, link)| serde_json::to_value(link).expect("LinkEntry serializes"))
+                .collect();
             match drive(working, idx, spool, sleeper, now, max_retries, || {
                 client.post_links(owner_repo, &entry.ulid, &ours)
             })
             .await?
             {
-                Driven::Done => Ok(EntryStats::uploaded()),
+                Driven::Done => {
+                    let hashes: Vec<String> = pairs.iter().map(|(hash, _)| hash.clone()).collect();
+                    spool.mark_links_sent(&entry.ulid, &hashes)?;
+                    Ok(EntryStats::uploaded())
+                }
                 Driven::Kept { conflict } => Ok(conflict_stats(conflict)),
             }
         }
