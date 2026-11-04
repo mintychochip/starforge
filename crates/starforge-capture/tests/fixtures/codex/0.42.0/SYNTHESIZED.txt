@@ -1,0 +1,25 @@
+SYNTHESIZED — no real Codex CLI transcript was available on this machine.
+
+This fixture mimics the native shape of the Codex CLI session store
+`~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` (one JSON object per line),
+following the Task B3 brief: `response` / `function_call` /
+`function_call_output` / `compacted` record types carrying `cwd`,
+`session_id`, `version`, and `timestamp` on every record, plus the two
+companion shapes the mapping requires — `prompt` records (user input text)
+and `reasoning` records (reasoning summaries).
+
+- `prompt.text` mimics the user-prompt payload.
+- `response` mimics a model turn: `text`, `model`, and token `usage`
+  (`input_tokens` / `output_tokens` / `cache_*`). The optional
+  `reasoning_summary` field is a tolerance affordance so one record can
+  carry two events (message + reasoning); it exercises the multi-event
+  resume path in the incremental test.
+- `function_call` mimics the OpenAI function-call shape: `name` plus
+  `arguments` as a JSON-encoded string (an object is also accepted).
+- `function_call_output.output` mimics the tool result payload.
+- `compacted.summary` mimics the rolling-window compaction record. It sits
+  mid-file (record 7 of 8, with a `prompt` after it) to pin that the
+  adapter emits every record exactly once in file order — never reordered,
+  never dropped.
+
+Model name (`gpt-5-codex`), versions, token counts, and prose are invented.
