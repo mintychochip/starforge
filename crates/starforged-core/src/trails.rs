@@ -556,11 +556,8 @@ impl Core {
         }
         let name = normalize_label(name)?;
         let row = self.trail_row(access.repo.id, number).await?;
-        if !db_trails::labels_of(self.db(), row.id)
-            .await?
-            .contains(&name)
-            && db_trails::labels_of(self.db(), row.id).await?.len() >= MAX_LABELS
-        {
+        let current = db_trails::labels_of(self.db(), row.id).await?;
+        if !current.contains(&name) && current.len() >= MAX_LABELS {
             return Err(CoreError::Invalid("too many labels on this trail".into()));
         }
         if !db_trails::add_label(self.db(), row.id, &name).await? {
@@ -989,10 +986,25 @@ mod tests {
                 .await
                 .unwrap();
         }
+        let timelines = || async {
+            db_trails::timeline_of_trail(core.db(), 1)
+                .await
+                .unwrap()
+                .len()
+        };
+        let rows_before = timelines().await;
         assert!(matches!(
             core.add_label(&alice, "alice", "proj", 1, "overflow").await,
             Err(CoreError::Invalid(_))
         ));
+        // The rejected 11th label inserts nothing and writes no timeline row.
+        let detail = core
+            .trail_by_number(Some(&alice), "alice", "proj", 1)
+            .await
+            .unwrap();
+        assert_eq!(detail.trail.labels.len(), 10);
+        assert!(!detail.trail.labels.contains(&"overflow".to_string()));
+        assert_eq!(timelines().await, rows_before);
         // Remove writes a remove row.
         let view = core
             .remove_label(&alice, "alice", "proj", 1, "BUG")

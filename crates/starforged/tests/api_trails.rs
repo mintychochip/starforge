@@ -281,6 +281,57 @@ async fn patch_title_ready_and_state() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn patch_rejected_state_writes_nothing() {
+    let c = Ctx::start().await;
+    let client = reqwest::Client::new();
+    c.create("untouched").await;
+
+    // A rejected state must not leave field edits behind: 422 and the
+    // follow-up GET shows the original title, open state, and no edit row.
+    let rejected = client
+        .patch(c.trail(1))
+        .bearer_auth(&c.triage)
+        .json(&json!({"title": "changed", "state": "merged"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), 422);
+    let (code, message) = error(rejected.json().await.unwrap());
+    assert_eq!(code, "invalid");
+    assert_eq!(message, "merged is set by the merge path");
+    let after = client
+        .get(c.trail(1))
+        .bearer_auth(&c.read)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(after.status(), 200);
+    let after = after.json::<Value>().await.unwrap();
+    assert_eq!(after["title"], "untouched");
+    assert_eq!(after["state"], "open");
+    let kinds: Vec<&str> = after["timeline"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, vec!["trail.open"]);
+
+    // The valid combination applies both halves.
+    let both = client
+        .patch(c.trail(1))
+        .bearer_auth(&c.triage)
+        .json(&json!({"title": "ok", "state": "closed"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(both.status(), 200);
+    let both = both.json::<Value>().await.unwrap();
+    assert_eq!(both["title"], "ok");
+    assert_eq!(both["state"], "closed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_detail_shape() {
     let c = Ctx::start().await;
     let client = reqwest::Client::new();

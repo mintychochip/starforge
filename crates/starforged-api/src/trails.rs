@@ -238,6 +238,10 @@ pub struct PatchTrailBody {
 /// `PATCH /repos/{owner}/{repo}/trails/{n}`: title/intent/ready edits and/or a
 /// state transition. `{"state": "merged"}` answers `422` — the merge path owns
 /// that transition (the message surfaces verbatim).
+///
+/// The state transition runs first: a rejected state must not leave field
+/// edits (or their timeline rows) behind, so an error truly means nothing
+/// changed.
 pub async fn patch_trail(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -246,41 +250,32 @@ pub async fn patch_trail(
 ) -> Result<Json<TrailJson>, ApiError> {
     let auth = auth.require(Scope::TrailWrite)?;
     let Json(body) = body.map_err(|e| ApiError::Invalid(e.body_text()))?;
-    let mut view = None;
-    if body.title.is_some() || body.intent.is_some() || body.ready.is_some() {
-        view = Some(
-            state
-                .core
-                .update_trail(
-                    &auth.user,
-                    &owner,
-                    &repo,
-                    number,
-                    body.title.as_deref(),
-                    body.intent.as_deref(),
-                    body.ready,
-                )
-                .await?,
-        );
-    }
     if let Some(next) = body.state.as_deref() {
-        view = Some(
-            state
-                .core
-                .set_trail_state(&auth.user, &owner, &repo, number, next)
-                .await?,
-        );
+        state
+            .core
+            .set_trail_state(&auth.user, &owner, &repo, number, next)
+            .await?;
     }
-    match view {
-        Some(view) => Ok(Json(trail_json(&view))),
-        None => {
-            let detail = state
-                .core
-                .trail_by_number(Some(&auth.user), &owner, &repo, number)
-                .await?;
-            Ok(Json(trail_json(&detail.trail)))
-        }
+    if body.title.is_some() || body.intent.is_some() || body.ready.is_some() {
+        let view = state
+            .core
+            .update_trail(
+                &auth.user,
+                &owner,
+                &repo,
+                number,
+                body.title.as_deref(),
+                body.intent.as_deref(),
+                body.ready,
+            )
+            .await?;
+        return Ok(Json(trail_json(&view)));
     }
+    let detail = state
+        .core
+        .trail_by_number(Some(&auth.user), &owner, &repo, number)
+        .await?;
+    Ok(Json(trail_json(&detail.trail)))
 }
 
 /// `GET /repos/{owner}/{repo}/trails/{n}/comments`.
