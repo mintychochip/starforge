@@ -10,6 +10,7 @@ use futures_util::TryStreamExt;
 use serde::Deserialize;
 use starforged_core::CoreError;
 use starforged_core::accounts::User;
+use starforged_core::jobs::Job;
 use starforged_core::permission::Permission;
 use starforged_core::repos::RepoAccess;
 use starforged_core::tokens::{self, Scope};
@@ -204,6 +205,9 @@ async fn rpc(
 
     let mut stderr = process.stderr;
     let mut child = process.child;
+    // A successful push queues `git maintenance` for the repository (one pending run per repository).
+    let maintenance =
+        (service == Service::ReceivePack).then(|| (state.core.clone(), access.repo.id));
     tokio::spawn(async move {
         let mut text = String::new();
         let _ = stderr.read_to_string(&mut text).await;
@@ -211,6 +215,12 @@ async fn rpc(
         let failed = !matches!(&status, Ok(s) if s.success());
         if failed || !text.trim().is_empty() {
             tracing::warn!(stderr = %text.trim(), ?status, "git rpc finished");
+        }
+        if !failed
+            && let Some((core, repo_id)) = maintenance
+            && let Err(err) = core.enqueue(&Job::GitMaintenance { repo_id }).await
+        {
+            tracing::warn!(error = %err, repo_id, "queueing git maintenance failed");
         }
     });
 

@@ -47,6 +47,8 @@ pub enum Job {
         subject: String,
         body: String,
     },
+    /// `git maintenance run --auto` for one repository, after a push to it (forge-basics design §8.4).
+    GitMaintenance { repo_id: i64 },
 }
 
 impl Job {
@@ -57,6 +59,7 @@ impl Job {
             Job::DailyPrune => "daily_prune",
             Job::PurgeDeletedRepos => "purge_deleted_repos",
             Job::SendEmail { .. } => "send_email",
+            Job::GitMaintenance { .. } => "git_maintenance",
         }
     }
 
@@ -68,6 +71,15 @@ impl Job {
             Job::DailyPrune => Some(DAY),
             Job::PurgeDeletedRepos => Some(DAY),
             Job::SendEmail { .. } => None,
+            Job::GitMaintenance { .. } => None,
+        }
+    }
+
+    /// At most one job per key is pending: recurring jobs use their kind, maintenance one key per repository.
+    fn dedupe_key(&self) -> Option<String> {
+        match self {
+            Job::GitMaintenance { repo_id } => Some(format!("git_maintenance:{repo_id}")),
+            _ => self.recurrence().map(|_| self.kind().to_owned()),
         }
     }
 }
@@ -81,13 +93,13 @@ impl Core {
     /// Queues `job` to run at `run_at` (unix seconds). A recurring job that is already pending is left alone.
     pub async fn enqueue_at(&self, job: &Job, run_at: i64) -> CoreResult<()> {
         let payload = serde_json::to_string(job).map_err(|e| CoreError::Internal(e.to_string()))?;
-        let dedupe_key = job.recurrence().map(|_| job.kind());
+        let dedupe_key = job.dedupe_key();
         jobs::insert(
             self.db(),
             &NewJob {
                 kind: job.kind(),
                 payload: &payload,
-                dedupe_key,
+                dedupe_key: dedupe_key.as_deref(),
                 run_at,
             },
         )
@@ -155,6 +167,7 @@ impl Core {
                 Ok(())
             }
             Job::PurgeDeletedRepos => self.purge_deleted_repos().await.map(|_| ()),
+            Job::GitMaintenance { repo_id } => self.maintain_repo(*repo_id).await,
             Job::SendEmail { to, subject, body } => {
                 let mailer = self
                     .config()
@@ -204,6 +217,17 @@ impl Core {
         Ok(())
     }
 
+    /// `git maintenance` for a repository that still exists; it may have been deleted since the push.
+    async fn maintain_repo(&self, repo_id: i64) -> CoreResult<()> {
+        let live = starforged_db::repos::by_id(self.db(), repo_id)
+            .await?
+            .is_some_and(|row| row.deleted_at.is_none());
+        if live {
+            starforged_git::maintenance::run_auto(&self.repo_path(repo_id)).await?;
+        }
+        Ok(())
+    }
+
     async fn worker(self) {
         loop {
             match self.run_one_job().await {
@@ -235,6 +259,8 @@ mod tests {
     use starforged_db::web_sessions::NewWebSession;
 
     use super::*;
+    use crate::permission::Visibility;
+    use crate::repos::CreateRepo;
     use crate::testing::{test_core, user};
 
     #[test]
@@ -414,5 +440,46 @@ mod tests {
             }
         }
         assert_eq!(bodies, vec![String::new(), "a secret link".to_owned()]);
+    }
+
+    #[test]
+    fn maintenance_payloads_carry_the_repository() {
+        let json = serde_json::to_string(&Job::GitMaintenance { repo_id: 7 }).unwrap();
+        assert_eq!(json, r#"{"kind":"git_maintenance","repo_id":7}"#);
+    }
+
+    #[tokio::test]
+    async fn maintenance_runs_once_per_repository_and_skips_deleted_ones() {
+        let (core, _f) = test_core().await;
+        let alice = user(&core, "alice").await;
+        let repo = |name: &str| CreateRepo {
+            name: name.into(),
+            description: String::new(),
+            visibility: Visibility::Public,
+            readme: true,
+        };
+        let a = core.create_repo(&alice, repo("a")).await.unwrap();
+        let b = core.create_repo(&alice, repo("b")).await.unwrap();
+        for repo_id in [a.id, a.id, b.id] {
+            core.enqueue(&Job::GitMaintenance { repo_id })
+                .await
+                .unwrap();
+        }
+        let pending: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM jobs WHERE kind = 'git_maintenance'")
+                .fetch_one(core.db().pool())
+                .await
+                .unwrap();
+        assert_eq!(pending, 2, "one pending run per repository");
+        core.delete_repo(&alice, "alice", "b", "alice/b")
+            .await
+            .unwrap();
+        assert_eq!(core.run_due_jobs().await.unwrap(), 2);
+        let states: Vec<String> =
+            sqlx::query_scalar("SELECT state FROM jobs WHERE kind = 'git_maintenance' ORDER BY id")
+                .fetch_all(core.db().pool())
+                .await
+                .unwrap();
+        assert_eq!(states, vec!["done", "done"]);
     }
 }

@@ -3982,6 +3982,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sqlx",
  "starforged-api",
  "starforged-core",
  "starforged-db",

@@ -62,13 +62,33 @@ page offers "Forgot password?", and invites can be emailed. `smtp://` always use
 For local development, `url = "file:///tmp/starforge-mail"` writes each message to that directory instead of sending
 it.
 
-Signed-in users manage their display name, email address, password, sessions, and tokens under **Settings**.
+Signed-in users manage their display name, email address, password, sessions, and tokens under **Settings**, and
+can delete their account there once they own no repositories.
+
+## Repositories
+
+New repositories can start with a README. Each repository has a **Settings** tab for maintainers and admins:
+maintainers change the description and the default branch (new clones check it out); admins also change the
+visibility, manage collaborators, rename, archive, and delete.
+
+- **Renaming** keeps the old name working: pages, `git clone`/`fetch`/`push`, and API reads that use it are
+  redirected to the new name, as long as the person asking can read the repository. A repository created with an
+  old name takes the name over.
+- **Archived** repositories stay readable and refuse pushes until they are unarchived.
+- **Deleted** repositories disappear at once. Their owner can restore them from **Settings → Repositories** for 7
+  days; then a daily job removes them for good.
+
+The code views show branches, tags, comparisons between two refs (`/{owner}/{repo}/compare/{base}...{head}`), and
+syntax-highlighted files with linkable line numbers (`#L42`). After each push, a background job runs
+`git maintenance run --auto` for the repository.
 
 ## API
 
-`/api/v1` accepts `Authorization: Bearer <token>`: `GET /user`, `POST /user/repos`, `GET /repos/{owner}/{repo}`,
-and `GET`/`PUT`/`DELETE /repos/{owner}/{repo}/collaborators[/{handle}]`. Errors use
-`{"error": {"code", "message"}}`.
+`/api/v1` accepts `Authorization: Bearer <token>`: `GET /user`, `POST /user/repos` (with `"readme": true` for a
+first commit), `GET /repos/{owner}/{repo}` (including `archived`), and
+`GET`/`PUT`/`DELETE /repos/{owner}/{repo}/collaborators[/{handle}]`. Reads of a renamed repository answer `301`
+with the new location.
+Errors use `{"error": {"code", "message"}}`.
 
 ## Development
 
