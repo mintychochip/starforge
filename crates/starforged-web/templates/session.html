@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block title %}Session {{ ulid }} · {{ head.owner }}/{{ head.name }}{% endblock %}
+{% block content %}
+{% include "repo_head.html" %}
+<h2>Session <code>{{ ulid }}</code></h2>
+{% if !title.is_empty() %}<p>{{ title }}</p>{% endif %}
+{% if quarantined %}
+<div class="notice">
+  <strong>quarantined for review:</strong> {{ quarantine_reason }} · {{ quarantine_detail }}
+  {% if can_admin %}
+  <form method="post" action="/{{ head.owner }}/{{ head.name }}/sessions/{{ ulid }}/release" class="inline">
+    <input type="hidden" name="_csrf" value="{{ csrf }}">
+    <button type="submit">Release</button>
+  </form>
+  <form method="post" action="/{{ head.owner }}/{{ head.name }}/sessions/{{ ulid }}/purge" class="inline">
+    <input type="hidden" name="_csrf" value="{{ csrf }}">
+    <button type="submit">Purge</button>
+  </form>
+  {% endif %}
+</div>
+{% endif %}
+<dl>
+  <dt>Agent</dt><dd>{{ agent_name }} {{ agent_version }}{% if !adapter_verified %} <span class="badge">unverified</span>{% endif %}</dd>
+  <dt>Models</dt><dd>{{ models }}</dd>
+  <dt>Branch</dt><dd><code>{{ branch }}</code></dd>
+  <dt>Head</dt><dd><code>{{ head_sha }}</code></dd>
+  <dt>Started</dt><dd>{{ started }}</dd>
+  <dt>Ended</dt><dd>{{ ended }}</dd>
+  <dt>Usage</dt><dd>{{ usage }}</dd>
+  <dt>Redaction fingerprint</dt><dd><code>{{ redaction_fingerprint }}</code></dd>
+  <dt>Redaction counts</dt><dd><code>{{ redaction_counts }}</code></dd>
+  <dt>Capture mode</dt><dd>{{ capture_mode }}</dd>
+  <dt>Visibility</dt><dd>{{ visibility }}</dd>
+</dl>
+<div class="events">
+{% for ev in events %}
+<article id="{{ ev.anchor }}"{% if ev.focused %} class="focused"{% endif %}>{{ ev.html|safe }}</article>
+{% endfor %}
+</div>
+<nav class="pager muted">Page {{ page }} of {{ pages }} · {{ total }} events{% if let Some(p) = prev %} · <a href="?page={{ p }}">Previous</a>{% endif %}{% if let Some(n) = next %} · <a href="?page={{ n }}">Next</a>{% endif %} · <a href="/{{ head.owner }}/{{ head.name }}/sessions/{{ ulid }}/download">Download JSONL</a></nav>
+{% endblock %}

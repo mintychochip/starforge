@@ -7,6 +7,7 @@ pub mod highlight;
 pub mod markdown;
 mod moved;
 mod pages;
+pub mod session_render;
 pub mod views;
 
 use std::sync::Arc;
@@ -202,6 +203,19 @@ fn page_routes() -> Router<AppState> {
             get(pages::history::commits),
         )
         .route("/{owner}/{repo}/commit/{id}", get(pages::history::commit))
+        .route("/{owner}/{repo}/sessions/{ulid}", get(pages::session::show))
+        .route(
+            "/{owner}/{repo}/sessions/{ulid}/download",
+            get(pages::session::download),
+        )
+        .route(
+            "/{owner}/{repo}/sessions/{ulid}/release",
+            post(pages::session::release),
+        )
+        .route(
+            "/{owner}/{repo}/sessions/{ulid}/purge",
+            post(pages::session::purge),
+        )
         .route("/{owner}/{repo}/compare", get(pages::compare::pick))
         .route(
             "/{owner}/{repo}/compare/{*spec}",

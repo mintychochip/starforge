@@ -20,6 +20,8 @@ futures-util.workspace = true
 comrak.workspace = true
 percent-encoding.workspace = true
 serde.workspace = true
+serde_json.workspace = true
+starforge-format = { path = "../starforge-format" }
 starforged-core = { path = "../starforged-core" }
 starforged-git = { path = "../starforged-git" }
 subtle.workspace = true

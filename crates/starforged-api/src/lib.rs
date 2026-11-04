@@ -57,7 +57,7 @@ pub fn router(core: Core, base_url: String) -> Router {
         )
         .route(
             "/repos/{owner}/{repo}/sessions/{ulid}",
-            put(sessions::put_meta),
+            put(sessions::put_meta).get(sessions::get_session),
         )
         .route(
             "/repos/{owner}/{repo}/sessions",
@@ -71,6 +71,10 @@ pub fn router(core: Core, base_url: String) -> Router {
         .route(
             "/repos/{owner}/{repo}/sessions/{ulid}/complete",
             post(sessions::post_complete),
+        )
+        .route(
+            "/repos/{owner}/{repo}/sessions/{ulid}/events",
+            get(sessions::get_events),
         )
         .route(
             "/repos/{owner}/{repo}/sessions/{ulid}/links",

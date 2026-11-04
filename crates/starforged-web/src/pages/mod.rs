@@ -15,6 +15,7 @@ pub mod password;
 pub mod refs;
 pub mod repo_new;
 pub mod repo_settings;
+pub mod session;
 pub mod settings;
 pub mod tokens;
 pub mod verify;

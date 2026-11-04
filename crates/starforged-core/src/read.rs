@@ -4,6 +4,8 @@
 //! stay undiscoverable — the same convention as [`Core::repo_for`] for
 //! repositories the viewer cannot read.
 
+use starforge_format::{Event, decompress_bounded, parse_event};
+use starforge_redact::redact_event;
 use starforged_db::{
     collaborators, repos as db_repos, sessions as db_sessions, sessions::SessionRow,
 };
@@ -14,6 +16,28 @@ use crate::{
     permission::{Permission, Viewer, effective},
     repos::{Repo, RepoAccess},
 };
+
+/// Events per session viewer page (spec §10.2, binding).
+pub const VIEWER_PER_PAGE: i64 = 200;
+
+/// One slot on a rendered session page: a server-redacted event, or a marker
+/// for a segment whose bytes could not be decoded. Markers render as an
+/// inline "unreadable segment" notice, never a 500.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SessionPageItem {
+    Event(Event),
+    UnreadableSegment { n: i64 },
+}
+
+/// One 1-based page over the concatenated segment event stream in stored
+/// order. Paging is a pure function of `(segments, page, VIEWER_PER_PAGE)`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionPage {
+    pub items: Vec<SessionPageItem>,
+    pub page: i64,
+    pub pages: i64,
+    pub total: i64,
+}
 
 impl Core {
     /// Whether `user_id` holds an explicit grant on the repository: ownership or a
@@ -92,6 +116,134 @@ impl Core {
         self.authorize_session_read(viewer, &access.repo, &session)
             .await?;
         Ok((access, session))
+    }
+}
+impl Core {
+    /// The full redacted item stream for `session_id`: segments in stored
+    /// order, each decompressed under the configured cap, parsed line by
+    /// line, and redacted with the effective server rule set (so stored
+    /// secrets render as `[redacted:<id>]` and never raw). Undecodable
+    /// segment bytes (missing blob, failed decompression, non-UTF-8) become
+    /// [`SessionPageItem::UnreadableSegment`]; unparseable lines are skipped
+    /// with a warning, never failing the page.
+    async fn load_session_items(&self, session_id: i64) -> CoreResult<Vec<SessionPageItem>> {
+        let session = db_sessions::session_by_id(self.db(), session_id)
+            .await?
+            .ok_or(CoreError::NotFound)?;
+        let rules = self.scan_rules_for(session.repo_id).await?;
+        let limit = usize::try_from(self.config().max_decompressed_bytes).unwrap_or(usize::MAX);
+        let mut items = Vec::new();
+        for segment in db_sessions::segments_of(self.db(), session_id).await? {
+            let bytes = match self
+                .config()
+                .blob_store
+                .get_by_hash(&segment.blob_hash)
+                .await
+            {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    tracing::warn!(session_id, seg = segment.n, error = %err, "unreadable segment blob");
+                    items.push(SessionPageItem::UnreadableSegment { n: segment.n });
+                    continue;
+                }
+            };
+            let raw = match decompress_bounded(&bytes, limit) {
+                Ok(raw) => raw,
+                Err(err) => {
+                    tracing::warn!(session_id, seg = segment.n, error = %err, "unreadable segment bytes");
+                    items.push(SessionPageItem::UnreadableSegment { n: segment.n });
+                    continue;
+                }
+            };
+            let text = match String::from_utf8(raw) {
+                Ok(text) => text,
+                Err(err) => {
+                    tracing::warn!(session_id, seg = segment.n, error = %err, "segment is not UTF-8");
+                    items.push(SessionPageItem::UnreadableSegment { n: segment.n });
+                    continue;
+                }
+            };
+            for line in text.lines() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                match parse_event(line) {
+                    Ok(event) => {
+                        let (redacted, _) = redact_event(&rules, &event);
+                        items.push(SessionPageItem::Event(redacted));
+                    }
+                    Err(err) => {
+                        tracing::warn!(session_id, seg = segment.n, error = %err, "skipping unparseable event line");
+                    }
+                }
+            }
+        }
+        Ok(items)
+    }
+
+    /// The 1-based page slice of the session transcript. Out-of-range pages
+    /// (including unknown sessions) answer [`CoreError::NotFound`].
+    pub async fn read_session_page(&self, session_id: i64, page: i64) -> CoreResult<SessionPage> {
+        let items = self.load_session_items(session_id).await?;
+        let total = items.len() as i64;
+        let pages = ((total + VIEWER_PER_PAGE - 1) / VIEWER_PER_PAGE).max(1);
+        if page < 1 || page > pages {
+            return Err(CoreError::NotFound);
+        }
+        let start = ((page - 1) * VIEWER_PER_PAGE) as usize;
+        let end = (page * VIEWER_PER_PAGE).min(total) as usize;
+        Ok(SessionPage {
+            items: items[start..end].to_vec(),
+            page,
+            pages,
+            total,
+        })
+    }
+
+    /// The 1-based page containing event `seq`, for `?focus=<seq>` deep
+    /// links. Unknown seqs resolve to page 1 with `found = false` (the
+    /// caller renders page 1 with no anchor).
+    pub async fn page_for_seq(&self, session_id: i64, seq: i64) -> CoreResult<(i64, bool)> {
+        let items = self.load_session_items(session_id).await?;
+        let wanted = u64::try_from(seq).ok();
+        for (index, item) in items.iter().enumerate() {
+            if let SessionPageItem::Event(event) = item
+                && wanted.is_some_and(|seq| event.seq == seq)
+            {
+                return Ok(((index as i64) / VIEWER_PER_PAGE + 1, true));
+            }
+        }
+        Ok((1, false))
+    }
+
+    /// The full normalized transcript: every redacted event re-serialized to
+    /// its canonical JSONL line (the same bytes the viewer renders, and the
+    /// bytes a future export bundle will contain). Undecodable segments and
+    /// unparseable lines are skipped exactly as in
+    /// [`Core::read_session_page`], so the download never fails on stored
+    /// evidence the page itself tolerates.
+    pub async fn read_session_jsonl(&self, session_id: i64) -> CoreResult<Vec<u8>> {
+        let items = self.load_session_items(session_id).await?;
+        let mut out = Vec::new();
+        for item in &items {
+            if let SessionPageItem::Event(event) = item {
+                let line = serde_json::to_vec(event)
+                    .map_err(|e| CoreError::Internal(format!("encoding event: {e}")))?;
+                out.extend_from_slice(&line);
+                out.push(b'\n');
+            }
+        }
+        Ok(out)
+    }
+
+    /// The commit-link rows filed under the session (trailer + CLI claims),
+    /// oldest first. Callers authorize the session first; links carry no
+    /// content of their own.
+    pub async fn session_links(
+        &self,
+        session_id: i64,
+    ) -> CoreResult<Vec<db_sessions::CommitLinkRow>> {
+        Ok(db_sessions::links_of_session(self.db(), session_id).await?)
     }
 }
 

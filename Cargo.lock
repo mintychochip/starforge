@@ -4533,6 +4533,8 @@ dependencies = [
  "futures-util",
  "percent-encoding",
  "serde",
+ "serde_json",
+ "starforge-format",
  "starforged-core",
  "starforged-git",
  "subtle",

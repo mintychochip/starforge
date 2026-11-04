@@ -7,12 +7,13 @@
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use starforged_core::ingest::SegmentPut;
 use starforged_core::permission::Permission;
+use starforged_core::read::SessionPageItem;
 use starforged_core::tokens::Scope;
 
 use crate::ApiState;
@@ -21,6 +22,14 @@ use crate::error::ApiError;
 
 fn session_json(id: i64, ulid: &str, lifecycle: &str, quarantine: &str) -> Value {
     json!({ "id": id, "ulid": ulid, "lifecycle": lifecycle, "quarantine": quarantine })
+}
+
+/// Sessions never reach search indexes (spec §11.1): every session response
+/// carries the header, including these JSON endpoints.
+fn noindex_headers() -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert("x-robots-tag", HeaderValue::from_static("noindex"));
+    headers
 }
 
 /// Query for the session listing: only the quarantine queue exists in M1d.
@@ -233,4 +242,110 @@ pub async fn purge_session(
         .purge_session(&token.user, &access, &ulid)
         .await?;
     Ok(StatusCode::NO_CONTENT.into_response())
+}
+/// Query for the event page: 1-based, default 1.
+#[derive(Debug, Deserialize)]
+pub struct SessionEventsQuery {
+    pub page: Option<i64>,
+}
+
+/// Parses a JSON-encoded row column back to a value (raw string fallback).
+fn json_column(raw: &str) -> Value {
+    serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_owned()))
+}
+
+/// `GET /repos/{owner}/{repo}/sessions/{ulid}`: session metadata plus its
+/// commit links. One [`Core::authorize_session_read_by_ulid`] check —
+/// non-readers get `404`, never `403`.
+pub async fn get_session(
+    State(state): State<ApiState>,
+    auth: ApiAuth,
+    Path((owner, repo, ulid)): Path<(String, String, String)>,
+) -> Result<impl IntoResponse, ApiError> {
+    let user = auth.reader()?;
+    let (_, row) = state
+        .core
+        .authorize_session_read_by_ulid(user, &owner, &repo, &ulid)
+        .await?;
+    let links = state.core.session_links(row.id).await?;
+    let body = json!({
+        "ulid": row.ulid,
+        "agent": {"name": row.agent_name, "version": row.agent_version},
+        "adapter_version_verified": row.adapter_verified != 0,
+        "models": json_column(&row.models),
+        "title": row.title,
+        "branch": row.branch,
+        "head": row.head_sha,
+        "started_at": row.started_at,
+        "ended_at": row.ended_at,
+        "usage": {
+            "input": row.usage_input,
+            "output": row.usage_output,
+            "cache_read": row.usage_cache_read,
+            "cache_write": row.usage_cache_write,
+            "reasoning": row.usage_reasoning,
+        },
+        "visibility": row.visibility,
+        "quarantine": {
+            "state": row.quarantine,
+            "reason": row.quarantine_reason,
+            "detail": row.quarantine_detail,
+        },
+        "redaction": {
+            "fingerprint": row.redaction_fingerprint,
+            "counts": json_column(&row.redaction_counts),
+        },
+        "capture": {"mode": row.capture_mode, "cli_version": row.cli_version},
+        "links": links
+            .iter()
+            .map(|link| {
+                json!({
+                    "sha": link.sha,
+                    "confidence": link.confidence,
+                    "seq_start": link.seq_start,
+                    "seq_end": link.seq_end,
+                })
+            })
+            .collect::<Vec<_>>(),
+    });
+    Ok((noindex_headers(), Json(body)))
+}
+
+/// `GET /repos/{owner}/{repo}/sessions/{ulid}/events?page=N`: the same
+/// 200-event page the viewer renders, as JSON. Undecodable segments appear
+/// as `{"kind": "unreadable_segment", "n": N}` placeholders.
+pub async fn get_events(
+    State(state): State<ApiState>,
+    auth: ApiAuth,
+    Path((owner, repo, ulid)): Path<(String, String, String)>,
+    Query(query): Query<SessionEventsQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let user = auth.reader()?;
+    let (_, row) = state
+        .core
+        .authorize_session_read_by_ulid(user, &owner, &repo, &ulid)
+        .await?;
+    let view = state
+        .core
+        .read_session_page(row.id, query.page.unwrap_or(1))
+        .await?;
+    let events = view
+        .items
+        .iter()
+        .map(|item| match item {
+            SessionPageItem::Event(event) => serde_json::to_value(event).unwrap_or(Value::Null),
+            SessionPageItem::UnreadableSegment { n } => {
+                json!({"kind": "unreadable_segment", "n": n})
+            }
+        })
+        .collect::<Vec<_>>();
+    Ok((
+        noindex_headers(),
+        Json(json!({
+            "events": events,
+            "page": view.page,
+            "pages": view.pages,
+            "total": view.total,
+        })),
+    ))
 }

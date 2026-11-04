@@ -11,6 +11,7 @@ a:hover { text-decoration: underline; }
 .brand { font-weight: 700; }
 .muted { color: var(--muted); }
 .badge { border: 1px solid var(--border); border-radius: 1rem; padding: 0 .5rem; font-size: .8rem; color: var(--muted); }
+.redacted { font-family: ui-monospace, monospace; font-size: .85em; background: var(--target); border-radius: .2rem; padding: 0 .2rem; }
 .error { color: #cf222e; }
 .notice { border: 1px solid var(--border); border-radius: .4rem; padding: .5rem 1rem; }
 form.inline { display: inline; }
