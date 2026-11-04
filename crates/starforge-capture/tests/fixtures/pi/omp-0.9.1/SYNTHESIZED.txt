@@ -1,0 +1,12 @@
+SYNTHESIZED — no real omp transcript was available on this machine.
+
+This fixture mimics the native shape of `<data_dir>/omp/agent/sessions/**/<session>.jsonl`
+as written by omp: one JSON object per line with the same Pi-compatible record
+shapes (`message` with `role`, `content`, `model`, `reasoning`, `usage`;
+`tool_call` with `name` / `input`; `tool_result`; `subagent_start` /
+`subagent_end`; `summary`), except the session version is reported as
+`omp-<version>` (`omp-0.9.1` here) and omp-only record shapes may appear — this
+fixture includes one `extension_state` record carrying an opaque `state` object.
+The adapter maps such unmapped shapes to `system { text: <raw JSON> }` (never
+dropped, never an error). Session ids, token counts, and prose are invented.
+It is not a captured production transcript.

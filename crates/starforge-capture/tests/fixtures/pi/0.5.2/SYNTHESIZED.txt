@@ -1,0 +1,12 @@
+SYNTHESIZED — no real Pi agent transcript was available on this machine.
+
+This fixture mimics the native shape of `<data_dir>/sessions/<session>.jsonl`
+as written by the Pi coding agent: one JSON object per line, each with `type`,
+`cwd`, `session`, `version`, and `timestamp`, plus per-type fields — `message`
+records carry `role` (`user` | `assistant`), `content` text, and (assistant
+only) `model`, `reasoning`, and token `usage`; `tool_call` records carry `name`
+and `input`; `tool_result` records carry `tool`, `output`, and `is_error`;
+`subagent_start` / `subagent_end` records carry `subagent_id` and `task`; and
+`summary` records carry compaction context in `summary`. Field names follow the
+documented Pi session format; session ids, token counts, and prose are
+invented. It is not a captured production transcript.

@@ -1,0 +1,8 @@
+SYNTHESIZED — no real Pi agent transcript was available on this machine.
+
+Same synthesized Pi native shape as `tests/fixtures/pi/0.5.2/` (see its
+SYNTHESIZED.txt), but every record reports `version: "0.0.0-unknown"`, which is
+not in the adapter's `COVERED` list. It proves the closest-known parser still
+parses the session while the header reports
+`capture.adapter_version_verified == false`. It is not a captured production
+transcript.
