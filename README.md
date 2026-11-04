@@ -82,6 +82,18 @@ The code views show branches, tags, comparisons between two refs (`/{owner}/{rep
 syntax-highlighted files with linkable line numbers (`#L42`). After each push, a background job runs
 `git maintenance run --auto` for the repository.
 
+## Site administration
+
+Admins manage the instance under **Admin** (`/admin`): instance counts with the sign-up mode and mail
+status, then **Users**, **Invites**, **Repositories**, and **Jobs** tabs. Users can be created
+(pre-verified), suspended, granted or revoked admin, deleted, or issued a password reset; invites are
+created and revoked; deleted repositories are restored or purged before the daily job removes them for
+good; failed background jobs are retried or dropped.
+
+Every `/admin` page and action answers 404 to anyone who is not a site admin, so the area is
+indistinguishable from a missing page. Guards refuse to suspend or delete yourself, and the last active
+admin cannot be suspended, demoted, or deleted. Each admin action is recorded in the audit log.
+
 ## API
 
 `/api/v1` accepts `Authorization: Bearer <token>`: `GET /user`, `POST /user/repos` (with `"readme": true` for a

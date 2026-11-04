@@ -87,3 +87,51 @@ async fn admin_pages_404_to_non_admins() {
         .unwrap();
     assert_eq!(post.status(), 404, "no-session POST suspend");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_admin_action_404s_to_non_admins() {
+    let s = TestServer::start().await;
+    let anon = s.browser();
+    s.user("bob").await;
+    let (bob, _) = s.login("bob").await;
+    let posts = [
+        "/admin/users",
+        "/admin/users/bob/suspend",
+        "/admin/users/bob/unsuspend",
+        "/admin/users/bob/grant",
+        "/admin/users/bob/revoke",
+        "/admin/users/bob/delete",
+        "/admin/users/bob/reset-password",
+        "/admin/invites",
+        "/admin/invites/1/revoke",
+        "/admin/repositories/1/restore",
+        "/admin/repositories/1/purge",
+        "/admin/jobs/1/retry",
+        "/admin/jobs/1/delete",
+    ];
+    for path in posts {
+        for client in [&anon, &bob] {
+            let response = client
+                .post(s.url(path))
+                .form(&[("_csrf", "x")])
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 404, "{path}");
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_forms_reject_forged_csrf() {
+    let s = TestServer::start().await;
+    let (admin, _) = admin_client(&s).await;
+    s.user("bob").await;
+    let forged = admin
+        .post(s.url("/admin/users/bob/suspend"))
+        .form(&[("_csrf", "forged")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(forged.status(), 403);
+}
