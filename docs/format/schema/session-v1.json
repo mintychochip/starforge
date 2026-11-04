@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://starforge.example/format/session-v1.json",
+  "title": "Starforge Trace Format v1 — session metadata",
+  "description": "Session metadata object (meta.json). Unknown fields are allowed and ignored by readers.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["format", "id", "agent", "models", "started_at", "repo", "usage", "files_touched", "redaction", "capture"],
+  "properties": {
+    "format": {"type": "string", "const": "starforge.session/v1"},
+    "id": {"type": "string", "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"},
+    "agent": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["name"],
+      "properties": {
+        "name": {"type": "string", "enum": ["claude-code", "codex", "pi", "opencode", "gemini"]},
+        "version": {"type": "string"}
+      }
+    },
+    "models": {"type": "array", "items": {"type": "string"}},
+    "title": {"type": ["string", "null"]},
+    "started_at": {"type": "string"},
+    "ended_at": {"type": ["string", "null"]},
+    "repo": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "remote_urls": {"type": "array", "items": {"type": "string"}},
+        "branch": {"type": "string"},
+        "head_at_start": {"type": "string"}
+      }
+    },
+    "parent_id": {"type": ["string", "null"], "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"},
+    "usage": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "input": {"type": "integer", "minimum": 0},
+        "output": {"type": "integer", "minimum": 0},
+        "cache_read": {"type": "integer", "minimum": 0},
+        "cache_write": {"type": "integer", "minimum": 0},
+        "reasoning": {"type": "integer", "minimum": 0}
+      }
+    },
+    "files_touched": {"type": "array", "items": {"type": "string"}},
+    "redaction": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "fingerprint": {"type": "string"},
+        "counts": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 0}}
+      }
+    },
+    "capture": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["mode"],
+      "properties": {
+        "mode": {"type": "string", "enum": ["hook", "discovery"]},
+        "cli_version": {"type": "string"},
+        "adapter_version_verified": {"type": "boolean"}
+      }
+    }
+  }
+}

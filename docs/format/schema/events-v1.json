@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://starforge.example/format/events-v1.json",
+  "title": "Starforge Trace Format v1 — event line",
+  "description": "One normalized event (one JSONL line). `kind` is an open string and unknown top-level fields are allowed: schemas must not reject future kinds or fields.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["v", "seq", "ts", "kind"],
+  "properties": {
+    "v": {"type": "integer", "minimum": 1},
+    "seq": {"type": "integer", "minimum": 0},
+    "ts": {"type": "string"},
+    "kind": {"type": "string"},
+    "id": {"type": "string"},
+    "parent": {"type": "string"},
+    "text": {"type": "string"},
+    "model": {"type": "string"},
+    "usage": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "input": {"type": "integer", "minimum": 0},
+        "output": {"type": "integer", "minimum": 0},
+        "cache_read": {"type": "integer", "minimum": 0},
+        "cache_write": {"type": "integer", "minimum": 0},
+        "reasoning": {"type": "integer", "minimum": 0}
+      }
+    },
+    "tool": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "name": {"type": "string"},
+        "input": true
+      }
+    },
+    "result": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "output": {"type": "string"},
+        "is_error": {"type": "boolean"},
+        "truncated": {"type": "boolean"},
+        "original_bytes": {"type": "integer", "minimum": 0}
+      }
+    },
+    "path": {"type": "string"},
+    "change": {"type": "string", "enum": ["add", "modify", "delete", "rename"]},
+    "diff": {"type": "string"},
+    "summary": {"type": "string"},
+    "subagent_id": {"type": "string"},
+    "task": {"type": "string"}
+  }
+}
