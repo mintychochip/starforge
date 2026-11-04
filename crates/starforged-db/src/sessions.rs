@@ -793,6 +793,43 @@ pub async fn quarantined_of_repo(db: &Db, repo_id: i64) -> DbResult<Vec<SessionR
     rows.iter().map(session_from_row).collect()
 }
 
+/// Every commit-link row filed under `sha` for the repository, oldest first — both trailer-first rows
+/// (with a `NULL` `session_id`) and claimed rows. Used by the commit panel (M1e); callers filter by
+/// read rule before displaying.
+pub async fn links_for_sha(db: &Db, repo_id: i64, sha: &str) -> DbResult<Vec<CommitLinkRow>> {
+    let rows = sqlx::query(select_link!(
+        "WHERE repo_id = $1 AND sha = $2 ORDER BY session_ulid ASC"
+    ))
+    .bind(repo_id)
+    .bind(sha)
+    .fetch_all(db.pool())
+    .await?;
+    rows.iter().map(link_from_row).collect()
+}
+
+/// Sessions of the repository, oldest first, at most `limit` rows.
+pub async fn sessions_of_repo(db: &Db, repo_id: i64, limit: i64) -> DbResult<Vec<SessionRow>> {
+    let rows = sqlx::query(select_session!(
+        "WHERE repo_id = $1 ORDER BY id ASC LIMIT $2"
+    ))
+    .bind(repo_id)
+    .bind(limit)
+    .fetch_all(db.pool())
+    .await?;
+    rows.iter().map(session_from_row).collect()
+}
+
+/// Overwrites the session visibility (`inherit` or `published`). Callers validate the value.
+pub async fn set_visibility(db: &Db, id: i64, visibility: &str) -> DbResult<()> {
+    sqlx::query("UPDATE sessions SET visibility = $1, updated_at = $2 WHERE id = $3")
+        .bind(visibility)
+        .bind(now())
+        .bind(id)
+        .execute(db.pool())
+        .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1282,5 +1319,100 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(links_of_session(&t.db, sid).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn links_for_sha_returns_trailer_and_claimed_rows() {
+        let (t, alice, repo_id) = setup().await;
+        let sha = "a".repeat(40);
+        // Trailer-first arrival with no session yet: NULL session_id.
+        upsert_trailer_link(&t.db, repo_id, "01SHAA", &sha)
+            .await
+            .unwrap();
+        // A claimed row for the same SHA under another ULID.
+        let sid = insert_session(&t.db, &session(repo_id, alice, "01SHAB"))
+            .await
+            .unwrap();
+        upsert_claim_link(
+            &t.db,
+            repo_id,
+            sid,
+            "01SHAB",
+            &sha,
+            "exact",
+            Some(0),
+            Some(9),
+        )
+        .await
+        .unwrap();
+        // A row on another SHA must not match.
+        upsert_claim_link(
+            &t.db,
+            repo_id,
+            sid,
+            "01SHAB",
+            &"b".repeat(40),
+            "heuristic",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let rows = links_for_sha(&t.db, repo_id, &sha).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].session_ulid, "01SHAA");
+        assert_eq!(rows[0].session_id, None);
+        assert_eq!(rows[1].session_ulid, "01SHAB");
+        assert_eq!(rows[1].session_id, Some(sid));
+        assert!(
+            links_for_sha(&t.db, repo_id, &"c".repeat(40))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn set_visibility_round_trips() {
+        let (t, alice, repo_id) = setup().await;
+        let sid = insert_session(&t.db, &session(repo_id, alice, "01VIS"))
+            .await
+            .unwrap();
+        assert_eq!(
+            session_by_id(&t.db, sid).await.unwrap().unwrap().visibility,
+            "inherit"
+        );
+        set_visibility(&t.db, sid, "published").await.unwrap();
+        assert_eq!(
+            session_by_id(&t.db, sid).await.unwrap().unwrap().visibility,
+            "published"
+        );
+        set_visibility(&t.db, sid, "inherit").await.unwrap();
+        assert_eq!(
+            session_by_id(&t.db, sid).await.unwrap().unwrap().visibility,
+            "inherit"
+        );
+    }
+
+    #[tokio::test]
+    async fn sessions_of_repo_is_scoped_and_capped() {
+        let (t, alice, repo_id) = setup().await;
+        let other = repos::insert(&t.db, &repo(alice, "other")).await.unwrap();
+        insert_session(&t.db, &session(repo_id, alice, "01LISTA"))
+            .await
+            .unwrap();
+        insert_session(&t.db, &session(repo_id, alice, "01LISTB"))
+            .await
+            .unwrap();
+        insert_session(&t.db, &session(other, alice, "01LISTC"))
+            .await
+            .unwrap();
+        let all = sessions_of_repo(&t.db, repo_id, 10).await.unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].ulid, "01LISTA");
+        assert_eq!(all[1].ulid, "01LISTB");
+        let capped = sessions_of_repo(&t.db, repo_id, 1).await.unwrap();
+        assert_eq!(capped.len(), 1);
+        assert_eq!(capped[0].ulid, "01LISTA");
     }
 }

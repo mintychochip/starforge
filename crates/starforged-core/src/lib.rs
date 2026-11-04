@@ -17,6 +17,7 @@ pub mod oauth;
 pub mod passwords;
 pub mod permission;
 pub mod quota;
+pub mod read;
 pub mod registration;
 pub mod repos;
 pub mod rescan;
