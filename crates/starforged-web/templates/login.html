@@ -3,6 +3,16 @@
 {% block content %}
 <h1>Sign in</h1>
 {% if let Some(e) = error %}<p class="error">{{ e }}</p>{% endif %}
+{% if unverified %}
+<div class="notice">
+<p>Verify your email address before signing in. We sent you a link when you signed up; we can send a new one:</p>
+<form method="post" action="/verify/resend" class="stack">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <label>Email <input name="email" type="email" autocomplete="email" required></label>
+  <button type="submit">Send a new link</button>
+</form>
+</div>
+{% endif %}
 <form method="post" action="/login" class="stack">
   <input type="hidden" name="_csrf" value="{{ csrf }}">
   <input type="hidden" name="next" value="{{ next }}">

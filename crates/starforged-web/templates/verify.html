@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block title %}Confirm your email address · Starforge{% endblock %}
+{% block content %}
+<h1>Confirm your email address</h1>
+<form method="post" action="/verify/{{ token }}" class="stack">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <button type="submit">Confirm</button>
+</form>
+{% endblock %}

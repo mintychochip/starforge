@@ -12,8 +12,8 @@ use starforged_core::CoreError;
 
 use crate::AppState;
 use crate::auth::{
-    CsrfForm, LOGIN_CSRF_COOKIE, MaybeUser, RequireUser, SESSION_COOKIE, login_csrf_cookie,
-    removal, safe_next, session_cookie, verify_csrf,
+    CsrfForm, LOGIN_CSRF_COOKIE, MaybeUser, RequireUser, SESSION_COOKIE, anonymous_csrf, removal,
+    safe_next, session_cookie, verify_anonymous_csrf, verify_csrf,
 };
 use crate::error::WebError;
 use crate::views::NavUser;
@@ -41,6 +41,8 @@ struct LoginPage {
     next: String,
     login: String,
     error: Option<String>,
+    /// The password was right but the address is unverified: show the resend form.
+    unverified: bool,
 }
 
 pub async fn form(
@@ -53,11 +55,7 @@ pub async fn form(
     if session.is_some() {
         return Redirect::to(&next).into_response();
     }
-    let csrf = starforged_core::crypto::random_hex(32);
-    let jar = jar.add(login_csrf_cookie(
-        csrf.clone(),
-        state.settings.secure_cookies,
-    ));
+    let (jar, csrf) = anonymous_csrf(jar, state.settings.secure_cookies);
     (
         jar,
         LoginPage {
@@ -66,6 +64,7 @@ pub async fn form(
             next,
             login: String::new(),
             error: None,
+            unverified: false,
         },
     )
         .into_response()
@@ -78,11 +77,7 @@ pub async fn submit(
     headers: HeaderMap,
     Form(form): Form<LoginForm>,
 ) -> Result<Response, WebError> {
-    let expected = jar
-        .get(LOGIN_CSRF_COOKIE)
-        .map(|c| c.value().to_owned())
-        .unwrap_or_default();
-    verify_csrf(&expected, &form.csrf)?;
+    verify_anonymous_csrf(&jar, &form.csrf)?;
     let user_agent = headers
         .get(header::USER_AGENT)
         .and_then(|v| v.to_str().ok())
@@ -114,8 +109,20 @@ pub async fn submit(
                 next,
                 login: form.login,
                 error: Some("Incorrect handle, email, or password.".into()),
+                unverified: false,
             };
             Ok((StatusCode::UNAUTHORIZED, page).into_response())
+        }
+        Err(CoreError::EmailUnverified) => {
+            let page = LoginPage {
+                nav_user: None,
+                csrf: form.csrf,
+                next,
+                login: form.login,
+                error: None,
+                unverified: true,
+            };
+            Ok((StatusCode::FORBIDDEN, page).into_response())
         }
         Err(other) => Err(other.into()),
     }

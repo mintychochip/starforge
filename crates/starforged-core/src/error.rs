@@ -8,6 +8,8 @@ pub enum CoreError {
     Forbidden,
     #[error("authentication required")]
     Unauthenticated,
+    #[error("the email address is not verified")]
+    EmailUnverified,
     #[error("{0}")]
     Invalid(String),
     #[error("{0}")]

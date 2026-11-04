@@ -5,6 +5,7 @@ pub mod accounts;
 pub mod audit;
 pub mod content;
 pub mod crypto;
+pub mod email_tokens;
 pub mod error;
 pub mod jobs;
 pub mod mail;
@@ -13,6 +14,7 @@ pub mod repos;
 pub mod sessions;
 pub mod tokens;
 pub mod validate;
+pub mod verification;
 
 use std::path::PathBuf;
 use std::sync::Arc;

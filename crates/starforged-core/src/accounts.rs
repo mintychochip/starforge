@@ -13,6 +13,7 @@ pub struct User {
     pub handle: String,
     pub display_name: String,
     pub email: Option<String>,
+    pub email_verified: bool,
     pub is_admin: bool,
     pub active: bool,
 }
@@ -24,6 +25,7 @@ impl From<UserRow> for User {
             handle: row.handle,
             display_name: row.display_name,
             email: row.email,
+            email_verified: row.email_verified,
             is_admin: row.is_admin,
             active: row.state == "active",
         }
@@ -35,6 +37,9 @@ pub struct CreateUser {
     pub handle: String,
     pub display_name: String,
     pub email: Option<String>,
+    /// The caller vouches for `email`: site admins creating accounts, and sign-ups through an invite that was
+    /// sent to that address.
+    pub email_verified: bool,
     /// `None` creates an account that cannot sign in with a password.
     pub password: Option<String>,
     pub is_admin: bool,
@@ -55,6 +60,7 @@ impl Core {
             handle: &handle,
             display_name: input.display_name.trim(),
             email: email.as_deref(),
+            email_verified: input.email_verified && email.is_some(),
             password_hash: password_hash.as_deref(),
             is_admin: input.is_admin,
         };

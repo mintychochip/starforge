@@ -106,6 +106,25 @@ pub fn login_csrf_cookie(value: String, secure: bool) -> Cookie<'static> {
     cookie.set_max_age(time::Duration::hours(1));
     cookie
 }
+/// The CSRF token for a form shown to signed-out visitors, kept in the double-submit cookie `sf_login_csrf`.
+/// An existing cookie is reused (and its lifetime renewed), so several such forms can be open at once.
+pub fn anonymous_csrf(jar: CookieJar, secure: bool) -> (CookieJar, String) {
+    let csrf = jar
+        .get(LOGIN_CSRF_COOKIE)
+        .map(|c| c.value().to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| starforged_core::crypto::random_hex(32));
+    (jar.add(login_csrf_cookie(csrf.clone(), secure)), csrf)
+}
+
+/// Checks a signed-out form's `_csrf` field against its cookie.
+pub fn verify_anonymous_csrf(jar: &CookieJar, submitted: &str) -> Result<(), WebError> {
+    let expected = jar
+        .get(LOGIN_CSRF_COOKIE)
+        .map(|c| c.value().to_owned())
+        .unwrap_or_default();
+    verify_csrf(&expected, submitted)
+}
 
 /// Pass to `CookieJar::remove` to clear the cookie `name` (path `/`).
 pub fn removal(name: &'static str) -> Cookie<'static> {
@@ -140,5 +159,18 @@ mod tests {
         assert!(verify_csrf("abc", "abc").is_ok());
         assert!(verify_csrf("abc", "abd").is_err());
         assert!(verify_csrf("", "").is_err());
+    }
+    #[test]
+    fn anonymous_csrf_reuses_its_cookie() {
+        let (jar, first) = anonymous_csrf(CookieJar::new(), false);
+        assert_eq!(first.len(), 64);
+        let (jar, second) = anonymous_csrf(jar, false);
+        assert_eq!(
+            first, second,
+            "open forms keep working when another one is loaded"
+        );
+        assert!(verify_anonymous_csrf(&jar, &first).is_ok());
+        assert!(verify_anonymous_csrf(&jar, "forged").is_err());
+        assert!(verify_anonymous_csrf(&CookieJar::new(), "").is_err());
     }
 }

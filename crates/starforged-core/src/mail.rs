@@ -193,6 +193,21 @@ pub fn test_email(to: &str, base_url: &str) -> CoreResult<Email> {
         body: render(&TestText { base_url })?,
     })
 }
+#[derive(Template)]
+#[template(path = "mail/verify_email.txt")]
+struct VerifyEmailText<'a> {
+    handle: &'a str,
+    link: &'a str,
+}
+
+/// "Verify your email address", with a link valid for 24 hours.
+pub(crate) fn verify_email(to: &str, handle: &str, link: &str) -> CoreResult<Email> {
+    Ok(Email {
+        to: to.to_owned(),
+        subject: "Verify your email address".into(),
+        body: render(&VerifyEmailText { handle, link })?,
+    })
+}
 
 impl Core {
     /// Whether this instance sends email (`[mail] url` is set).
@@ -201,7 +216,6 @@ impl Core {
     }
 
     /// Queues `email` for the workers. Callers check [`Core::mail_enabled`] first.
-    #[allow(dead_code)] // Later tasks queue verification, invite, and reset emails here.
     pub(crate) async fn queue_email(&self, email: Email) -> CoreResult<()> {
         if !self.mail_enabled() {
             return Err(CoreError::Internal("mail is not configured".into()));

@@ -61,6 +61,7 @@ pub async fn create_user(config: &Config, args: NewUserArgs) -> anyhow::Result<U
             handle: args.handle,
             display_name: args.display_name.unwrap_or_default(),
             email: args.email,
+            email_verified: true,
             password,
             is_admin: args.admin,
         })

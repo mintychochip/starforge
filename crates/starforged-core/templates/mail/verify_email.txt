@@ -1,0 +1,7 @@
+Hello {{ handle }},
+
+Confirm the email address of your Starforge account by opening this link:
+
+{{ link }}
+
+The link works once and expires in 24 hours. If you did not create an account, ignore this message.

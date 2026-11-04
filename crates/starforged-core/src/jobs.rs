@@ -171,6 +171,7 @@ impl Core {
     async fn hourly_cleanup(&self) -> CoreResult<()> {
         let ts = now();
         web_sessions::delete_expired(self.db(), ts).await?;
+        starforged_db::email_tokens::delete_expired(self.db(), ts).await?;
         // Every link in a message is dead 7 days after it was sent (invites live longest), so a failed
         // message's body is kept no longer than that.
         for row in jobs::failed_of_kind_before(self.db(), "send_email", ts - 7 * DAY).await? {
@@ -299,6 +300,35 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(left, vec!["current".to_owned()]);
+    }
+    #[tokio::test]
+    async fn hourly_cleanup_deletes_expired_email_tokens() {
+        let (core, _f) = test_core().await;
+        let alice = user(&core, "alice").await;
+        for (purpose, token_hash, expires_at) in [
+            ("verify_email", "expired", 10),
+            ("reset_password", "live", now() + 3_600),
+        ] {
+            starforged_db::email_tokens::replace(
+                core.db(),
+                &starforged_db::email_tokens::NewEmailToken {
+                    user_id: alice.id,
+                    purpose,
+                    token_hash,
+                    email: "alice@example.com",
+                    expires_at,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        core.enqueue(&Job::HourlyCleanup).await.unwrap();
+        core.run_due_jobs().await.unwrap();
+        let left: Vec<String> = sqlx::query_scalar("SELECT token_hash FROM email_tokens")
+            .fetch_all(core.db().pool())
+            .await
+            .unwrap();
+        assert_eq!(left, vec!["live".to_owned()]);
     }
 
     #[tokio::test]

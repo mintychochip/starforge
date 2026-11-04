@@ -241,40 +241,35 @@ impl TestServer {
             .unwrap()
     }
 
-    /// Signs `handle` in through the login form; returns the client and the session's CSRF token.
-    pub async fn login(&self, handle: &str) -> (reqwest::Client, String) {
+    /// Submits the sign-in form from a fresh browser; returns the browser and the response.
+    pub async fn try_login(
+        &self,
+        login: &str,
+        password: &str,
+    ) -> (reqwest::Client, reqwest::Response) {
         let client = self.browser();
-        let page = client
-            .get(self.url("/login"))
-            .send()
-            .await
-            .unwrap()
-            .text()
-            .await
-            .unwrap();
+        let page = get_text(&client, &self.url("/login")).await;
         let csrf = extract_input(&page, "_csrf");
         let response = client
             .post(self.url("/login"))
             .form(&[
                 ("_csrf", csrf.as_str()),
                 ("next", "/"),
-                ("login", handle),
-                ("password", PASSWORD),
+                ("login", login),
+                ("password", password),
             ])
             .send()
             .await
             .unwrap();
+        (client, response)
+    }
+
+    /// Signs `handle` in with [`PASSWORD`]; returns the browser and the session's CSRF token.
+    pub async fn login(&self, handle: &str) -> (reqwest::Client, String) {
+        let (client, response) = self.try_login(handle, PASSWORD).await;
         assert_eq!(response.status(), 303, "signing in as {handle} failed");
-        let dashboard = client
-            .get(self.url("/"))
-            .send()
-            .await
-            .unwrap()
-            .text()
-            .await
-            .unwrap();
-        let session_csrf = extract_input(&dashboard, "_csrf");
-        (client, session_csrf)
+        let dashboard = get_text(&client, &self.url("/")).await;
+        (client, extract_input(&dashboard, "_csrf"))
     }
 }
 

@@ -41,6 +41,18 @@ impl Core {
             }
             Err(other) => return Err(other),
         };
+        if self.mail_enabled() && user.email.is_some() && !user.email_verified {
+            self.audit_client(
+                Some(user.id),
+                "auth.login_unverified",
+                &format!("user:{}", user.handle),
+                "",
+                ip,
+                &user_agent,
+            )
+            .await?;
+            return Err(CoreError::EmailUnverified);
+        }
         let cookie_value = crypto::random_hex(32);
         let csrf_token = crypto::random_hex(32);
         web_sessions::insert(

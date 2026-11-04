@@ -11,6 +11,8 @@ pub struct UserRow {
     pub handle: String,
     pub display_name: String,
     pub email: Option<String>,
+    /// The owner of `email` confirmed it, or an administrator vouched for it.
+    pub email_verified: bool,
     pub password_hash: Option<String>,
     pub is_admin: bool,
     pub state: String,
@@ -21,6 +23,8 @@ pub struct NewUser<'a> {
     pub handle: &'a str,
     pub display_name: &'a str,
     pub email: Option<&'a str>,
+    /// The owner of `email` confirmed it, or an administrator vouched for it.
+    pub email_verified: bool,
     pub password_hash: Option<&'a str>,
     pub is_admin: bool,
 }
@@ -28,7 +32,7 @@ pub struct NewUser<'a> {
 macro_rules! select_user {
     ($tail:literal) => {
         concat!(
-            "SELECT u.id, o.handle, u.display_name, u.email, u.password_hash, u.is_admin, u.state, u.created_at ",
+            "SELECT u.id, o.handle, u.display_name, u.email, u.email_verified, u.password_hash, u.is_admin, u.state, u.created_at ",
             "FROM users u JOIN owners o ON o.id = u.id ",
             $tail
         )
@@ -41,6 +45,7 @@ fn from_row(row: &AnyRow) -> DbResult<UserRow> {
         handle: row.try_get("handle")?,
         display_name: row.try_get("display_name")?,
         email: row.try_get("email")?,
+        email_verified: row.try_get::<i64, _>("email_verified")? != 0,
         password_hash: row.try_get("password_hash")?,
         is_admin: row.try_get::<i64, _>("is_admin")? != 0,
         state: row.try_get("state")?,
@@ -60,11 +65,13 @@ pub async fn insert(db: &Db, new: &NewUser<'_>) -> DbResult<i64> {
     .fetch_one(&mut *tx)
     .await?;
     sqlx::query(
-        "INSERT INTO users (id, display_name, email, password_hash, is_admin, created_at) VALUES ($1, $2, $3, $4, $5, $6)",
+        "INSERT INTO users (id, display_name, email, email_verified, password_hash, is_admin, created_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
     )
     .bind(id)
     .bind(new.display_name)
     .bind(new.email.map(str::to_owned))
+    .bind(i64::from(new.email_verified))
     .bind(new.password_hash.map(str::to_owned))
     .bind(i64::from(new.is_admin))
     .bind(created_at)
@@ -108,6 +115,14 @@ pub async fn set_state(db: &Db, id: i64, state: &str) -> DbResult<()> {
         .await?;
     Ok(())
 }
+pub async fn set_email_verified(db: &Db, id: i64, verified: bool) -> DbResult<()> {
+    sqlx::query("UPDATE users SET email_verified = $1 WHERE id = $2")
+        .bind(i64::from(verified))
+        .bind(id)
+        .execute(db.pool())
+        .await?;
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {
@@ -119,6 +134,7 @@ mod tests {
             handle: "alice",
             display_name: "Alice",
             email: Some("alice@example.com"),
+            email_verified: false,
             password_hash: Some("hash"),
             is_admin: false,
         }
@@ -179,5 +195,21 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(owners, 0, "a failed insert must roll back its owner row");
+    }
+    #[tokio::test]
+    async fn email_verification_is_stored() {
+        let t = TestDb::new().await;
+        let id = insert(
+            &t.db,
+            &NewUser {
+                email_verified: true,
+                ..alice()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(by_id(&t.db, id).await.unwrap().unwrap().email_verified);
+        set_email_verified(&t.db, id, false).await.unwrap();
+        assert!(!by_id(&t.db, id).await.unwrap().unwrap().email_verified);
     }
 }

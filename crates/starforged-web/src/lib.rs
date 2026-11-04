@@ -46,6 +46,11 @@ fn page_routes() -> Router<AppState> {
         .route("/", get(pages::dashboard::show))
         .route("/login", get(pages::login::form).post(pages::login::submit))
         .route("/logout", post(pages::login::logout))
+        .route("/verify/resend", post(pages::verify::resend))
+        .route(
+            "/verify/{token}",
+            get(pages::verify::confirm_form).post(pages::verify::confirm),
+        )
         .route(
             "/new",
             get(pages::repo_new::form).post(pages::repo_new::submit),

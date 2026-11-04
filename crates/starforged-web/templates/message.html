@@ -1,0 +1,7 @@
+{% extends "base.html" %}
+{% block title %}{{ title }} · Starforge{% endblock %}
+{% block content %}
+<h1>{{ title }}</h1>
+<p>{{ message }}</p>
+{% if !link_href.is_empty() %}<p><a href="{{ link_href }}">{{ link_text }}</a></p>{% endif %}
+{% endblock %}

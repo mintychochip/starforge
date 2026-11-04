@@ -24,6 +24,7 @@ impl From<CoreError> for ApiError {
             CoreError::Unauthenticated => ApiError::Unauthenticated,
             CoreError::Invalid(message) => ApiError::Invalid(message),
             CoreError::Conflict(message) => ApiError::Conflict(message),
+            CoreError::EmailUnverified => ApiError::Forbidden("email address not verified".into()),
             other => ApiError::Internal(other.to_string()),
         }
     }

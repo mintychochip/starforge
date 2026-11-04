@@ -20,7 +20,9 @@ impl From<CoreError> for WebError {
     fn from(err: CoreError) -> WebError {
         match err {
             CoreError::NotFound => WebError::NotFound,
-            CoreError::Forbidden | CoreError::Unauthenticated => WebError::Forbidden,
+            CoreError::Forbidden | CoreError::Unauthenticated | CoreError::EmailUnverified => {
+                WebError::Forbidden
+            }
             CoreError::Invalid(message) | CoreError::Conflict(message) => {
                 WebError::BadRequest(message)
             }
