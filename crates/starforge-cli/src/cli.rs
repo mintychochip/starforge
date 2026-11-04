@@ -81,11 +81,16 @@ pub enum AuthCmd {
     Status,
 }
 
-/// `sessions` subcommands (full set lands C5/C7).
+/// `sessions` subcommands (`list`/`show` land C4; the rest lands C5/C7).
 #[derive(Debug, Subcommand)]
 pub enum SessionsCmd {
     /// List local sessions.
     List,
+    /// Show a session's metadata.
+    Show {
+        /// Session ULID.
+        ulid: String,
+    },
 }
 
 /// CLI errors. Every non-root cause maps to an exit code (0/1/2).
@@ -133,6 +138,7 @@ pub fn run(cli: Cli, paths: CliPaths) -> std::process::ExitCode {
 }
 
 fn sync_stub(cli: Cli, _paths: CliPaths) -> std::process::ExitCode {
+    let dry_run = cli.dry_run;
     let result: Result<(), CliError> = match cli.cmd {
         Cmd::Auth { .. } => unreachable!("auth dispatches via run_async"),
         Cmd::Status => unreachable!("status dispatches via run_async"),
@@ -140,7 +146,7 @@ fn sync_stub(cli: Cli, _paths: CliPaths) -> std::process::ExitCode {
         Cmd::Disable => Err(CliError::Unimplemented("disable")),
         Cmd::Doctor => Err(CliError::Unimplemented("doctor")),
         Cmd::Sync => Err(CliError::Unimplemented("sync")),
-        Cmd::Sessions { .. } => Err(CliError::Unimplemented("sessions")),
+        Cmd::Sessions { cmd } => return run_sessions(cmd, dry_run),
         Cmd::Export => Err(CliError::Unimplemented("export")),
         Cmd::Import => Err(CliError::Unimplemented("import")),
         Cmd::Trail => Err(CliError::Unimplemented("trail")),
@@ -155,6 +161,27 @@ fn sync_stub(cli: Cli, _paths: CliPaths) -> std::process::ExitCode {
             std::process::ExitCode::from(err.exit_code())
         }
     }
+}
+
+/// `sessions list` / `sessions show`: read-only spool views (C4).
+fn run_sessions(cmd: SessionsCmd, dry_run: bool) -> std::process::ExitCode {
+    let repo = match std::env::current_dir() {
+        Ok(dir) => dir,
+        Err(err) => {
+            eprintln!("error: cannot determine current directory: {err}");
+            return std::process::ExitCode::from(1);
+        }
+    };
+    let (out, code) = match cmd {
+        SessionsCmd::List => crate::commands::sessions::list(&repo, dry_run),
+        SessionsCmd::Show { ulid } => crate::commands::sessions::show(&repo, &ulid, dry_run),
+    };
+    if code == 0 {
+        println!("{out}");
+    } else {
+        eprintln!("{out}");
+    }
+    std::process::ExitCode::from(code)
 }
 
 /// Async dispatch (auth handlers live here; other commands stay stubs).

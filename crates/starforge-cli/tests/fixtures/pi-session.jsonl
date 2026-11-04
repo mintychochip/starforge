@@ -1,0 +1,3 @@
+{"content":"Please review the new auth flow before release.","cwd":"/work/repo","role":"user","session":"pi-session-1","timestamp":"2026-10-01T12:00:00Z","type":"message","version":"0.5.2"}
+{"content":"Here is the deploy key for staging: ghp_0123456789abcdef0123456789abcdef0123 — rotate it soon.","cwd":"/work/repo","model":"pi-model-x","role":"assistant","session":"pi-session-1","timestamp":"2026-10-01T12:01:00Z","type":"message","usage":{"input_tokens":10,"output_tokens":20},"version":"0.5.2"}
+{"cwd":"/work/repo","input":{"edits":1,"file_path":"/work/repo/src/lib.rs"},"name":"Edit","session":"pi-session-1","timestamp":"2026-10-01T12:02:00Z","type":"tool_call","version":"0.5.2"}
