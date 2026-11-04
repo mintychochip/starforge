@@ -468,3 +468,90 @@ pub async fn revoke_invite(
         Err(other) => Err(other.into()),
     }
 }
+/// One live repository row: no actions, just the owner/name link, visibility, and archive badge.
+pub struct LiveRow {
+    owner: String,
+    name: String,
+    visibility: String,
+    archived: bool,
+}
+
+/// One deleted repository row with restore and purge-now forms.
+pub struct DeletedRow {
+    id: i64,
+    owner: String,
+    name: String,
+    deleted: String,
+}
+
+#[derive(Template, WebTemplate)]
+#[template(path = "admin_repos.html")]
+pub struct ReposPage {
+    nav_user: Option<NavUser>,
+    csrf: String,
+    admin_tab: &'static str,
+    live: Vec<LiveRow>,
+    deleted: Vec<DeletedRow>,
+}
+
+pub async fn repositories(
+    State(state): State<AppState>,
+    RequireAdmin(session): RequireAdmin,
+) -> Result<ReposPage, WebError> {
+    let live = state
+        .core
+        .admin_all_repos(&session.user)
+        .await?
+        .into_iter()
+        .map(|r| LiveRow {
+            owner: r.owner,
+            name: r.name,
+            visibility: r.visibility,
+            archived: r.archived,
+        })
+        .collect();
+    let deleted = state
+        .core
+        .admin_deleted_repos(&session.user)
+        .await?
+        .into_iter()
+        .map(|r| DeletedRow {
+            id: r.id,
+            owner: r.owner,
+            name: r.name,
+            deleted: r
+                .deleted_at
+                .map(crate::views::format_time)
+                .unwrap_or_default(),
+        })
+        .collect();
+    Ok(ReposPage {
+        nav_user: Some(NavUser::from_session(&session)),
+        csrf: session.csrf_token.clone(),
+        admin_tab: "repositories",
+        live,
+        deleted,
+    })
+}
+
+pub async fn restore_repo(
+    State(state): State<AppState>,
+    RequireAdmin(session): RequireAdmin,
+    Path(id): Path<i64>,
+    Form(form): Form<CsrfForm>,
+) -> Result<Response, WebError> {
+    verify_csrf(&session.csrf_token, &form.csrf)?;
+    state.core.restore_repo(&session.user, id).await?;
+    Ok(Redirect::to("/admin/repositories").into_response())
+}
+
+pub async fn purge_repo(
+    State(state): State<AppState>,
+    RequireAdmin(session): RequireAdmin,
+    Path(id): Path<i64>,
+    Form(form): Form<CsrfForm>,
+) -> Result<Response, WebError> {
+    verify_csrf(&session.csrf_token, &form.csrf)?;
+    state.core.purge_repo_now(&session.user, id).await?;
+    Ok(Redirect::to("/admin/repositories").into_response())
+}

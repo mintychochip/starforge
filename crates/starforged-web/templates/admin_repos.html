@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+{% block title %}Repositories · Site administration{% endblock %}
+{% block content %}
+<h1>Site administration</h1>
+{% include "admin_nav.html" %}
+<section>
+  <h2>Repositories</h2>
+  {% if live.is_empty() %}
+  <p>No live repositories.</p>
+  {% else %}
+  <table>
+    <thead>
+      <tr><th>Repository</th><th>Visibility</th><th>Status</th></tr>
+    </thead>
+    <tbody>
+      {% for r in live %}
+      <tr>
+        <td><a href="/{{ r.owner }}/{{ r.name }}">{{ r.owner }}/{{ r.name }}</a></td>
+        <td>{{ r.visibility }}</td>
+        <td>{% if r.archived %}archived{% else %}active{% endif %}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+</section>
+<section>
+  <h2>Deleted repositories</h2>
+  {% if deleted.is_empty() %}
+  <p>No deleted repositories.</p>
+  {% else %}
+  <table>
+    <thead>
+      <tr><th>Repository</th><th>Deleted</th><th></th></tr>
+    </thead>
+    <tbody>
+      {% for r in deleted %}
+      <tr>
+        <td>{{ r.owner }}/{{ r.name }}</td>
+        <td>{{ r.deleted }}</td>
+        <td><form method="post" action="/admin/repositories/{{ r.id }}/restore" class="inline"><input type="hidden" name="_csrf" value="{{ csrf }}"><button type="submit">Restore</button></form> <form method="post" action="/admin/repositories/{{ r.id }}/purge" class="inline"><input type="hidden" name="_csrf" value="{{ csrf }}"><button type="submit">Purge now</button></form></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+</section>
+{% endblock %}

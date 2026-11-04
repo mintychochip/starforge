@@ -294,6 +294,22 @@ impl Core {
         }
         Ok(deleted)
     }
+    /// Every live repository of every owner, ordered by owner then name.
+    pub async fn admin_all_repos(&self, admin: &User) -> CoreResult<Vec<AdminRepo>> {
+        forbidden_unless_admin(admin)?;
+        Ok(db_repos::list_all_live(self.db(), 200)
+            .await?
+            .into_iter()
+            .map(|row| AdminRepo {
+                id: row.id,
+                owner: row.owner_handle,
+                name: row.name,
+                visibility: row.visibility,
+                archived: row.archived_at.is_some(),
+                deleted_at: row.deleted_at,
+            })
+            .collect())
+    }
 
     /// Removes a deleted repository for good. A missing id and a live repository both answer `NotFound`
     /// so the call never reveals whether a live repository exists.

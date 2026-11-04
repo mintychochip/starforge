@@ -142,6 +142,15 @@ fn page_routes() -> Router<AppState> {
             "/admin/invites/{id}/revoke",
             post(pages::admin::revoke_invite),
         )
+        .route("/admin/repositories", get(pages::admin::repositories))
+        .route(
+            "/admin/repositories/{id}/restore",
+            post(pages::admin::restore_repo),
+        )
+        .route(
+            "/admin/repositories/{id}/purge",
+            post(pages::admin::purge_repo),
+        )
         .route("/{owner}", get(pages::owner::show))
         .route(
             "/{owner}/{repo}/settings",

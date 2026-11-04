@@ -240,6 +240,16 @@ pub async fn list_all_deleted(db: &Db, limit: i64) -> DbResult<Vec<RepoRow>> {
     .await?;
     rows.iter().map(from_row).collect()
 }
+/// Every live repository of every owner, ordered by owner then name, at most `limit`.
+pub async fn list_all_live(db: &Db, limit: i64) -> DbResult<Vec<RepoRow>> {
+    let rows = sqlx::query(select_repo!(
+        "WHERE r.deleted_at IS NULL ORDER BY o.handle, r.lower_name LIMIT $1"
+    ))
+    .bind(limit)
+    .fetch_all(db.pool())
+    .await?;
+    rows.iter().map(from_row).collect()
+}
 
 /// Live plus deleted repositories, for the admin overview.
 pub async fn count_all(db: &Db) -> DbResult<i64> {
