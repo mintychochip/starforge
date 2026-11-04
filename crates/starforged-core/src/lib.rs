@@ -5,6 +5,7 @@ pub mod account;
 pub mod accounts;
 pub mod admin;
 pub mod audit;
+pub mod blame;
 pub mod content;
 pub mod crypto;
 pub mod email_tokens;

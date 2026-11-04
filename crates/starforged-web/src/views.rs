@@ -254,6 +254,27 @@ impl SessionChip {
     }
 }
 
+/// One blamed line: its 1-based file number and escaped text.
+pub struct BlameLine {
+    pub n: usize,
+    pub text: String,
+}
+
+/// One contiguous blamed run on the current page: attribution, session
+/// chips, and the page's slice of its lines.
+pub struct BlameLineGroup {
+    pub sha: String,
+    pub short: String,
+    pub author: String,
+    pub when: String,
+    pub summary: String,
+    pub commit_href: String,
+    /// The run started on an earlier page; the header marks the continuation.
+    pub continuation: bool,
+    pub sessions: Vec<SessionChip>,
+    pub lines: Vec<BlameLine>,
+}
+
 pub struct LineView {
     pub class: &'static str,
     pub old: String,

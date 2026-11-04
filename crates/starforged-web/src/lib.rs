@@ -194,6 +194,7 @@ fn page_routes() -> Router<AppState> {
         .route("/{owner}/{repo}/tree/{*rest}", get(pages::code::tree))
         .route("/{owner}/{repo}/blob/{*rest}", get(pages::code::blob))
         .route("/{owner}/{repo}/raw/{*rest}", get(pages::code::raw))
+        .route("/{owner}/{repo}/blame/{*rest}", get(pages::blame::show))
         .route(
             "/{owner}/{repo}/commits",
             get(pages::history::default_commits),

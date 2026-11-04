@@ -1,6 +1,7 @@
 //! starforged-git: repositories on disk. The network protocol, merges, and diffs run the `git` binary;
 //! read paths use gix (spec D11).
 
+pub mod blame;
 pub mod command;
 pub mod diff;
 pub mod http;

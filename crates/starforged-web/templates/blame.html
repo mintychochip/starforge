@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %}blame {{ path }} · {{ head.owner }}/{{ head.name }}{% endblock %}
+{% block content %}
+{% include "repo_head.html" %}
+<p class="crumbs"><span class="badge">{{ ref_name }}</span>{% for c in crumbs %} / <a href="{{ c.href }}">{{ c.name }}</a>{% endfor %} / {{ file_name }} · <a href="{{ blob_href }}">Blob</a> · {{ total }} lines</p>
+{% if let Some(n) = notice %}
+<p class="muted">{{ n }}</p>
+{% else %}
+{% for g in groups %}
+<section class="blame-block" data-sha="{{ g.sha }}">
+<header>{% if g.continuation %}<span class="badge">continued</span> {% endif %}<a href="{{ g.commit_href }}"><code>{{ g.short }}</code></a> {{ g.author }} · {{ g.when }} · {{ g.summary }}</header>
+{% if !g.sessions.is_empty() %}
+<ul class="session-chips">
+{% for s in g.sessions %}
+<li><a href="{{ s.href }}"><code>{{ s.ulid }}</code></a> {{ s.agent }} · {{ s.started }} <span class="badge">{{ s.confidence }}</span> <span class="badge">{{ s.source }}</span></li>
+{% endfor %}
+</ul>
+{% endif %}
+<table class="code"><tbody>
+{% for l in g.lines %}<tr id="L{{ l.n }}"><td class="ln"><a href="#L{{ l.n }}">{{ l.n }}</a></td><td><pre>{{ l.text }}</pre></td></tr>
+{% endfor %}
+</tbody></table>
+</section>
+{% endfor %}
+<p class="pager">{% if let Some(p) = prev %}<a href="?at={{ ref_name }}&amp;page={{ p }}">Previous</a>{% endif %} Page {{ page }} of {{ pages }} {% if let Some(p) = next %}<a href="?at={{ ref_name }}&amp;page={{ p }}">Next</a>{% endif %}</p>
+{% endif %}
+{% endblock %}

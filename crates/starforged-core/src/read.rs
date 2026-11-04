@@ -286,7 +286,7 @@ impl Core {
     /// Resolves each link row to its session (via `session_id`, falling back
     /// to `session_ulid` for trailer-first rows whose upload has since
     /// arrived) and keeps only rows [`can_read_session`] admits for `viewer`.
-    async fn filter_readable_links(
+    pub(crate) async fn filter_readable_links(
         &self,
         access: &RepoAccess,
         viewer: Option<&User>,
