@@ -233,6 +233,39 @@ fn page_routes() -> Router<AppState> {
             "/{owner}/{repo}/sessions/{ulid}/rescan",
             post(pages::session::rescan),
         )
+        .route("/{owner}/{repo}/trails", get(pages::trails::list))
+        .route(
+            "/{owner}/{repo}/trails/new",
+            get(pages::trails::new_form).post(pages::trails::create),
+        )
+        .route(
+            "/{owner}/{repo}/trails/{number}",
+            get(pages::trails::detail),
+        )
+        .route(
+            "/{owner}/{repo}/trails/{number}/comment",
+            post(pages::trails::comment),
+        )
+        .route(
+            "/{owner}/{repo}/trails/{number}/edit",
+            post(pages::trails::edit),
+        )
+        .route(
+            "/{owner}/{repo}/trails/{number}/state",
+            post(pages::trails::set_state),
+        )
+        .route(
+            "/{owner}/{repo}/trails/{number}/labels",
+            post(pages::trails::set_label),
+        )
+        .route(
+            "/{owner}/{repo}/trails/{number}/assignees",
+            post(pages::trails::set_assignee),
+        )
+        .route(
+            "/{owner}/{repo}/trails/{number}/comments/{id}/edit",
+            post(pages::trails::edit_comment),
+        )
         .route("/{owner}/{repo}/compare", get(pages::compare::pick))
         .route(
             "/{owner}/{repo}/compare/{*spec}",

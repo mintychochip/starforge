@@ -1,0 +1,115 @@
+{% extends "base.html" %}
+{% block title %}#{{ number }} {{ title }} · {{ head.owner }}/{{ head.name }}{% endblock %}
+{% block content %}
+{% include "repo_head.html" %}
+<h2>#{{ number }} {{ title }}</h2>
+<p><span class="badge">{{ state }}</span>{% if ready %} <span class="badge">ready</span>{% endif %}
+opened by <a href="/{{ author_handle }}">{{ author_handle }}</a> · <span class="muted">{{ created }}</span></p>
+{% if let Some(e) = error %}<p class="notice">{{ e }}</p>{% endif %}
+<div class="labels">
+{% for l in labels %}<span class="badge">{{ l }}</span>{% if can_triage %}
+  <form method="post" action="/{{ head.owner }}/{{ head.name }}/trails/{{ number }}/labels" class="inline">
+    <input type="hidden" name="_csrf" value="{{ csrf }}">
+    <input type="hidden" name="action" value="remove">
+    <input type="hidden" name="name" value="{{ l }}">
+    <button type="submit" aria-label="Remove label {{ l }}">×</button>
+  </form>{% endif %} {% endfor %}
+{% if can_triage %}
+  <form method="post" action="/{{ head.owner }}/{{ head.name }}/trails/{{ number }}/labels" class="inline" id="add-label">
+    <input type="hidden" name="_csrf" value="{{ csrf }}">
+    <input type="hidden" name="action" value="add">
+    <input type="text" name="name" placeholder="new label" maxlength="50">
+    <button type="submit">Add label</button>
+  </form>
+{% endif %}
+</div>
+<div class="assignees">
+  Assignees:{% for a in assignees %} <a href="/{{ a }}">{{ a }}</a>{% if can_triage %}
+  <form method="post" action="/{{ head.owner }}/{{ head.name }}/trails/{{ number }}/assignees" class="inline">
+    <input type="hidden" name="_csrf" value="{{ csrf }}">
+    <input type="hidden" name="action" value="remove">
+    <input type="hidden" name="handle" value="{{ a }}">
+    <button type="submit" aria-label="Unassign {{ a }}">×</button>
+  </form>{% endif %}{% endfor %}
+{% if can_triage %}
+  <form method="post" action="/{{ head.owner }}/{{ head.name }}/trails/{{ number }}/assignees" class="inline" id="add-assignee">
+    <input type="hidden" name="_csrf" value="{{ csrf }}">
+    <input type="hidden" name="action" value="add">
+    <input type="text" name="handle" placeholder="assignee handle">
+    <button type="submit">Assign</button>
+  </form>
+{% endif %}
+</div>
+{% if can_edit %}
+<details id="edit-trail">
+  <summary>Edit trail</summary>
+  <form method="post" action="/{{ head.owner }}/{{ head.name }}/trails/{{ number }}/edit">
+    <input type="hidden" name="_csrf" value="{{ csrf }}">
+    <label>Title <input type="text" name="title" value="{{ title }}" maxlength="200"></label>
+    <label>Intent <textarea name="intent" rows="6">{{ intent_raw }}</textarea></label>
+{% if can_triage %}
+    <label>Ready
+      <select name="ready" id="trail-ready">
+        <option value="false"{% if !ready %} selected{% endif %}>not ready</option>
+        <option value="true"{% if ready %} selected{% endif %}>ready</option>
+      </select>
+    </label>
+{% endif %}
+    <button type="submit">Save</button>
+  </form>
+</details>
+{% endif %}
+{% if can_triage %}
+<div class="actions">
+{% if is_open %}
+  <form method="post" action="/{{ head.owner }}/{{ head.name }}/trails/{{ number }}/state" class="inline" id="close-trail">
+    <input type="hidden" name="_csrf" value="{{ csrf }}">
+    <input type="hidden" name="state" value="closed">
+    <button type="submit">Close trail</button>
+  </form>
+{% else %}
+  <form method="post" action="/{{ head.owner }}/{{ head.name }}/trails/{{ number }}/state" class="inline" id="reopen-trail">
+    <input type="hidden" name="_csrf" value="{{ csrf }}">
+    <input type="hidden" name="state" value="open">
+    <button type="submit">Reopen trail</button>
+  </form>
+{% endif %}
+</div>
+{% endif %}
+<div class="intent">{{ intent_html|safe }}</div>
+<dl class="muted">
+  <dt>Created</dt><dd>{{ created }}</dd>
+  <dt>Updated</dt><dd>{{ updated }}</dd>
+{% if let Some(c) = closed %}<dt>Closed</dt><dd>{{ c }}</dd>{% endif %}
+</dl>
+<h3>Timeline</h3>
+<ul class="timeline">
+{% for ev in timeline %}
+<li>{{ ev.text }} · <span class="muted">{{ ev.time }}</span></li>
+{% endfor %}
+</ul>
+<h3>Comments</h3>
+{% for c in comments %}
+<article id="comment-{{ c.id }}">
+  <p><a href="/{{ c.author_handle }}">{{ c.author_handle }}</a> · <span class="muted">{{ c.created }}</span>{% if let Some(e) = c.edited %} · <span class="muted">edited {{ e }}</span>{% endif %}</p>
+  <div class="comment-body">{{ c.body_html|safe }}</div>
+{% if c.can_edit %}
+  <details>
+    <summary>Edit comment</summary>
+    <form method="post" action="/{{ head.owner }}/{{ head.name }}/trails/{{ number }}/comments/{{ c.id }}/edit">
+      <input type="hidden" name="_csrf" value="{{ csrf }}">
+      <textarea name="body" rows="4">{{ c.body_raw }}</textarea>
+      <button type="submit">Save comment</button>
+    </form>
+  </details>
+{% endif %}
+</article>
+{% endfor %}
+{% if can_comment %}
+<form method="post" action="/{{ head.owner }}/{{ head.name }}/trails/{{ number }}/comment" id="add-comment">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <label>Comment <textarea name="body" rows="4"></textarea></label>
+  <button type="submit">Comment</button>
+</form>
+{% endif %}
+{% endblock %}

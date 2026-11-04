@@ -19,4 +19,5 @@ pub mod repo_settings;
 pub mod session;
 pub mod settings;
 pub mod tokens;
+pub mod trails;
 pub mod verify;

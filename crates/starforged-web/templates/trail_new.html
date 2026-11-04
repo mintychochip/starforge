@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block title %}New trail · {{ head.owner }}/{{ head.name }}{% endblock %}
+{% block content %}
+{% include "repo_head.html" %}
+<h2>New trail</h2>
+{% if let Some(e) = error %}<p class="notice">{{ e }}</p>{% endif %}
+<form method="post" action="/{{ head.owner }}/{{ head.name }}/trails/new">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <label>Title <input type="text" name="title" value="{{ title }}" maxlength="200" required></label>
+  <label>Intent <textarea name="intent" rows="8">{{ intent }}</textarea></label>
+  <p class="muted">Markdown is supported in the intent.</p>
+  <button type="submit">Create trail</button>
+</form>
+{% endblock %}

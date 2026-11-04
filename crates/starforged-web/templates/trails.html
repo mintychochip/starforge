@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block title %}Trails · {{ head.owner }}/{{ head.name }}{% endblock %}
+{% block content %}
+{% include "repo_head.html" %}
+<h2>Trails</h2>
+<form method="get" action="/{{ head.owner }}/{{ head.name }}/trails" class="filters">
+  <label>State
+    <select name="state">
+      <option value=""{% if state.is_empty() %} selected{% endif %}>all</option>
+      <option value="open"{% if state == "open" %} selected{% endif %}>open</option>
+      <option value="closed"{% if state == "closed" %} selected{% endif %}>closed</option>
+    </select>
+  </label>
+  <label>Label <input type="text" name="label" value="{{ label }}"></label>
+  <label>Assignee <input type="text" name="assignee" value="{{ assignee }}"></label>
+  <label>Author <input type="text" name="author" value="{{ author }}"></label>
+  <button type="submit">Filter</button>
+</form>
+<p><a href="/{{ head.owner }}/{{ head.name }}/trails/new">New trail</a></p>
+{% if rows.is_empty() %}
+<p class="muted">No trails yet.</p>
+{% else %}
+<table class="list"><tbody>
+{% for t in rows %}
+<tr><td><a href="/{{ head.owner }}/{{ head.name }}/trails/{{ t.number }}">#{{ t.number }} {{ t.title }}</a>
+  <span class="badge">{{ t.state }}</span>{% if t.ready %} <span class="badge">ready</span>{% endif %}</td>
+<td>{% for l in t.labels %}<span class="badge">{{ l }}</span> {% endfor %}{% for a in t.assignees %}<a href="/{{ a }}">{{ a }}</a> {% endfor %}<span class="muted" title="{{ t.number }}">{{ t.age }}</span></td></tr>
+{% endfor %}
+</tbody></table>
+{% endif %}
+<nav class="pager muted">Page {{ page }}{% if let Some(href) = prev_href %} · <a href="{{ href }}">Previous</a>{% endif %}{% if let Some(href) = next_href %} · <a href="{{ href }}">Next</a>{% endif %}</nav>
+{% endblock %}
