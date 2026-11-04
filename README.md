@@ -209,6 +209,28 @@ depth; other pages use the site default.
 Not yet: a repository session index (commit panels and direct ULID links are the discovery
 paths), blame syntax highlighting, and the §10.2 transcript/diff split view.
 
+## Trails
+
+Trails are per-repo numbered issues: `/{owner}/{repo}/trails` lists them (`?page=N`, 30 per page,
+`?state=open|closed`, `?label=`, `?assignee=`), `.../trails/new` opens one, and
+`.../trails/{number}` shows the detail — description, comments, labels, assignees, and the
+timeline — with triage-gated close/reopen, label, assignee, and ready controls. Titles and
+descriptions render as sanitized Markdown (labels are `[a-z0-9-_.]`, lowercase, max 50 chars);
+creating and commenting need read access, everything curatorial needs triage, comment edits
+belong to the author or an admin, and strangers get `404` so trail numbers stay undiscoverable.
+Every web form carries a `_csrf` token.
+
+The JSON API mirrors the pages: `GET`/`POST /api/v1/repos/{owner}/{repo}/trails` (keyset
+`?after=&limit=`, `next_after` cursor), `GET`/`PATCH .../trails/{n}` (title, intent, ready,
+state; `merged` is refused — only the merge path may set it), `GET`/`POST
+.../trails/{n}/comments` plus `PATCH .../comments/{id}`, and `POST`/`DELETE .../labels` and
+`.../assignees` (assignees must already be repo members). Reads need `repo:read`; every
+mutation needs `trail:write` on top, so a curator token carries `"repo:read trail:write"`.
+Errors use the shared `{"error": {"code", "message"}}` envelope.
+
+Not yet: changes, revisions, and the `refs/for` push flow (M2b); reviews, checks, gate rules,
+and server-side merge (M2c); `trail` CLI commands (M2d); trail deletion (close covers M2a).
+
 ## Development
 
 ```bash
