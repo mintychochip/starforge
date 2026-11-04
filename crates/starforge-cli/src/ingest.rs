@@ -217,15 +217,15 @@ pub fn ingest(
                     continue;
                 }
             };
-            if out.next != cursor || first_sight {
-                spool.write_cursor(
-                    &key,
-                    &ulid,
-                    out.next,
-                    &candidate.native_path.to_string_lossy(),
-                )?;
-            }
             if out.events.is_empty() {
+                if out.next != cursor || first_sight {
+                    spool.write_cursor(
+                        &key,
+                        &ulid,
+                        out.next,
+                        &candidate.native_path.to_string_lossy(),
+                    )?;
+                }
                 continue;
             }
             stats.sessions += 1;
@@ -415,6 +415,19 @@ pub fn ingest(
                     None,
                     &mut queued,
                     &mut stats,
+                )?;
+            }
+            // Cursor advances LAST: every persist above (session dir, segments,
+            // raw slices, meta fold, queue entries) succeeded when this runs, so
+            // a mid-candidate failure leaves the cursor behind the new records
+            // and the next sweep replays them (possible duplicates) instead of
+            // skipping them (silent loss). Value is still `out.next`.
+            if out.next != cursor || first_sight {
+                spool.write_cursor(
+                    &key,
+                    &ulid,
+                    out.next,
+                    &candidate.native_path.to_string_lossy(),
                 )?;
             }
         }

@@ -334,3 +334,97 @@ fn credentialed_remote_url_never_reaches_spool_or_show() {
     assert!(!out.contains("s3cr3t"), "no token in show output");
     assert!(!out.contains("deploy-user"), "no user in show output");
 }
+
+// Cursor advances last: if `append_events` fails, `ingest` must return the
+// error with the cursor UNCHANGED, so the next sweep replays the records
+// (possible duplicates across the failed boundary are acceptable; silent
+// loss is not). After repair, every event appears exactly once.
+#[test]
+fn spool_failure_leaves_cursor_and_replays_without_loss_or_dupes() {
+    let (_repo_dir, repo) = init_repo();
+    let home = TempDir::new().unwrap();
+    std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+    let native = home.path().join("sessions/pi-replay-1.jsonl");
+    std::fs::copy(fixture_path(), &native).unwrap();
+
+    let common = common_dir(&repo).unwrap();
+    let spool = Spool::open(&common);
+    spool.ensure_layout().unwrap();
+    let roots = Roots {
+        config_dir: home.path().join(".config"),
+        data_dir: home.path().to_path_buf(),
+        worktree: PathBuf::from("/"),
+    };
+    let now = parse_now("2026-11-04T00:00:00Z");
+
+    let stats = ingest(&spool, &roots, &repo, now).unwrap();
+    assert!(stats.new_events >= 3, "fixture ingested: {stats:?}");
+    let records = spool.cursor_records().unwrap();
+    assert_eq!(records.len(), 1, "one cursor record: {records:?}");
+    let (key, rec) = records.iter().next().unwrap();
+    let (key, ulid, prev_cursor) = (key.clone(), rec.ulid.clone(), rec.cursor);
+
+    // Grow the native transcript by one record so the next sweep has work.
+    let mut grown = std::fs::read(fixture_path()).unwrap();
+    grown.extend_from_slice(
+        concat!(
+            "{\"cwd\":\"/work/repo\",\"input\":{\"edits\":2,\"file_path\":\"/work/repo/src/main.rs\"},",
+            "\"name\":\"Edit\",\"session\":\"pi-session-1\",\"timestamp\":\"2026-10-01T12:03:00Z\",",
+            "\"type\":\"tool_call\",\"version\":\"0.5.2\"}\n",
+        )
+        .as_bytes(),
+    );
+    std::fs::write(&native, grown).unwrap();
+
+    // Break `append_events`: the session dir exists (no `put_session` on this
+    // path), but the segments dir is parked aside behind a regular file, so
+    // the segment write fails. Existing segment bytes survive via rename.
+    let seg_dir = spool.root.join("sessions").join(&ulid).join("segments");
+    let seg_bak = spool.root.join("sessions").join(&ulid).join("segments.bak");
+    std::fs::rename(&seg_dir, &seg_bak).unwrap();
+    std::fs::write(&seg_dir, b"not a dir").unwrap();
+
+    let err = ingest(&spool, &roots, &repo, now).unwrap_err();
+    let _ = err.to_string();
+    let rec2 = spool
+        .read_cursor(&key)
+        .unwrap()
+        .expect("cursor record survives the failed sweep");
+    assert_eq!(rec2.ulid, ulid, "same session");
+    assert_eq!(
+        rec2.cursor, prev_cursor,
+        "cursor unchanged after the failed sweep"
+    );
+
+    // Repair and re-run: every event appears exactly once.
+    std::fs::remove_file(&seg_dir).unwrap();
+    std::fs::rename(&seg_bak, &seg_dir).unwrap();
+    let stats3 = ingest(&spool, &roots, &repo, now).unwrap();
+    assert!(stats3.new_events >= 1, "replayed growth: {stats3:?}");
+
+    let mut seqs = Vec::new();
+    for n in 0.. {
+        match spool.segment_bytes(&ulid, n) {
+            Ok(bytes) => {
+                let text =
+                    String::from_utf8(starforge_format::decompress(&bytes).unwrap()).unwrap();
+                for line in text.lines() {
+                    let v: serde_json::Value = serde_json::from_str(line).unwrap();
+                    seqs.push(v.get("seq").and_then(|s| s.as_u64()).unwrap());
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    assert!(
+        seqs.len() > stats.new_events,
+        "all events present: {seqs:?}"
+    );
+    seqs.sort_unstable();
+    for (i, s) in seqs.iter().enumerate() {
+        assert_eq!(
+            *s, i as u64,
+            "seq set is the full range, no dupes: {seqs:?}"
+        );
+    }
+}
