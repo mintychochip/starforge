@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block title %}Delete account · Settings · Starforge{% endblock %}
+{% block content %}
+{% include "settings_nav.html" %}
+<h1>Delete your account</h1>
+{% if let Some(e) = error %}<p class="error">{{ e }}</p>{% endif %}
+<p>Deleting your account signs you out everywhere, revokes your tokens and collaborator access, and removes your deleted repositories for good. It cannot be undone. Delete your repositories first.</p>
+<form method="post" action="/settings/delete" class="stack">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <label>Type your handle, <code>{{ handle }}</code>, to confirm <input name="confirm" required autocomplete="off"></label>
+  <button type="submit">Delete my account</button>
+</form>
+{% endblock %}

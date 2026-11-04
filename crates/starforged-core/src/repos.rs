@@ -719,6 +719,18 @@ impl Core {
         )
         .await
     }
+
+    /// Purges every deleted repository of `owner_id` now, whatever its age (account deletion).
+    pub(crate) async fn purge_deleted_repos_of(
+        &self,
+        owner_id: i64,
+        actor_id: Option<i64>,
+    ) -> CoreResult<()> {
+        for row in db_repos::list_deleted_by_owner(self.db(), owner_id).await? {
+            self.purge_repo(&to_repo(row)?, actor_id).await?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

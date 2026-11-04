@@ -152,6 +152,28 @@ pub async fn set_email(db: &Db, id: i64, email: Option<&str>, verified: bool) ->
     Ok(())
 }
 
+/// Active site admins other than `id`.
+pub async fn count_active_admins_except(db: &Db, id: i64) -> DbResult<i64> {
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM users WHERE is_admin = 1 AND state = 'active' AND id <> $1",
+    )
+    .bind(id)
+    .fetch_one(db.pool())
+    .await?;
+    Ok(count)
+}
+
+/// Deletes the account's owner row. The user row, web sessions, access tokens, email links, collaborator
+/// grants, repository redirects, and any repository rows cascade; invites and audit entries keep their rows
+/// with the user cleared.
+pub async fn delete(db: &Db, id: i64) -> DbResult<()> {
+    sqlx::query("DELETE FROM owners WHERE id = $1")
+        .bind(id)
+        .execute(db.pool())
+        .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

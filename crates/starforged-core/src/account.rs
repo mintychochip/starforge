@@ -1,5 +1,6 @@
 //! Account settings (forge-basics design §4.6): profile, email address, password, and web sessions.
 
+use starforged_db::repos as db_repos;
 use starforged_db::{now, users, web_sessions};
 
 use crate::accounts::{User, hash_password};
@@ -158,6 +159,47 @@ impl Core {
         )
         .await?;
         Ok(ended)
+    }
+
+    /// Deletes the account once the user typed their handle (forge-basics design §4.6). Refused while the user
+    /// owns repositories that are not deleted, or is the only active site admin. Their deleted repositories are
+    /// purged at once; sessions, tokens, and collaborator grants go with the account; audit entries stay with
+    /// the actor cleared.
+    pub async fn delete_account(&self, user: &User, confirm: &str) -> CoreResult<()> {
+        if confirm.trim().to_ascii_lowercase() != user.handle {
+            return Err(CoreError::Invalid(format!(
+                "Type your handle, {}, to confirm.",
+                user.handle
+            )));
+        }
+        let owned: Vec<String> = db_repos::list_by_owner(self.db(), user.id)
+            .await?
+            .into_iter()
+            .map(|r| r.name)
+            .collect();
+        if !owned.is_empty() {
+            return Err(CoreError::Invalid(format!(
+                "Delete your repositories first: {}.",
+                owned.join(", ")
+            )));
+        }
+        if user.is_admin && users::count_active_admins_except(self.db(), user.id).await? == 0 {
+            return Err(CoreError::Invalid(
+                "You are the only site administrator; make another user an administrator first."
+                    .into(),
+            ));
+        }
+        self.purge_deleted_repos_of(user.id, Some(user.id)).await?;
+        // Recorded before the account goes: the foreign key then clears the actor and keeps the entry.
+        self.audit(
+            Some(user.id),
+            "account.delete",
+            &format!("user:{}", user.handle),
+            "",
+        )
+        .await?;
+        users::delete(self.db(), user.id).await?;
+        Ok(())
     }
 }
 
@@ -430,5 +472,92 @@ mod tests {
                 .as_deref(),
             Some("alice@example.com")
         );
+    }
+    #[tokio::test]
+    async fn accounts_go_only_without_repositories_and_never_the_last_admin() {
+        use crate::accounts::CreateUser;
+        use crate::permission::{Permission, Visibility};
+        use crate::repos::CreateRepo;
+        use crate::tokens::Scope;
+        let (core, _f) = test_core().await;
+        let root = core
+            .create_user(CreateUser {
+                handle: "root".into(),
+                is_admin: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let alice = user(&core, "alice").await;
+        let bob = user(&core, "bob").await;
+        let repo = |name: &str| CreateRepo {
+            name: name.into(),
+            description: String::new(),
+            visibility: Visibility::Public,
+            readme: false,
+        };
+        let kept = core.create_repo(&alice, repo("kept")).await.unwrap();
+        let gone = core.create_repo(&alice, repo("gone")).await.unwrap();
+        core.create_repo(&bob, repo("theirs")).await.unwrap();
+        core.set_collaborator(&bob, "bob", "theirs", "alice", Permission::Write)
+            .await
+            .unwrap();
+        core.delete_repo(&alice, "alice", "gone", "alice/gone")
+            .await
+            .unwrap();
+        core.create_token(&alice, "laptop", &[Scope::RepoRead], 30)
+            .await
+            .unwrap();
+        assert!(matches!(
+            core.delete_account(&alice, "bob").await,
+            Err(CoreError::Invalid(_))
+        ));
+        let refused = core.delete_account(&alice, "alice").await;
+        assert!(
+            matches!(&refused, Err(CoreError::Invalid(m)) if m.contains("kept")),
+            "{refused:?}"
+        );
+        let last_admin = core.delete_account(&root, "root").await;
+        assert!(
+            matches!(&last_admin, Err(CoreError::Invalid(m)) if m.contains("only site administrator")),
+            "{last_admin:?}"
+        );
+        core.delete_repo(&alice, "alice", "kept", "alice/kept")
+            .await
+            .unwrap();
+        core.delete_account(&alice, " ALICE ").await.unwrap();
+        assert!(core.user_by_handle("alice").await.unwrap().is_none());
+        for id in [kept.id, gone.id] {
+            assert!(
+                starforged_db::repos::by_id(core.db(), id)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "deleted repositories are purged at once"
+            );
+            assert!(!core.repo_path(id).exists());
+        }
+        assert!(
+            core.collaborators(&bob, "bob", "theirs")
+                .await
+                .unwrap()
+                .is_empty(),
+            "collaborator grants go with the account"
+        );
+        let tokens: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM access_tokens")
+            .fetch_one(core.db().pool())
+            .await
+            .unwrap();
+        assert_eq!(tokens, 0);
+        let entry = starforged_db::audit::recent(core.db(), 1)
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            (entry.action.as_str(), entry.target.as_str(), entry.actor_id),
+            ("account.delete", "user:alice", None),
+            "the entry survives with its actor cleared"
+        );
+        user(&core, "alice").await;
     }
 }

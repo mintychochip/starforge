@@ -101,6 +101,10 @@ fn page_routes() -> Router<AppState> {
             "/settings/repositories/{id}/restore",
             post(pages::settings::restore_repository),
         )
+        .route(
+            "/settings/delete",
+            get(pages::settings::delete_account_form).post(pages::settings::delete_account),
+        )
         .route("/{owner}", get(pages::owner::show))
         .route(
             "/{owner}/{repo}/settings",

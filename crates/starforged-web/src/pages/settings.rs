@@ -15,6 +15,7 @@ use starforged_core::sessions::WebSession;
 use crate::AppState;
 use crate::auth::{CsrfForm, RequireUser, SESSION_COOKIE, removal, verify_csrf};
 use crate::error::WebError;
+use crate::pages::message::MessagePage;
 use crate::views::{NavUser, format_time};
 
 pub async fn index() -> Redirect {
@@ -370,4 +371,66 @@ pub async fn restore_repository(
     verify_csrf(&session.csrf_token, &form.csrf)?;
     let repo = state.core.restore_repo(&session.user, id).await?;
     Ok(Redirect::to(&format!("/{}/{}", repo.owner, repo.name)).into_response())
+}
+
+#[derive(Template, WebTemplate)]
+#[template(path = "settings_delete.html")]
+pub struct DeleteAccountPage {
+    nav_user: Option<NavUser>,
+    csrf: String,
+    settings_tab: &'static str,
+    handle: String,
+    error: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct DeleteAccountForm {
+    #[serde(rename = "_csrf")]
+    csrf: String,
+    #[serde(default)]
+    confirm: String,
+}
+
+fn delete_account_page(session: &WebSession, error: Option<String>) -> DeleteAccountPage {
+    DeleteAccountPage {
+        nav_user: Some(NavUser::from_session(session)),
+        csrf: session.csrf_token.clone(),
+        settings_tab: "delete",
+        handle: session.user.handle.clone(),
+        error,
+    }
+}
+
+pub async fn delete_account_form(RequireUser(session): RequireUser) -> DeleteAccountPage {
+    delete_account_page(&session, None)
+}
+
+pub async fn delete_account(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    RequireUser(session): RequireUser,
+    Form(form): Form<DeleteAccountForm>,
+) -> Result<Response, WebError> {
+    verify_csrf(&session.csrf_token, &form.csrf)?;
+    match state
+        .core
+        .delete_account(&session.user, &form.confirm)
+        .await
+    {
+        Ok(()) => {
+            let page = MessagePage::new(
+                None,
+                "Account deleted",
+                "Your account and everything it owned are gone.",
+            )
+            .with_link("/", "Home");
+            Ok((jar.remove(removal(SESSION_COOKIE)), page).into_response())
+        }
+        Err(CoreError::Invalid(message)) => Ok((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            delete_account_page(&session, Some(message)),
+        )
+            .into_response()),
+        Err(other) => Err(other.into()),
+    }
 }
