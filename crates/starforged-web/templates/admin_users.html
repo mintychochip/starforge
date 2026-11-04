@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block title %}Users · Site administration{% endblock %}
+{% block content %}
+<h1>Site administration</h1>
+{% include "admin_nav.html" %}
+<section>
+  <h2>Users</h2>
+  <form method="get" action="/admin/users" class="stack">
+    <label>Search <input name="q" type="search" value="{{ query }}"></label>
+    <button type="submit">Search</button>
+  </form>
+  {% if users.is_empty() %}
+  <p>No users match.</p>
+  {% else %}
+  <table>
+    <thead>
+      <tr><th>Handle</th><th>Email</th><th>Admin</th><th>State</th><th></th></tr>
+    </thead>
+    <tbody>
+      {% for u in users %}
+      <tr>
+        <td><a href="/admin/users/{{ u.handle }}">{{ u.handle }}</a></td>
+        <td>{% if let Some(email) = u.email %}{{ email }}{% else %}none{% endif %}</td>
+        <td>{% if u.is_admin %}<span class="badge">admin</span>{% endif %}</td>
+        <td>{% if u.active %}active{% else %}suspended{% endif %}</td>
+        <td><a href="/admin/users/{{ u.handle }}">Manage</a></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+</section>
+{% endblock %}

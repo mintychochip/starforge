@@ -108,6 +108,8 @@ fn page_routes() -> Router<AppState> {
             get(pages::settings::delete_account_form).post(pages::settings::delete_account),
         )
         .route("/admin", get(pages::admin::overview))
+        .route("/admin/users", get(pages::admin::users))
+        .route("/admin/users/{handle}", get(pages::admin::user_detail))
         .route("/{owner}", get(pages::owner::show))
         .route(
             "/{owner}/{repo}/settings",

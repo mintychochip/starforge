@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+{% block title %}{{ summary.user.handle }} · Users · Site administration{% endblock %}
+{% block content %}
+<h1>Site administration</h1>
+{% include "admin_nav.html" %}
+<section>
+  <h2>{{ summary.user.handle }}</h2>
+  <dl>
+    <dt>Handle</dt><dd>{{ summary.user.handle }}</dd>
+    <dt>Display name</dt><dd>{{ summary.user.display_name }}</dd>
+    <dt>Email</dt><dd>{% if let Some(email) = summary.user.email %}{{ email }} {% if summary.user.email_verified %}verified{% else %}unverified{% endif %}{% else %}none{% endif %}</dd>
+    <dt>Admin</dt><dd>{% if summary.user.is_admin %}yes{% else %}no{% endif %}</dd>
+    <dt>State</dt><dd>{% if summary.user.active %}active{% else %}suspended{% endif %}</dd>
+    <dt>Repositories</dt><dd>{{ summary.repo_count }}</dd>
+  </dl>
+  {% if summary.user.active %}
+  <form method="post" action="/admin/users/{{ summary.user.handle }}/suspend" class="stack">
+    <input type="hidden" name="_csrf" value="{{ csrf }}">
+    <button type="submit">Suspend</button>
+  </form>
+  {% else %}
+  <form method="post" action="/admin/users/{{ summary.user.handle }}/unsuspend" class="stack">
+    <input type="hidden" name="_csrf" value="{{ csrf }}">
+    <button type="submit">Unsuspend</button>
+  </form>
+  {% endif %}
+  {% if summary.user.is_admin %}
+  <form method="post" action="/admin/users/{{ summary.user.handle }}/revoke" class="stack">
+    <input type="hidden" name="_csrf" value="{{ csrf }}">
+    <button type="submit">Revoke admin</button>
+  </form>
+  {% else %}
+  <form method="post" action="/admin/users/{{ summary.user.handle }}/grant" class="stack">
+    <input type="hidden" name="_csrf" value="{{ csrf }}">
+    <button type="submit">Grant admin</button>
+  </form>
+  {% endif %}
+  <form method="post" action="/admin/users/{{ summary.user.handle }}/delete" class="stack">
+    <input type="hidden" name="_csrf" value="{{ csrf }}">
+    <label>Type the handle to confirm deletion <input name="confirm" autocomplete="off" placeholder="{{ summary.user.handle }}"></label>
+    <button type="submit">Delete</button>
+  </form>
+  <form method="post" action="/admin/users/{{ summary.user.handle }}/reset-password" class="stack">
+    <input type="hidden" name="_csrf" value="{{ csrf }}">
+    <button type="submit">Send password reset</button>
+  </form>
+</section>
+{% endblock %}
