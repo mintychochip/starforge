@@ -1,0 +1,49 @@
+/// Resume cursor for one native session.
+///
+/// For JSONL-file agents `offset` is bytes consumed and `lines` is records
+/// consumed; for OpenCode `offset` is the last SQLite `rowid` consumed and
+/// `lines` is rows consumed. Never wall-clock, never mtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct Cursor {
+    pub offset: u64,
+    pub lines: u64,
+}
+
+impl Cursor {
+    pub fn start() -> Self {
+        Self {
+            offset: 0,
+            lines: 0,
+        }
+    }
+
+    /// Next `seq` to assign: resume never reuses or skips a `seq`.
+    pub fn next_seq(&self) -> u64 {
+        self.lines
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cursor_start_and_round_trip() {
+        let c = Cursor::start();
+        assert_eq!(c.next_seq(), 0);
+        let s = serde_json::to_string(&c).unwrap();
+        assert_eq!(serde_json::from_str::<Cursor>(&s).unwrap(), c);
+    }
+
+    #[test]
+    fn cursor_next_seq_continues() {
+        assert_eq!(
+            Cursor {
+                offset: 9,
+                lines: 4
+            }
+            .next_seq(),
+            4
+        );
+    }
+}

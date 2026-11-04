@@ -1,0 +1,22 @@
+[package]
+name = "starforge-capture"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "MIT OR Apache-2.0"
+publish = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+starforge-format = { path = "../starforge-format" }
+thiserror.workspace = true
+time.workspace = true
+ulid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
