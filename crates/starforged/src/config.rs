@@ -125,6 +125,15 @@ pub struct SessionsConfig {
     /// Rejects session segment bodies larger than this (spec §6.3).
     #[serde(default = "default_max_segment_bytes")]
     pub max_segment_bytes: u64,
+    /// Rejects segment uploads past this per-repository stored total (spec §7.7).
+    #[serde(default = "default_max_repo_bytes")]
+    pub max_repo_bytes: u64,
+    /// Rejects segment uploads past this per-uploader stored total (spec §7.7).
+    #[serde(default = "default_max_user_bytes")]
+    pub max_user_bytes: u64,
+    /// Rejects segment uploads past this per-uploader rolling-hour volume (spec §7.7).
+    #[serde(default = "default_max_hourly_bytes")]
+    pub max_hourly_bytes: u64,
 }
 
 fn default_blob_dir() -> PathBuf {
@@ -135,11 +144,26 @@ fn default_max_segment_bytes() -> u64 {
     starforged_core::DEFAULT_MAX_SEGMENT_BYTES
 }
 
+fn default_max_repo_bytes() -> u64 {
+    starforged_core::DEFAULT_MAX_REPO_BYTES
+}
+
+fn default_max_user_bytes() -> u64 {
+    starforged_core::DEFAULT_MAX_USER_BYTES
+}
+
+fn default_max_hourly_bytes() -> u64 {
+    starforged_core::DEFAULT_MAX_HOURLY_BYTES
+}
+
 impl Default for SessionsConfig {
     fn default() -> Self {
         SessionsConfig {
             blob_dir: default_blob_dir(),
             max_segment_bytes: default_max_segment_bytes(),
+            max_repo_bytes: default_max_repo_bytes(),
+            max_user_bytes: default_max_user_bytes(),
+            max_hourly_bytes: default_max_hourly_bytes(),
         }
     }
 }
@@ -186,6 +210,21 @@ impl Config {
                 "sessions__blob_dir" => self.sessions.blob_dir = PathBuf::from(value),
                 "sessions__max_segment_bytes" => {
                     self.sessions.max_segment_bytes = value
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("{key} must be a non-negative byte count"))?;
+                }
+                "sessions__max_repo_bytes" => {
+                    self.sessions.max_repo_bytes = value
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("{key} must be a non-negative byte count"))?;
+                }
+                "sessions__max_user_bytes" => {
+                    self.sessions.max_user_bytes = value
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("{key} must be a non-negative byte count"))?;
+                }
+                "sessions__max_hourly_bytes" => {
+                    self.sessions.max_hourly_bytes = value
                         .parse()
                         .map_err(|_| anyhow::anyhow!("{key} must be a non-negative byte count"))?;
                 }
@@ -479,6 +518,22 @@ mod tests {
             starforged_core::DEFAULT_MAX_SEGMENT_BYTES
         );
         assert_eq!(starforged_core::DEFAULT_MAX_SEGMENT_BYTES, 16 * 1024 * 1024);
+        // Quota defaults (spec §7.7): 20 GiB/repo, 5 GiB/user, 500 MiB/user/hour.
+        assert_eq!(without.sessions.max_repo_bytes, 20 * 1024 * 1024 * 1024);
+        assert_eq!(without.sessions.max_user_bytes, 5 * 1024 * 1024 * 1024);
+        assert_eq!(without.sessions.max_hourly_bytes, 500 * 1024 * 1024);
+        assert_eq!(
+            without.sessions.max_repo_bytes,
+            starforged_core::DEFAULT_MAX_REPO_BYTES
+        );
+        assert_eq!(
+            without.sessions.max_user_bytes,
+            starforged_core::DEFAULT_MAX_USER_BYTES
+        );
+        assert_eq!(
+            without.sessions.max_hourly_bytes,
+            starforged_core::DEFAULT_MAX_HOURLY_BYTES
+        );
         assert!(without.validate().is_ok());
 
         // Explicit values parse and validate.
@@ -490,6 +545,24 @@ mod tests {
         assert_eq!(explicit.sessions.blob_dir, PathBuf::from("/var/lib/blobs"));
         assert_eq!(explicit.sessions.max_segment_bytes, 1024);
         assert!(explicit.validate().is_ok());
+
+        // Quota fields parse from TOML and environment.
+        let quotas: Config = toml::from_str(&format!(
+            "{bare}[sessions]\nmax_repo_bytes = 1\nmax_user_bytes = 2\nmax_hourly_bytes = 3\n",
+            bare = bare_toml()
+        ))
+        .unwrap();
+        assert_eq!(quotas.sessions.max_repo_bytes, 1);
+        assert_eq!(quotas.sessions.max_user_bytes, 2);
+        assert_eq!(quotas.sessions.max_hourly_bytes, 3);
+        let mut config = sample();
+        config
+            .apply_env([(
+                "STARFORGE__SESSIONS__MAX_REPO_BYTES".to_owned(),
+                "4096".to_owned(),
+            )])
+            .unwrap();
+        assert_eq!(config.sessions.max_repo_bytes, 4096);
 
         // Environment overrides apply, including rejection of a bad byte count.
         let mut config = sample();

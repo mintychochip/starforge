@@ -13,6 +13,7 @@ pub enum ApiError {
     NotFound,
     Invalid(String),
     Conflict(String),
+    PayloadTooLarge(String),
     Internal(String),
 }
 
@@ -42,6 +43,9 @@ impl IntoResponse for ApiError {
             ApiError::NotFound => (StatusCode::NOT_FOUND, "not_found", "not found".to_owned()),
             ApiError::Invalid(message) => (StatusCode::UNPROCESSABLE_ENTITY, "invalid", message),
             ApiError::Conflict(message) => (StatusCode::CONFLICT, "conflict", message),
+            ApiError::PayloadTooLarge(message) => {
+                (StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large", message)
+            }
             ApiError::Internal(message) => {
                 tracing::error!(error = %message, "api request failed");
                 (

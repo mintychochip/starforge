@@ -4,6 +4,7 @@ pub mod auth;
 pub mod error;
 mod moved;
 mod repos;
+mod sessions;
 mod user;
 
 use std::sync::Arc;
@@ -37,6 +38,22 @@ pub fn router(core: Core, base_url: String) -> Router {
         .route(
             "/repos/{owner}/{repo}/collaborators/{handle}",
             put(repos::set_collaborator).delete(repos::remove_collaborator),
+        )
+        .route(
+            "/repos/{owner}/{repo}/sessions/{ulid}",
+            put(sessions::put_meta),
+        )
+        .route(
+            "/repos/{owner}/{repo}/sessions/{ulid}/segments/{n}",
+            put(sessions::put_segment).route_layer(axum::extract::DefaultBodyLimit::disable()),
+        )
+        .route(
+            "/repos/{owner}/{repo}/sessions/{ulid}/complete",
+            post(sessions::post_complete),
+        )
+        .route(
+            "/repos/{owner}/{repo}/sessions/{ulid}/links",
+            post(sessions::post_links),
         )
         .fallback(|| async { ApiError::NotFound })
         .layer(axum::middleware::from_fn_with_state(

@@ -26,6 +26,9 @@ pub async fn open_core(config: &Config, hook_exe: PathBuf) -> anyhow::Result<Cor
             tmp_dir: config.tmp_dir(),
             blob_dir: config.sessions.blob_dir.clone(),
             max_segment_bytes: config.sessions.max_segment_bytes,
+            max_repo_bytes: config.sessions.max_repo_bytes,
+            max_user_bytes: config.sessions.max_user_bytes,
+            max_hourly_bytes: config.sessions.max_hourly_bytes,
             blob_store: Arc::new(starforged_blob::FsBlobStore::new(
                 config.sessions.blob_dir.clone(),
             )),

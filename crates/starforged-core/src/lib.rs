@@ -9,11 +9,13 @@ pub mod content;
 pub mod crypto;
 pub mod email_tokens;
 pub mod error;
+pub mod ingest;
 pub mod invites;
 pub mod jobs;
 pub mod mail;
 pub mod passwords;
 pub mod permission;
+pub mod quota;
 pub mod registration;
 pub mod repos;
 pub mod sessions;
@@ -30,6 +32,12 @@ pub use error::{CoreError, CoreResult};
 
 /// Default cap for one uploaded session segment body (spec §6.3).
 pub const DEFAULT_MAX_SEGMENT_BYTES: u64 = 16 * 1024 * 1024;
+/// Default cap for total segment bytes stored for one repository (spec §7.7).
+pub const DEFAULT_MAX_REPO_BYTES: u64 = 20 * 1024 * 1024 * 1024;
+/// Default cap for total segment bytes stored for one uploader (spec §7.7).
+pub const DEFAULT_MAX_USER_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+/// Default cap for segment bytes one uploader may add per rolling hour (spec §7.7).
+pub const DEFAULT_MAX_HOURLY_BYTES: u64 = 500 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct CoreConfig {
@@ -42,6 +50,12 @@ pub struct CoreConfig {
     pub blob_dir: PathBuf,
     /// Rejects segment bodies larger than this (spec §6.3).
     pub max_segment_bytes: u64,
+    /// Rejects segment uploads past this per-repository stored total (spec §7.7).
+    pub max_repo_bytes: u64,
+    /// Rejects segment uploads past this per-uploader stored total (spec §7.7).
+    pub max_user_bytes: u64,
+    /// Rejects segment uploads past this per-uploader rolling-hour volume (spec §7.7).
+    pub max_hourly_bytes: u64,
     /// Content-addressed store behind segment/raw bytes; `FsBlobStore` on `blob_dir` in production.
     pub blob_store: std::sync::Arc<dyn starforged_blob::BlobStore>,
     /// Program that repository hooks execute (`starforged`); tests point it at the built binary.
@@ -137,6 +151,9 @@ pub(crate) mod testing {
             blob_store: std::sync::Arc::new(starforged_blob::FsBlobStore::new(blob_dir.clone())),
             blob_dir,
             max_segment_bytes: DEFAULT_MAX_SEGMENT_BYTES,
+            max_repo_bytes: DEFAULT_MAX_REPO_BYTES,
+            max_user_bytes: DEFAULT_MAX_USER_BYTES,
+            max_hourly_bytes: DEFAULT_MAX_HOURLY_BYTES,
             hook_exe: PathBuf::from("/bin/false"),
             base_url: "http://forge.test".into(),
             mailer: None,
