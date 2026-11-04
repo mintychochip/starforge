@@ -22,6 +22,7 @@ pub async fn open_core(config: &Config, hook_exe: PathBuf) -> anyhow::Result<Cor
         db,
         CoreConfig {
             repos_dir: config.repos_dir(),
+            tmp_dir: config.tmp_dir(),
             hook_exe,
             base_url: config.server.base_url.clone(),
             mailer: config.mailer()?,

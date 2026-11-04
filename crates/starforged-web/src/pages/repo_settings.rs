@@ -155,6 +155,40 @@ pub async fn unarchive(
     finish(&state, &session, &owner, &repo, result).await
 }
 
+#[derive(Deserialize)]
+pub struct DeleteForm {
+    #[serde(rename = "_csrf")]
+    csrf: String,
+    #[serde(default)]
+    confirm: String,
+}
+
+/// After deleting, owners land on Settings → Repositories (where Restore is); site admins deleting someone
+/// else's repository land on the owner's page.
+pub async fn delete(
+    State(state): State<AppState>,
+    RequireUser(session): RequireUser,
+    Path((owner, repo)): Path<(String, String)>,
+    Form(form): Form<DeleteForm>,
+) -> Result<Response, WebError> {
+    verify_csrf(&session.csrf_token, &form.csrf)?;
+    match state
+        .core
+        .delete_repo(&session.user, &owner, &repo, &form.confirm)
+        .await
+    {
+        Ok(deleted) => {
+            let next = if deleted.owner_id == session.user.id {
+                "/settings/repositories".to_owned()
+            } else {
+                format!("/{}", deleted.owner)
+            };
+            Ok(Redirect::to(&next).into_response())
+        }
+        Err(err) => finish(&state, &session, &owner, &repo, Err(err)).await,
+    }
+}
+
 /// After a settings action: back to the settings page under the repository's current name, or this page
 /// again with the message when the input was refused.
 pub(crate) async fn finish(

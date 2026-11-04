@@ -31,6 +31,9 @@ pub use error::{CoreError, CoreResult};
 pub struct CoreConfig {
     /// Directory holding bare repositories (`<data_dir>/repos`).
     pub repos_dir: PathBuf,
+    /// Scratch space on the same filesystem as `repos_dir` (`<data_dir>/tmp`); purged repositories pass
+    /// through it.
+    pub tmp_dir: PathBuf,
     /// Program that repository hooks execute (`starforged`); tests point it at the built binary.
     pub hook_exe: PathBuf,
     /// Public URL without a trailing slash; links in emails start with it.
@@ -119,6 +122,7 @@ pub(crate) mod testing {
         let dir = tempfile::tempdir().unwrap();
         let mut config = CoreConfig {
             repos_dir: dir.path().join("repos"),
+            tmp_dir: dir.path().join("tmp"),
             hook_exe: PathBuf::from("/bin/false"),
             base_url: "http://forge.test".into(),
             mailer: None,

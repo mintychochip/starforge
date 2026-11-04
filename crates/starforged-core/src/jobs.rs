@@ -39,6 +39,8 @@ pub enum Job {
     HourlyCleanup,
     /// Daily: deletes `done` jobs after 7 days and `failed` jobs after 30.
     DailyPrune,
+    /// Daily: purges repositories deleted more than 7 days ago (forge-basics design §5.5).
+    PurgeDeletedRepos,
     /// One email. The worker blanks `body` once it is sent: links in it carry secrets.
     SendEmail {
         to: String,
@@ -53,6 +55,7 @@ impl Job {
         match self {
             Job::HourlyCleanup => "hourly_cleanup",
             Job::DailyPrune => "daily_prune",
+            Job::PurgeDeletedRepos => "purge_deleted_repos",
             Job::SendEmail { .. } => "send_email",
         }
     }
@@ -63,6 +66,7 @@ impl Job {
         match self {
             Job::HourlyCleanup => Some(HOUR),
             Job::DailyPrune => Some(DAY),
+            Job::PurgeDeletedRepos => Some(DAY),
             Job::SendEmail { .. } => None,
         }
     }
@@ -150,6 +154,7 @@ impl Core {
                 jobs::prune(self.db(), ts - 7 * DAY, ts - 30 * DAY).await?;
                 Ok(())
             }
+            Job::PurgeDeletedRepos => self.purge_deleted_repos().await.map(|_| ()),
             Job::SendEmail { to, subject, body } => {
                 let mailer = self
                     .config()
@@ -216,7 +221,7 @@ impl Core {
 
 /// Queues the recurring jobs (when none is pending) and starts `count` workers on the current runtime.
 pub async fn start_workers(core: &Core, count: usize) -> CoreResult<()> {
-    for job in [Job::HourlyCleanup, Job::DailyPrune] {
+    for job in [Job::HourlyCleanup, Job::DailyPrune, Job::PurgeDeletedRepos] {
         core.enqueue(&job).await?;
     }
     for _ in 0..count {
@@ -234,7 +239,7 @@ mod tests {
 
     #[test]
     fn payloads_are_tagged_with_the_kind() {
-        for job in [Job::HourlyCleanup, Job::DailyPrune] {
+        for job in [Job::HourlyCleanup, Job::DailyPrune, Job::PurgeDeletedRepos] {
             let json = serde_json::to_string(&job).unwrap();
             assert_eq!(json, format!(r#"{{"kind":"{}"}}"#, job.kind()));
             assert_eq!(serde_json::from_str::<Job>(&json).unwrap(), job);
@@ -364,12 +369,12 @@ mod tests {
                 .fetch_one(core.db().pool())
                 .await
                 .unwrap();
-            if done == 2 {
+            if done == 3 {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(30)).await;
         }
-        panic!("the workers did not run the two recurring jobs");
+        panic!("the three recurring jobs");
     }
 
     #[tokio::test]

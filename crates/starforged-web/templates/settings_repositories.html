@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block title %}Repositories · Settings · Starforge{% endblock %}
+{% block content %}
+{% include "settings_nav.html" %}
+<h1>Deleted repositories</h1>
+{% if deleted.is_empty() %}
+<p class="muted">You have no deleted repositories. A repository you delete can be restored here for 7 days.</p>
+{% else %}
+<table class="list">
+<thead><tr><th>Repository</th><th>Deleted</th><th>Removed for good after</th><th></th></tr></thead>
+<tbody>
+{% for r in deleted %}
+<tr><td>{{ handle }}/{{ r.name }}</td><td>{{ r.deleted }}</td><td>{{ r.purge_after }}</td>
+<td><form method="post" action="/settings/repositories/{{ r.id }}/restore" class="inline"><input type="hidden" name="_csrf" value="{{ csrf }}"><button type="submit">Restore</button></form></td></tr>
+{% endfor %}
+</tbody>
+</table>
+{% endif %}
+{% endblock %}

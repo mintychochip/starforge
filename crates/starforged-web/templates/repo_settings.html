@@ -47,5 +47,12 @@
   <button type="submit">Archive this repository</button>
 </form>
 {% endif %}
+<h2>Delete</h2>
+<form method="post" action="/{{ head.owner }}/{{ head.name }}/settings/delete" class="stack">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <p>The repository disappears at once and is removed for good after 7 days. Until then its owner can restore it from <strong>Settings → Repositories</strong>.</p>
+  <label>Type <code>{{ head.owner }}/{{ head.name }}</code> to confirm <input name="confirm" required autocomplete="off"></label>
+  <button type="submit">Delete this repository</button>
+</form>
 {% endif %}
 {% endblock %}

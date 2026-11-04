@@ -317,3 +317,57 @@ pub async fn revoke_other_sessions(
         .await?;
     Ok(Redirect::to("/settings/sessions"))
 }
+
+pub struct DeletedRow {
+    id: i64,
+    name: String,
+    deleted: String,
+    purge_after: String,
+}
+
+#[derive(Template, WebTemplate)]
+#[template(path = "settings_repositories.html")]
+pub struct RepositoriesPage {
+    nav_user: Option<NavUser>,
+    csrf: String,
+    settings_tab: &'static str,
+    handle: String,
+    deleted: Vec<DeletedRow>,
+}
+
+/// `/settings/repositories`: the user's deleted repositories that can still be restored.
+pub async fn repositories(
+    State(state): State<AppState>,
+    RequireUser(session): RequireUser,
+) -> Result<RepositoriesPage, WebError> {
+    let deleted = state
+        .core
+        .deleted_repos(&session.user)
+        .await?
+        .into_iter()
+        .map(|d| DeletedRow {
+            id: d.id,
+            name: d.name,
+            deleted: format_time(d.deleted_at),
+            purge_after: format_time(d.purge_after),
+        })
+        .collect();
+    Ok(RepositoriesPage {
+        nav_user: Some(NavUser::from_session(&session)),
+        csrf: session.csrf_token.clone(),
+        settings_tab: "repositories",
+        handle: session.user.handle.clone(),
+        deleted,
+    })
+}
+
+pub async fn restore_repository(
+    State(state): State<AppState>,
+    RequireUser(session): RequireUser,
+    Path(id): Path<i64>,
+    Form(form): Form<CsrfForm>,
+) -> Result<Response, WebError> {
+    verify_csrf(&session.csrf_token, &form.csrf)?;
+    let repo = state.core.restore_repo(&session.user, id).await?;
+    Ok(Redirect::to(&format!("/{}/{}", repo.owner, repo.name)).into_response())
+}

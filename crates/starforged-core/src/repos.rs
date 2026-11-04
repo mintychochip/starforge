@@ -23,6 +23,9 @@ pub struct Repo {
     pub default_branch: String,
     /// When the repository was archived; an archived repository refuses pushes (forge-basics design §5.4).
     pub archived_at: Option<i64>,
+    /// When the repository was deleted; a deleted repository answers like a missing one until it is restored
+    /// or purged (forge-basics design §5.5).
+    pub deleted_at: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -68,6 +71,7 @@ fn to_repo(row: RepoRow) -> CoreResult<Repo> {
         visibility,
         default_branch: row.default_branch,
         archived_at: row.archived_at,
+        deleted_at: row.deleted_at,
         created_at: row.created_at,
         updated_at: row.updated_at,
     })
@@ -83,6 +87,19 @@ fn viewer(user: Option<&User>) -> Option<Viewer> {
 
 /// Longest repository description, in characters.
 const MAX_DESCRIPTION_CHARS: usize = 350;
+
+/// How long a deleted repository can be restored; the daily job purges it afterwards.
+pub const RESTORE_SECS: i64 = 7 * 86_400;
+
+/// A deleted repository that its owner can still restore.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeletedRepo {
+    pub id: i64,
+    pub name: String,
+    pub deleted_at: i64,
+    /// After this time the daily job removes it for good.
+    pub purge_after: i64,
+}
 
 /// Trims a description and checks its length.
 fn checked_description(input: &str) -> CoreResult<String> {
@@ -123,13 +140,13 @@ impl Core {
             visibility: input.visibility.as_str(),
             default_branch: "main",
         };
-        let id = db_repos::insert(self.db(), &new).await.map_err(|e| {
-            if e.is_unique_violation() {
-                CoreError::Conflict(format!("{}/{name} already exists", actor.handle))
-            } else {
-                e.into()
+        let id = match db_repos::insert(self.db(), &new).await {
+            Ok(id) => id,
+            Err(e) if e.is_unique_violation() => {
+                return Err(self.name_taken(actor.id, &actor.handle, &name).await);
             }
-        })?;
+            Err(e) => return Err(e.into()),
+        };
         let path = self.repo_path(id);
         if let Err(err) = self
             .initialize(actor, &path, &name, &description, input.readme)
@@ -467,15 +484,13 @@ impl Core {
         if new_name == old.name {
             return Ok(old);
         }
-        db_repos::rename(self.db(), old.id, &new_name)
-            .await
-            .map_err(|e| {
-                if e.is_unique_violation() {
-                    CoreError::Conflict(format!("{}/{new_name} already exists", old.owner))
-                } else {
-                    e.into()
-                }
-            })?;
+        if let Err(e) = db_repos::rename(self.db(), old.id, &new_name).await {
+            return Err(if e.is_unique_violation() {
+                self.name_taken(old.owner_id, &old.owner, &new_name).await
+            } else {
+                e.into()
+            });
+        }
         let repo = self.reload_repo(old.id).await?;
         self.audit(
             Some(actor.id),
@@ -554,6 +569,9 @@ impl Core {
             return Ok(None);
         };
         let repo = to_repo(row)?;
+        if repo.deleted_at.is_some() {
+            return Ok(None);
+        }
         Ok(self.permission_on(&repo, user).await?.map(|_| repo))
     }
 
@@ -565,12 +583,149 @@ impl Core {
                 .ok_or(CoreError::NotFound)?,
         )
     }
+
+    /// The error for a name already used in `owner`'s namespace. A deleted repository keeps its name until it
+    /// is purged, and the message says so.
+    async fn name_taken(&self, owner_id: i64, owner: &str, name: &str) -> CoreError {
+        match db_repos::deleted_name_exists(self.db(), owner_id, name).await {
+            Ok(true) => CoreError::Conflict(format!(
+                "{owner}/{name} already exists as a deleted repository; restore it, or use the name after it is removed for good"
+            )),
+            Ok(false) => CoreError::Conflict(format!("{owner}/{name} already exists")),
+            Err(err) => err.into(),
+        }
+    }
+
+    /// Admins: deletes the repository once `confirm` is `owner/name`. It answers 404 everywhere at once, keeps
+    /// its name, and can be restored for [`RESTORE_SECS`] (forge-basics design §5.5).
+    pub async fn delete_repo(
+        &self,
+        actor: &User,
+        owner: &str,
+        name: &str,
+        confirm: &str,
+    ) -> CoreResult<Repo> {
+        let access = self
+            .require_repo(Some(actor), owner, name, Permission::Admin)
+            .await?;
+        let full_name = access.repo.full_name();
+        if confirm.trim() != full_name {
+            return Err(CoreError::Invalid(format!("Type {full_name} to confirm.")));
+        }
+        db_repos::set_deleted(self.db(), access.repo.id, Some(now())).await?;
+        self.audit(
+            Some(actor.id),
+            "repo.delete",
+            &format!("repo:{full_name}"),
+            "",
+        )
+        .await?;
+        self.reload_repo(access.repo.id).await
+    }
+
+    /// The user's own deleted repositories that can still be restored, the most recently deleted first.
+    pub async fn deleted_repos(&self, user: &User) -> CoreResult<Vec<DeletedRepo>> {
+        let cutoff = now() - RESTORE_SECS;
+        let mut deleted = Vec::new();
+        for row in db_repos::list_deleted_by_owner(self.db(), user.id).await? {
+            if let Some(deleted_at) = row.deleted_at
+                && deleted_at > cutoff
+            {
+                deleted.push(DeletedRepo {
+                    id: row.id,
+                    name: row.name,
+                    deleted_at,
+                    purge_after: deleted_at + RESTORE_SECS,
+                });
+            }
+        }
+        Ok(deleted)
+    }
+
+    /// Restores a deleted repository within [`RESTORE_SECS`]; its owner or a site admin may. Anyone else, and a
+    /// repository that is not deleted or is past the window, gets `NotFound`.
+    pub async fn restore_repo(&self, actor: &User, repo_id: i64) -> CoreResult<Repo> {
+        let repo = to_repo(
+            db_repos::by_id(self.db(), repo_id)
+                .await?
+                .ok_or(CoreError::NotFound)?,
+        )?;
+        let allowed = actor.active && (actor.id == repo.owner_id || actor.is_admin);
+        let restorable = repo.deleted_at.is_some_and(|at| at > now() - RESTORE_SECS);
+        if !allowed || !restorable {
+            return Err(CoreError::NotFound);
+        }
+        db_repos::set_deleted(self.db(), repo.id, None).await?;
+        self.audit(
+            Some(actor.id),
+            "repo.restore",
+            &format!("repo:{}", repo.full_name()),
+            "",
+        )
+        .await?;
+        self.reload_repo(repo.id).await
+    }
+
+    /// The daily job: purges repositories deleted more than [`RESTORE_SECS`] ago; returns how many.
+    pub async fn purge_deleted_repos(&self) -> CoreResult<usize> {
+        let rows = db_repos::deleted_before(self.db(), now() - RESTORE_SECS).await?;
+        let count = rows.len();
+        for row in rows {
+            self.purge_repo(&to_repo(row)?, None).await?;
+        }
+        Ok(count)
+    }
+
+    /// Removes a deleted repository for good: the directory moves to `<tmp_dir>/purge-<id>.git`, the rows go
+    /// (collaborators and redirects cascade), then the directory is removed. Every step is safe to repeat
+    /// after a crash.
+    pub(crate) async fn purge_repo(&self, repo: &Repo, actor_id: Option<i64>) -> CoreResult<()> {
+        let path = self.repo_path(repo.id);
+        let tmp = &self.config().tmp_dir;
+        let parked = tmp.join(format!("purge-{}.git", repo.id));
+        let failed = |step: &str, err: std::io::Error| {
+            CoreError::Internal(format!("purging {}: {step}: {err}", repo.full_name()))
+        };
+        if tokio::fs::try_exists(&path)
+            .await
+            .map_err(|e| failed("checking the directory", e))?
+        {
+            tokio::fs::create_dir_all(tmp)
+                .await
+                .map_err(|e| failed("creating the tmp directory", e))?;
+            if tokio::fs::try_exists(&parked)
+                .await
+                .map_err(|e| failed("checking the tmp directory", e))?
+            {
+                tokio::fs::remove_dir_all(&parked)
+                    .await
+                    .map_err(|e| failed("clearing an earlier attempt", e))?;
+            }
+            tokio::fs::rename(&path, &parked)
+                .await
+                .map_err(|e| failed("parking the directory", e))?;
+        }
+        db_repos::delete(self.db(), repo.id).await?;
+        match tokio::fs::remove_dir_all(&parked).await {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(failed("removing the directory", err)),
+        }
+        self.audit(
+            actor_id,
+            "repo.purge",
+            &format!("repo:{}", repo.full_name()),
+            "",
+        )
+        .await
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::accounts::CreateUser;
+    use crate::jobs::Job;
     use crate::testing::{seed_branches, test_core, user};
 
     fn new(name: &str, visibility: Visibility) -> CreateRepo {
@@ -1057,5 +1212,221 @@ mod tests {
             .filter(|a| a.ends_with("archive"))
             .collect();
         assert_eq!(actions, vec!["repo.unarchive", "repo.archive"]);
+    }
+
+    #[tokio::test]
+    async fn deleted_repositories_vanish_keep_their_name_and_can_be_restored() {
+        let (core, _f) = test_core().await;
+        let alice = user(&core, "alice").await;
+        let bob = user(&core, "bob").await;
+        let repo = core
+            .create_repo(&alice, new("proj", Visibility::Public))
+            .await
+            .unwrap();
+        core.set_collaborator(&alice, "alice", "proj", "bob", Permission::Admin)
+            .await
+            .unwrap();
+        assert!(matches!(
+            core.delete_repo(&alice, "alice", "proj", "alice/other")
+                .await,
+            Err(CoreError::Invalid(_))
+        ));
+        let deleted = core
+            .delete_repo(&bob, "alice", "proj", " alice/proj ")
+            .await
+            .unwrap();
+        assert!(
+            deleted.deleted_at.is_some(),
+            "an admin collaborator may delete"
+        );
+        for viewer in [Some(&alice), Some(&bob), None] {
+            assert!(matches!(
+                core.repo_for(viewer, "alice", "proj").await,
+                Err(CoreError::NotFound)
+            ));
+        }
+        assert!(
+            core.repos_of(Some(&alice), "alice")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(core.dashboard_repos(&bob).await.unwrap().is_empty());
+        assert!(
+            core.repo_path(repo.id).exists(),
+            "the data stays until the purge"
+        );
+        let taken = core
+            .create_repo(&alice, new("PROJ", Visibility::Public))
+            .await;
+        assert!(
+            matches!(&taken, Err(CoreError::Conflict(m)) if m.contains("deleted")),
+            "{taken:?}"
+        );
+        let listed: Vec<String> = core
+            .deleted_repos(&alice)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
+        assert_eq!(listed, vec!["proj"]);
+        assert!(
+            core.deleted_repos(&bob).await.unwrap().is_empty(),
+            "the list shows the user's own repositories"
+        );
+        assert!(
+            matches!(
+                core.restore_repo(&bob, repo.id).await,
+                Err(CoreError::NotFound)
+            ),
+            "only the owner or a site admin restores"
+        );
+        let restored = core.restore_repo(&alice, repo.id).await.unwrap();
+        assert_eq!(restored.deleted_at, None);
+        assert_eq!(
+            core.repo_for(Some(&bob), "alice", "proj")
+                .await
+                .unwrap()
+                .permission,
+            Permission::Admin,
+            "collaborators come back with the repository"
+        );
+        let actions: Vec<String> = starforged_db::audit::recent(core.db(), 20)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.action)
+            .collect();
+        assert!(actions.contains(&"repo.delete".to_owned()));
+        assert!(actions.contains(&"repo.restore".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn the_daily_purge_removes_week_old_deletions() {
+        let (core, _f) = test_core().await;
+        let alice = user(&core, "alice").await;
+        let old = core
+            .create_repo(&alice, new("old", Visibility::Public))
+            .await
+            .unwrap();
+        let recent = core
+            .create_repo(&alice, new("recent", Visibility::Public))
+            .await
+            .unwrap();
+        core.delete_repo(&alice, "alice", "old", "alice/old")
+            .await
+            .unwrap();
+        core.delete_repo(&alice, "alice", "recent", "alice/recent")
+            .await
+            .unwrap();
+        sqlx::query("UPDATE repos SET deleted_at = $1 WHERE id = $2")
+            .bind(now() - 8 * 86_400)
+            .bind(old.id)
+            .execute(core.db().pool())
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                core.restore_repo(&alice, old.id).await,
+                Err(CoreError::NotFound)
+            ),
+            "past the restore window"
+        );
+        let listed: Vec<String> = core
+            .deleted_repos(&alice)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
+        assert_eq!(listed, vec!["recent"]);
+        core.enqueue(&Job::PurgeDeletedRepos).await.unwrap();
+        core.run_due_jobs().await.unwrap();
+        assert!(
+            starforged_db::repos::by_id(core.db(), old.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(!core.repo_path(old.id).exists());
+        assert!(
+            !core
+                .config()
+                .tmp_dir
+                .join(format!("purge-{}.git", old.id))
+                .exists()
+        );
+        assert!(
+            starforged_db::repos::by_id(core.db(), recent.id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(core.repo_path(recent.id).exists());
+        let purged = starforged_db::audit::recent(core.db(), 20)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|e| e.action == "repo.purge")
+            .unwrap();
+        assert_eq!(
+            (purged.target.as_str(), purged.actor_id),
+            ("repo:alice/old", None)
+        );
+        core.create_repo(&alice, new("old", Visibility::Public))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_purge_interrupted_after_parking_the_directory_finishes() {
+        let (core, _f) = test_core().await;
+        let alice = user(&core, "alice").await;
+        let repo = core
+            .create_repo(&alice, new("proj", Visibility::Public))
+            .await
+            .unwrap();
+        core.delete_repo(&alice, "alice", "proj", "alice/proj")
+            .await
+            .unwrap();
+        sqlx::query("UPDATE repos SET deleted_at = $1 WHERE id = $2")
+            .bind(now() - 8 * 86_400)
+            .bind(repo.id)
+            .execute(core.db().pool())
+            .await
+            .unwrap();
+        let parked = core.config().tmp_dir.join(format!("purge-{}.git", repo.id));
+        std::fs::create_dir_all(&core.config().tmp_dir).unwrap();
+        std::fs::rename(core.repo_path(repo.id), &parked).unwrap();
+        assert_eq!(core.purge_deleted_repos().await.unwrap(), 1);
+        assert!(!parked.exists());
+        assert!(
+            starforged_db::repos::by_id(core.db(), repo.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn old_names_of_deleted_repositories_lead_nowhere() {
+        let (core, _f) = test_core().await;
+        let alice = user(&core, "alice").await;
+        core.create_repo(&alice, new("proj", Visibility::Public))
+            .await
+            .unwrap();
+        core.rename_repo(&alice, "alice", "proj", "renamed")
+            .await
+            .unwrap();
+        core.delete_repo(&alice, "alice", "renamed", "alice/renamed")
+            .await
+            .unwrap();
+        assert!(
+            core.moved_repo(Some(&alice), "alice", "proj")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }

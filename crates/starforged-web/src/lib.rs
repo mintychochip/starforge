@@ -96,6 +96,11 @@ fn page_routes() -> Router<AppState> {
             get(pages::tokens::list).post(pages::tokens::create),
         )
         .route("/settings/tokens/{id}/revoke", post(pages::tokens::revoke))
+        .route("/settings/repositories", get(pages::settings::repositories))
+        .route(
+            "/settings/repositories/{id}/restore",
+            post(pages::settings::restore_repository),
+        )
         .route("/{owner}", get(pages::owner::show))
         .route(
             "/{owner}/{repo}/settings",
@@ -116,6 +121,10 @@ fn page_routes() -> Router<AppState> {
         .route(
             "/{owner}/{repo}/settings/unarchive",
             post(pages::repo_settings::unarchive),
+        )
+        .route(
+            "/{owner}/{repo}/settings/delete",
+            post(pages::repo_settings::delete),
         )
         .route(
             "/{owner}/{repo}/settings/collaborators",

@@ -216,6 +216,10 @@ impl Config {
         self.storage.data_dir.join("repos")
     }
 
+    pub fn tmp_dir(&self) -> PathBuf {
+        self.storage.data_dir.join("tmp")
+    }
+
     /// Cookies carry `Secure` when the public URL is HTTPS.
     pub fn secure_cookies(&self) -> bool {
         self.server.base_url.starts_with("https://")

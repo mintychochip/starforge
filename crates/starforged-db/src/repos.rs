@@ -15,6 +15,7 @@ pub struct RepoRow {
     pub visibility: String,
     pub default_branch: String,
     pub archived_at: Option<i64>,
+    pub deleted_at: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -31,7 +32,7 @@ macro_rules! select_repo {
     ($tail:literal) => {
         concat!(
             "SELECT r.id, r.owner_id, o.handle AS owner_handle, r.name, r.description, r.visibility, ",
-            "r.default_branch, r.archived_at, r.created_at, r.updated_at FROM repos r JOIN owners o ON o.id = r.owner_id ",
+            "r.default_branch, r.archived_at, r.deleted_at, r.created_at, r.updated_at FROM repos r JOIN owners o ON o.id = r.owner_id ",
             $tail
         )
     };
@@ -47,6 +48,7 @@ fn from_row(row: &AnyRow) -> DbResult<RepoRow> {
         visibility: row.try_get("visibility")?,
         default_branch: row.try_get("default_branch")?,
         archived_at: row.try_get("archived_at")?,
+        deleted_at: row.try_get("deleted_at")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })
@@ -80,20 +82,23 @@ pub async fn insert(db: &Db, repo: &NewRepo<'_>) -> DbResult<i64> {
     Ok(id)
 }
 
-/// Case-insensitive lookup by owner handle and repository name.
+/// Case-insensitive lookup by owner handle and repository name, among repositories that are not deleted.
 pub async fn by_owner_and_name(
     db: &Db,
     owner_handle: &str,
     name: &str,
 ) -> DbResult<Option<RepoRow>> {
-    let row = sqlx::query(select_repo!("WHERE o.handle = $1 AND r.lower_name = $2"))
-        .bind(owner_handle.to_ascii_lowercase())
-        .bind(name.to_ascii_lowercase())
-        .fetch_optional(db.pool())
-        .await?;
+    let row = sqlx::query(select_repo!(
+        "WHERE o.handle = $1 AND r.lower_name = $2 AND r.deleted_at IS NULL"
+    ))
+    .bind(owner_handle.to_ascii_lowercase())
+    .bind(name.to_ascii_lowercase())
+    .fetch_optional(db.pool())
+    .await?;
     row.as_ref().map(from_row).transpose()
 }
 
+/// Any repository with this id, deleted or not.
 pub async fn by_id(db: &Db, id: i64) -> DbResult<Option<RepoRow>> {
     let row = sqlx::query(select_repo!("WHERE r.id = $1"))
         .bind(id)
@@ -102,18 +107,22 @@ pub async fn by_id(db: &Db, id: i64) -> DbResult<Option<RepoRow>> {
     row.as_ref().map(from_row).transpose()
 }
 
+/// The owner's repositories that are not deleted, by name.
 pub async fn list_by_owner(db: &Db, owner_id: i64) -> DbResult<Vec<RepoRow>> {
-    let rows = sqlx::query(select_repo!("WHERE r.owner_id = $1 ORDER BY r.lower_name"))
-        .bind(owner_id)
-        .fetch_all(db.pool())
-        .await?;
+    let rows = sqlx::query(select_repo!(
+        "WHERE r.owner_id = $1 AND r.deleted_at IS NULL ORDER BY r.lower_name"
+    ))
+    .bind(owner_id)
+    .fetch_all(db.pool())
+    .await?;
     rows.iter().map(from_row).collect()
 }
 
-/// Repositories where `user_id` is a collaborator, by owner then name.
+/// Repositories that are not deleted where `user_id` is a collaborator, by owner then name.
 pub async fn list_collaborating(db: &Db, user_id: i64) -> DbResult<Vec<RepoRow>> {
     let rows = sqlx::query(select_repo!(
-        "JOIN collaborators c ON c.repo_id = r.id WHERE c.user_id = $1 ORDER BY o.handle, r.lower_name"
+        "JOIN collaborators c ON c.repo_id = r.id WHERE c.user_id = $1 AND r.deleted_at IS NULL \
+         ORDER BY o.handle, r.lower_name"
     ))
     .bind(user_id)
     .fetch_all(db.pool())
@@ -208,4 +217,49 @@ pub async fn set_archived(db: &Db, id: i64, archived_at: Option<i64>) -> DbResul
         .execute(db.pool())
         .await?;
     Ok(())
+}
+
+/// The owner's deleted repositories, the most recently deleted first.
+pub async fn list_deleted_by_owner(db: &Db, owner_id: i64) -> DbResult<Vec<RepoRow>> {
+    let rows = sqlx::query(select_repo!(
+        "WHERE r.owner_id = $1 AND r.deleted_at IS NOT NULL ORDER BY r.deleted_at DESC"
+    ))
+    .bind(owner_id)
+    .fetch_all(db.pool())
+    .await?;
+    rows.iter().map(from_row).collect()
+}
+
+/// Repositories deleted at or before `cutoff`, the oldest deletion first.
+pub async fn deleted_before(db: &Db, cutoff: i64) -> DbResult<Vec<RepoRow>> {
+    let rows = sqlx::query(select_repo!(
+        "WHERE r.deleted_at IS NOT NULL AND r.deleted_at <= $1 ORDER BY r.deleted_at"
+    ))
+    .bind(cutoff)
+    .fetch_all(db.pool())
+    .await?;
+    rows.iter().map(from_row).collect()
+}
+
+/// Deletes the repository softly (`Some(time)`) or restores it (`None`).
+pub async fn set_deleted(db: &Db, id: i64, deleted_at: Option<i64>) -> DbResult<()> {
+    sqlx::query("UPDATE repos SET deleted_at = $1, updated_at = $2 WHERE id = $3")
+        .bind(deleted_at)
+        .bind(now())
+        .bind(id)
+        .execute(db.pool())
+        .await?;
+    Ok(())
+}
+
+/// Whether a deleted repository of `owner_id` holds `name` (case-insensitive).
+pub async fn deleted_name_exists(db: &Db, owner_id: i64, name: &str) -> DbResult<bool> {
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM repos WHERE owner_id = $1 AND lower_name = $2 AND deleted_at IS NOT NULL",
+    )
+    .bind(owner_id)
+    .bind(name.to_ascii_lowercase())
+    .fetch_one(db.pool())
+    .await?;
+    Ok(count > 0)
 }
