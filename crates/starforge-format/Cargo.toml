@@ -10,11 +10,13 @@ publish = true
 workspace = true
 
 [dependencies]
+blake3.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 ulid.workspace = true
 thiserror.workspace = true
 time.workspace = true
+zstd.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

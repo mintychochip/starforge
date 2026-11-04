@@ -4,6 +4,7 @@
 //! ([`SessionMeta`]), normalized events ([`Event`]), and version handling.
 
 pub mod events;
+pub mod segments;
 pub mod session;
 
 pub use events::{
@@ -11,6 +12,7 @@ pub use events::{
     SubagentBoundary, System, ToolCall, ToolOutcome, ToolRef, ToolResult, UserMessage, kind_name,
     parse_event,
 };
+pub use segments::{DEFAULT_SEGMENT_CAP, assemble, blake3_hex, compress, decompress, split_jsonl};
 pub use session::{
     Agent, AgentName, CaptureInfo, CaptureMode, FORMAT_TAG, RedactionSummary, RepoInfo,
     SessionMeta, Usage,
@@ -36,4 +38,8 @@ pub enum FormatError {
     BadAgent(String),
     #[error("wrong format tag: expected `starforge.session/v1`")]
     BadFormatTag,
+    #[error("segment failed to decompress")]
+    Decompress,
+    #[error("segment payload is not valid UTF-8")]
+    BadUtf8,
 }
