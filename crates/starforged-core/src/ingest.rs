@@ -13,7 +13,7 @@ use ulid::Ulid;
 
 use crate::accounts::User;
 use crate::jobs::Job;
-use crate::permission::Permission;
+use crate::permission::{Permission, Visibility};
 use crate::quota;
 use crate::repos::RepoAccess;
 use crate::tokens::TokenAuth;
@@ -575,6 +575,112 @@ impl Core {
             event: "segment.stored".to_owned(),
         })
         .await
+    }
+}
+impl Core {
+    /// Publishes a session (`visibility`: `inherit` → `published`) so it
+    /// becomes readable beyond the repository members (spec §6.4). Handlers
+    /// prove `maintain` via [`Core::require_repo`] (site admins carry
+    /// `Admin` through `effective`); publishing on a non-public repository
+    /// answers `Invalid` (422): it would have no effect there. Audits
+    /// `session.publish`.
+    pub async fn publish_session(
+        &self,
+        actor: &User,
+        access: &RepoAccess,
+        ulid: &str,
+    ) -> CoreResult<SessionRow> {
+        self.set_session_visibility(actor, access, ulid, "published", "session.publish")
+            .await
+    }
+
+    /// Mirrors [`Core::publish_session`] back to `inherit`. Unpublishing a
+    /// never-published session is an `Ok` no-op. Audits `session.unpublish`.
+    pub async fn unpublish_session(
+        &self,
+        actor: &User,
+        access: &RepoAccess,
+        ulid: &str,
+    ) -> CoreResult<SessionRow> {
+        self.set_session_visibility(actor, access, ulid, "inherit", "session.unpublish")
+            .await
+    }
+
+    async fn set_session_visibility(
+        &self,
+        actor: &User,
+        access: &RepoAccess,
+        ulid: &str,
+        visibility: &str,
+        audit_action: &str,
+    ) -> CoreResult<SessionRow> {
+        if access.repo.visibility != Visibility::Public {
+            return Err(CoreError::Invalid(
+                "publishing has no effect on non-public repos".into(),
+            ));
+        }
+        let session = db_sessions::session_by_ulid(self.db(), access.repo.id, ulid)
+            .await?
+            .ok_or(CoreError::NotFound)?;
+        db_sessions::set_visibility(self.db(), session.id, visibility).await?;
+        self.audit(Some(actor.id), audit_action, &format!("session:{ulid}"), "")
+            .await?;
+        db_sessions::session_by_ulid(self.db(), access.repo.id, ulid)
+            .await?
+            .ok_or_else(|| CoreError::Internal("session vanished during publish".into()))
+    }
+
+    /// The user-facing delete path (spec §11.5): the uploader, a repo admin,
+    /// or a site admin removes the session row, its segment rows (blob
+    /// refcounts decremented; zero-ref files swept by the hourly cleanup),
+    /// and every commit link filed under its ULID — including trailer-first
+    /// `NULL` rows, which would survive the row cascade. Anyone else gets
+    /// `NotFound` (never `Forbidden`), so ULIDs stay undiscoverable; unknown
+    /// ULIDs answer the same way, making a second delete `404`. Audits
+    /// `session.deleted`. Quarantined sessions delete the same way (purge
+    /// stays the admin-queue path with its `session.purged` audit).
+    pub async fn delete_session(
+        &self,
+        actor: &User,
+        access: &RepoAccess,
+        ulid: &str,
+    ) -> CoreResult<()> {
+        let session = db_sessions::session_by_ulid(self.db(), access.repo.id, ulid)
+            .await?
+            .ok_or(CoreError::NotFound)?;
+        if session.uploader_id != actor.id
+            && access.permission < Permission::Admin
+            && !actor.is_admin
+        {
+            return Err(CoreError::NotFound);
+        }
+        self.remove_session_rows(Some(actor.id), access, &session, "session.deleted")
+            .await
+    }
+
+    /// Deletes the session row, its segment rows, and every commit link filed
+    /// under its ULID. Shared by user delete and admin purge; only the audit
+    /// action differs.
+    pub(crate) async fn remove_session_rows(
+        &self,
+        actor_id: Option<i64>,
+        access: &RepoAccess,
+        session: &SessionRow,
+        audit_action: &str,
+    ) -> CoreResult<()> {
+        db_sessions::delete_session_links(self.db(), access.repo.id, &session.ulid).await?;
+        let removed = db_sessions::delete_session(self.db(), session.id).await?;
+        for seg in &removed {
+            db_sessions::blob_decref(self.db(), &seg.blob_hash).await?;
+        }
+        self.audit(
+            actor_id,
+            audit_action,
+            &format!("session:{}", session.ulid),
+            &format!("{} segments", removed.len()),
+        )
+        .await?;
+        Ok(())
     }
 }
 

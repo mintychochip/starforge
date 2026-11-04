@@ -210,11 +210,9 @@ impl Core {
             .ok_or_else(|| CoreError::Internal("session vanished during release".into()))
     }
 
-    /// Deletes the session row, its segment rows (blob refcounts decremented;
-    /// zero-ref files are swept by the hourly cleanup job), and every commit
-    /// link filed under its ULID — including trailer-first rows, which carry a
-    /// `NULL` session id and would survive the row cascade. Audits
-    /// `session.purged`.
+    /// Deletes the session row, its segment rows, and every commit link filed
+    /// under its ULID (the removal itself is [`Core::remove_session_rows`],
+    /// shared with the user-facing delete path). Audits `session.purged`.
     pub async fn purge_session(
         &self,
         actor: &User,
@@ -224,19 +222,33 @@ impl Core {
         let session = db_sessions::session_by_ulid(self.db(), access.repo.id, ulid)
             .await?
             .ok_or(CoreError::NotFound)?;
-        db_sessions::delete_session_links(self.db(), access.repo.id, ulid).await?;
-        let removed = db_sessions::delete_session(self.db(), session.id).await?;
-        for seg in &removed {
-            db_sessions::blob_decref(self.db(), &seg.blob_hash).await?;
-        }
+        self.remove_session_rows(Some(actor.id), access, &session, "session.purged")
+            .await
+    }
+
+    /// The admin rescan route's thin wrapper around [`Core::rescan_session`]:
+    /// no new verdict logic. Looks the session up by ULID under the
+    /// handler-proved `Admin` access, re-runs the rule scan (idempotent: an
+    /// already-quarantined session keeps its stored verdict), and audits
+    /// `session.rescan`.
+    pub async fn admin_rescan_session(
+        &self,
+        actor: &User,
+        access: &RepoAccess,
+        ulid: &str,
+    ) -> CoreResult<QuarantineOutcome> {
+        let session = db_sessions::session_by_ulid(self.db(), access.repo.id, ulid)
+            .await?
+            .ok_or(CoreError::NotFound)?;
+        let outcome = self.rescan_session(session.id).await?;
         self.audit(
             Some(actor.id),
-            "session.purged",
+            "session.rescan",
             &format!("session:{ulid}"),
-            &format!("{} segments", removed.len()),
+            "",
         )
         .await?;
-        Ok(())
+        Ok(outcome)
     }
 
     /// Merges one segment's server-found counts into the session's

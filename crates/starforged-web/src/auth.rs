@@ -70,10 +70,12 @@ impl FromRequestParts<AppState> for RequireAdmin {
     }
 }
 
-/// A form body carrying only the CSRF token.
+/// A form body carrying only the CSRF token. A missing field deserializes to
+/// `""`, which [`verify_csrf`] rejects with `403` — a form without a token
+/// is a forged form, not a malformed one.
 #[derive(Deserialize)]
 pub struct CsrfForm {
-    #[serde(rename = "_csrf")]
+    #[serde(rename = "_csrf", default)]
     pub csrf: String,
 }
 

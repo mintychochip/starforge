@@ -217,6 +217,22 @@ fn page_routes() -> Router<AppState> {
             "/{owner}/{repo}/sessions/{ulid}/purge",
             post(pages::session::purge),
         )
+        .route(
+            "/{owner}/{repo}/sessions/{ulid}/publish",
+            post(pages::session::publish),
+        )
+        .route(
+            "/{owner}/{repo}/sessions/{ulid}/unpublish",
+            post(pages::session::unpublish),
+        )
+        .route(
+            "/{owner}/{repo}/sessions/{ulid}/delete",
+            post(pages::session::delete),
+        )
+        .route(
+            "/{owner}/{repo}/sessions/{ulid}/rescan",
+            post(pages::session::rescan),
+        )
         .route("/{owner}/{repo}/compare", get(pages::compare::pick))
         .route(
             "/{owner}/{repo}/compare/{*spec}",

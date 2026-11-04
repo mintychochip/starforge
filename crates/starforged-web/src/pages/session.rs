@@ -51,10 +51,13 @@ pub struct SessionPageView {
     redaction_counts: String,
     capture_mode: String,
     visibility: String,
+    is_published: bool,
     quarantined: bool,
     quarantine_reason: String,
     quarantine_detail: String,
     can_admin: bool,
+    can_maintain: bool,
+    can_delete: bool,
     csrf: String,
     events: Vec<EventView>,
     page: i64,
@@ -138,10 +141,17 @@ pub async fn show(
         redaction_counts: session_row.redaction_counts.clone(),
         capture_mode: session_row.capture_mode.clone(),
         visibility: session_row.visibility.clone(),
+        is_published: session_row.visibility == "published",
         quarantined: session_row.quarantine == "quarantined",
         quarantine_reason: session_row.quarantine_reason.clone(),
         quarantine_detail: session_row.quarantine_detail.clone(),
         can_admin: access.permission >= Permission::Admin,
+        can_maintain: access.permission >= Permission::Maintain,
+        can_delete: session.as_ref().is_some_and(|s| {
+            session_row.uploader_id == s.user.id
+                || access.permission >= Permission::Admin
+                || s.user.is_admin
+        }),
         csrf: session
             .as_ref()
             .map(|s| s.csrf_token.clone())
@@ -210,6 +220,120 @@ pub async fn purge(
         .purge_session(&session.user, &access, &ulid)
         .await?;
     Ok(Redirect::to(&format!("/{}/{}", access.repo.owner, access.repo.name)).into_response())
+}
+/// `POST /{owner}/{repo}/sessions/{ulid}/publish`: flips `visibility` to
+/// `published` (public repositories only). Repo `maintain` or above;
+/// everyone else 404s, exactly like the viewer itself.
+pub async fn publish(
+    State(state): State<AppState>,
+    MaybeUser(session): MaybeUser,
+    Path((owner, repo, ulid)): Path<(String, String, String)>,
+    Form(form): Form<CsrfForm>,
+) -> Result<Response, WebError> {
+    let session = session.as_ref().ok_or(WebError::NotFound)?;
+    let (access, _) = state
+        .core
+        .authorize_session_read_by_ulid(Some(&session.user), &owner, &repo, &ulid)
+        .await?;
+    if access.permission < Permission::Maintain {
+        return Err(WebError::NotFound);
+    }
+    verify_csrf(&session.csrf_token, &form.csrf)?;
+    state
+        .core
+        .publish_session(&session.user, &access, &ulid)
+        .await?;
+    Ok(Redirect::to(&format!(
+        "/{}/{}/sessions/{ulid}",
+        access.repo.owner, access.repo.name
+    ))
+    .into_response())
+}
+
+/// `POST /{owner}/{repo}/sessions/{ulid}/unpublish`: the mirror of
+/// [`publish`], back to `inherit` (an `Ok` no-op when the session was never
+/// published). Same auth.
+pub async fn unpublish(
+    State(state): State<AppState>,
+    MaybeUser(session): MaybeUser,
+    Path((owner, repo, ulid)): Path<(String, String, String)>,
+    Form(form): Form<CsrfForm>,
+) -> Result<Response, WebError> {
+    let session = session.as_ref().ok_or(WebError::NotFound)?;
+    let (access, _) = state
+        .core
+        .authorize_session_read_by_ulid(Some(&session.user), &owner, &repo, &ulid)
+        .await?;
+    if access.permission < Permission::Maintain {
+        return Err(WebError::NotFound);
+    }
+    verify_csrf(&session.csrf_token, &form.csrf)?;
+    state
+        .core
+        .unpublish_session(&session.user, &access, &ulid)
+        .await?;
+    Ok(Redirect::to(&format!(
+        "/{}/{}/sessions/{ulid}",
+        access.repo.owner, access.repo.name
+    ))
+    .into_response())
+}
+
+/// `POST /{owner}/{repo}/sessions/{ulid}/delete`: the user-facing delete
+/// path (forms cannot `DELETE`). The uploader, a repo admin, or a site admin
+/// removes the session; everyone else 404s. Redirects to the repo page.
+pub async fn delete(
+    State(state): State<AppState>,
+    MaybeUser(session): MaybeUser,
+    Path((owner, repo, ulid)): Path<(String, String, String)>,
+    Form(form): Form<CsrfForm>,
+) -> Result<Response, WebError> {
+    let session = session.as_ref().ok_or(WebError::NotFound)?;
+    let (access, row) = state
+        .core
+        .authorize_session_read_by_ulid(Some(&session.user), &owner, &repo, &ulid)
+        .await?;
+    if row.uploader_id != session.user.id
+        && access.permission < Permission::Admin
+        && !session.user.is_admin
+    {
+        return Err(WebError::NotFound);
+    }
+    verify_csrf(&session.csrf_token, &form.csrf)?;
+    state
+        .core
+        .delete_session(&session.user, &access, &ulid)
+        .await?;
+    Ok(Redirect::to(&format!("/{}/{}", access.repo.owner, access.repo.name)).into_response())
+}
+
+/// `POST /{owner}/{repo}/sessions/{ulid}/rescan`: re-runs the rule scan over
+/// the stored segments and returns to the viewer, which shows the new
+/// quarantine banner. Repo admins only; everyone else 404s.
+pub async fn rescan(
+    State(state): State<AppState>,
+    MaybeUser(session): MaybeUser,
+    Path((owner, repo, ulid)): Path<(String, String, String)>,
+    Form(form): Form<CsrfForm>,
+) -> Result<Response, WebError> {
+    let session = session.as_ref().ok_or(WebError::NotFound)?;
+    let (access, _) = state
+        .core
+        .authorize_session_read_by_ulid(Some(&session.user), &owner, &repo, &ulid)
+        .await?;
+    if access.permission < Permission::Admin {
+        return Err(WebError::NotFound);
+    }
+    verify_csrf(&session.csrf_token, &form.csrf)?;
+    state
+        .core
+        .admin_rescan_session(&session.user, &access, &ulid)
+        .await?;
+    Ok(Redirect::to(&format!(
+        "/{}/{}/sessions/{ulid}",
+        access.repo.owner, access.repo.name
+    ))
+    .into_response())
 }
 /// `GET /{owner}/{repo}/sessions/{ulid}/download`: the full normalized
 /// transcript (the same redacted bytes the viewer renders) as an attachment.

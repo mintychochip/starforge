@@ -57,7 +57,9 @@ pub fn router(core: Core, base_url: String) -> Router {
         )
         .route(
             "/repos/{owner}/{repo}/sessions/{ulid}",
-            put(sessions::put_meta).get(sessions::get_session),
+            put(sessions::put_meta)
+                .get(sessions::get_session)
+                .delete(sessions::delete_session),
         )
         .route(
             "/repos/{owner}/{repo}/sessions",
@@ -87,6 +89,18 @@ pub fn router(core: Core, base_url: String) -> Router {
         .route(
             "/repos/{owner}/{repo}/sessions/{ulid}/purge",
             post(sessions::purge_session),
+        )
+        .route(
+            "/repos/{owner}/{repo}/sessions/{ulid}/publish",
+            post(sessions::publish_session),
+        )
+        .route(
+            "/repos/{owner}/{repo}/sessions/{ulid}/unpublish",
+            post(sessions::unpublish_session),
+        )
+        .route(
+            "/repos/{owner}/{repo}/sessions/{ulid}/rescan",
+            post(sessions::rescan_session),
         )
         .fallback(|| async { ApiError::NotFound })
         .layer(axum::middleware::from_fn_with_state(

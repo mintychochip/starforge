@@ -14,6 +14,7 @@ use serde_json::{Value, json};
 use starforged_core::ingest::SegmentPut;
 use starforged_core::permission::Permission;
 use starforged_core::read::SessionPageItem;
+use starforged_core::rescan::QuarantineOutcome;
 use starforged_core::tokens::Scope;
 
 use crate::ApiState;
@@ -242,6 +243,103 @@ pub async fn purge_session(
         .purge_session(&token.user, &access, &ulid)
         .await?;
     Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+/// `POST /repos/{owner}/{repo}/sessions/{ulid}/publish`: flips `visibility`
+/// to `published` (public repositories only — elsewhere `422`, since
+/// publishing would have no effect) and audits `session.publish`. Repo
+/// `maintain` or above; visible-but-insufficient answers `403`, invisible
+/// repositories `404`.
+pub async fn publish_session(
+    State(state): State<ApiState>,
+    auth: ApiAuth,
+    Path((owner, repo, ulid)): Path<(String, String, String)>,
+) -> Result<impl IntoResponse, ApiError> {
+    let token = auth.require(Scope::SessionUpload)?;
+    let access = state
+        .core
+        .require_repo(Some(&token.user), &owner, &repo, Permission::Maintain)
+        .await?;
+    let row = state
+        .core
+        .publish_session(&token.user, &access, &ulid)
+        .await?;
+    Ok((
+        noindex_headers(),
+        Json(json!({ "ulid": row.ulid, "visibility": row.visibility })),
+    ))
+}
+
+/// `POST /repos/{owner}/{repo}/sessions/{ulid}/unpublish`: the mirror of
+/// [`publish_session`], back to `inherit` (an `Ok` no-op when the session was
+/// never published). Same auth; audits `session.unpublish`.
+pub async fn unpublish_session(
+    State(state): State<ApiState>,
+    auth: ApiAuth,
+    Path((owner, repo, ulid)): Path<(String, String, String)>,
+) -> Result<impl IntoResponse, ApiError> {
+    let token = auth.require(Scope::SessionUpload)?;
+    let access = state
+        .core
+        .require_repo(Some(&token.user), &owner, &repo, Permission::Maintain)
+        .await?;
+    let row = state
+        .core
+        .unpublish_session(&token.user, &access, &ulid)
+        .await?;
+    Ok((
+        noindex_headers(),
+        Json(json!({ "ulid": row.ulid, "visibility": row.visibility })),
+    ))
+}
+
+/// `DELETE /repos/{owner}/{repo}/sessions/{ulid}`: the user-facing delete
+/// path — the uploader, a repo admin, or a site admin removes the session,
+/// its segments (blob refcounts decremented), and its commit links, auditing
+/// `session.deleted`. Answers `204`; anyone else (and unknown ULIDs) answer
+/// `404`, so session ULIDs stay undiscoverable.
+pub async fn delete_session(
+    State(state): State<ApiState>,
+    auth: ApiAuth,
+    Path((owner, repo, ulid)): Path<(String, String, String)>,
+) -> Result<Response, ApiError> {
+    let token = auth.require(Scope::SessionUpload)?;
+    let access = state
+        .core
+        .require_repo(Some(&token.user), &owner, &repo, Permission::Read)
+        .await?;
+    state
+        .core
+        .delete_session(&token.user, &access, &ulid)
+        .await?;
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+/// `POST /repos/{owner}/{repo}/sessions/{ulid}/rescan`: re-runs the rule
+/// scan over the stored segments (filling the M1d gap — `Core::rescan_session`
+/// had no HTTP route) and answers the new quarantine verdict. Repo `admin`
+/// only; audits `session.rescan`; idempotent.
+pub async fn rescan_session(
+    State(state): State<ApiState>,
+    auth: ApiAuth,
+    Path((owner, repo, ulid)): Path<(String, String, String)>,
+) -> Result<impl IntoResponse, ApiError> {
+    let token = auth.require(Scope::SessionUpload)?;
+    let access = state
+        .core
+        .require_repo(Some(&token.user), &owner, &repo, Permission::Admin)
+        .await?;
+    let outcome = state
+        .core
+        .admin_rescan_session(&token.user, &access, &ulid)
+        .await?;
+    let body = match outcome {
+        QuarantineOutcome::Clean => json!({"quarantine": "none", "reason": null, "detail": null}),
+        QuarantineOutcome::Quarantined { reason, detail } => {
+            json!({"quarantine": "quarantined", "reason": reason, "detail": detail})
+        }
+    };
+    Ok((noindex_headers(), Json(body)))
 }
 /// Query for the event page: 1-based, default 1.
 #[derive(Debug, Deserialize)]
