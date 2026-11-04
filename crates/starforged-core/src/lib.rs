@@ -7,6 +7,7 @@ pub mod admin;
 pub mod audit;
 pub mod blame;
 pub mod changes;
+pub mod checks;
 pub mod content;
 pub mod crypto;
 pub mod email_tokens;

@@ -26,30 +26,7 @@ use starforged_core::tokens::Scope;
 use crate::ApiState;
 use crate::auth::ApiAuth;
 use crate::error::ApiError;
-
-/// Unix seconds → `YYYY-MM-DDTHH:MM:SSZ` (same civil-from-days shape as trails).
-fn rfc3339(secs: i64) -> String {
-    let days = secs.div_euclid(86_400);
-    let rest = secs.rem_euclid(86_400);
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let mut y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    if m <= 2 {
-        y += 1;
-    }
-    format!(
-        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
-        rest / 3600,
-        rest % 3600 / 60,
-        rest % 60
-    )
-}
+use crate::time::rfc3339;
 
 #[derive(Serialize)]
 pub struct ChangeJson {

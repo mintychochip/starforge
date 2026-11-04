@@ -7,6 +7,8 @@ mod moved;
 mod oauth;
 mod repos;
 mod sessions;
+mod statuses;
+mod time;
 mod trails;
 mod user;
 
@@ -174,6 +176,14 @@ pub fn router(core: Core, base_url: String) -> Router {
         .route(
             "/repos/{owner}/{repo}/trails/{n}/changes/{k}/threads/{t}/comments",
             post(changes::add_comment),
+        )
+        .route(
+            "/repos/{owner}/{repo}/statuses/{sha}",
+            post(statuses::submit_status).get(statuses::list_statuses),
+        )
+        .route(
+            "/repos/{owner}/{repo}/commits/{sha}/combined-status",
+            get(statuses::combined_status),
         )
         .fallback(|| async { ApiError::NotFound })
         .layer(axum::middleware::from_fn_with_state(
