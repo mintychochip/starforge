@@ -131,8 +131,9 @@ impl Detector for PrivateKeyDetector {
     }
 }
 
-/// Cloud credentials: AWS access-key ids (`AKIA…`), AWS secret assignments,
-/// and GCP service-account markers.
+/// Cloud credentials: AWS access-key ids (long-term `AKIA…` and
+/// temporary/session `ASIA…`, `ABIA…`, `ACCA…` prefixes), AWS secret
+/// assignments, and GCP service-account markers.
 pub struct CloudCredentialDetector {
     res: Vec<Regex>,
 }
@@ -141,7 +142,7 @@ impl CloudCredentialDetector {
     pub fn new() -> Self {
         Self {
             res: vec![
-                compile("AKIA[0-9A-Z]{16}"),
+                compile("(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}"),
                 compile(
                     "(?i)(?:aws_secret_access_key|aws_secret|secret_access_key)\\s*[:=]\\s*['\"]?[A-Za-z0-9/+=]{40}['\"]?",
                 ),
@@ -174,7 +175,10 @@ impl Detector for CloudCredentialDetector {
     }
 }
 
-/// Well-known token prefixes with minimum-length checks.
+/// Well-known token prefixes with minimum-length checks. The `sk-` family
+/// admits `-` and `_` after the prefix so `sk-proj-…` matches, with
+/// dedicated `sk_live_…` / `sk_test_…` alternatives; the length check still
+/// rejects shorts like `sk-123`.
 pub struct KnownTokenDetector {
     re: Regex,
 }
@@ -183,7 +187,7 @@ impl KnownTokenDetector {
     pub fn new() -> Self {
         Self {
             re: compile(
-                "gh[opurs]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,}|xox[baprs]-[A-Za-z0-9-]{10,}|sk-ant-[A-Za-z0-9-]{20,}|sk-[A-Za-z0-9]{20,}|AIza[0-9A-Za-z_-]{35}|glpat-[A-Za-z0-9_-]{20,}|npm_[A-Za-z0-9]{36,}|pypi-[A-Za-z0-9_-]{10,}",
+                "gh[opurs]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,}|xox[baprs]-[A-Za-z0-9-]{10,}|sk-ant-[A-Za-z0-9_-]{20,}|sk-[A-Za-z0-9_-]{20,}|sk_(?:live|test)_[A-Za-z0-9_-]{20,}|AIza[0-9A-Za-z_-]{35}|glpat-[A-Za-z0-9_-]{20,}|npm_[A-Za-z0-9]{36,}|pypi-[A-Za-z0-9_-]{10,}",
             ),
         }
     }

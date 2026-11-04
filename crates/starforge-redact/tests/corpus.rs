@@ -493,10 +493,10 @@ fn fingerprint_change_sensitive() {
         .push(Rule::Literal("extra".to_string()));
     assert_ne!(fingerprint(&with_literal), base);
     let mut pii = RuleSet::built_in();
-    pii.pii_email = true;
+    pii.pii_email = Some(true);
     assert_ne!(fingerprint(&pii), base);
     let mut entropy = RuleSet::built_in();
-    entropy.entropy_threshold = 5.0;
+    entropy.entropy_threshold = Some(5.0);
     assert_ne!(fingerprint(&entropy), base);
 }
 
@@ -518,14 +518,14 @@ id = "internal-token"
 regex = "INT-[0-9]{8}"
 "#;
     let site = RuleSet::parse_toml(toml).unwrap();
-    assert!(site.pii_email);
-    assert!(!site.pii_phone);
-    assert_eq!(site.entropy_min_len, 24);
-    assert_eq!(site.entropy_threshold, 5.0);
+    assert_eq!(site.pii_email, Some(true));
+    assert_eq!(site.pii_phone, None);
+    assert_eq!(site.entropy_min_len, Some(24));
+    assert_eq!(site.entropy_threshold, Some(5.0));
 
     let merged = RuleSet::built_in().merge(&site);
-    assert!(merged.pii_email);
-    assert_eq!(merged.entropy_min_len, 24);
+    assert_eq!(merged.pii_email, Some(true));
+    assert_eq!(merged.entropy_min_len, Some(24));
     let compiled = merged.compile().unwrap();
     let (out, counts) = redact_text(&compiled, "has secret-string and INT-12345678 here");
     assert!(out.contains("[redacted:literal]"), "out: {out}");
@@ -549,6 +549,120 @@ fn toml_rejects_bad_regex_and_threshold() {
         bad_t,
         Err(starforge_redact::RuleError::BadThreshold { .. })
     ));
+}
+
+#[test]
+fn merge_absent_sections_inherit() {
+    // Site sets PII + entropy; the higher-precedence repo file omits those
+    // sections entirely. The repo's silence must not reset the site values.
+    let site = RuleSet::parse_toml(
+        "[pii]\nemail = true\nphone = true\n[entropy]\nmin_len = 24\nthreshold = 5.0\n",
+    )
+    .unwrap();
+    let repo =
+        RuleSet::parse_toml("[[pattern]]\nid = \"repo-pat\"\nregex = \"R[0-9]+\"\n").unwrap();
+    assert_eq!(repo.pii_email, None);
+    assert_eq!(repo.entropy_min_len, None);
+    let merged = site.merge(&repo);
+    assert_eq!(merged.pii_email, Some(true));
+    assert_eq!(merged.pii_phone, Some(true));
+    assert_eq!(merged.entropy_min_len, Some(24));
+    assert_eq!(merged.entropy_threshold, Some(5.0));
+    // Behavior survives: PII on, higher entropy floor active, both rule
+    // lists present.
+    let compiled = merged.compile().unwrap();
+    let (out, counts) = redact_text(&compiled, "mail a@b.co blob Q7zKp2LmV9xRn4DwY6cFbH8 R42");
+    assert!(out.contains("[redacted:email]"), "out: {out}");
+    assert!(out.contains("Q7zKp2LmV9xRn4DwY6cFbH8"), "out: {out}");
+    assert!(out.contains("[redacted:repo-pat]"), "out: {out}");
+    assert_eq!(counts.get("email"), Some(&1));
+    assert!(!counts.contains_key("high-entropy"), "counts: {counts:?}");
+    // Explicit `Some` in the higher-precedence set still overrides.
+    let off = RuleSet::parse_toml("[pii]\nemail = false\n").unwrap();
+    let merged2 = site.merge(&off);
+    assert_eq!(merged2.pii_email, Some(false));
+    assert_eq!(merged2.pii_phone, Some(true));
+    // Same set merged over itself is a fingerprint no-op for settings.
+    assert_eq!(
+        fingerprint(&site),
+        fingerprint(&site.clone().merge(&RuleSet::default()))
+    );
+}
+
+#[test]
+fn known_token_openai_variants_redacted() {
+    for token in [
+        format!("sk-proj-{}", "a".repeat(20)),
+        format!("sk_live_{}", "b".repeat(20)),
+        format!("sk_test_{}", "c".repeat(20)),
+    ] {
+        let (out, counts) = redact_text(&builtin(), &format!("key {token} end"));
+        assert!(
+            out.contains("[redacted:known-token]"),
+            "token {token}: {out}"
+        );
+        assert!(!out.contains(&token), "token {token}: {out}");
+        assert_eq!(counts.get("known-token"), Some(&1), "token {token}");
+    }
+}
+
+#[test]
+fn cloud_credential_session_prefixes_redacted() {
+    for prefix in ["ASIA", "ABIA", "ACCA"] {
+        let key = format!("{prefix}IOSFODNN7EXAMPLE");
+        let (out, counts) = redact_text(&builtin(), &format!("key {key} end"));
+        assert!(
+            out.contains("[redacted:cloud-credential]"),
+            "key {key}: {out}"
+        );
+        assert!(!out.contains(&key), "key {key}: {out}");
+        assert_eq!(counts.get("cloud-credential"), Some(&1), "key {key}");
+    }
+}
+
+#[test]
+fn jsonl_metadata_values_untouched() {
+    let token = format!("ghp_{}", "a".repeat(36));
+    let line = format!(
+        "{{\"v\": 1, \"seq\": 7, \"ts\": \"2026-11-04T00:00:00Z\", \"kind\": \"note {token}\", \"payload\": \"key AKIAIOSFODNN7EXAMPLE\"}}"
+    );
+    let (out, counts) = redact_jsonl(&builtin(), &line);
+    // Structural metadata passes through verbatim — even the token inside `kind`.
+    assert!(
+        out.contains(&format!("\"kind\":\"note {token}\"")),
+        "out: {out}"
+    );
+    assert!(out.contains("\"v\":1"), "out: {out}");
+    assert!(out.contains("\"seq\":7"), "out: {out}");
+    assert!(
+        out.contains("\"ts\":\"2026-11-04T00:00:00Z\""),
+        "out: {out}"
+    );
+    // Payload values are still redacted.
+    assert!(
+        out.contains("\"payload\":\"key [redacted:cloud-credential]\""),
+        "out: {out}"
+    );
+    assert!(!out.contains("AKIAIOSFODNN7EXAMPLE"), "out: {out}");
+    assert_eq!(counts.get("cloud-credential"), Some(&1));
+    assert!(!counts.contains_key("known-token"), "counts: {counts:?}");
+}
+
+#[test]
+fn entropy_min_len_override_behavioral() {
+    // 23 chars, ~4.52 bits/char: detected under defaults (20 / 4.5).
+    let text = "blob Q7zKp2LmV9xRn4DwY6cFbH8 end";
+    let (out, counts) = redact_text(&builtin(), text);
+    assert!(out.contains("[redacted:high-entropy]"), "out: {out}");
+    assert_eq!(counts.get("high-entropy"), Some(&1));
+    // A higher-precedence file raising only min_len suppresses it.
+    let site = RuleSet::parse_toml("[entropy]\nmin_len = 24\n").unwrap();
+    let merged = RuleSet::built_in().merge(&site);
+    assert_eq!(merged.entropy_min_len, Some(24));
+    assert_eq!(merged.entropy_threshold, Some(4.5));
+    let (out2, counts2) = redact_text(&merged.compile().unwrap(), text);
+    assert_eq!(out2, text);
+    assert!(counts2.is_empty());
 }
 
 // --- determinism / replacement format ---

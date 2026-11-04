@@ -166,28 +166,37 @@ pub enum Rule {
 }
 
 /// Serializable redaction configuration.
+///
+/// The scalar settings are `Option`s so a parsed file can distinguish
+/// "absent" (`None`, inherit from the lower-precedence set) from
+/// "explicitly set" (`Some`, wins on merge). [`RuleSet::built_in`] fills
+/// every setting; [`RuleSet::parse_toml`] leaves omitted sections as
+/// `None`; [`RuleSet::merge`] keeps `other`'s value when it is `Some` and
+/// otherwise inherits `self`'s. Compilation and fingerprinting resolve
+/// `None` to the defaults (PII off, 20 characters, 4.5 bits).
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuleSet {
     /// Rules in match-priority order (built-ins first after a merge).
     pub detectors: Vec<Rule>,
-    /// Whether the `email` detector runs.
-    pub pii_email: bool,
-    /// Whether the `phone` detector runs.
-    pub pii_phone: bool,
-    /// High-entropy token minimum length.
-    pub entropy_min_len: usize,
-    /// High-entropy Shannon threshold in bits per character.
-    pub entropy_threshold: f64,
+    /// Whether the `email` detector runs (`None` = inherit).
+    pub pii_email: Option<bool>,
+    /// Whether the `phone` detector runs (`None` = inherit).
+    pub pii_phone: Option<bool>,
+    /// High-entropy token minimum length (`None` = inherit).
+    pub entropy_min_len: Option<usize>,
+    /// High-entropy Shannon threshold in bits per character (`None` = inherit).
+    pub entropy_threshold: Option<f64>,
 }
 
 impl Default for RuleSet {
+    /// Empty overlay: no rules, every setting unset (inherits on merge).
     fn default() -> Self {
         Self {
             detectors: Vec::new(),
-            pii_email: false,
-            pii_phone: false,
-            entropy_min_len: 20,
-            entropy_threshold: 4.5,
+            pii_email: None,
+            pii_phone: None,
+            entropy_min_len: None,
+            entropy_threshold: None,
         }
     }
 }
@@ -227,9 +236,9 @@ struct TomlRules {
 #[derive(Debug, Default, Deserialize)]
 struct TomlPii {
     #[serde(default)]
-    email: bool,
+    email: Option<bool>,
     #[serde(default)]
-    phone: bool,
+    phone: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -252,7 +261,7 @@ struct TomlPattern {
 
 impl RuleSet {
     /// The default set: the seven non-PII built-in detectors, PII off,
-    /// entropy at 20 characters / 4.5 bits.
+    /// entropy at 20 characters / 4.5 bits (all settings explicitly set).
     pub fn built_in() -> Self {
         Self {
             detectors: vec![
@@ -264,18 +273,49 @@ impl RuleSet {
                 Rule::Detector(BuiltInId::Authorization),
                 Rule::Detector(BuiltInId::HighEntropy),
             ],
-            ..Self::default()
+            pii_email: Some(false),
+            pii_phone: Some(false),
+            entropy_min_len: Some(20),
+            entropy_threshold: Some(4.5),
         }
     }
 
+    /// Effective `email` toggle, resolving an unset value to off.
+    pub fn effective_pii_email(&self) -> bool {
+        self.pii_email.unwrap_or(false)
+    }
+
+    /// Effective `phone` toggle, resolving an unset value to off.
+    pub fn effective_pii_phone(&self) -> bool {
+        self.pii_phone.unwrap_or(false)
+    }
+
+    /// Effective entropy minimum length, resolving an unset value to 20.
+    pub fn effective_entropy_min_len(&self) -> usize {
+        self.entropy_min_len.unwrap_or(20)
+    }
+
+    /// Effective entropy threshold, resolving an unset value to 4.5.
+    pub fn effective_entropy_threshold(&self) -> f64 {
+        self.entropy_threshold.unwrap_or(4.5)
+    }
+
     /// Parse the `.starforge/redact.toml` grammar (`[pii]`, `[entropy]` with
-    /// `literals`, and `[[pattern]]` entries).
+    /// `literals`, and `[[pattern]]` entries). Omitted sections stay
+    /// `None` so a later [`RuleSet::merge`] inherits rather than resets.
     pub fn parse_toml(text: &str) -> Result<Self, RuleError> {
         let parsed: TomlRules = toml::from_str(text)?;
-        let threshold = parsed.entropy.threshold.unwrap_or(4.5);
-        let min_len = parsed.entropy.min_len.unwrap_or(20);
-        if !(threshold > 0.0 && threshold <= 8.0) || min_len < 1 {
+        if let Some(threshold) = parsed.entropy.threshold
+            && !(threshold > 0.0 && threshold <= 8.0)
+        {
             return Err(RuleError::BadThreshold { value: threshold });
+        }
+        if let Some(min_len) = parsed.entropy.min_len
+            && min_len < 1
+        {
+            return Err(RuleError::BadThreshold {
+                value: min_len as f64,
+            });
         }
         let mut detectors =
             Vec::with_capacity(parsed.entropy.literals.len() + parsed.pattern.len());
@@ -298,39 +338,46 @@ impl RuleSet {
             detectors,
             pii_email: parsed.pii.email,
             pii_phone: parsed.pii.phone,
-            entropy_min_len: min_len,
-            entropy_threshold: threshold,
+            entropy_min_len: parsed.entropy.min_len,
+            entropy_threshold: parsed.entropy.threshold,
         })
     }
 
-    /// Order-preserving concat of rule lists with the other's PII/entropy
-    /// settings winning. Precedence across files is decided by the caller
-    /// (M1c); this only concatenates `self` then `other`.
+    /// Order-preserving concat of rule lists (`self` then `other`) where a
+    /// setting set (`Some`) in `other` wins and an unset (`None`) one
+    /// inherits `self`'s. Absent TOML sections therefore never reset a
+    /// lower-precedence file's toggles. Precedence across files is decided
+    /// by the caller (M1c).
     pub fn merge(&self, other: &Self) -> Self {
         let mut detectors = self.detectors.clone();
         detectors.extend(other.detectors.iter().cloned());
         Self {
             detectors,
-            pii_email: other.pii_email,
-            pii_phone: other.pii_phone,
-            entropy_min_len: other.entropy_min_len,
-            entropy_threshold: other.entropy_threshold,
+            pii_email: other.pii_email.or(self.pii_email),
+            pii_phone: other.pii_phone.or(self.pii_phone),
+            entropy_min_len: other.entropy_min_len.or(self.entropy_min_len),
+            entropy_threshold: other.entropy_threshold.or(self.entropy_threshold),
         }
     }
 
     /// Precompile every regex once. Custom patterns are re-validated so a
     /// hand-built set with a bad regex fails here instead of panicking.
+    /// Unset settings resolve to the defaults (PII off, 20 / 4.5).
     pub fn compile(&self) -> Result<Compiled, RuleError> {
         // PII detectors named explicitly still obey their toggle.
         let has = |id: BuiltInId| self.detectors.contains(&Rule::Detector(id));
+        let min_len = self.effective_entropy_min_len();
+        let threshold = self.effective_entropy_threshold();
+        let email_on = self.effective_pii_email();
+        let phone_on = self.effective_pii_phone();
         let mut entries = Vec::with_capacity(self.detectors.len() + 2);
         for rule in &self.detectors {
             match rule {
                 Rule::Detector(id) => {
-                    if matches!(id, BuiltInId::Email) && !self.pii_email {
+                    if matches!(id, BuiltInId::Email) && !email_on {
                         continue;
                     }
-                    if matches!(id, BuiltInId::Phone) && !self.pii_phone {
+                    if matches!(id, BuiltInId::Phone) && !phone_on {
                         continue;
                     }
                     entries.push(CompiledEntry {
@@ -341,9 +388,7 @@ impl RuleSet {
                                 | BuiltInId::CloudCredential
                                 | BuiltInId::KnownToken
                         ),
-                        kind: EntryKind::BuiltIn(
-                            id.build(self.entropy_min_len, self.entropy_threshold),
-                        ),
+                        kind: EntryKind::BuiltIn(id.build(min_len, threshold)),
                     });
                 }
                 Rule::Literal(literal) => entries.push(CompiledEntry {
@@ -364,22 +409,18 @@ impl RuleSet {
                 }
             }
         }
-        if self.pii_email && !has(BuiltInId::Email) {
+        if email_on && !has(BuiltInId::Email) {
             entries.push(CompiledEntry {
                 id: BuiltInId::Email.id().to_string(),
                 high_confidence: false,
-                kind: EntryKind::BuiltIn(
-                    BuiltInId::Email.build(self.entropy_min_len, self.entropy_threshold),
-                ),
+                kind: EntryKind::BuiltIn(BuiltInId::Email.build(min_len, threshold)),
             });
         }
-        if self.pii_phone && !has(BuiltInId::Phone) {
+        if phone_on && !has(BuiltInId::Phone) {
             entries.push(CompiledEntry {
                 id: BuiltInId::Phone.id().to_string(),
                 high_confidence: false,
-                kind: EntryKind::BuiltIn(
-                    BuiltInId::Phone.build(self.entropy_min_len, self.entropy_threshold),
-                ),
+                kind: EntryKind::BuiltIn(BuiltInId::Phone.build(min_len, threshold)),
             });
         }
         Ok(Compiled { entries })
@@ -500,14 +541,18 @@ pub fn redact_text(rules: &Compiled, text: &str) -> (String, BTreeMap<String, u6
 }
 
 /// Lowercase BLAKE3 hex over the canonical record encoding (see module
-/// docs). Detector order in the set does not affect the hash.
+/// docs). Detector order in the set does not affect the hash. Unset
+/// settings resolve to the defaults, so an explicit default and an
+/// omitted section hash identically.
 pub fn fingerprint(rules: &RuleSet) -> String {
+    let min_len = rules.effective_entropy_min_len();
+    let threshold_value = rules.effective_entropy_threshold();
     let mut records: Vec<String> = Vec::with_capacity(rules.detectors.len() + 3);
     for rule in &rules.detectors {
         match rule {
             Rule::Detector(id) => {
                 let threshold = if matches!(id, BuiltInId::HighEntropy) {
-                    format!("{}:{}", rules.entropy_min_len, rules.entropy_threshold)
+                    format!("{min_len}:{threshold_value}")
                 } else {
                     String::new()
                 };
@@ -525,17 +570,22 @@ pub fn fingerprint(rules: &RuleSet) -> String {
             }
         }
     }
-    records.push(format!(
-        "entropy\0{}\0{}\0",
-        rules.entropy_min_len, rules.entropy_threshold
-    ));
+    records.push(format!("entropy\0{min_len}\0{threshold_value}\0"));
     records.push(format!(
         "pii:email\0{}\0\0",
-        if rules.pii_email { "on" } else { "off" }
+        if rules.effective_pii_email() {
+            "on"
+        } else {
+            "off"
+        }
     ));
     records.push(format!(
         "pii:phone\0{}\0\0",
-        if rules.pii_phone { "on" } else { "off" }
+        if rules.effective_pii_phone() {
+            "on"
+        } else {
+            "off"
+        }
     ));
     records.sort();
     let joined = records.join("");

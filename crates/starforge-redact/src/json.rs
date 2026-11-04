@@ -3,7 +3,9 @@
 //! Redaction targets free-text/value fields only. Structural metadata —
 //! versions, sequence numbers, timestamps, kind discriminants, flags,
 //! model names, file paths, subagent ids, object keys — passes through
-//! untouched. Object keys are never redacted; only string values are.
+//! untouched. Object keys are never redacted; only string values are,
+//! except the top-level `v`/`seq`/`ts`/`kind` values of a JSON object
+//! line, which are structural metadata and pass through verbatim.
 
 use std::collections::BTreeMap;
 
@@ -88,15 +90,20 @@ pub fn redact_event(rules: &Compiled, event: &Event) -> (Event, BTreeMap<String,
 /// Redact a JSONL stream line by line, preserving line count and order.
 ///
 /// A line that parses as a JSON object has its string values redacted
-/// (keys intact) and is re-serialized; any other line is redacted as
-/// plain text. A trailing newline is preserved.
+/// (keys intact) and is re-serialized, except the top-level `v`, `seq`,
+/// `ts`, and `kind` values, which are structural metadata and pass
+/// through verbatim; any other line is redacted as plain text.
+/// A trailing newline is preserved.
 pub fn redact_jsonl(rules: &Compiled, jsonl: &str) -> (String, BTreeMap<String, u64>) {
     let mut counts: BTreeMap<String, u64> = BTreeMap::new();
     let mut lines_out: Vec<String> = Vec::new();
     for line in jsonl.lines() {
         match serde_json::from_str::<Value>(line) {
             Ok(Value::Object(mut map)) => {
-                for v in map.values_mut() {
+                for (k, v) in map.iter_mut() {
+                    if matches!(k.as_str(), "v" | "seq" | "ts" | "kind") {
+                        continue;
+                    }
                     let mut owned = v.take();
                     redact_value(rules, &mut owned, &mut counts);
                     *v = owned;
