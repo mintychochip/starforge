@@ -10,7 +10,8 @@ use crate::FormatError;
 /// Default maximum compressed segment size (16 MiB).
 pub const DEFAULT_SEGMENT_CAP: usize = 16 * 1024 * 1024;
 
-/// Uncompressed buffer size past which the accumulator is compressed and measured.
+/// Uncompressed growth between compression measurements (performance
+/// cadence only; the `cap` invariant is enforced at every emission).
 const MEASURE_TRIGGER: usize = 256 * 1024;
 
 /// zstd compression level for every segment; fixed so output is deterministic.
@@ -35,12 +36,23 @@ pub fn decompress(bytes: &[u8]) -> Result<Vec<u8>, FormatError> {
 
 /// Greedily pack JSONL text into compressed segments of at most `cap` bytes.
 ///
-/// Lines accumulate in an uncompressed buffer; whenever the buffer exceeds
-/// 256 KiB it is compressed and measured, and if it is over `cap` everything
-/// before the current line is emitted as a segment. A single line that alone
-/// exceeds the cap is emitted as its own oversized segment. Empty input
-/// yields no segments. A final unterminated line is terminated first.
+/// Every emitted segment compresses to at most `cap` bytes, unless it is a
+/// single line that alone exceeds the cap (emitted as its own oversized
+/// segment; a line cannot be split). Lines accumulate in an uncompressed
+/// buffer that is compressed and measured each time it has grown by at least
+/// `MEASURE_TRIGGER.min(cap)` bytes since the last check, plus at the final
+/// flush. Lazy checking costs only packing efficiency, never the invariant:
+/// emission always takes the largest line-boundary prefix that fits.
+/// Empty input yields no segments. A final unterminated line is terminated first.
 pub fn split_jsonl(jsonl: &str, cap: usize) -> Vec<Vec<u8>> {
+    split_jsonl_with_trigger(jsonl, cap, MEASURE_TRIGGER.min(cap))
+}
+
+/// [`split_jsonl`] with an explicit measurement cadence.
+///
+/// Tests pass a small `trigger` to exercise multi-segment logic
+/// deterministically; production use goes through [`split_jsonl`].
+pub(crate) fn split_jsonl_with_trigger(jsonl: &str, cap: usize, trigger: usize) -> Vec<Vec<u8>> {
     if jsonl.is_empty() {
         return Vec::new();
     }
@@ -50,23 +62,67 @@ pub fn split_jsonl(jsonl: &str, cap: usize) -> Vec<Vec<u8>> {
     }
     let mut segments = Vec::new();
     let mut buf = String::new();
+    // Cumulative byte length of each buffered line: `buf[..ends[k]]` is `k + 1` lines.
+    let mut ends: Vec<usize> = Vec::new();
+    let mut next_check = trigger;
     for line in text.split_inclusive('\n') {
         buf.push_str(line);
-        if buf.len() > MEASURE_TRIGGER && compress(buf.as_bytes()).len() > cap {
-            let prefix_len = buf.len() - line.len();
-            if prefix_len == 0 {
-                segments.push(compress(buf.as_bytes()));
-                buf.clear();
-            } else {
-                segments.push(compress(&buf.as_bytes()[..prefix_len]));
-                buf.drain(..prefix_len);
-            }
+        ends.push(buf.len());
+        if buf.len() >= next_check {
+            next_check = buf.len().saturating_add(trigger);
+            emit_one_if_over(&mut buf, &mut ends, &mut segments, cap);
         }
     }
-    if !buf.is_empty() {
-        segments.push(compress(buf.as_bytes()));
+    // Final flush under the same enforcement: the remainder may exceed `cap`.
+    while !buf.is_empty() {
+        if compress(buf.as_bytes()).len() <= cap {
+            segments.push(compress(buf.as_bytes()));
+            break;
+        }
+        emit_one(&mut buf, &mut ends, &mut segments, cap);
     }
     segments
+}
+
+/// Emit one segment from the front of `buf` if it is over `cap`.
+fn emit_one_if_over(
+    buf: &mut String,
+    ends: &mut Vec<usize>,
+    segments: &mut Vec<Vec<u8>>,
+    cap: usize,
+) {
+    if compress(buf.as_bytes()).len() > cap {
+        emit_one(buf, ends, segments, cap);
+    }
+}
+
+/// Emit one segment: the largest line-boundary prefix of `buf` compressing
+/// to at most `cap` bytes, or the first line alone if it already exceeds
+/// `cap`. Requires non-empty `buf`; always drains at least one line.
+fn emit_one(buf: &mut String, ends: &mut Vec<usize>, segments: &mut Vec<Vec<u8>>, cap: usize) {
+    debug_assert!(!buf.is_empty());
+    let bytes = buf.as_bytes();
+    // Binary search for the largest line count whose prefix was measured to
+    // fit. Compressed size is assumed near-monotonic in prefix length, but
+    // safety does not depend on it: only a measured prefix is ever emitted.
+    let mut lo = 0;
+    let mut hi = ends.len();
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if compress(&bytes[..ends[mid - 1]]).len() <= cap {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    let taken_lines = if lo == 0 { 1 } else { lo };
+    let take = ends[taken_lines - 1];
+    segments.push(compress(&bytes[..take]));
+    buf.drain(..take);
+    ends.drain(..taken_lines);
+    for end in ends.iter_mut() {
+        *end -= take;
+    }
 }
 
 /// Decompress `segments` and concatenate them.
@@ -188,6 +244,25 @@ mod tests {
         ));
     }
 
+    /// Every segment is within `cap`, unless it is a single line that alone exceeds it.
+    fn assert_cap_invariant(segments: &[Vec<u8>], cap: usize) {
+        for seg in segments {
+            if seg.len() <= cap {
+                continue;
+            }
+            let raw = decompress(seg).expect("segment decompresses");
+            let text = String::from_utf8(raw).expect("test data is UTF-8");
+            assert!(
+                text.ends_with('\n') && !text[..text.len() - 1].contains('\n'),
+                "over-cap segment holds several lines"
+            );
+            assert!(
+                compress(text.as_bytes()).len() > cap,
+                "over-cap segment's line fits in cap"
+            );
+        }
+    }
+
     #[test]
     fn oversized_single_line_is_its_own_segment() {
         let line = pseudo_random_ascii(300 * 1024, 7) + "\n";
@@ -197,6 +272,25 @@ mod tests {
         assert_eq!(segments.len(), 1);
         assert!(segments[0].len() > cap);
         assert_eq!(assemble(&as_refs(&segments)).unwrap(), line);
+    }
+
+    #[test]
+    fn oversized_line_followed_by_more_lines() {
+        let big = pseudo_random_ascii(3000, 11) + "\n";
+        let mut input = big.clone();
+        for i in 0..50 {
+            input.push_str(&pseudo_random_ascii(120, 2000 + i));
+            input.push('\n');
+        }
+        let cap = 1024;
+        assert!(compress(big.as_bytes()).len() > cap);
+        // Small trigger exercises the check path; the oversized line is
+        // emitted alone mid-stream and the following lines keep packing.
+        let segments = split_jsonl_with_trigger(&input, cap, 64);
+        assert!(segments.len() >= 2);
+        assert_eq!(decompress(&segments[0]).unwrap(), big.as_bytes());
+        assert_cap_invariant(&segments, cap);
+        assert_eq!(assemble(&as_refs(&segments)).unwrap(), input);
     }
 
     #[test]
@@ -211,29 +305,53 @@ mod tests {
 
     #[test]
     fn boundary_measure_trigger_256kib() {
+        const TRIGGER: usize = 256 * 1024;
         let cap = 1024;
         let line1 = pseudo_random_ascii(200 * 1024 - 1, 1) + "\n";
         let line2 = pseudo_random_ascii(56 * 1024 - 1, 2) + "\n";
-        assert_eq!(line1.len() + line2.len(), 256 * 1024);
-        // Exactly at the trigger: no measurement, single segment.
+        assert_eq!(line1.len() + line2.len(), TRIGGER);
+        // Both lines alone exceed the cap, so each becomes its own oversized
+        // segment; the check path (over the trigger) and the flush-only path
+        // (exactly at the trigger) must agree byte for byte.
         let input = format!("{line1}{line2}");
-        let segments = split_jsonl(&input, cap);
-        assert_eq!(segments.len(), 1);
-        assert_eq!(assemble(&as_refs(&segments)).unwrap(), input);
-        // One byte over the trigger: measurement fires, prefix emitted.
-        let line2_long = pseudo_random_ascii(56 * 1024, 2) + "\n";
-        let input = format!("{line1}{line2_long}");
-        let segments = split_jsonl(&input, cap);
-        assert_eq!(segments.len(), 2);
-        assert_eq!(decompress(&segments[0]).unwrap(), line1.as_bytes());
-        assert_eq!(assemble(&as_refs(&segments)).unwrap(), input);
+        let checked = split_jsonl_with_trigger(&format!("{input}x"), cap, TRIGGER);
+        let flushed = split_jsonl_with_trigger(&input, cap, TRIGGER + 1);
+        assert_eq!(checked.len(), 3);
+        assert_eq!(decompress(&checked[0]).unwrap(), line1.as_bytes());
+        assert_eq!(decompress(&checked[1]).unwrap(), line2.as_bytes());
+        assert_eq!(assemble(&as_refs(&checked)).unwrap(), format!("{input}x\n"));
+        assert_eq!(flushed.len(), 2);
+        assert_eq!(checked[..2], flushed);
+        assert_eq!(assemble(&as_refs(&flushed)).unwrap(), input);
     }
 
     #[test]
-    fn segments_stay_near_cap() {
+    fn segments_stay_within_cap() {
         let mut input = String::new();
         for i in 0..4096 {
             input.push_str(&pseudo_random_ascii(120, 1000 + i));
+            input.push('\n');
+        }
+        for cap in [1024, 4096, 65_536] {
+            let segments = split_jsonl(&input, cap);
+            assert!(
+                segments.len() >= 2,
+                "expected splits, got {}",
+                segments.len()
+            );
+            assert_cap_invariant(&segments, cap);
+            for seg in &segments {
+                assert!(seg.len() <= cap, "segment {} over cap {}", seg.len(), cap);
+            }
+            assert_eq!(assemble(&as_refs(&segments)).unwrap(), input);
+        }
+    }
+
+    #[test]
+    fn default_trigger_multi_segment() {
+        let mut input = String::new();
+        for i in 0..16_528 {
+            input.push_str(&pseudo_random_ascii(120, 3000 + i));
             input.push('\n');
         }
         let cap = 300_000;
@@ -243,16 +361,28 @@ mod tests {
             "expected splits, got {}",
             segments.len()
         );
-        for seg in &segments {
-            assert!(
-                seg.len() <= cap + 64 * 1024,
-                "segment {} over cap {}",
-                seg.len(),
-                cap
-            );
-            decompress(seg).unwrap();
-        }
+        assert_cap_invariant(&segments, cap);
         assert_eq!(assemble(&as_refs(&segments)).unwrap(), input);
+    }
+
+    #[test]
+    fn lazy_checks_cost_only_packing() {
+        // Same input+cap with near-instant checks and (almost) no checks:
+        // identical reassembled output, invariant holds on both paths.
+        let mut input = String::new();
+        for i in 0..200 {
+            input.push_str(&pseudo_random_ascii(120, 4000 + i));
+            input.push('\n');
+        }
+        let cap = 1024;
+        let eager = split_jsonl_with_trigger(&input, cap, 64);
+        let lazy = split_jsonl_with_trigger(&input, cap, 1 << 40);
+        assert!(eager.len() >= 2);
+        assert!(lazy.len() >= 2);
+        assert_cap_invariant(&eager, cap);
+        assert_cap_invariant(&lazy, cap);
+        assert_eq!(assemble(&as_refs(&eager)).unwrap(), input);
+        assert_eq!(assemble(&as_refs(&lazy)).unwrap(), input);
     }
 
     proptest! {
@@ -272,6 +402,26 @@ mod tests {
         fn determinism_arbitrary(chars in prop::collection::vec(any::<char>(), 0..300)) {
             let input: String = chars.into_iter().collect();
             prop_assert_eq!(split_jsonl(&input, 1024), split_jsonl(&input, 1024));
+        }
+
+        #[test]
+        fn multisegment_small_trigger(
+            lines in prop::collection::vec("[a-zA-Z0-9 ]{1,60}", 1..80),
+            cap in 64usize..2048,
+        ) {
+            let input = lines.join("\n") + "\n";
+            let segments = split_jsonl_with_trigger(&input, cap, 64);
+            prop_assert!(!segments.is_empty());
+            for seg in &segments {
+                let raw = decompress(seg).map_err(|_| TestCaseError::fail("segment must decompress"))?;
+                if seg.len() > cap {
+                    let text = String::from_utf8(raw).map_err(|_| TestCaseError::fail("test data is UTF-8"))?;
+                    prop_assert!(text.ends_with('\n') && !text[..text.len() - 1].contains('\n'));
+                    prop_assert!(compress(text.as_bytes()).len() > cap);
+                }
+            }
+            prop_assert_eq!(assemble(&as_refs(&segments)).unwrap(), input.clone());
+            prop_assert_eq!(segments, split_jsonl_with_trigger(&input, cap, 64));
         }
     }
 }
