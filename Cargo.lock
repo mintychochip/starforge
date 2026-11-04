@@ -4480,6 +4480,7 @@ dependencies = [
  "sha2 0.11.1",
  "sqlx",
  "starforge-format",
+ "starforge-redact",
  "starforged-blob",
  "starforged-db",
  "starforged-git",

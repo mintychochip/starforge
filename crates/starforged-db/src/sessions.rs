@@ -5,7 +5,7 @@
 //! `NULL` in M1d (Ruling R1); the M1f raw wire fills it with no migration rewrite.
 
 use sqlx::Row;
-use sqlx::any::AnyRow;
+use sqlx::any::{Any, AnyRow};
 
 use crate::{Db, DbResult, now};
 
@@ -365,6 +365,26 @@ pub async fn set_quarantine(
     Ok(())
 }
 
+pub async fn session_by_id(db: &Db, id: i64) -> DbResult<Option<SessionRow>> {
+    let row = sqlx::query(select_session!("WHERE id = $1"))
+        .bind(id)
+        .fetch_optional(db.pool())
+        .await?;
+    row.as_ref().map(session_from_row).transpose()
+}
+
+/// Overwrites the merged server/client redaction counts (`redaction_counts`
+/// accumulates server-found hits on top of the client's fingerprint counts).
+pub async fn set_redaction_counts(db: &Db, id: i64, counts: &str) -> DbResult<()> {
+    sqlx::query("UPDATE sessions SET redaction_counts = $1, updated_at = $2 WHERE id = $3")
+        .bind(counts)
+        .bind(now())
+        .bind(id)
+        .execute(db.pool())
+        .await?;
+    Ok(())
+}
+
 pub async fn segment_by_n(db: &Db, session_id: i64, n: i64) -> DbResult<Option<SegmentRow>> {
     let row = sqlx::query(select_segment!("WHERE session_id = $1 AND n = $2"))
         .bind(session_id)
@@ -425,6 +445,16 @@ pub async fn delete_session(db: &Db, id: i64) -> DbResult<Vec<SegmentRow>> {
         .await?;
     Ok(removed)
 }
+/// Deletes every commit link filed under `ulid`: trailer-first rows carry a
+/// `NULL` `session_id` and would survive the session row's `ON DELETE CASCADE`.
+pub async fn delete_session_links(db: &Db, repo_id: i64, ulid: &str) -> DbResult<u64> {
+    let result = sqlx::query("DELETE FROM commit_links WHERE repo_id = $1 AND session_ulid = $2")
+        .bind(repo_id)
+        .bind(ulid)
+        .execute(db.pool())
+        .await?;
+    Ok(result.rows_affected())
+}
 
 /// Records a `Starforge-Session` push trailer. Trailer-first arrivals have no session row
 /// yet, so `session_id` stays `NULL` until the CLI claim fills it in.
@@ -463,6 +493,62 @@ pub async fn upsert_claim_link(
     seq_start: Option<i64>,
     seq_end: Option<i64>,
 ) -> DbResult<i64> {
+    let mut tx = db.pool().begin().await?;
+    let id = upsert_claim_link_tx(
+        &mut tx, repo_id, session_id, ulid, sha, confidence, seq_start, seq_end,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(id)
+}
+
+/// One validated commit claim, ready for [`upsert_claim_links`].
+pub struct ClaimLinkUpsert<'a> {
+    pub sha: &'a str,
+    pub confidence: &'a str,
+    pub seq_start: Option<i64>,
+    pub seq_end: Option<i64>,
+}
+
+/// Records a whole validated batch in one transaction: any row failing rolls
+/// back every row, so callers never leave a partial batch behind.
+pub async fn upsert_claim_links(
+    db: &Db,
+    repo_id: i64,
+    session_id: i64,
+    ulid: &str,
+    entries: &[ClaimLinkUpsert<'_>],
+) -> DbResult<()> {
+    let mut tx = db.pool().begin().await?;
+    for entry in entries {
+        upsert_claim_link_tx(
+            &mut tx,
+            repo_id,
+            session_id,
+            ulid,
+            entry.sha,
+            entry.confidence,
+            entry.seq_start,
+            entry.seq_end,
+        )
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// [`upsert_claim_link`] inside the caller's transaction.
+#[allow(clippy::too_many_arguments)]
+pub async fn upsert_claim_link_tx(
+    tx: &mut sqlx::Transaction<'_, Any>,
+    repo_id: i64,
+    session_id: i64,
+    ulid: &str,
+    sha: &str,
+    confidence: &str,
+    seq_start: Option<i64>,
+    seq_end: Option<i64>,
+) -> DbResult<i64> {
     sqlx::query(
         "INSERT INTO commit_links (repo_id, session_ulid, session_id, sha, source, confidence, seq_start, seq_end, \
          trailer_seen, claim_seen) \
@@ -475,7 +561,7 @@ pub async fn upsert_claim_link(
     .bind(confidence)
     .bind(seq_start)
     .bind(seq_end)
-    .execute(db.pool())
+    .execute(&mut **tx)
     .await?;
     sqlx::query(
         "UPDATE commit_links SET session_id = $4, source = 'cli_claim', confidence = $5, seq_start = $6, \
@@ -488,9 +574,9 @@ pub async fn upsert_claim_link(
     .bind(confidence)
     .bind(seq_start)
     .bind(seq_end)
-    .execute(db.pool())
+    .execute(&mut **tx)
     .await?;
-    link_id_by_key(db, repo_id, ulid, sha).await
+    link_id_by_key_tx(tx, repo_id, ulid, sha).await
 }
 
 async fn link_id_by_key(db: &Db, repo_id: i64, ulid: &str, sha: &str) -> DbResult<i64> {
@@ -501,6 +587,23 @@ async fn link_id_by_key(db: &Db, repo_id: i64, ulid: &str, sha: &str) -> DbResul
     .bind(ulid)
     .bind(sha)
     .fetch_one(db.pool())
+    .await?;
+    Ok(id)
+}
+
+async fn link_id_by_key_tx(
+    tx: &mut sqlx::Transaction<'_, Any>,
+    repo_id: i64,
+    ulid: &str,
+    sha: &str,
+) -> DbResult<i64> {
+    let id: i64 = sqlx::query_scalar(
+        "SELECT id FROM commit_links WHERE repo_id = $1 AND session_ulid = $2 AND sha = $3",
+    )
+    .bind(repo_id)
+    .bind(ulid)
+    .bind(sha)
+    .fetch_one(&mut **tx)
     .await?;
     Ok(id)
 }
@@ -1032,5 +1135,66 @@ mod tests {
                 .unwrap();
         assert_eq!(dangling_links, 0);
         assert!(blob_by_hash(&t.db, "qa").await.unwrap().is_some());
+    }
+    #[tokio::test]
+    async fn claim_batch_rolls_back_on_mid_batch_db_failure() {
+        let (t, alice, repo_id) = setup().await;
+        let sid = insert_session(&t.db, &session(repo_id, alice, "01TX"))
+            .await
+            .unwrap();
+        // One good row, then a row violating the confidence CHECK: dropping
+        // the transaction must leave zero rows behind.
+        let mut tx = t.db.pool().begin().await.unwrap();
+        upsert_claim_link_tx(
+            &mut tx,
+            repo_id,
+            sid,
+            "01TX",
+            &"a".repeat(40),
+            "exact",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let bad = upsert_claim_link_tx(
+            &mut tx,
+            repo_id,
+            sid,
+            "01TX",
+            &"b".repeat(40),
+            "bogus",
+            None,
+            None,
+        )
+        .await;
+        assert!(bad.is_err(), "confidence CHECK must reject 'bogus'");
+        drop(tx);
+        assert!(links_of_session(&t.db, sid).await.unwrap().is_empty());
+
+        // The batch entry point commits the same shape all-or-nothing.
+        upsert_claim_links(
+            &t.db,
+            repo_id,
+            sid,
+            "01TX",
+            &[
+                ClaimLinkUpsert {
+                    sha: &"a".repeat(40),
+                    confidence: "exact",
+                    seq_start: Some(0),
+                    seq_end: Some(9),
+                },
+                ClaimLinkUpsert {
+                    sha: &"b".repeat(40),
+                    confidence: "heuristic",
+                    seq_start: None,
+                    seq_end: None,
+                },
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(links_of_session(&t.db, sid).await.unwrap().len(), 2);
     }
 }

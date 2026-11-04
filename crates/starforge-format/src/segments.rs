@@ -34,6 +34,26 @@ pub fn decompress(bytes: &[u8]) -> Result<Vec<u8>, FormatError> {
     zstd::stream::decode_all(bytes).map_err(|_| FormatError::Decompress)
 }
 
+/// Decompress one zstd frame with an output cap: at most `limit + 1` bytes
+/// are ever read from the decoder, so a decompression bomb cannot force the
+/// caller to materialize the full expansion. Output longer than `limit`
+/// yields [`FormatError::TooLarge`]; corrupt input yields
+/// [`FormatError::Decompress`] like [`decompress`].
+pub fn decompress_bounded(bytes: &[u8], limit: usize) -> Result<Vec<u8>, FormatError> {
+    use std::io::Read;
+
+    let decoder = zstd::stream::read::Decoder::new(bytes).map_err(|_| FormatError::Decompress)?;
+    let mut out = Vec::new();
+    decoder
+        .take(limit as u64 + 1)
+        .read_to_end(&mut out)
+        .map_err(|_| FormatError::Decompress)?;
+    if out.len() > limit {
+        return Err(FormatError::TooLarge { limit });
+    }
+    Ok(out)
+}
+
 /// Greedily pack JSONL text into compressed segments of at most `cap` bytes.
 ///
 /// Every emitted segment compresses to at most `cap` bytes, unless it is a
@@ -226,6 +246,49 @@ mod tests {
         truncated.truncate(truncated.len() / 2);
         assert!(matches!(
             decompress(&truncated),
+            Err(FormatError::Decompress)
+        ));
+    }
+    #[test]
+    fn bounded_decompress_roundtrips_small_bodies() {
+        let input = "{\"seq\":42,\"kind\":\"system\"}\n".repeat(100);
+        let compressed = compress(input.as_bytes());
+        assert_eq!(
+            decompress_bounded(&compressed, input.len()).unwrap(),
+            input.as_bytes()
+        );
+        assert_eq!(
+            decompress_bounded(&compressed, input.len() * 2).unwrap(),
+            input.as_bytes()
+        );
+    }
+
+    #[test]
+    fn bounded_decompress_rejects_bombs_without_full_expansion() {
+        // 8 MiB of zeros compresses to kilobytes; the cap trips after
+        // reading limit + 1 bytes, never materializing the full body.
+        let bomb = compress(&vec![b'0'; 8 * 1024 * 1024]);
+        assert!(bomb.len() < 1024, "bomb must stay small on the wire");
+        assert!(matches!(
+            decompress_bounded(&bomb, 1024),
+            Err(FormatError::TooLarge { limit: 1024 })
+        ));
+    }
+
+    #[test]
+    fn bounded_decompress_rejects_corrupt_input() {
+        assert!(matches!(
+            decompress_bounded(b"this is not zstd", 1024),
+            Err(FormatError::Decompress)
+        ));
+        assert!(matches!(
+            decompress_bounded(&[], 1024),
+            Err(FormatError::Decompress)
+        ));
+        let mut truncated = compress(b"{\"seq\":1}\n");
+        truncated.truncate(truncated.len() / 2);
+        assert!(matches!(
+            decompress_bounded(&truncated, 1024),
             Err(FormatError::Decompress)
         ));
     }

@@ -14,7 +14,10 @@ pub use events::{
     SubagentBoundary, System, ToolCall, ToolOutcome, ToolRef, ToolResult, UserMessage, kind_name,
     parse_event,
 };
-pub use segments::{DEFAULT_SEGMENT_CAP, assemble, blake3_hex, compress, decompress, split_jsonl};
+pub use segments::{
+    DEFAULT_SEGMENT_CAP, assemble, blake3_hex, compress, decompress, decompress_bounded,
+    split_jsonl,
+};
 pub use session::{
     Agent, AgentName, CaptureInfo, CaptureMode, FORMAT_TAG, RedactionSummary, RepoInfo,
     SessionMeta, Usage,
@@ -42,6 +45,11 @@ pub enum FormatError {
     BadFormatTag,
     #[error("segment failed to decompress")]
     Decompress,
+    /// The decompressed body exceeds the caller's byte limit: the stored
+    /// `limit` is the cap that was exceeded, not the actual size (which the
+    /// decoder never materializes).
+    #[error("segment decompresses past the {limit}-byte limit")]
+    TooLarge { limit: usize },
     #[error("segment payload is not valid UTF-8")]
     BadUtf8,
 }

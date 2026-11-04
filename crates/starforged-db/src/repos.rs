@@ -106,6 +106,16 @@ pub async fn by_id(db: &Db, id: i64) -> DbResult<Option<RepoRow>> {
         .await?;
     row.as_ref().map(from_row).transpose()
 }
+/// The repo's `.starforge/redact.toml` content (`''` when none is configured).
+/// Read as a scalar so session ingest does not need the full row.
+pub async fn redact_rules(db: &Db, id: i64) -> DbResult<String> {
+    let rules: Option<String> = sqlx::query_scalar("SELECT redact_rules FROM repos WHERE id = $1")
+        .bind(id)
+        .fetch_optional(db.pool())
+        .await?
+        .flatten();
+    Ok(rules.unwrap_or_default())
+}
 
 /// The owner's repositories that are not deleted, by name.
 pub async fn list_by_owner(db: &Db, owner_id: i64) -> DbResult<Vec<RepoRow>> {

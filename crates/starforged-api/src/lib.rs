@@ -60,6 +60,10 @@ pub fn router(core: Core, base_url: String) -> Router {
             put(sessions::put_meta),
         )
         .route(
+            "/repos/{owner}/{repo}/sessions",
+            get(sessions::list_sessions),
+        )
+        .route(
             "/repos/{owner}/{repo}/sessions/{ulid}/segments/{n}",
             put(sessions::put_segment)
                 .route_layer(axum::extract::DefaultBodyLimit::max(segment_limit)),
@@ -71,6 +75,14 @@ pub fn router(core: Core, base_url: String) -> Router {
         .route(
             "/repos/{owner}/{repo}/sessions/{ulid}/links",
             post(sessions::post_links),
+        )
+        .route(
+            "/repos/{owner}/{repo}/sessions/{ulid}/release",
+            post(sessions::release_session),
+        )
+        .route(
+            "/repos/{owner}/{repo}/sessions/{ulid}/purge",
+            post(sessions::purge_session),
         )
         .fallback(|| async { ApiError::NotFound })
         .layer(axum::middleware::from_fn_with_state(

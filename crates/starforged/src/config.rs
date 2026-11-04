@@ -137,6 +137,15 @@ pub struct SessionsConfig {
     /// Rejects segment uploads past this per-uploader rolling-hour volume (spec §7.7).
     #[serde(default = "default_max_hourly_bytes")]
     pub max_hourly_bytes: u64,
+    /// Rejects segment bodies whose decompressed event JSONL exceeds this
+    /// (default 256 MiB, spec §6.3): the server never materializes more than
+    /// `limit + 1` bytes per segment, so a decompression bomb cannot OOM it.
+    #[serde(default = "default_max_decompressed_bytes")]
+    pub max_decompressed_bytes: u64,
+    /// Operator redact rules in `.starforge/redact.toml` grammar, merged last
+    /// (operator wins over repo rules). Default: unset, meaning no site rules.
+    #[serde(default)]
+    pub site_redact_rules: Option<String>,
 }
 
 fn default_blob_dir() -> PathBuf {
@@ -159,6 +168,10 @@ fn default_max_hourly_bytes() -> u64 {
     starforged_core::DEFAULT_MAX_HOURLY_BYTES
 }
 
+fn default_max_decompressed_bytes() -> u64 {
+    starforged_core::DEFAULT_MAX_DECOMPRESSED_BYTES
+}
+
 impl Default for SessionsConfig {
     fn default() -> Self {
         SessionsConfig {
@@ -167,6 +180,8 @@ impl Default for SessionsConfig {
             max_repo_bytes: default_max_repo_bytes(),
             max_user_bytes: default_max_user_bytes(),
             max_hourly_bytes: default_max_hourly_bytes(),
+            max_decompressed_bytes: default_max_decompressed_bytes(),
+            site_redact_rules: None,
         }
     }
 }
@@ -230,6 +245,18 @@ impl Config {
                     self.sessions.max_hourly_bytes = value
                         .parse()
                         .map_err(|_| anyhow::anyhow!("{key} must be a non-negative byte count"))?;
+                }
+                "sessions__max_decompressed_bytes" => {
+                    self.sessions.max_decompressed_bytes = value
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("{key} must be a non-negative byte count"))?;
+                }
+                "sessions__site_redact_rules" => {
+                    self.sessions.site_redact_rules = if value.trim().is_empty() {
+                        None
+                    } else {
+                        Some(value)
+                    };
                 }
                 _ => bail!("unknown configuration override {key}"),
             }

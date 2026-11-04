@@ -7,7 +7,7 @@
 
 use std::collections::HashSet;
 
-use starforge_format::{SessionMeta, blake3_hex, decompress, parse_event};
+use starforge_format::{FormatError, SessionMeta, blake3_hex, decompress_bounded, parse_event};
 use starforged_db::sessions::{self as db_sessions, NewSession, SessionRow};
 use ulid::Ulid;
 
@@ -16,7 +16,7 @@ use crate::permission::Permission;
 use crate::quota;
 use crate::repos::RepoAccess;
 use crate::tokens::TokenAuth;
-use crate::{Core, CoreError, CoreResult};
+use crate::{Core, CoreConfig, CoreError, CoreResult};
 
 /// Proof that an authenticated caller may upload sessions to a repository.
 #[derive(Debug, Clone)]
@@ -46,6 +46,20 @@ pub struct StoredBlob {
 }
 
 impl Core {
+    /// Session-write guard: the uploader or a repo admin may mutate the
+    /// session (metadata, segments, lifecycle, links). Any other writer who
+    /// knows the ULID gets `Forbidden` — without this, a stranger could
+    /// append segments to someone else's session, complete it, file commit
+    /// links, or squat segment numbers so the uploader's bytes 409 forever.
+    /// Takes `&IngestAuth` (not `&TokenAuth`) because the caller's effective
+    /// repo permission is already resolved on `access` by `authorize_upload`.
+    fn authorize_session_write(session: &SessionRow, auth: &IngestAuth) -> CoreResult<()> {
+        if session.uploader_id == auth.user.id || auth.access.permission >= Permission::Admin {
+            return Ok(());
+        }
+        Err(CoreError::Forbidden)
+    }
+
     /// Authorizes a session upload: the caller must have effective `write` or
     /// above on the repository. Unknown repositories and repositories invisible
     /// to the caller answer `NotFound` (so private repositories stay
@@ -118,11 +132,7 @@ impl Core {
                 Ok((row, true))
             }
             Some(existing) => {
-                if existing.uploader_id != auth.user.id
-                    && auth.access.permission < Permission::Admin
-                {
-                    return Err(CoreError::Forbidden);
-                }
+                Self::authorize_session_write(&existing, auth)?;
                 let mut updated = session_from_meta(
                     repo_id,
                     existing.uploader_id,
@@ -133,8 +143,13 @@ impl Core {
                     &files_touched,
                     &redaction_counts,
                 );
-                // Re-PUT never moves quarantine or uploader ownership.
+                // Re-PUT never moves quarantine or uploader ownership, and never
+                // drops server-merged redaction counts the metadata refresh did
+                // not observe.
                 updated.quarantine = existing.quarantine.as_str();
+                if !existing.redaction_counts.is_empty() {
+                    updated.redaction_counts = existing.redaction_counts.as_str();
+                }
                 db_sessions::update_session_meta(self.db(), existing.id, &updated).await?;
                 let row = db_sessions::session_by_ulid(self.db(), repo_id, ulid)
                     .await?
@@ -184,6 +199,9 @@ impl Core {
         let session = db_sessions::session_by_ulid(self.db(), repo_id, ulid)
             .await?
             .ok_or(CoreError::NotFound)?;
+        // Before the idempotency branches: the `Conflict` hash is still a
+        // stored-secret oracle, and every later path writes.
+        Self::authorize_session_write(&session, auth)?;
         let stored_segments = db_sessions::segments_of(self.db(), session.id).await?;
         let expected = stored_segments.len() as i64;
         let actual_hex = blake3_hex(bytes);
@@ -228,7 +246,8 @@ impl Core {
                 ));
             }
         }
-        let (seq_start, seq_end) = segment_seq_range(bytes)?;
+        let text = decompress_segment_text(self.config(), bytes)?;
+        let (seq_start, seq_end) = segment_seq_range(&text)?;
         if let Some(prev_end) = stored_segments.iter().map(|s| s.seq_end).max()
             && seq_start <= prev_end
         {
@@ -236,6 +255,11 @@ impl Core {
                 "segment sequence range {seq_start}..={seq_end} overlaps stored events ending at {prev_end}"
             )));
         }
+        // The re-scan runs on the decompressed, already-validated JSONL before
+        // the segment row is committed; a hit quarantines the session below
+        // without rejecting the bytes.
+        let compiled = self.scan_rules_for(repo_id).await?;
+        let scan = crate::rescan::scan_segment_text(&compiled, &text, n);
         let stored = self.store_segment(bytes).await?;
         debug_assert_eq!(stored.hash, actual_hex);
         match db_sessions::insert_segment(
@@ -249,7 +273,20 @@ impl Core {
         )
         .await
         {
-            Ok(_) => Ok(SegmentPut::Stored(session)),
+            Ok(_) => {
+                let accepted = db_sessions::session_by_ulid(self.db(), repo_id, ulid)
+                    .await?
+                    .ok_or_else(|| CoreError::Internal("session vanished after insert".into()))?;
+                self.merge_scan_counts(&accepted, &scan.counts).await?;
+                if let Some(hit) = &scan.first_hit {
+                    self.apply_quarantine_hit(Some(auth.user.id), &accepted, hit)
+                        .await?;
+                }
+                let done = db_sessions::session_by_ulid(self.db(), repo_id, ulid)
+                    .await?
+                    .ok_or_else(|| CoreError::Internal("session vanished after insert".into()))?;
+                Ok(SegmentPut::Stored(done))
+            }
             Err(e) if e.is_unique_violation() => {
                 // A concurrent upload won the race: drop our extra refcount so
                 // exactly one ref is held per accepted segment, then report
@@ -281,6 +318,7 @@ impl Core {
         let session = db_sessions::session_by_ulid(self.db(), auth.access.repo.id, ulid)
             .await?
             .ok_or(CoreError::NotFound)?;
+        Self::authorize_session_write(&session, auth)?;
         if session.lifecycle != "complete" {
             db_sessions::set_lifecycle(self.db(), session.id, "complete").await?;
         }
@@ -289,12 +327,14 @@ impl Core {
             .ok_or_else(|| CoreError::Internal("session vanished after complete".into()))
     }
 
-    /// Records the CLI's commit claims through D1's `upsert_claim_link`.
+    /// Records the CLI's commit claims through D1's `upsert_claim_links`.
     /// Every entry is validated up front (`sha` is 40 hexadecimal characters
     /// under `sha` or the CLI's `commit` key, confidence is known, the
     /// sequence range is sane), so a bad entry rejects the whole batch with
-    /// no partial insert. Duplicate SHAs in one payload dedupe to a single
-    /// row; re-posts merge idempotently. Returns the accepted count.
+    /// no partial insert; the validated rows then commit in one transaction,
+    /// so a mid-batch database failure rolls everything back. Duplicate SHAs
+    /// in one payload dedupe to a single row; re-posts merge idempotently.
+    /// Returns the accepted count.
     pub async fn claim_links(
         &self,
         auth: &IngestAuth,
@@ -304,6 +344,7 @@ impl Core {
         let session = db_sessions::session_by_ulid(self.db(), auth.access.repo.id, ulid)
             .await?
             .ok_or(CoreError::NotFound)?;
+        Self::authorize_session_write(&session, auth)?;
         let mut seen = HashSet::new();
         let mut valid = Vec::with_capacity(links.len());
         for link in links {
@@ -344,19 +385,17 @@ impl Core {
                 });
             }
         }
-        for entry in &valid {
-            db_sessions::upsert_claim_link(
-                self.db(),
-                auth.access.repo.id,
-                session.id,
-                ulid,
-                &entry.sha,
-                &entry.confidence,
-                entry.seq_start,
-                entry.seq_end,
-            )
+        let batch: Vec<db_sessions::ClaimLinkUpsert<'_>> = valid
+            .iter()
+            .map(|entry| db_sessions::ClaimLinkUpsert {
+                sha: &entry.sha,
+                confidence: &entry.confidence,
+                seq_start: entry.seq_start,
+                seq_end: entry.seq_end,
+            })
+            .collect();
+        db_sessions::upsert_claim_links(self.db(), auth.access.repo.id, session.id, ulid, &batch)
             .await?;
-        }
         Ok(valid.len())
     }
 }
@@ -390,14 +429,26 @@ fn link_seq(link: &serde_json::Value, key: &str) -> CoreResult<Option<i64>> {
     }
 }
 
-/// Validates that `bytes` are a zstd-compressed JSONL transcript of `v:1`
-/// events and returns the `(min, max)` event sequence numbers. Validation
-/// only: the stored form stays the compressed bytes.
-fn segment_seq_range(bytes: &[u8]) -> CoreResult<(i64, i64)> {
-    let decompressed =
-        decompress(bytes).map_err(|e| CoreError::Invalid(format!("invalid segment body: {e}")))?;
-    let text = String::from_utf8(decompressed)
-        .map_err(|_| CoreError::Invalid("segment payload is not valid UTF-8".into()))?;
+/// Decompresses one segment body with the configured cap. Validation and the
+/// D5 re-scan both go through this helper, so an over-cap body answers
+/// `Invalid` (422) before anything is stored and the server never
+/// materializes more than `limit + 1` bytes per segment.
+pub(crate) fn decompress_segment_text(config: &CoreConfig, bytes: &[u8]) -> CoreResult<String> {
+    let limit = usize::try_from(config.max_decompressed_bytes).unwrap_or(usize::MAX);
+    let raw = decompress_bounded(bytes, limit).map_err(|e| match e {
+        FormatError::TooLarge { limit } => {
+            CoreError::Invalid(format!("segment decompresses past the {limit}-byte limit"))
+        }
+        other => CoreError::Invalid(format!("invalid segment body: {other}")),
+    })?;
+    String::from_utf8(raw)
+        .map_err(|_| CoreError::Invalid("segment payload is not valid UTF-8".into()))
+}
+
+/// Validates that `text` is a JSONL transcript of `v:1` events and returns
+/// the `(min, max)` event sequence numbers. Validation only: the stored form
+/// stays the compressed bytes.
+fn segment_seq_range(text: &str) -> CoreResult<(i64, i64)> {
     let mut seqs: Vec<u64> = Vec::new();
     for (index, line) in text.split('\n').enumerate() {
         if line.trim().is_empty() {

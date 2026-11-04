@@ -20,6 +20,7 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 starforge-format = { path = "../starforge-format" }
+starforge-redact = { path = "../starforge-redact" }
 starforged-blob = { path = "../starforged-blob" }
 starforged-db = { path = "../starforged-db" }
 starforged-git = { path = "../starforged-git" }

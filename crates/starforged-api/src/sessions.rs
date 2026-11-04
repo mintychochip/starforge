@@ -6,19 +6,27 @@
 
 use axum::Json;
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use starforged_core::ingest::SegmentPut;
+use starforged_core::permission::Permission;
 use starforged_core::tokens::Scope;
 
 use crate::ApiState;
 use crate::auth::ApiAuth;
 use crate::error::ApiError;
 
-fn session_json(id: i64, ulid: &str, state: &str) -> Value {
-    json!({ "id": id, "ulid": ulid, "state": state })
+fn session_json(id: i64, ulid: &str, state: &str, quarantine: &str) -> Value {
+    json!({ "id": id, "ulid": ulid, "state": state, "quarantine": quarantine })
+}
+
+/// Query for the session listing: only the quarantine queue exists in M1d.
+#[derive(Debug, Deserialize)]
+pub struct SessionListQuery {
+    pub quarantined: Option<bool>,
 }
 
 /// `PUT /repos/{owner}/{repo}/sessions/{ulid}`: creates the session row from
@@ -49,7 +57,12 @@ pub async fn put_meta(
     };
     Ok((
         status,
-        Json(session_json(row.id, &row.ulid, &row.lifecycle)),
+        Json(session_json(
+            row.id,
+            &row.ulid,
+            &row.lifecycle,
+            &row.quarantine,
+        )),
     ))
 }
 
@@ -95,7 +108,12 @@ pub async fn put_segment(
     {
         SegmentPut::Stored(session) | SegmentPut::Unchanged(session) => Ok((
             StatusCode::OK,
-            Json(session_json(session.id, &session.ulid, &session.lifecycle)),
+            Json(session_json(
+                session.id,
+                &session.ulid,
+                &session.lifecycle,
+                &session.quarantine,
+            )),
         )
             .into_response()),
         SegmentPut::Conflict { stored_hash, .. } => {
@@ -127,12 +145,13 @@ pub async fn post_complete(
         session.id,
         &session.ulid,
         &session.lifecycle,
+        &session.quarantine,
     )))
 }
 
 /// `POST /repos/{owner}/{repo}/sessions/{ulid}/links`: records the CLI's
 /// commit claims (`{"links": [...]}`). Re-posts merge idempotently through
-/// `upsert_claim_link`; answers `{"accepted": k}`.
+/// `upsert_claim_links` (one transaction); answers `{"accepted": k}`.
 pub async fn post_links(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -149,4 +168,69 @@ pub async fn post_links(
         .ok_or_else(|| ApiError::Invalid("body must be {\"links\": [...]}".into()))?;
     let accepted = state.core.claim_links(&ingest, &ulid, links).await?;
     Ok(Json(json!({ "accepted": accepted })))
+}
+
+/// `GET /repos/{owner}/{repo}/sessions?quarantined=true`: the admin
+/// quarantine queue. Repo-`admin` only (visible-but-insufficient answers
+/// `403`, invisible repositories `404`); anything but `?quarantined=true`
+/// answers `422` — the full session listing lands with the M1e read path.
+pub async fn list_sessions(
+    State(state): State<ApiState>,
+    auth: ApiAuth,
+    Path((owner, repo)): Path<(String, String)>,
+    Query(query): Query<SessionListQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let token = auth.require(Scope::SessionUpload)?;
+    let access = state
+        .core
+        .require_repo(Some(&token.user), &owner, &repo, Permission::Admin)
+        .await?;
+    if query.quarantined != Some(true) {
+        return Err(ApiError::Invalid(
+            "only ?quarantined=true is supported".into(),
+        ));
+    }
+    let sessions = state.core.list_quarantined(&access).await?;
+    Ok(Json(json!({ "sessions": sessions })))
+}
+
+/// `POST /repos/{owner}/{repo}/sessions/{ulid}/release`: clears a quarantine
+/// back to `released` (the evidence columns stay for forensics) and audits
+/// `session.quarantine.released`. A session that is not quarantined answers
+/// `422`.
+pub async fn release_session(
+    State(state): State<ApiState>,
+    auth: ApiAuth,
+    Path((owner, repo, ulid)): Path<(String, String, String)>,
+) -> Result<impl IntoResponse, ApiError> {
+    let token = auth.require(Scope::SessionUpload)?;
+    let access = state
+        .core
+        .require_repo(Some(&token.user), &owner, &repo, Permission::Admin)
+        .await?;
+    let view = state
+        .core
+        .release_session(&token.user, &access, &ulid)
+        .await?;
+    Ok(Json(view))
+}
+
+/// `POST /repos/{owner}/{repo}/sessions/{ulid}/purge`: deletes the session
+/// row, its segment rows (blob refcounts decremented), and its commit links,
+/// then audits `session.purged`. Answers `204`; an unknown session is `404`.
+pub async fn purge_session(
+    State(state): State<ApiState>,
+    auth: ApiAuth,
+    Path((owner, repo, ulid)): Path<(String, String, String)>,
+) -> Result<Response, ApiError> {
+    let token = auth.require(Scope::SessionUpload)?;
+    let access = state
+        .core
+        .require_repo(Some(&token.user), &owner, &repo, Permission::Admin)
+        .await?;
+    state
+        .core
+        .purge_session(&token.user, &access, &ulid)
+        .await?;
+    Ok(StatusCode::NO_CONTENT.into_response())
 }

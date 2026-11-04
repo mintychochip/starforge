@@ -29,6 +29,8 @@ pub async fn open_core(config: &Config, hook_exe: PathBuf) -> anyhow::Result<Cor
             max_repo_bytes: config.sessions.max_repo_bytes,
             max_user_bytes: config.sessions.max_user_bytes,
             max_hourly_bytes: config.sessions.max_hourly_bytes,
+            max_decompressed_bytes: config.sessions.max_decompressed_bytes,
+            site_redact_rules: config.sessions.site_redact_rules.clone(),
             blob_store: Arc::new(starforged_blob::FsBlobStore::new(config.blob_dir())),
             hook_exe,
             base_url: config.server.base_url.clone(),

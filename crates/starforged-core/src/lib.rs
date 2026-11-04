@@ -19,6 +19,7 @@ pub mod permission;
 pub mod quota;
 pub mod registration;
 pub mod repos;
+pub mod rescan;
 pub mod sessions;
 pub mod tokens;
 pub mod validate;
@@ -39,7 +40,9 @@ pub const DEFAULT_MAX_REPO_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 pub const DEFAULT_MAX_USER_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 /// Default cap for segment bytes one uploader may add per rolling hour (spec §7.7).
 pub const DEFAULT_MAX_HOURLY_BYTES: u64 = 500 * 1024 * 1024;
-
+/// Default cap for one segment's decompressed event JSONL (spec §6.3): 256 MiB
+/// bounds the in-memory expansion of any accepted segment body.
+pub const DEFAULT_MAX_DECOMPRESSED_BYTES: u64 = 256 * 1024 * 1024;
 #[derive(Debug, Clone)]
 pub struct CoreConfig {
     /// Directory holding bare repositories (`<data_dir>/repos`).
@@ -57,6 +60,12 @@ pub struct CoreConfig {
     pub max_user_bytes: u64,
     /// Rejects segment uploads past this per-uploader rolling-hour volume (spec §7.7).
     pub max_hourly_bytes: u64,
+    /// Rejects segment bodies whose decompressed event JSONL exceeds this (spec §6.3):
+    /// the server never materializes more than `limit + 1` bytes per segment.
+    pub max_decompressed_bytes: u64,
+    /// Operator redact rules (`.starforge/redact.toml` grammar, `None` = unset)
+    /// merged last over built-ins and repo rules, so the operator always wins.
+    pub site_redact_rules: Option<String>,
     /// Content-addressed store behind segment/raw bytes; `FsBlobStore` on `blob_dir` in production.
     pub blob_store: std::sync::Arc<dyn starforged_blob::BlobStore>,
     /// Program that repository hooks execute (`starforged`); tests point it at the built binary.
@@ -155,6 +164,8 @@ pub(crate) mod testing {
             max_repo_bytes: DEFAULT_MAX_REPO_BYTES,
             max_user_bytes: DEFAULT_MAX_USER_BYTES,
             max_hourly_bytes: DEFAULT_MAX_HOURLY_BYTES,
+            max_decompressed_bytes: DEFAULT_MAX_DECOMPRESSED_BYTES,
+            site_redact_rules: None,
             hook_exe: PathBuf::from("/bin/false"),
             base_url: "http://forge.test".into(),
             mailer: None,
