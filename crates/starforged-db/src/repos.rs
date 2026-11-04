@@ -302,6 +302,29 @@ pub async fn deleted_name_exists(db: &Db, owner_id: i64, name: &str) -> DbResult
     Ok(count > 0)
 }
 
+/// Who may use `refs/for` pushes on the repository: `'anyone_with_read'`
+/// (the default on insert) or `'members'`. The allowed set is enforced by a
+/// `CHECK` on the column (added by migration 0012 on both engines); anything
+/// outside it fails here as a database error.
+pub async fn refs_for_access(db: &Db, id: i64) -> DbResult<String> {
+    let value: Option<String> =
+        sqlx::query_scalar("SELECT refs_for_access FROM repos WHERE id = $1")
+            .bind(id)
+            .fetch_optional(db.pool())
+            .await?
+            .flatten();
+    Ok(value.unwrap_or_else(|| "anyone_with_read".to_owned()))
+}
+
+pub async fn set_refs_for_access(db: &Db, id: i64, value: &str) -> DbResult<()> {
+    sqlx::query("UPDATE repos SET refs_for_access = $1 WHERE id = $2")
+        .bind(value)
+        .bind(id)
+        .execute(db.pool())
+        .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
