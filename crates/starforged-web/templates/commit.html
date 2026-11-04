@@ -5,5 +5,6 @@
 <h2>{{ summary }}</h2>
 {% if !body.is_empty() %}<pre class="message">{{ body }}</pre>{% endif %}
 <p class="muted">{{ author }} · {{ when }} · <code>{{ id }}</code>{% for p in parents %} · parent <a href="/{{ head.owner }}/{{ head.name }}/commit/{{ p }}"><code>{{ p }}</code></a>{% endfor %}</p>
+{% include "sessions_panel.html" %}
 {% include "diff_files.html" %}
 {% endblock %}

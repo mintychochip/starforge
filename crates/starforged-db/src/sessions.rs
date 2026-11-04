@@ -807,6 +807,37 @@ pub async fn links_for_sha(db: &Db, repo_id: i64, sha: &str) -> DbResult<Vec<Com
     rows.iter().map(link_from_row).collect()
 }
 
+/// Every commit-link row filed under any of `shas`, oldest first — the
+/// batched variant of [`links_for_sha`] for the commits list page (one query
+/// per page, never one per commit). Callers filter by read rule before displaying.
+pub async fn links_for_shas(
+    db: &Db,
+    repo_id: i64,
+    shas: &[String],
+) -> DbResult<Vec<CommitLinkRow>> {
+    if shas.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut sql = String::from(
+        "SELECT id, repo_id, session_ulid, session_id, sha, source, confidence, seq_start, seq_end, \
+         trailer_seen, claim_seen FROM commit_links WHERE repo_id = $1 AND sha IN (",
+    );
+    for (index, _) in shas.iter().enumerate() {
+        if index > 0 {
+            sql.push_str(", ");
+        }
+        sql.push_str(&format!("${}", index + 2));
+    }
+    sql.push_str(") ORDER BY sha ASC, session_ulid ASC");
+    // Safe: only `$N` placeholders are interpolated; every sha is a bound parameter.
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql)).bind(repo_id);
+    for sha in shas {
+        query = query.bind(sha);
+    }
+    let rows = query.fetch_all(db.pool()).await?;
+    rows.iter().map(link_from_row).collect()
+}
+
 /// Sessions of the repository, oldest first, at most `limit` rows.
 pub async fn sessions_of_repo(db: &Db, repo_id: i64, limit: i64) -> DbResult<Vec<SessionRow>> {
     let rows = sqlx::query(select_session!(

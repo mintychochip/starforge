@@ -9,7 +9,9 @@ use crate::AppState;
 use crate::auth::MaybeUser;
 use crate::error::WebError;
 use crate::pages::code::default_ref;
-use crate::views::{CommitRow, FileView, NavUser, RepoHead, file_views, format_time, nav};
+use crate::views::{
+    CommitRow, FileView, NavUser, RepoHead, SessionChip, file_views, format_time, nav,
+};
 
 pub const PER_PAGE: usize = 50;
 
@@ -43,6 +45,9 @@ pub struct CommitPage {
     parents: Vec<String>,
     files: Vec<FileView>,
     truncated: bool,
+    /// Sessions the viewer may read linked to this commit (unreadable links
+    /// are omitted entirely — never a locked chip). Empty renders no card.
+    sessions: Vec<SessionChip>,
 }
 
 pub async fn commits(
@@ -116,6 +121,11 @@ async fn commits_page(
     };
     let has_next = commits.len() > PER_PAGE;
     commits.truncate(PER_PAGE);
+    let shas: Vec<String> = commits.iter().map(|c| c.id.clone()).collect();
+    let counts = state
+        .core
+        .readable_link_counts(access, session.as_ref().map(|s| &s.user), &shas)
+        .await?;
     let head = RepoHead::new(
         access,
         "commits",
@@ -125,7 +135,14 @@ async fn commits_page(
         nav_user: nav(session),
         head,
         ref_name,
-        commits: commits.into_iter().map(CommitRow::from).collect(),
+        commits: commits
+            .into_iter()
+            .map(|c| {
+                let mut row = CommitRow::from(c);
+                row.session_count = counts.get(&row.id).copied().unwrap_or(0);
+                row
+            })
+            .collect(),
         page,
         has_next,
     })
@@ -157,8 +174,27 @@ pub async fn commit(
         author: info.author_name,
         when: format_time(info.author_time),
         parents: info.parents,
-        id: info.id,
+        id: info.id.clone(),
         files,
         truncated: diff.truncated,
+        sessions: state
+            .core
+            .readable_links_for_commit(&access, session.as_ref().map(|s| &s.user), &info.id)
+            .await?
+            .iter()
+            .map(|(link, session_row)| {
+                SessionChip::new(
+                    &access.repo.owner,
+                    &access.repo.name,
+                    &link.session_ulid,
+                    &session_row.agent_name,
+                    &session_row.agent_version,
+                    session_row.started_at,
+                    &link.confidence,
+                    &link.source,
+                    link.seq_start,
+                )
+            })
+            .collect(),
     })
 }

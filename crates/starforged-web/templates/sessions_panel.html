@@ -1,0 +1,10 @@
+{% if !sessions.is_empty() %}
+<section id="sessions">
+<h3>Sessions</h3>
+<ul class="session-chips">
+{% for s in sessions %}
+<li><a href="{{ s.href }}"><code>{{ s.ulid }}</code></a> {{ s.agent }} · {{ s.started }} <span class="badge">{{ s.confidence }}</span> <span class="badge">{{ s.source }}</span></li>
+{% endfor %}
+</ul>
+</section>
+{% endif %}

@@ -192,6 +192,8 @@ pub struct CommitRow {
     pub summary: String,
     pub author: String,
     pub when: String,
+    /// Readable linked sessions (commits list badge; always 0 on compare).
+    pub session_count: usize,
 }
 
 impl From<CommitInfo> for CommitRow {
@@ -203,6 +205,51 @@ impl From<CommitInfo> for CommitRow {
             summary: commit.summary,
             author: commit.author_name,
             when: format_time(commit.author_time),
+            session_count: 0,
+        }
+    }
+}
+
+/// One linked session in the commit Sessions panel (`sessions_panel.html`)
+/// and the commits-list count badge (`commits.html`).
+pub struct SessionChip {
+    /// Session ULID (only ever populated for sessions the viewer may read).
+    pub ulid: String,
+    /// `agent_name agent_version`, e.g. `pi 2.1`.
+    pub agent: String,
+    pub started: String,
+    /// Link confidence: `exact` or `heuristic`.
+    pub confidence: String,
+    /// Link provenance: `trailer` or `cli_claim`.
+    pub source: String,
+    /// Viewer URL, with `#turn-<seq_start>` when the claim carries a range.
+    pub href: String,
+}
+
+impl SessionChip {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        owner: &str,
+        repo: &str,
+        ulid: &str,
+        agent_name: &str,
+        agent_version: &str,
+        started_at: i64,
+        confidence: &str,
+        source: &str,
+        seq_start: Option<i64>,
+    ) -> SessionChip {
+        let mut href = format!("/{owner}/{repo}/sessions/{ulid}");
+        if let Some(seq) = seq_start {
+            href.push_str(&format!("#turn-{seq}"));
+        }
+        SessionChip {
+            ulid: ulid.to_owned(),
+            agent: format!("{agent_name} {agent_version}"),
+            started: format_time(started_at),
+            confidence: confidence.to_owned(),
+            source: source.to_owned(),
+            href,
         }
     }
 }

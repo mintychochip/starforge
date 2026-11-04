@@ -8,7 +8,7 @@
 <h2>Commits on <span class="badge">{{ ref_name }}</span></h2>
 <ol class="commits">
 {% for c in commits %}
-<li><a href="/{{ head.owner }}/{{ head.name }}/commit/{{ c.id }}"><code>{{ c.short_id }}</code></a> {{ c.summary }} <span class="muted">{{ c.author }} · {{ c.when }}</span></li>
+<li><a href="/{{ head.owner }}/{{ head.name }}/commit/{{ c.id }}"><code>{{ c.short_id }}</code></a> {{ c.summary }} <span class="muted">{{ c.author }} · {{ c.when }}</span>{% if c.session_count > 0 %} <a href="/{{ head.owner }}/{{ head.name }}/commit/{{ c.id }}#sessions" class="badge">{{ c.session_count }} session{% if c.session_count > 1 %}s{% endif %}</a>{% endif %}</li>
 {% endfor %}
 </ol>
 <p class="pager">{% if page > 1 %}<a href="?page={{ page - 1 }}">Newer</a> {% endif %}{% if has_next %}<a href="?page={{ page + 1 }}">Older</a>{% endif %}</p>

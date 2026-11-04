@@ -245,6 +245,89 @@ impl Core {
     ) -> CoreResult<Vec<db_sessions::CommitLinkRow>> {
         Ok(db_sessions::links_of_session(self.db(), session_id).await?)
     }
+    /// Links filed under `sha` that `viewer` may read, oldest first, each
+    /// paired with its session row.
+    ///
+    /// Unreadable links are **omitted entirely** (never a locked chip): a
+    /// public commit page must not leak the existence — let alone the ULID —
+    /// of a session the viewer cannot read. Rows whose upload has not
+    /// arrived yet (`session_id IS NULL` with no matching session row) are
+    /// skipped: the panel shows uploaded sessions only.
+    pub async fn readable_links_for_commit(
+        &self,
+        access: &RepoAccess,
+        viewer: Option<&User>,
+        sha: &str,
+    ) -> CoreResult<Vec<(db_sessions::CommitLinkRow, SessionRow)>> {
+        let links = db_sessions::links_for_sha(self.db(), access.repo.id, sha).await?;
+        self.filter_readable_links(access, viewer, links).await
+    }
+
+    /// Readable-link counts per sha for a commits list page: one
+    /// [`links_for_shas`](db_sessions::links_for_shas) query for every sha,
+    /// then the same per-row [`can_read_session`] filter as
+    /// [`Core::readable_links_for_commit`]. Shas without a readable link are
+    /// absent from the map.
+    pub async fn readable_link_counts(
+        &self,
+        access: &RepoAccess,
+        viewer: Option<&User>,
+        shas: &[String],
+    ) -> CoreResult<std::collections::HashMap<String, usize>> {
+        let links = db_sessions::links_for_shas(self.db(), access.repo.id, shas).await?;
+        let readable = self.filter_readable_links(access, viewer, links).await?;
+        let mut counts = std::collections::HashMap::new();
+        for (link, _) in &readable {
+            *counts.entry(link.sha.clone()).or_insert(0) += 1;
+        }
+        Ok(counts)
+    }
+
+    /// Resolves each link row to its session (via `session_id`, falling back
+    /// to `session_ulid` for trailer-first rows whose upload has since
+    /// arrived) and keeps only rows [`can_read_session`] admits for `viewer`.
+    async fn filter_readable_links(
+        &self,
+        access: &RepoAccess,
+        viewer: Option<&User>,
+        links: Vec<db_sessions::CommitLinkRow>,
+    ) -> CoreResult<Vec<(db_sessions::CommitLinkRow, SessionRow)>> {
+        // Mirror `authorize_session_read_by_ulid`: suspended users are anonymous.
+        let viewer_opt = viewer.filter(|u| u.active).map(|u| Viewer {
+            user_id: u.id,
+            is_admin: u.is_admin,
+        });
+        let collaborator = match viewer_opt {
+            Some(v) => collaborators::permission(self.db(), access.repo.id, v.user_id)
+                .await?
+                .as_deref()
+                .and_then(Permission::parse),
+            None => None,
+        };
+        let is_owner = viewer_opt
+            .map(|v| v.user_id == access.repo.owner_id)
+            .unwrap_or(false);
+        let is_member = is_owner || collaborator.is_some();
+        let is_admin = access.permission >= Permission::Admin;
+        let mut out = Vec::new();
+        for link in links {
+            let session = match link.session_id {
+                Some(id) => db_sessions::session_by_id(self.db(), id).await?,
+                None => {
+                    db_sessions::session_by_ulid(self.db(), access.repo.id, &link.session_ulid)
+                        .await?
+                }
+            };
+            let Some(session) = session else { continue };
+            if session.repo_id != access.repo.id {
+                continue;
+            }
+            if can_read_session(viewer_opt, &access.repo, &session, is_member, is_admin) {
+                out.push((link, session));
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// Pure read rule: may `viewer` see `session` on `repo`?
