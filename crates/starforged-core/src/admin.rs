@@ -118,6 +118,9 @@ impl Core {
     pub async fn grant_admin(&self, admin: &User, target_id: i64) -> CoreResult<User> {
         forbidden_unless_admin(admin)?;
         let target = load_target(self, target_id).await?;
+        if target.is_admin {
+            return refresh(self, target.id).await;
+        }
         users::set_is_admin(self.db(), target.id, true).await?;
         self.audit(
             Some(admin.id),
@@ -132,6 +135,9 @@ impl Core {
     pub async fn revoke_admin(&self, admin: &User, target_id: i64) -> CoreResult<User> {
         forbidden_unless_admin(admin)?;
         let target = load_target(self, target_id).await?;
+        if !target.is_admin {
+            return refresh(self, target.id).await;
+        }
         ensure_not_last_admin(self, &target).await?;
         users::set_is_admin(self.db(), target.id, false).await?;
         self.audit(
@@ -303,6 +309,41 @@ mod tests {
             core.revoke_admin(&vice, vice.id).await,
             Err(CoreError::Invalid(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn grant_and_revoke_noops_change_nothing_and_audit_nothing() {
+        use starforged_db::audit;
+        let (core, _f) = test_core().await;
+        let root = admin_user(&core, "root").await;
+        let bob = plain_user(&core, "bob").await;
+        async fn action_count(core: &Core, action: &str) -> usize {
+            audit::recent(core.db(), 100)
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|e| e.action == action)
+                .count()
+        }
+        // Revoking a non-admin is a no-op: same user back, no audit entry.
+        let same = core.revoke_admin(&root, bob.id).await.unwrap();
+        assert!(!same.is_admin);
+        assert_eq!(action_count(&core, "user.revoke_admin").await, 0);
+        // Grant once: one audit entry.
+        let bob = core.grant_admin(&root, bob.id).await.unwrap();
+        assert!(bob.is_admin);
+        assert_eq!(action_count(&core, "user.grant_admin").await, 1);
+        // Granting again changes and audits nothing.
+        let same = core.grant_admin(&root, bob.id).await.unwrap();
+        assert!(same.is_admin);
+        assert_eq!(action_count(&core, "user.grant_admin").await, 1);
+        // Revoke, then revoking again is a no-op.
+        let bob = core.revoke_admin(&root, bob.id).await.unwrap();
+        assert!(!bob.is_admin);
+        assert_eq!(action_count(&core, "user.revoke_admin").await, 1);
+        let same = core.revoke_admin(&root, bob.id).await.unwrap();
+        assert!(!same.is_admin);
+        assert_eq!(action_count(&core, "user.revoke_admin").await, 1);
     }
 
     #[tokio::test]

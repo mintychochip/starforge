@@ -132,7 +132,7 @@ pub async fn list_users(db: &Db, query: &str, limit: i64) -> DbResult<Vec<UserRo
 /// Sets or clears the site-admin flag (`0`/`1` on both engines).
 pub async fn set_is_admin(db: &Db, id: i64, is_admin: bool) -> DbResult<()> {
     sqlx::query("UPDATE users SET is_admin = $1 WHERE id = $2")
-        .bind(if is_admin { 1 } else { 0 })
+        .bind(i64::from(is_admin))
         .bind(id)
         .execute(db.pool())
         .await?;
