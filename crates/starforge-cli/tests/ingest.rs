@@ -165,3 +165,172 @@ fn ingest_redacts_seed_spool_and_records_fingerprint() {
         "same ULID across ingests"
     );
 }
+
+// Finding 1: one unreadable native file for an earlier adapter must not
+// starve a later adapter's valid session. The Codex file below is not valid
+// JSONL, so Codex `read` fails; the Pi session must still reach the spool.
+
+#[test]
+fn unreadable_native_file_does_not_starve_later_adapters() {
+    let (_repo_dir, repo) = init_repo();
+    let home = TempDir::new().unwrap();
+    std::fs::create_dir_all(home.path().join("sessions/bad")).unwrap();
+    std::fs::write(
+        home.path().join("sessions/bad/rollout-1.jsonl"),
+        "this is not json\n",
+    )
+    .unwrap();
+    std::fs::copy(fixture_path(), home.path().join("sessions/pi-good.jsonl")).unwrap();
+
+    let common = common_dir(&repo).unwrap();
+    let spool = Spool::open(&common);
+    spool.ensure_layout().unwrap();
+    let roots = Roots {
+        config_dir: home.path().join(".config"),
+        data_dir: home.path().to_path_buf(),
+        worktree: PathBuf::from("/"),
+    };
+
+    let stats = ingest(&spool, &roots, &repo, parse_now("2026-11-04T00:00:00Z")).unwrap();
+    assert_eq!(
+        stats.sessions, 1,
+        "only the valid Pi session counts: {stats:?}"
+    );
+    assert!(stats.new_events >= 3, "Pi events ingested: {stats:?}");
+
+    let mut ulids = Vec::new();
+    for entry in std::fs::read_dir(spool.root.join("sessions")).unwrap() {
+        let entry = entry.unwrap();
+        if entry.path().is_dir() {
+            ulids.push(entry.file_name().to_string_lossy().into_owned());
+        }
+    }
+    assert_eq!(
+        ulids.len(),
+        1,
+        "exactly the Pi session reached the spool: {ulids:?}"
+    );
+    assert!(
+        !spool.segment_bytes(&ulids[0], 0).unwrap().is_empty(),
+        "Pi segments written"
+    );
+}
+
+// Finding 2: a detector hit that appears only in the raw native slice (the
+// `model` field passes `redact_event` through untouched but `redact_text`
+// scrubs it) increments the session counts.
+
+#[test]
+fn raw_only_detector_hit_increments_counts() {
+    let (_repo_dir, repo) = init_repo();
+    let home = TempDir::new().unwrap();
+    let native = concat!(
+        "{\"type\":\"message\",\"role\":\"user\",\"session\":\"raw-only-1\",",
+        "\"cwd\":\"/\",\"version\":\"0.5.2\",\"timestamp\":\"2026-10-01T12:00:00Z\",",
+        "\"content\":\"hello\"}\n",
+        "{\"type\":\"message\",\"role\":\"assistant\",\"session\":\"raw-only-1\",",
+        "\"cwd\":\"/\",\"version\":\"0.5.2\",\"timestamp\":\"2026-10-01T12:01:00Z\",",
+        "\"model\":\"sk-ant-abcdefghij1234567890\",\"content\":\"all good\"}\n",
+    );
+    std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+    std::fs::write(home.path().join("sessions/raw-only-1.jsonl"), native).unwrap();
+
+    let common = common_dir(&repo).unwrap();
+    let spool = Spool::open(&common);
+    spool.ensure_layout().unwrap();
+    let roots = Roots {
+        config_dir: home.path().join(".config"),
+        data_dir: home.path().to_path_buf(),
+        worktree: PathBuf::from("/"),
+    };
+
+    let stats = ingest(&spool, &roots, &repo, parse_now("2026-11-04T00:00:00Z")).unwrap();
+    assert_eq!(stats.sessions, 1);
+    let mut ulids = Vec::new();
+    for entry in std::fs::read_dir(spool.root.join("sessions")).unwrap() {
+        let entry = entry.unwrap();
+        if entry.path().is_dir() {
+            ulids.push(entry.file_name().to_string_lossy().into_owned());
+        }
+    }
+    assert_eq!(ulids.len(), 1);
+    let meta = spool.read_meta(&ulids[0]).unwrap();
+    assert_eq!(
+        meta.redaction
+            .counts
+            .get("known-token")
+            .copied()
+            .unwrap_or(0),
+        1,
+        "raw-only model hit counted: {:?}",
+        meta.redaction.counts
+    );
+    let raw = String::from_utf8(
+        starforge_format::decompress(&spool.raw_bytes(&ulids[0], 0).unwrap()).unwrap(),
+    )
+    .unwrap();
+    assert!(!raw.contains("sk-ant-"), "raw slice redacted");
+    assert!(
+        raw.contains("[redacted:known-token]"),
+        "raw slice carries the marker: {raw:?}"
+    );
+}
+
+// I1: credentialed remote URLs never reach the spool or `sessions show`.
+
+#[test]
+fn credentialed_remote_url_never_reaches_spool_or_show() {
+    let (_repo_dir, repo) = init_repo();
+    git_ok(
+        &repo,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://deploy-user:s3cr3t@example.com/o/r.git",
+        ],
+    );
+    let home = TempDir::new().unwrap();
+    std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+    std::fs::copy(fixture_path(), home.path().join("sessions/pi-cred.jsonl")).unwrap();
+
+    let common = common_dir(&repo).unwrap();
+    let spool = Spool::open(&common);
+    spool.ensure_layout().unwrap();
+    let roots = Roots {
+        config_dir: home.path().join(".config"),
+        data_dir: home.path().to_path_buf(),
+        worktree: PathBuf::from("/"),
+    };
+    ingest(&spool, &roots, &repo, parse_now("2026-11-04T00:00:00Z")).unwrap();
+
+    let mut ulids = Vec::new();
+    for entry in std::fs::read_dir(spool.root.join("sessions")).unwrap() {
+        let entry = entry.unwrap();
+        if entry.path().is_dir() {
+            ulids.push(entry.file_name().to_string_lossy().into_owned());
+        }
+    }
+    assert_eq!(ulids.len(), 1);
+
+    let meta_bytes = std::fs::read(
+        spool
+            .root
+            .join("sessions")
+            .join(&ulids[0])
+            .join("meta.json"),
+    )
+    .unwrap();
+    let meta_text = String::from_utf8(meta_bytes).unwrap();
+    assert!(!meta_text.contains("s3cr3t"), "no token in meta.json");
+    assert!(!meta_text.contains("deploy-user"), "no user in meta.json");
+    assert!(
+        meta_text.contains("https://example.com/o/r.git"),
+        "sanitized host and path preserved: {meta_text:?}"
+    );
+
+    let (out, code) = starforge_cli::commands::sessions::show(&repo, &ulids[0], false);
+    assert_eq!(code, 0, "show output: {out}");
+    assert!(!out.contains("s3cr3t"), "no token in show output");
+    assert!(!out.contains("deploy-user"), "no user in show output");
+}

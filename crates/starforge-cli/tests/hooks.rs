@@ -393,11 +393,11 @@ fn hook_failure_never_blocks_commit() {
         "warning on stderr; got:\n{stderr}"
     );
 }
-
-// Heuristic: session with file data but no overlap still links.
+// Heuristic (§7.2): a session WITH file-level data whose files do not overlap
+// the staged files gets NO trailer.
 
 #[test]
-fn heuristic_trailer_when_no_overlap_but_session_has_data() {
+fn filed_session_without_overlap_gets_no_trailer() {
     let (_dir, repo) = init_repo();
     let (_home, paths) = test_paths();
     let (_, code) = enable(&repo, &paths, false);
@@ -409,6 +409,40 @@ fn heuristic_trailer_when_no_overlap_but_session_has_data() {
     spool.ensure_layout().unwrap();
     let events = format!("{}\n", tool_event(0, "Edit", "/work/elsewhere.txt"));
     seed_session(&spool, ulid, &["elsewhere.txt"], &events);
+
+    std::fs::write(repo.join("tracked.txt"), "hello\n").unwrap();
+    git_ok(&repo, &["add", "tracked.txt"]);
+
+    let msg = repo.join("COMMIT_MSG");
+    std::fs::write(&msg, "subject\n").unwrap();
+    assert_eq!(hook_prepare(&repo, &msg, &paths), 0);
+    let body = std::fs::read_to_string(&msg).unwrap();
+    assert!(
+        !body.contains("Starforge-Session:"),
+        "filed-but-unrelated session must not link; body:\n{body}"
+    );
+
+    assert_eq!(hook_post_commit(&repo, &paths), 0);
+    assert!(spool.links().unwrap().is_empty(), "no link recorded");
+}
+
+// Heuristic (§7.2): a session with NO file-level data but activity since the
+// last commit links with heuristic confidence.
+
+#[test]
+fn fileless_active_session_gets_heuristic_trailer() {
+    let (_dir, repo) = init_repo();
+    let (_home, paths) = test_paths();
+    let (_, code) = enable(&repo, &paths, false);
+    assert_eq!(code, 0);
+
+    let ulid = "01J9KQXF1T3NP2R8A5B6C7D9E6";
+    let common = common_dir(&repo).unwrap();
+    let spool = Spool::open(&common);
+    spool.ensure_layout().unwrap();
+    // Shell tool call: activity with no file paths.
+    let events = format!("{}\n", tool_event(0, "Bash", "/work/nowhere.txt"));
+    seed_session(&spool, ulid, &[], &events);
 
     std::fs::write(repo.join("tracked.txt"), "hello\n").unwrap();
     git_ok(&repo, &["add", "tracked.txt"]);
@@ -487,7 +521,7 @@ fn select_links_exact_beats_heuristic_and_inactive_is_skipped() {
     let staged = vec!["src/main.rs".to_string()];
     let candidates = vec![
         SessionCandidate {
-            ulid: "U-HEU".to_string(),
+            ulid: "U-HEU-FILED".to_string(),
             files_touched: vec!["other.txt".to_string()],
             active: true,
         },
@@ -497,17 +531,23 @@ fn select_links_exact_beats_heuristic_and_inactive_is_skipped() {
             active: true,
         },
         SessionCandidate {
+            ulid: "U-HEU-FREE".to_string(),
+            files_touched: Vec::new(),
+            active: true,
+        },
+        SessionCandidate {
             ulid: "U-IDLE".to_string(),
             files_touched: Vec::new(),
             active: false,
         },
     ];
     let links = select_links(&staged, &candidates);
+    // Filed-but-unrelated sessions get nothing; fileless-but-active ones get
+    // the heuristic trailer. Stable order: sorted by ULID.
     assert_eq!(links.len(), 2);
-    // Stable order: sorted by ULID.
     assert_eq!(links[0].ulid, "U-EXACT");
     assert_eq!(links[0].confidence, LinkConfidence::Exact);
-    assert_eq!(links[1].ulid, "U-HEU");
+    assert_eq!(links[1].ulid, "U-HEU-FREE");
     assert_eq!(links[1].confidence, LinkConfidence::Heuristic);
 }
 
@@ -524,13 +564,18 @@ fn dispatcher_body_runs_orig_then_hidden_hook() {
     }
     let prepare = dispatcher_body("prepare-commit-msg");
     let pre_push = dispatcher_body("pre-push");
+    let post_commit = dispatcher_body("post-commit");
     assert!(
         prepare.contains("ORIG_STATUS") || prepare.contains("orig"),
         "prepare propagates the orig hook's exit status"
     );
     assert!(
-        !pre_push.contains("exit $") || pre_push.trim_end().ends_with("exit 0"),
-        "pre-push always exits 0"
+        pre_push.contains("ORIG_STATUS") && pre_push.trim_end().ends_with("exit $ORIG_STATUS"),
+        "pre-push propagates the orig hook's exit status: {pre_push:?}"
+    );
+    assert!(
+        post_commit.trim_end().ends_with("exit 0") && !post_commit.contains("ORIG_STATUS"),
+        "post-commit always exits 0: {post_commit:?}"
     );
 }
 
@@ -557,4 +602,47 @@ fn install_and_remove_round_trip_unit() {
     for hook in HOOKS {
         assert!(remove_hook(dir.path(), hook).unwrap().is_empty());
     }
+}
+
+// I2: the pre-push dispatcher propagates a failing orig hook's exit status
+// (the starforge step itself always exits 0 and never changes it).
+
+#[test]
+fn pre_push_dispatcher_propagates_orig_exit_status() {
+    let (_dir, repo) = init_repo();
+    let (_home, paths) = test_paths();
+    let common = common_dir(&repo).unwrap();
+    let hooks_dir = common.join("hooks");
+    std::fs::create_dir_all(&hooks_dir).unwrap();
+
+    // Failing orig hook (executable bit only matters on unix).
+    let orig = hooks_dir.join("pre-push.starforge-orig");
+    std::fs::write(&orig, "#!/bin/sh\nexit 3\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&orig, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let dispatcher = install_hook(&common, "pre-push").unwrap();
+
+    let shim_dir = install_shim(&repo);
+    let run = |orig_present: bool| {
+        if !orig_present {
+            std::fs::remove_file(&orig).ok();
+        }
+        Command::new("sh")
+            .arg(&dispatcher)
+            .current_dir(&repo)
+            .env("PATH", path_with(&shim_dir))
+            .env("STARFORGE_HOME", &paths.home)
+            .output()
+            .expect("dispatcher runs")
+    };
+    #[cfg(unix)]
+    assert_eq!(
+        run(true).status.code(),
+        Some(3),
+        "failing orig pre-push hook fails the push"
+    );
+    assert_eq!(run(false).status.code(), Some(0), "no orig hook exits 0");
 }

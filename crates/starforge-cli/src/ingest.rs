@@ -207,7 +207,16 @@ pub fn ingest(
                 ),
             };
             let first_sight = spool.read_meta(&ulid).is_err();
-            let out = adapter.read(&candidate, &cursor, &now_rfc3339)?;
+            // Per-candidate failures must not starve later candidates or
+            // adapters: warn and move on. Only genuinely global spool/queue
+            // failures (below) abort the sweep.
+            let out = match adapter.read(&candidate, &cursor, &now_rfc3339) {
+                Ok(out) => out,
+                Err(err) => {
+                    tracing::warn!("ingest: skipping {agent}/{}: {err}", candidate.session_key);
+                    continue;
+                }
+            };
             if out.next != cursor || first_sight {
                 spool.write_cursor(
                     &key,
@@ -229,7 +238,11 @@ pub fn ingest(
                 meta.id = ulid.parse().expect("fresh ULID parses");
                 let remotes = crate::git::remotes(repo_root).unwrap_or_default();
                 meta.repo = starforge_format::RepoInfo {
-                    remote_urls: remotes.into_iter().map(|(_, url)| url).collect(),
+                    // Strip credential userinfo: secrets must never reach the spool.
+                    remote_urls: remotes
+                        .into_iter()
+                        .map(|(_, url)| crate::discovery::sanitize_remote_url(&url))
+                        .collect(),
                     branch: String::new(),
                     head_at_start: crate::git::head_commit(repo_root).unwrap_or_default(),
                 };
@@ -266,12 +279,24 @@ pub fn ingest(
             stats.new_segments += nums.len();
 
             // Raw native slice for the newly consumed byte range, redacted as text.
-            let native = std::fs::read(&candidate.native_path)?;
+            // A raw read failure skips the rest of this candidate (like a read
+            // failure above): the next sweep retries from the stored cursor,
+            // and `sync` reconciles any segments already on disk.
+            let native = match std::fs::read(&candidate.native_path) {
+                Ok(native) => native,
+                Err(err) => {
+                    tracing::warn!(
+                        "ingest: skipping raw slice for {agent}/{}: {err}",
+                        candidate.session_key
+                    );
+                    continue;
+                }
+            };
+            let mut raw_counts: BTreeMap<String, u64> = BTreeMap::new();
             let start = (cursor.offset as usize).min(native.len());
             let end = (out.next.offset as usize).min(native.len());
             if end > start {
                 let mut raw_lines = Vec::new();
-                let mut raw_counts: BTreeMap<String, u64> = BTreeMap::new();
                 for line in String::from_utf8_lossy(&native[start..end]).lines() {
                     let (redacted, c) = starforge_redact::redact_text(&compiled, line);
                     for (k, v) in c {
@@ -291,11 +316,15 @@ pub fn ingest(
 
             // The session dir exists here (created above on first sight), so
             // fold into the stored meta: `append_events` already accumulated
-            // the redaction counts.
+            // the event counts; merge the raw-slice counts too so `meta.json`
+            // reports raw hits as well.
             let mut meta = spool.read_meta(&ulid)?;
             meta.capture.mode = starforge_format::CaptureMode::Discovery;
             meta.capture.cli_version = env!("CARGO_PKG_VERSION").to_string();
             meta.redaction.fingerprint = fingerprint.clone();
+            for (k, v) in &raw_counts {
+                *meta.redaction.counts.entry(k.clone()).or_insert(0) += v;
+            }
             for model in &out.header.models {
                 if !meta.models.contains(model) {
                     meta.models.push(model.clone());

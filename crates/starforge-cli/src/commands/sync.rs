@@ -441,7 +441,7 @@ async fn settle_entry(
                 Ok(meta) => meta,
                 Err(err) => {
                     tracing::warn!("sync: cannot read meta for `{}`: {err}", entry.ulid);
-                    return Ok(EntryStats::kept());
+                    return keep_with_backoff(working, idx, spool, now);
                 }
             };
             match drive(working, idx, spool, sleeper, now, max_retries, || {
@@ -466,7 +466,7 @@ async fn settle_entry(
                 Ok(bytes) => bytes,
                 Err(err) => {
                     tracing::warn!("sync: cannot read segment {n} for `{}`: {err}", entry.ulid);
-                    return Ok(EntryStats::kept());
+                    return keep_with_backoff(working, idx, spool, now);
                 }
             };
             let hash = starforge_format::blake3_hex(&bytes);
@@ -477,7 +477,7 @@ async fn settle_entry(
                 Ok(_) => {}
                 Err(err) => {
                     tracing::warn!("sync: cannot read upload.json for `{}`: {err}", entry.ulid);
-                    return Ok(EntryStats::kept());
+                    return keep_with_backoff(working, idx, spool, now);
                 }
             }
             match drive(working, idx, spool, sleeper, now, max_retries, || {
@@ -497,7 +497,7 @@ async fn settle_entry(
                 Ok(meta) => meta,
                 Err(err) => {
                     tracing::warn!("sync: cannot read meta for `{}`: {err}", entry.ulid);
-                    return Ok(EntryStats::kept());
+                    return keep_with_backoff(working, idx, spool, now);
                 }
             };
             if meta.ended_at.is_none() {
@@ -521,7 +521,7 @@ async fn settle_entry(
                 Ok(pairs) => pairs,
                 Err(err) => {
                     tracing::warn!("sync: cannot read links: {err}");
-                    return Ok(EntryStats::kept());
+                    return keep_with_backoff(working, idx, spool, now);
                 }
             };
             if pairs.is_empty() {
@@ -552,6 +552,20 @@ fn conflict_stats(conflict: bool) -> EntryStats {
         conflict,
         ..EntryStats::kept()
     }
+}
+
+/// Spool-read failure: bump attempts + `not_before` like every other failure
+/// path, persist the queue, and keep the entry (no sleep: the run continues
+/// with the next entry; the bumped `not_before` spaces out the retry).
+fn keep_with_backoff(
+    working: &mut [QueueEntry],
+    idx: usize,
+    spool: &Spool,
+    now: time::OffsetDateTime,
+) -> Result<EntryStats, UploadError> {
+    bump_entry(working, idx, now)?;
+    rewrite_queue(spool, working)?;
+    Ok(EntryStats::kept())
 }
 
 /// Run `op` with backoff retries. `Ok(Done)` on success; terminal failures

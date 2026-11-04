@@ -5,8 +5,10 @@
 //! dispatcher is a POSIX `sh` script carrying a `# starforge-managed`
 //! marker. It runs the `.starforge-orig` file first (when present and
 //! executable), then the hidden `starforge _hook-*` command.
-//! `prepare-commit-msg` exits with the orig hook's status; `post-commit`
-//! and `pre-push` always exit `0`. `disable` deletes only marker-bearing
+//! `prepare-commit-msg` and `pre-push` exit with the orig hook's status (a
+//! failing user hook still fails the operation; the starforge step itself
+//! always exits `0` and never changes it); `post-commit` always exits `0`.
+//! `disable` deletes only marker-bearing
 //! dispatchers and restores `.starforge-orig` files byte-for-byte.
 //!
 //! Windows: hooks are POSIX `sh` (Git for Windows ships `sh`, which is how
@@ -40,13 +42,12 @@ fn is_managed(bytes: &[u8]) -> bool {
         .windows(MANAGED_MARKER.len())
         .any(|w| w == MANAGED_MARKER.as_bytes())
 }
-
 /// Dispatcher script for `hook`.
-///
 /// Runs `<hook>.starforge-orig` first (when present and executable), then
 /// the matching hidden `starforge _hook-*` command. `prepare-commit-msg`
-/// propagates the orig hook's exit status while the starforge step never
-/// fails the commit; the other hooks always exit `0`.
+/// and `pre-push` propagate the orig hook's exit status while the starforge
+/// step never fails the operation (it always exits `0` and never changes the
+/// status); `post-commit` always exits `0`.
 pub fn dispatcher_body(hook: &str) -> String {
     let hidden = format!("_hook-{hook}");
     let header = format!(
@@ -64,6 +65,17 @@ pub fn dispatcher_body(hook: &str) -> String {
              starforge {hidden} \"$1\"\n\
              exit $ORIG_STATUS\n"
         ),
+        "pre-push" => format!(
+            "{header}\
+             ORIG=\"$0{ORIG_SUFFIX}\"\n\
+             ORIG_STATUS=0\n\
+             if [ -x \"$ORIG\" ]; then\n\
+             \x20 \"$ORIG\" \"$@\"\n\
+             \x20 ORIG_STATUS=$?\n\
+             fi\n\
+             starforge {hidden}\n\
+             exit $ORIG_STATUS\n"
+        ),
         _ => format!(
             "{header}\
              ORIG=\"$0{ORIG_SUFFIX}\"\n\
@@ -75,7 +87,6 @@ pub fn dispatcher_body(hook: &str) -> String {
         ),
     }
 }
-
 /// Install the dispatcher for `hook` (one of [`HOOKS`]) in
 /// `<common_dir>/hooks`.
 ///
@@ -196,11 +207,12 @@ pub struct PendingLink {
     /// `exact` on staged-file overlap, else `heuristic`.
     pub confidence: LinkConfidence,
 }
-
 /// Link selection (§7.2): sessions whose `files_touched` overlap the staged
-/// files link with `exact` confidence; sessions with activity but no overlap
-/// link with `heuristic` confidence; inactive sessions with no overlap are
-/// skipped. Output is deduped by ULID in stable (sorted) order.
+/// files link with `exact` confidence; a session with NO file-level data at
+/// all (`files_touched` empty — it touched no files in the new-event range
+/// either, since those are folded in) but with activity links with
+/// `heuristic` confidence; everything else is skipped. Output is deduped by
+/// ULID in stable (sorted) order.
 pub fn select_links(staged: &[String], candidates: &[SessionCandidate]) -> Vec<PendingLink> {
     let mut sorted: Vec<&SessionCandidate> = candidates.iter().collect();
     sorted.sort_by(|a, b| a.ulid.cmp(&b.ulid));
@@ -215,7 +227,7 @@ pub fn select_links(staged: &[String], candidates: &[SessionCandidate]) -> Vec<P
                 ulid: candidate.ulid.clone(),
                 confidence: LinkConfidence::Exact,
             });
-        } else if candidate.active {
+        } else if candidate.active && candidate.files_touched.is_empty() {
             out.push(PendingLink {
                 ulid: candidate.ulid.clone(),
                 confidence: LinkConfidence::Heuristic,

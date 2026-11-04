@@ -24,9 +24,11 @@
 //! session with no new events since its last link is inactive and gains no
 //! further heuristic trailers). `pre-push` enqueues segment uploads for
 //! sessions with unwritten segments and then runs one best-effort sync pass
-//! (no retries); every failure stays queued with a `warning:` on stderr and
-//! the push is never blocked. Hook handlers never fail the git operation:
-//! every error becomes a `warning:` on stderr with exit `0`.
+//! (no retries); every failure stays queued with a `warning:` on stderr.
+//! The starforge hook steps never fail the git operation (every starforge
+//! error becomes a `warning:` with exit `0`), but the dispatcher propagates
+//! a failing user hook's exit status, so a failing `.starforge-orig`
+//! pre-push hook still blocks the push.
 //!
 //! Accepted limitations (documented, not fixed in M1c): the pending-trailer
 //! sidecar is a single shared `pending-trailer.json` (concurrent commits in

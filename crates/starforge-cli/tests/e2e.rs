@@ -540,3 +540,26 @@ async fn pre_push_unreachable_leaves_queue_and_exits_zero() {
         "failed best-effort entry stays queued"
     );
 }
+
+// Finding 3: `--dry-run` resolves the ULID prefix first, so a typo'd prefix
+// fails the same way in both modes (still writing nothing).
+
+#[test]
+fn sessions_link_unlink_dry_run_rejects_unknown_prefix() {
+    let (_dir, repo) = init_repo();
+    let common = common_dir(&repo).unwrap();
+    let spool = Spool::open(&common);
+    spool.ensure_layout().unwrap();
+
+    let (out, code) = starforge_cli::commands::sessions::link(&repo, "deadbeef", None, true);
+    assert_eq!(code, 1, "dry-run link with unknown prefix fails: {out}");
+    let (out, code) = starforge_cli::commands::sessions::unlink(&repo, "deadbeef", "abc", true);
+    assert_eq!(code, 1, "dry-run unlink with unknown prefix fails: {out}");
+
+    // And an ambiguous prefix names the candidates.
+    let (out, code) = starforge_cli::commands::sessions::link(&repo, "", None, true);
+    assert_eq!(
+        code, 1,
+        "empty spool resolves to unknown, not a link: {out}"
+    );
+}

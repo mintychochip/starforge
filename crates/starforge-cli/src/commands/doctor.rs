@@ -57,10 +57,28 @@ pub async fn doctor(repo: &Path, paths: &CliPaths, dry_run: bool) -> (String, u8
         }
     }
 
-    for adapter in ["claude-code", "codex", "pi", "opencode", "gemini"] {
-        lines.push(format!(
-            "adapter {adapter}: ok (version check via capture fixtures)"
-        ));
+    // Probe each adapter's store via `detect`: present stores report `ok`,
+    // absent ones `skip` (never a failure — not every agent is installed).
+    {
+        use starforge_capture::Adapter as _;
+        use starforge_capture::agents::{
+            ClaudeAdapter, CodexAdapter, GeminiAdapter, OpencodeAdapter, PiAdapter,
+        };
+        let roots = super::hooks::adapter_roots(paths, repo);
+        let adapters: [(&str, bool); 5] = [
+            ("claude-code", ClaudeAdapter.detect(&roots)),
+            ("codex", CodexAdapter.detect(&roots)),
+            ("pi", PiAdapter.detect(&roots)),
+            ("opencode", OpencodeAdapter.detect(&roots)),
+            ("gemini", GeminiAdapter.detect(&roots)),
+        ];
+        for (name, present) in adapters {
+            lines.push(if present {
+                format!("adapter {name}: ok (store found)")
+            } else {
+                format!("adapter {name}: skip (no store)")
+            });
+        }
     }
 
     match super::status::resolve_server(repo, paths).await {

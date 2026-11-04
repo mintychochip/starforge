@@ -241,6 +241,12 @@ pub fn link(repo: &Path, ulid_prefix: &str, commit: Option<&str>, dry_run: bool)
     };
     let spool = Spool::open(&common);
     let owned;
+    // Resolve the prefix before the dry-run return so a typo'd ULID fails
+    // the same way in both modes (still writing nothing here).
+    let ulid = match resolve_prefix(&spool, ulid_prefix) {
+        Ok(ulid) => ulid,
+        Err(err) => return (format!("error: {err}"), 1),
+    };
     let commit: String = match commit {
         Some(c) => c.to_string(),
         None => {
@@ -257,10 +263,6 @@ pub fn link(repo: &Path, ulid_prefix: &str, commit: Option<&str>, dry_run: bool)
             0,
         );
     }
-    let ulid = match resolve_prefix(&spool, ulid_prefix) {
-        Ok(ulid) => ulid,
-        Err(err) => return (format!("error: {err}"), 1),
-    };
     let (seq_start, seq_end) = session_seq_range(&spool, &ulid);
     if let Err(err) = spool.record_link(&LinkEntry {
         ulid: ulid.clone(),
@@ -309,16 +311,18 @@ pub fn unlink(repo: &Path, ulid_prefix: &str, commit: &str, dry_run: bool) -> (S
         Err(err) => return (format!("error: {err}"), 1),
     };
     let spool = Spool::open(&common);
+    // Resolve the prefix before the dry-run return so a typo'd ULID fails
+    // the same way in both modes (still writing nothing here).
+    let ulid = match resolve_prefix(&spool, ulid_prefix) {
+        Ok(ulid) => ulid,
+        Err(err) => return (format!("error: {err}"), 1),
+    };
     if dry_run {
         return (
             format!("would unlink session {ulid_prefix} from commit {commit}"),
             0,
         );
     }
-    let ulid = match resolve_prefix(&spool, ulid_prefix) {
-        Ok(ulid) => ulid,
-        Err(err) => return (format!("error: {err}"), 1),
-    };
     let all = match spool.links() {
         Ok(all) => all,
         Err(err) => return (format!("error: {err}"), 1),

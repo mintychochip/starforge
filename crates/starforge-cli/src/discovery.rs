@@ -233,6 +233,28 @@ async fn fetch_well_known(client: &reqwest::Client, url: &str) -> Option<ServerI
     None
 }
 
+/// Strip credential userinfo from a remote URL, preserving everything else.
+///
+/// `https://user:token@host/o/r.git` becomes `https://host/o/r.git` so
+/// tokens never reach the spool (`meta.repo.remote_urls`), `sessions show`,
+/// `status`, or the wire. Only `scheme://` URLs with a password are
+/// rewritten: scp-style `user@host:path` and plain paths carry no password
+/// form and must keep their `user@` (scp needs it), as must password-less
+/// `https://user@host` URLs. Unparseable input is returned unchanged.
+pub fn sanitize_remote_url(url: &str) -> String {
+    if !url.contains("://") {
+        return url.to_string();
+    }
+    match url::Url::parse(url) {
+        Ok(mut parsed) if parsed.password().is_some() => {
+            let _ = parsed.set_username("");
+            let _ = parsed.set_password(None);
+            parsed.to_string()
+        }
+        _ => url.to_string(),
+    }
+}
+
 /// Display/error base for a configured server URL: `scheme://host[:port]`
 /// with any `user:pass@` userinfo stripped, so credentials embedded in
 /// `starforge.server` never reach stderr, logs, or stored records. Fetching
@@ -297,7 +319,7 @@ pub async fn resolve_server(
             let owner_repo = configured_repo
                 .clone()
                 .unwrap_or_else(|| owner_repo_from_remote(remote_url));
-            return Ok((info, owner_repo, remote_url.clone()));
+            return Ok((info, owner_repo, sanitize_remote_url(remote_url)));
         }
     }
     if tried.is_empty() {

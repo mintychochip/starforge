@@ -423,7 +423,8 @@ async fn run_sync(paths: CliPaths, dry_run: bool) -> std::process::ExitCode {
         return run_sync_dry_run(&spool);
     }
     // Ingest before draining so `sync` uploads fresh native sessions even when
-    // nothing was ever queued; an ingest failure surfaces as exit 1.
+    // nothing was ever queued. A bad transcript must not block a drainable
+    // queue: warn and continue draining.
     {
         let roots = crate::commands::hooks::adapter_roots(&paths, &repo);
         match crate::ingest::ingest(&spool, &roots, &repo, time::OffsetDateTime::now_utc()) {
@@ -433,8 +434,7 @@ async fn run_sync(paths: CliPaths, dry_run: bool) -> std::process::ExitCode {
                 stats.new_events
             ),
             Err(err) => {
-                eprintln!("error: ingest failed: {err}");
-                return std::process::ExitCode::from(1);
+                eprintln!("warning: starforge sync ingest skipped: {err}");
             }
         }
     }
