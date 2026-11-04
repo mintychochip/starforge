@@ -279,37 +279,39 @@ pub fn ingest(
             stats.new_segments += nums.len();
 
             // Raw native slice for the newly consumed byte range, redacted as text.
-            // A raw read failure skips the rest of this candidate (like a read
-            // failure above): the next sweep retries from the stored cursor,
-            // and `sync` reconciles any segments already on disk.
+            // A raw read failure only skips the raw bytes: events are already
+            // appended and the meta fold below must still run, otherwise
+            // models/usage/counts stay permanently stale for this batch.
             let native = match std::fs::read(&candidate.native_path) {
-                Ok(native) => native,
+                Ok(native) => Some(native),
                 Err(err) => {
                     tracing::warn!(
                         "ingest: skipping raw slice for {agent}/{}: {err}",
                         candidate.session_key
                     );
-                    continue;
+                    None
                 }
             };
             let mut raw_counts: BTreeMap<String, u64> = BTreeMap::new();
-            let start = (cursor.offset as usize).min(native.len());
-            let end = (out.next.offset as usize).min(native.len());
-            if end > start {
-                let mut raw_lines = Vec::new();
-                for line in String::from_utf8_lossy(&native[start..end]).lines() {
-                    let (redacted, c) = starforge_redact::redact_text(&compiled, line);
-                    for (k, v) in c {
-                        *raw_counts.entry(k).or_insert(0) += v;
+            if let Some(native) = native {
+                let start = (cursor.offset as usize).min(native.len());
+                let end = (out.next.offset as usize).min(native.len());
+                if end > start {
+                    let mut raw_lines = Vec::new();
+                    for line in String::from_utf8_lossy(&native[start..end]).lines() {
+                        let (redacted, c) = starforge_redact::redact_text(&compiled, line);
+                        for (k, v) in c {
+                            *raw_counts.entry(k).or_insert(0) += v;
+                        }
+                        raw_lines.push(redacted);
                     }
-                    raw_lines.push(redacted);
-                }
-                if !raw_lines.is_empty() {
-                    let raw = raw_lines.join("\n") + "\n";
-                    // One copy per new segment: the raw slice has no per-segment
-                    // split, so every new segment carries the full redacted slice.
-                    for n in &nums {
-                        spool.write_raw(&ulid, *n, raw.as_bytes())?;
+                    if !raw_lines.is_empty() {
+                        let raw = raw_lines.join("\n") + "\n";
+                        // One copy per new segment: the raw slice has no per-segment
+                        // split, so every new segment carries the full redacted slice.
+                        for n in &nums {
+                            spool.write_raw(&ulid, *n, raw.as_bytes())?;
+                        }
                     }
                 }
             }
