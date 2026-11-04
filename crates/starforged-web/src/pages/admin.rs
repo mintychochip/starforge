@@ -11,7 +11,7 @@ use starforged_core::CoreError;
 use starforged_core::CoreResult;
 use starforged_core::accounts::CreateUser;
 use starforged_core::accounts::User;
-use starforged_core::admin::{AdminOverview, UserSummary};
+use starforged_core::admin::{AdminOverview, JobInfo, UserSummary};
 use starforged_core::passwords::AdminReset;
 use starforged_core::sessions::WebSession;
 
@@ -554,4 +554,91 @@ pub async fn purge_repo(
     verify_csrf(&session.csrf_token, &form.csrf)?;
     state.core.purge_repo_now(&session.user, id).await?;
     Ok(Redirect::to("/admin/repositories").into_response())
+}
+
+/// One background job row: the last error is truncated in the handler to keep
+/// template logic trivial. Payloads are never rendered (mail bodies hold secrets).
+pub struct JobRow {
+    id: i64,
+    kind: String,
+    state: String,
+    attempts: i64,
+    short_error: String,
+    run_at: String,
+    created_at: String,
+}
+
+#[derive(Template, WebTemplate)]
+#[template(path = "admin_jobs.html")]
+pub struct JobsPage {
+    nav_user: Option<NavUser>,
+    csrf: String,
+    admin_tab: &'static str,
+    jobs: Vec<JobRow>,
+}
+
+/// Truncates the last error to 200 chars without splitting a char boundary.
+fn short_error(info: &JobInfo) -> String {
+    const MAX: usize = 200;
+    let truncated: String = info.last_error.chars().take(MAX).collect();
+    if truncated.len() < info.last_error.len() {
+        format!("{truncated}…")
+    } else {
+        truncated
+    }
+}
+
+pub async fn jobs(
+    State(state): State<AppState>,
+    RequireAdmin(session): RequireAdmin,
+) -> Result<JobsPage, WebError> {
+    let jobs = state
+        .core
+        .admin_list_jobs(&session.user)
+        .await?
+        .iter()
+        .map(|info| JobRow {
+            id: info.id,
+            kind: info.kind.clone(),
+            state: info.state.clone(),
+            attempts: info.attempts,
+            short_error: short_error(info),
+            run_at: crate::views::format_time(info.run_at),
+            created_at: crate::views::format_time(info.created_at),
+        })
+        .collect();
+    Ok(JobsPage {
+        nav_user: Some(NavUser::from_session(&session)),
+        csrf: session.csrf_token.clone(),
+        admin_tab: "jobs",
+        jobs,
+    })
+}
+
+pub async fn retry_job(
+    State(state): State<AppState>,
+    RequireAdmin(session): RequireAdmin,
+    Path(id): Path<i64>,
+    Form(form): Form<CsrfForm>,
+) -> Result<Response, WebError> {
+    verify_csrf(&session.csrf_token, &form.csrf)?;
+    match state.core.retry_job(&session.user, id).await {
+        Ok(()) => Ok(Redirect::to("/admin/jobs").into_response()),
+        Err(CoreError::NotFound) => Err(WebError::NotFound),
+        Err(other) => Err(other.into()),
+    }
+}
+
+pub async fn delete_job(
+    State(state): State<AppState>,
+    RequireAdmin(session): RequireAdmin,
+    Path(id): Path<i64>,
+    Form(form): Form<CsrfForm>,
+) -> Result<Response, WebError> {
+    verify_csrf(&session.csrf_token, &form.csrf)?;
+    match state.core.delete_job(&session.user, id).await {
+        Ok(()) => Ok(Redirect::to("/admin/jobs").into_response()),
+        Err(CoreError::NotFound) => Err(WebError::NotFound),
+        Err(other) => Err(other.into()),
+    }
 }

@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block title %}Jobs · Site administration{% endblock %}
+{% block content %}
+<h1>Site administration</h1>
+{% include "admin_nav.html" %}
+<section>
+  <h2>Jobs</h2>
+  {% if jobs.is_empty() %}
+  <p>No jobs.</p>
+  {% else %}
+  <table>
+    <thead>
+      <tr><th>ID</th><th>Kind</th><th>State</th><th>Attempts</th><th>Last error</th><th>Run at</th><th>Created</th><th></th></tr>
+    </thead>
+    <tbody>
+      {% for job in jobs %}
+      <tr>
+        <td>{{ job.id }}</td>
+        <td>{{ job.kind }}</td>
+        <td>{{ job.state }}</td>
+        <td>{{ job.attempts }}</td>
+        <td>{{ job.short_error }}</td>
+        <td>{{ job.run_at }}</td>
+        <td>{{ job.created_at }}</td>
+        <td>{% if job.state == "failed" %}<form method="post" action="/admin/jobs/{{ job.id }}/retry" class="inline"><input type="hidden" name="_csrf" value="{{ csrf }}"><button type="submit">Retry</button></form> <form method="post" action="/admin/jobs/{{ job.id }}/delete" class="inline"><input type="hidden" name="_csrf" value="{{ csrf }}"><button type="submit">Delete</button></form>{% endif %}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+</section>
+{% endblock %}

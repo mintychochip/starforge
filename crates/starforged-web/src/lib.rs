@@ -151,6 +151,9 @@ fn page_routes() -> Router<AppState> {
             "/admin/repositories/{id}/purge",
             post(pages::admin::purge_repo),
         )
+        .route("/admin/jobs", get(pages::admin::jobs))
+        .route("/admin/jobs/{id}/retry", post(pages::admin::retry_job))
+        .route("/admin/jobs/{id}/delete", post(pages::admin::delete_job))
         .route("/{owner}", get(pages::owner::show))
         .route(
             "/{owner}/{repo}/settings",
