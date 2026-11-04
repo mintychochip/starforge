@@ -18,6 +18,7 @@ pub mod collaborators;
 pub mod email_tokens;
 pub mod invites;
 pub mod jobs;
+pub mod redirects;
 pub mod repos;
 pub mod tokens;
 pub mod users;

@@ -4,6 +4,7 @@ pub mod auth;
 pub mod error;
 pub mod githttp;
 pub mod markdown;
+mod moved;
 mod pages;
 pub mod views;
 
@@ -37,6 +38,10 @@ pub fn router(core: Core, settings: WebSettings) -> Router {
     Router::new()
         .merge(page_routes())
         .merge(git_routes())
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            moved::redirect_renamed,
+        ))
         .layer(axum::middleware::map_response(security_headers))
         .with_state(state)
 }
@@ -99,6 +104,10 @@ fn page_routes() -> Router<AppState> {
         .route(
             "/{owner}/{repo}/settings/visibility",
             post(pages::repo_settings::change_visibility),
+        )
+        .route(
+            "/{owner}/{repo}/settings/rename",
+            post(pages::repo_settings::rename),
         )
         .route(
             "/{owner}/{repo}/settings/collaborators",

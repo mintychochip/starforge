@@ -4,6 +4,7 @@ use std::path::Path;
 
 use starforged_db::collaborators;
 use starforged_db::now;
+use starforged_db::redirects;
 use starforged_db::repos::{self as db_repos, NewRepo, RepoRow};
 use starforged_git::write::Identity;
 
@@ -89,6 +90,21 @@ fn checked_description(input: &str) -> CoreResult<String> {
         ));
     }
     Ok(description.to_owned())
+}
+
+/// Splits a request path `/{owner}/{segment}{rest}` into the owner, the repository segment (which may end in
+/// `.git`), and the rest (empty, or starting with `/`). `None` without two non-empty segments.
+pub fn split_repo_path(path: &str) -> Option<(&str, &str, &str)> {
+    let path = path.strip_prefix('/')?;
+    let (owner, after) = path.split_once('/')?;
+    let (segment, rest) = match after.find('/') {
+        Some(at) => after.split_at(at),
+        None => (after, ""),
+    };
+    if owner.is_empty() || segment.is_empty() {
+        return None;
+    }
+    Some((owner, segment, rest))
 }
 
 impl Core {
@@ -430,6 +446,73 @@ impl Core {
         )
         .await?;
         self.reload_repo(access.repo.id).await
+    }
+
+    /// Admins: renames the repository. The old name keeps working through a redirect (forge-basics design §5.3).
+    pub async fn rename_repo(
+        &self,
+        actor: &User,
+        owner: &str,
+        name: &str,
+        new_name: &str,
+    ) -> CoreResult<Repo> {
+        let access = self
+            .require_repo(Some(actor), owner, name, Permission::Admin)
+            .await?;
+        let new_name = validate::repo_name(new_name)?;
+        let old = access.repo;
+        if new_name == old.name {
+            return Ok(old);
+        }
+        db_repos::rename(self.db(), old.id, &new_name)
+            .await
+            .map_err(|e| {
+                if e.is_unique_violation() {
+                    CoreError::Conflict(format!("{}/{new_name} already exists", old.owner))
+                } else {
+                    e.into()
+                }
+            })?;
+        let repo = self.reload_repo(old.id).await?;
+        self.audit(
+            Some(actor.id),
+            "repo.rename",
+            &format!("repo:{}", repo.full_name()),
+            &old.name,
+        )
+        .await?;
+        Ok(repo)
+    }
+
+    /// The repository that `owner/name` was renamed to, when `user` can read it. `None` when a repository has
+    /// that name, no redirect exists, or the viewer cannot read the target, so an old name of a private
+    /// repository answers like a missing one.
+    pub async fn moved_repo(
+        &self,
+        user: Option<&User>,
+        owner: &str,
+        name: &str,
+    ) -> CoreResult<Option<Repo>> {
+        if db_repos::by_owner_and_name(self.db(), owner, name)
+            .await?
+            .is_some()
+        {
+            return Ok(None);
+        }
+        let Some(id) = redirects::target(
+            self.db(),
+            &owner.to_ascii_lowercase(),
+            &name.to_ascii_lowercase(),
+        )
+        .await?
+        else {
+            return Ok(None);
+        };
+        let Some(row) = db_repos::by_id(self.db(), id).await? else {
+            return Ok(None);
+        };
+        let repo = to_repo(row)?;
+        Ok(self.permission_on(&repo, user).await?.map(|_| repo))
     }
 
     /// The repository as stored now.
@@ -791,5 +874,107 @@ mod tests {
             .map(|e| e.detail)
             .collect();
         assert_eq!(audited, vec!["dev".to_owned()]);
+    }
+    #[test]
+    fn request_paths_split_into_owner_repository_and_rest() {
+        assert_eq!(split_repo_path("/alice/proj"), Some(("alice", "proj", "")));
+        assert_eq!(
+            split_repo_path("/alice/proj.git/info/refs"),
+            Some(("alice", "proj.git", "/info/refs"))
+        );
+        assert_eq!(
+            split_repo_path("/alice/proj/tree/main/src"),
+            Some(("alice", "proj", "/tree/main/src"))
+        );
+        for no in ["/alice", "/alice/", "//proj", "alice/proj", ""] {
+            assert_eq!(split_repo_path(no), None, "{no:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn renames_need_admin_and_old_names_lead_to_readers_only() {
+        let (core, _f) = test_core().await;
+        let alice = user(&core, "alice").await;
+        let mia = user(&core, "mia").await;
+        let bob = user(&core, "bob").await;
+        core.create_repo(&alice, new("proj", Visibility::Private))
+            .await
+            .unwrap();
+        core.create_repo(&alice, new("other", Visibility::Private))
+            .await
+            .unwrap();
+        core.set_collaborator(&alice, "alice", "proj", "mia", Permission::Maintain)
+            .await
+            .unwrap();
+        assert!(matches!(
+            core.rename_repo(&mia, "alice", "proj", "x").await,
+            Err(CoreError::Forbidden)
+        ));
+        assert!(matches!(
+            core.rename_repo(&alice, "alice", "proj", "x.git").await,
+            Err(CoreError::Invalid(_))
+        ));
+        assert!(matches!(
+            core.rename_repo(&alice, "alice", "proj", "OTHER").await,
+            Err(CoreError::Conflict(_))
+        ));
+        let same = core
+            .rename_repo(&alice, "alice", "proj", "proj")
+            .await
+            .unwrap();
+        assert_eq!(same.name, "proj");
+        let renamed = core
+            .rename_repo(&alice, "alice", "proj", "Renamed")
+            .await
+            .unwrap();
+        assert_eq!(renamed.full_name(), "alice/Renamed");
+        assert!(matches!(
+            core.repo_for(Some(&alice), "alice", "proj").await,
+            Err(CoreError::NotFound)
+        ));
+        let moved = core
+            .moved_repo(Some(&alice), "alice", "PROJ")
+            .await
+            .unwrap();
+        assert_eq!(moved.map(|r| r.id), Some(renamed.id));
+        assert!(
+            core.moved_repo(Some(&mia), "alice", "proj")
+                .await
+                .unwrap()
+                .is_some(),
+            "collaborators follow the rename"
+        );
+        assert!(
+            core.moved_repo(Some(&bob), "alice", "proj")
+                .await
+                .unwrap()
+                .is_none(),
+            "the private target stays hidden"
+        );
+        assert!(
+            core.moved_repo(None, "alice", "proj")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            core.moved_repo(Some(&alice), "alice", "Renamed")
+                .await
+                .unwrap()
+                .is_none(),
+            "a live name is not a redirect"
+        );
+        let entry = starforged_db::audit::recent(core.db(), 1)
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            (
+                entry.action.as_str(),
+                entry.target.as_str(),
+                entry.detail.as_str()
+            ),
+            ("repo.rename", "repo:alice/Renamed", "proj")
+        );
     }
 }

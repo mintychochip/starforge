@@ -2,6 +2,7 @@
 
 pub mod auth;
 pub mod error;
+mod moved;
 mod repos;
 mod user;
 
@@ -20,8 +21,11 @@ pub struct ApiState {
     pub base_url: Arc<str>,
 }
 
-/// Routes relative to `/api/v1`; the caller nests them there.
 pub fn router(core: Core, base_url: String) -> Router {
+    let state = ApiState {
+        core,
+        base_url: Arc::from(base_url),
+    };
     Router::new()
         .route("/user", get(user::show))
         .route("/user/repos", post(repos::create))
@@ -35,8 +39,9 @@ pub fn router(core: Core, base_url: String) -> Router {
             put(repos::set_collaborator).delete(repos::remove_collaborator),
         )
         .fallback(|| async { ApiError::NotFound })
-        .with_state(ApiState {
-            core,
-            base_url: Arc::from(base_url),
-        })
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            moved::redirect_renamed,
+        ))
+        .with_state(state)
 }

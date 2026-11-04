@@ -50,22 +50,31 @@ fn from_row(row: &AnyRow) -> DbResult<RepoRow> {
     })
 }
 
+/// Inserts the repository. A redirect that held its name stops (forge-basics design §5.3).
 pub async fn insert(db: &Db, repo: &NewRepo<'_>) -> DbResult<i64> {
     let ts = now();
+    let lower_name = repo.name.to_ascii_lowercase();
+    let mut tx = db.pool().begin().await?;
     let id: i64 = sqlx::query_scalar(
         "INSERT INTO repos (owner_id, name, lower_name, description, visibility, default_branch, created_at, updated_at) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id",
     )
     .bind(repo.owner_id)
     .bind(repo.name)
-    .bind(repo.name.to_ascii_lowercase())
+    .bind(lower_name.as_str())
     .bind(repo.description)
     .bind(repo.visibility)
     .bind(repo.default_branch)
     .bind(ts)
     .bind(ts)
-    .fetch_one(db.pool())
+    .fetch_one(&mut *tx)
     .await?;
+    sqlx::query("DELETE FROM repo_redirects WHERE owner_id = $1 AND lower_name = $2")
+        .bind(repo.owner_id)
+        .bind(lower_name.as_str())
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
     Ok(id)
 }
 
@@ -145,5 +154,45 @@ pub async fn set_visibility(db: &Db, id: i64, visibility: &str) -> DbResult<()> 
         .bind(id)
         .execute(db.pool())
         .await?;
+    Ok(())
+}
+
+/// Renames repository `id` in one transaction. The old name then redirects to it (unless only the case
+/// changed), and a redirect that held the new name is dropped. A taken name is a unique violation and changes
+/// nothing.
+pub async fn rename(db: &Db, id: i64, new_name: &str) -> DbResult<()> {
+    let ts = now();
+    let new_lower = new_name.to_ascii_lowercase();
+    let mut tx = db.pool().begin().await?;
+    let (owner_id, old_lower): (i64, String) =
+        sqlx::query_as("SELECT owner_id, lower_name FROM repos WHERE id = $1")
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
+    sqlx::query("UPDATE repos SET name = $1, lower_name = $2, updated_at = $3 WHERE id = $4")
+        .bind(new_name)
+        .bind(new_lower.as_str())
+        .bind(ts)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM repo_redirects WHERE owner_id = $1 AND lower_name = $2")
+        .bind(owner_id)
+        .bind(new_lower.as_str())
+        .execute(&mut *tx)
+        .await?;
+    if old_lower != new_lower {
+        sqlx::query(
+            "INSERT INTO repo_redirects (owner_id, lower_name, repo_id, created_at) VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (owner_id, lower_name) DO UPDATE SET repo_id = excluded.repo_id, created_at = excluded.created_at",
+        )
+        .bind(owner_id)
+        .bind(old_lower.as_str())
+        .bind(id)
+        .bind(ts)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
     Ok(())
 }

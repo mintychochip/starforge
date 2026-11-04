@@ -26,5 +26,12 @@
   </fieldset>
   <button type="submit">Change visibility</button>
 </form>
+<h2>Rename</h2>
+<form method="post" action="/{{ head.owner }}/{{ head.name }}/settings/rename" class="stack">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <label>New name <input name="new_name" required maxlength="100" value="{{ head.name }}"></label>
+  <p class="muted">Links, clones, and API calls that use the old name are redirected to the new one.</p>
+  <button type="submit">Rename</button>
+</form>
 {% endif %}
 {% endblock %}

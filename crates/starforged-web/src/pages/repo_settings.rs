@@ -109,6 +109,27 @@ pub async fn change_visibility(
     finish(&state, &session, &owner, &repo, result).await
 }
 
+#[derive(Deserialize)]
+pub struct RenameForm {
+    #[serde(rename = "_csrf")]
+    csrf: String,
+    new_name: String,
+}
+
+pub async fn rename(
+    State(state): State<AppState>,
+    RequireUser(session): RequireUser,
+    Path((owner, repo)): Path<(String, String)>,
+    Form(form): Form<RenameForm>,
+) -> Result<Response, WebError> {
+    verify_csrf(&session.csrf_token, &form.csrf)?;
+    let result = state
+        .core
+        .rename_repo(&session.user, &owner, &repo, &form.new_name)
+        .await;
+    finish(&state, &session, &owner, &repo, result).await
+}
+
 /// After a settings action: back to the settings page under the repository's current name, or this page
 /// again with the message when the input was refused.
 pub(crate) async fn finish(

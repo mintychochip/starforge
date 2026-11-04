@@ -1,6 +1,7 @@
 //! Bearer-token authentication.
 
 use axum::extract::FromRequestParts;
+use axum::http::HeaderMap;
 use axum::http::header;
 use axum::http::request::Parts;
 use starforged_core::accounts::User;
@@ -19,21 +20,21 @@ impl FromRequestParts<ApiState> for ApiAuth {
         parts: &mut Parts,
         state: &ApiState,
     ) -> Result<Self, Self::Rejection> {
-        let Some(value) = parts.headers.get(header::AUTHORIZATION) else {
+        if !parts.headers.contains_key(header::AUTHORIZATION) {
             return Ok(ApiAuth(None));
-        };
-        let token = value
-            .to_str()
-            .ok()
-            .and_then(|v| {
-                v.strip_prefix("Bearer ")
-                    .or_else(|| v.strip_prefix("token "))
-            })
-            .ok_or(ApiError::Unauthenticated)?;
-        Ok(ApiAuth(Some(
-            state.core.authenticate_token(token.trim()).await?,
-        )))
+        }
+        let token = bearer_token(&parts.headers).ok_or(ApiError::Unauthenticated)?;
+        Ok(ApiAuth(Some(state.core.authenticate_token(token).await?)))
     }
+}
+
+/// The token in `Authorization: Bearer …` (or `token …`); `None` without the header or with another scheme.
+pub(crate) fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+    value
+        .strip_prefix("Bearer ")
+        .or_else(|| value.strip_prefix("token "))
+        .map(str::trim)
 }
 
 impl ApiAuth {
