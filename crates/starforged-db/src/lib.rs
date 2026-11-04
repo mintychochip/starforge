@@ -23,6 +23,7 @@ pub mod redirects;
 pub mod repos;
 pub mod sessions;
 pub mod tokens;
+pub mod trails;
 pub mod users;
 pub mod web_sessions;
 
