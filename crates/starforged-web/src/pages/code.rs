@@ -12,6 +12,7 @@ use tokio_util::io::ReaderStream;
 use crate::AppState;
 use crate::auth::MaybeUser;
 use crate::error::WebError;
+use crate::highlight;
 use crate::markdown;
 use crate::views::{Crumb, NavUser, RepoHead, content_href, crumbs, nav};
 
@@ -49,6 +50,7 @@ pub struct BlobPage {
     raw_href: String,
     size: usize,
     lines: Vec<String>,
+    highlighted: bool,
     notice: Option<&'static str>,
 }
 
@@ -135,18 +137,25 @@ pub async fn blob(
         .blob(&access, &resolved.commit_id, &resolved.path)
         .await?;
     let size = usize::try_from(file.size).unwrap_or(usize::MAX);
-    let (lines, notice) = match file.bytes {
-        None => (Vec::new(), Some("This file is too large to display.")),
-        Some(bytes) => match classify(bytes) {
-            Blob::Text(text) => (text.lines().map(str::to_owned).collect(), None),
-            Blob::Binary => (Vec::new(), Some("Binary file not shown.")),
-        },
-    };
-    let repo = &access.repo;
     let (dir, file_name) = resolved
         .path
         .rsplit_once('/')
         .unwrap_or(("", resolved.path.as_str()));
+    let (lines, highlighted, notice) = match file.bytes {
+        None => (
+            Vec::new(),
+            false,
+            Some("This file is too large to display."),
+        ),
+        Some(bytes) => match classify(bytes) {
+            Blob::Text(text) => {
+                let (lines, highlighted) = render_lines(file_name.to_owned(), text).await?;
+                (lines, highlighted, None)
+            }
+            Blob::Binary => (Vec::new(), false, Some("Binary file not shown.")),
+        },
+    };
+    let repo = &access.repo;
     Ok(BlobPage {
         nav_user: nav(session.as_ref()),
         head: RepoHead::new(&access, "code", Some(&resolved.ref_name)),
@@ -163,8 +172,22 @@ pub async fn blob(
         path: resolved.path.clone(),
         size,
         lines,
+        highlighted,
         notice,
     })
+}
+
+/// The file's lines as highlighted HTML (`true`), or as plain text when highlighting does not apply
+/// (`false`). Runs on the blocking pool: highlighting a large file takes a while.
+async fn render_lines(file_name: String, text: String) -> Result<(Vec<String>, bool), WebError> {
+    tokio::task::spawn_blocking(
+        move || match highlight::highlight_lines(&file_name, &text) {
+            Some(lines) => (lines, true),
+            None => (text.lines().map(str::to_owned).collect(), false),
+        },
+    )
+    .await
+    .map_err(|e| WebError::Internal(e.to_string()))
 }
 
 /// Raw file bytes: plain text or an attachment, inside a CSP sandbox, never rendered as HTML (spec §11.1).

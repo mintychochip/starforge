@@ -3,6 +3,7 @@
 pub mod auth;
 pub mod error;
 pub mod githttp;
+pub mod highlight;
 pub mod markdown;
 mod moved;
 mod pages;
@@ -31,6 +32,7 @@ pub struct AppState {
 }
 
 pub fn router(core: Core, settings: WebSettings) -> Router {
+    std::sync::LazyLock::force(&highlight::STYLESHEET);
     let state = AppState {
         core,
         settings: Arc::new(settings),
@@ -159,6 +161,7 @@ fn page_routes() -> Router<AppState> {
         .route("/{owner}/{repo}/branches", get(pages::refs::branches))
         .route("/{owner}/{repo}/tags", get(pages::refs::tags))
         .route("/static/starforge.css", get(stylesheet))
+        .route("/static/highlight.css", get(highlight_stylesheet))
 }
 
 /// Smart HTTP. Pushes can be arbitrarily large, so the request body limit is disabled here.
@@ -183,6 +186,16 @@ async fn stylesheet() -> impl IntoResponse {
             (header::CACHE_CONTROL, "public, max-age=3600"),
         ],
         include_str!("../static/starforge.css"),
+    )
+}
+
+async fn highlight_stylesheet() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "text/css; charset=utf-8"),
+            (header::CACHE_CONTROL, "public, max-age=3600"),
+        ],
+        highlight::STYLESHEET.as_str(),
     )
 }
 

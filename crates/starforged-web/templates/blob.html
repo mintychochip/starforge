@@ -7,7 +7,7 @@
 <p class="muted">{{ n }}</p>
 {% else %}
 <table class="code"><tbody>
-{% for line in lines %}<tr><td class="ln">{{ loop.index }}</td><td><pre>{{ line }}</pre></td></tr>
+{% for line in lines %}<tr id="L{{ loop.index }}"><td class="ln"><a href="#L{{ loop.index }}">{{ loop.index }}</a></td><td><pre>{% if highlighted %}{{ line|safe }}{% else %}{{ line }}{% endif %}</pre></td></tr>
 {% endfor %}
 </tbody></table>
 {% endif %}

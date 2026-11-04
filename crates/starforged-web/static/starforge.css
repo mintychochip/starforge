@@ -1,6 +1,6 @@
-:root { color-scheme: light dark; --fg: #1f2328; --muted: #59636e; --border: #d1d9e0; --accent: #0969da; --add: #dafbe1; --del: #ffebe9; }
+:root { color-scheme: light dark; --fg: #1f2328; --muted: #59636e; --border: #d1d9e0; --accent: #0969da; --add: #dafbe1; --del: #ffebe9; --target: #fff8c5; }
 @media (prefers-color-scheme: dark) {
-  :root { --fg: #e6edf3; --muted: #9198a1; --border: #3d444d; --accent: #4493f8; --add: #12261e; --del: #25171c; }
+  :root { --fg: #e6edf3; --muted: #9198a1; --border: #3d444d; --accent: #4493f8; --add: #12261e; --del: #25171c; --target: #3d3200; }
 }
 body { font: 15px/1.5 system-ui, sans-serif; color: var(--fg); margin: 0; }
 header.site { display: flex; justify-content: space-between; align-items: center; padding: .6rem 1.2rem; border-bottom: 1px solid var(--border); }
@@ -34,3 +34,5 @@ article.readme { border: 1px solid var(--border); border-radius: .4rem; padding:
 section.file { border: 1px solid var(--border); border-radius: .4rem; margin: 1rem 0; }
 section.file h3 { margin: 0; padding: .4rem .8rem; border-bottom: 1px solid var(--border); font-size: .95rem; }
 nav.tabs a[aria-current] { font-weight: 600; text-decoration: underline; }
+table.code tr:target { background: var(--target); }
+td.ln a { color: inherit; }

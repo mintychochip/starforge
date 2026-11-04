@@ -22,11 +22,13 @@ percent-encoding.workspace = true
 serde.workspace = true
 starforged-core = { path = "../starforged-core" }
 starforged-git = { path = "../starforged-git" }
+subtle.workspace = true
+syntect.workspace = true
+time.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
-subtle.workspace = true
-time.workspace = true
+two-face.workspace = true
 
 [dev-dependencies]
 flate2.workspace = true

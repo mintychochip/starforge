@@ -63,7 +63,10 @@ async fn browsing_trees_files_raw_and_readme() {
     );
 
     let file = get_text(&client, &s.url("/alice/proj/blob/main/src/main.rs")).await;
-    assert!(file.contains("<pre>fn main() {}</pre>"), "{file}");
+    assert!(
+        file.contains(r#"<span class="hl-storage hl-type hl-function hl-rust">fn</span>"#),
+        "{file}"
+    );
     assert!(
         file.contains(r#"href="/alice/proj/raw/main/src/main.rs""#),
         "{file}"
