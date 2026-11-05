@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use starforged_core::accounts::{CreateUser, User};
-use starforged_core::{Core, CoreConfig, tokens};
+use starforged_core::{Core, CoreConfig, WebhookKey, tokens};
 use starforged_db::Db;
 
 use crate::config::Config;
@@ -36,7 +36,7 @@ pub async fn open_core(config: &Config, hook_exe: PathBuf) -> anyhow::Result<Cor
             base_url: config.server.base_url.clone(),
             mailer: config.mailer()?,
             registration: config.registration_settings()?,
-            webhook_key: webhook_key(&config.security.secret_key)?,
+            webhook_key: WebhookKey(webhook_key(&config.security.secret_key)?),
             // Test-only escape hatch for the integration suite's in-process
             // receiver (`STARFORGE__WEBHOOKS__ALLOW_LOOPBACK=1` or
             // `[webhooks] allow_loopback = true`). Production never sets it.

@@ -84,15 +84,25 @@ pub struct CoreConfig {
     pub mailer: Option<mail::Mailer>,
     /// Who may sign up.
     pub registration: registration::Registration,
-    /// 32-byte key sealing webhook secrets at rest (from
-    /// `security.secret_key`); `Debug` stays derived — the bytes render as
-    /// decimals, never hex, and the key never leaves the process.
-    pub webhook_key: [u8; 32],
+    /// Key sealing webhook secrets at rest (from `security.secret_key`).
+    /// `Debug` is redacted like `SecurityConfig::secret_key`: the bytes
+    /// never render, in any format.
+    pub webhook_key: WebhookKey,
     /// Test-only escape hatch for the webhook SSRF gate: when true, delivery
     /// may target loopback addresses (the integration suite's in-process
     /// receiver). Always false in production; everything else non-global is
     /// denied regardless.
     pub allow_loopback_webhooks: bool,
+}
+
+/// The 32-byte key sealing webhook secrets at rest.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct WebhookKey(pub [u8; 32]);
+
+impl std::fmt::Debug for WebhookKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("WebhookKey(<redacted>)")
+    }
 }
 
 /// The service layer. Cheap to clone; share one per process.
@@ -192,7 +202,7 @@ pub(crate) mod testing {
             base_url: "http://forge.test".into(),
             mailer: None,
             registration: registration::Registration::default(),
-            webhook_key: [7u8; 32],
+            webhook_key: WebhookKey([7u8; 32]),
             allow_loopback_webhooks: false,
         };
         configure(&mut config, dir.path());

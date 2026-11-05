@@ -341,10 +341,10 @@ async fn event_filter_and_signed_delivery() {
     assert_eq!(body["state"], "success");
     assert!(body["at"].is_number());
     let sig = hit.signature.as_deref().expect("signature header");
-    assert!(sig.starts_with("sha256:"), "{sig}");
+    assert!(sig.starts_with("sha256="), "{sig}");
     assert_eq!(
         sig,
-        &format!("sha256:{}", hmac_sha256_hex(&secret, &hit.body)),
+        &format!("sha256={}", hmac_sha256_hex(&secret, &hit.body)),
         "signature verifies over the exact body"
     );
 
@@ -591,7 +591,7 @@ async fn end_to_end_push_review_merge_fan_out() {
         let sig = hit.signature.as_deref().expect("signature header");
         assert_eq!(
             sig,
-            &format!("sha256:{}", hmac_sha256_hex(&secret, &hit.body)),
+            &format!("sha256={}", hmac_sha256_hex(&secret, &hit.body)),
             "delivery signature verifies"
         );
     }

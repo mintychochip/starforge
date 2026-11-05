@@ -216,7 +216,7 @@ impl Core {
         check_url(url)?;
         let events = check_events(events)?;
         let secret = crate::crypto::random_hex(32);
-        let sealed = seal_secret(&self.config().webhook_key, &secret)?;
+        let sealed = seal_secret(&self.config().webhook_key.0, &secret)?;
         let row = db_checks::insert_webhook(
             self.db(),
             access.repo.id,
@@ -411,7 +411,7 @@ impl Core {
         if hook.active == 0 {
             return Ok(());
         }
-        let secret = match open_secret(&self.config().webhook_key, &hook.secret_encrypted) {
+        let secret = match open_secret(&self.config().webhook_key.0, &hook.secret_encrypted) {
             Ok(secret) => secret,
             Err(err) => {
                 self.record_terminal(
@@ -425,7 +425,7 @@ impl Core {
                 return Ok(());
             }
         };
-        let signature = format!("sha256:{}", hmac_sha256_hex(&secret, payload.as_bytes()));
+        let signature = format!("sha256={}", hmac_sha256_hex(&secret, payload.as_bytes()));
         // Resolve and classify before touching the network: denials
         // (unresolvable or non-global hosts) are deterministic, so they are
         // terminal — fail-closed, with no request and no retry.
@@ -558,8 +558,9 @@ impl Core {
 /// (100.64/10), link-local (169.254/16 — including the 169.254.169.254
 /// metadata endpoint — and fe80::/10), unique-local (fc00::/7),
 /// unspecified, broadcast, multicast, documentation, benchmarking, and
-/// reserved ranges. The coarser checks use stable predicates, the rest
-/// explicit prefix matches.
+/// reserved ranges, in either address family — IPv4-mapped IPv6 forms
+/// (`::ffff:a.b.c.d`) unwrap to their inner IPv4 address first. The coarser
+/// checks use stable predicates, the rest explicit prefix matches.
 fn host_allowed(ip: std::net::IpAddr, allow_loopback: bool) -> bool {
     if ip.is_loopback() {
         return allow_loopback;
@@ -600,7 +601,12 @@ fn host_allowed(ip: std::net::IpAddr, allow_loopback: bool) -> bool {
             true
         }
         std::net::IpAddr::V6(v6) => {
-            // Stable predicates cover unspecified, multicast, link-local
+            // IPv4-mapped IPv6 (`::ffff:a.b.c.d`) is the same host as its
+            // inner IPv4 address: unwrap and classify as IPv4, or private
+            // and loopback ranges slip through the V6 checks below.
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return host_allowed(std::net::IpAddr::V4(v4), allow_loopback);
+            }
             // (fe80::/10), and unique-local (fc00::/7); documentation is a
             // prefix check.
             if v6.is_unspecified()
@@ -771,6 +777,13 @@ mod tests {
             "ff02::1",
             "192.0.2.1",
             "203.0.113.1",
+            // IPv4-mapped IPv6: the same hosts in `::ffff:` form, including
+            // what a hostname resolving to a mapped address yields.
+            // (`::ffff:127.0.0.1` is asserted explicitly below: this
+            // toolchain's `is_loopback` misses mapped forms, so the loop
+            // guard cannot tell it apart from a denied address.)
+            "::ffff:10.0.0.1",
+            "::ffff:169.254.169.254",
         ];
         for host in denied {
             let ip: IpAddr = host.parse().unwrap();
@@ -781,11 +794,42 @@ mod tests {
         }
         assert!(host_allowed("127.0.0.1".parse().unwrap(), true));
         assert!(host_allowed("::1".parse::<IpAddr>().unwrap(), true));
+        assert!(host_allowed(
+            "::ffff:127.0.0.1".parse::<IpAddr>().unwrap(),
+            true
+        ));
+        assert!(!host_allowed(
+            "::ffff:127.0.0.1".parse::<IpAddr>().unwrap(),
+            false
+        ));
+        assert!(!host_allowed(
+            "::ffff:10.0.0.1".parse::<IpAddr>().unwrap(),
+            true
+        ));
+        assert!(!host_allowed(
+            "::ffff:169.254.169.254".parse::<IpAddr>().unwrap(),
+            false
+        ));
         for host in ["8.8.8.8", "1.1.1.1", "2606:4700:4700::1111"] {
             let ip: IpAddr = host.parse().unwrap();
             assert!(host_allowed(ip, false), "{host} allowed");
             assert!(host_allowed(ip, true), "{host} allowed");
         }
+    }
+
+    /// The sealing key never renders in `Debug`, in any format (the unit
+    /// fixture key is `[7u8; 32]`, hex `0707…`).
+    #[tokio::test]
+    async fn debug_output_redacts_the_webhook_key() {
+        let (core, _f, _) = seeded(false).await;
+        let rendered = format!("{:?}", core.config());
+        assert!(rendered.contains("webhook_key"), "{rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+        assert!(!rendered.contains("0707"), "hex bytes leak: {rendered}");
+        assert!(
+            !rendered.contains("[7, 7"),
+            "decimal bytes leak: {rendered}"
+        );
     }
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -815,7 +859,7 @@ mod tests {
     }
 
     async fn insert_hook(core: &Core, repo_id: i64, url: &str) -> db_checks::WebhookRow {
-        let sealed = seal_secret(&core.config().webhook_key, "s3cret").unwrap();
+        let sealed = seal_secret(&core.config().webhook_key.0, "s3cret").unwrap();
         db_checks::insert_webhook(core.db(), repo_id, url, &sealed, "[]", now())
             .await
             .unwrap()
