@@ -822,3 +822,322 @@ async fn push_lookup_not_found_fails_fast() {
         "names the push and the lookup error: {out}"
     );
 }
+
+// --- J5: `trail review` and `trail merge` against the stub. ---
+//
+// The stub asserts exact paths, request bodies, and the bearer header; the
+// CLI handlers are called in-process through the library seam.
+use starforge_cli::commands::trail::decide::{
+    InlineComment, MergeArgs, ReviewArgs, Verdict, merge, review,
+};
+
+const J5_SESSION: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+const J5_SHA: &str = "cccccccccccccccccccccccccccccccccccccccc";
+
+fn j5_changes_list() -> Value {
+    json!({"changes": [{"k": 1, "state": "open"}]})
+}
+
+fn j5_comment(path: &str, side: &str, start: i64, end: i64, body: &str) -> InlineComment {
+    InlineComment {
+        path: path.to_string(),
+        side: side.to_string(),
+        start_line: start,
+        end_line: end,
+        body: body.to_string(),
+    }
+}
+
+fn j5_review_response() -> Value {
+    json!({
+        "id": 9, "revision": 2, "author": "alice", "verdict": "approve",
+        "body": "LGTM", "session": J5_SESSION, "state": "submitted",
+        "threads": [
+            {"id": 1, "revision": 2, "path": "a.txt", "side": "head",
+             "start_line": 1, "end_line": 2, "resolved": false, "outdated": false},
+            {"id": 2, "revision": 2, "path": "b.txt", "side": "base",
+             "start_line": 3, "end_line": 3, "resolved": false, "outdated": false}
+        ]
+    })
+}
+
+#[tokio::test]
+async fn review_posts_exact_body() {
+    let (base, app) = start(vec![
+        (
+            "GET",
+            "/api/v1/repos/o/r/trails/12/changes",
+            200,
+            j5_changes_list(),
+        ),
+        (
+            "POST",
+            "/api/v1/repos/o/r/trails/12/changes/1/reviews",
+            201,
+            j5_review_response(),
+        ),
+    ])
+    .await;
+    let ctx = ctx_for(&base);
+    let args = ReviewArgs {
+        n: 12,
+        change: None,
+        rev: Some(2),
+        verdict: Verdict::Approve,
+        body: "LGTM".to_string(),
+        comments: vec![
+            j5_comment("a.txt", "head", 1, 2, "nit"),
+            j5_comment("b.txt", "base", 3, 3, "q"),
+        ],
+        session: Some(J5_SESSION.to_string()),
+    };
+    let (out, code) = review(&ctx, &args, Format::Text).await;
+    assert_eq!(code, 0, "review: {out}");
+    assert_eq!(
+        out,
+        format!(
+            "approved trail #12 change 1 revision 2 (review 9, 2 inline comments): {base}/o/r/trails/12"
+        )
+    );
+
+    let reqs = app.recorded.lock().unwrap();
+    assert_eq!(reqs.len(), 2);
+    assert_eq!(reqs[1].auth.as_deref(), Some("Bearer test-token"));
+    let posted: Value = serde_json::from_slice(&reqs[1].body).unwrap();
+    assert_eq!(
+        posted,
+        json!({
+            "verdict": "approve",
+            "body": "LGTM",
+            "revision": 2,
+            "session": J5_SESSION,
+            "comments": [
+                {"path": "a.txt", "side": "head", "start_line": 1, "end_line": 2, "body": "nit"},
+                {"path": "b.txt", "side": "base", "start_line": 3, "end_line": 3, "body": "q"},
+            ],
+        }),
+        "exact review body"
+    );
+}
+
+#[tokio::test]
+async fn review_omits_empty_comments_and_session() {
+    let (base, app) = start(vec![
+        (
+            "GET",
+            "/api/v1/repos/o/r/trails/12/changes",
+            200,
+            j5_changes_list(),
+        ),
+        (
+            "POST",
+            "/api/v1/repos/o/r/trails/12/changes/1/reviews",
+            201,
+            json!({"id": 3, "revision": 1, "threads": []}),
+        ),
+    ])
+    .await;
+    let ctx = ctx_for(&base);
+    let args = ReviewArgs {
+        n: 12,
+        change: None,
+        rev: None,
+        verdict: Verdict::Comment,
+        body: "noting".to_string(),
+        comments: Vec::new(),
+        session: None,
+    };
+    let (out, code) = review(&ctx, &args, Format::Json).await;
+    assert_eq!(code, 0, "review: {out}");
+    let passed: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(passed["id"], 3);
+
+    let reqs = app.recorded.lock().unwrap();
+    assert_eq!(reqs.len(), 2);
+    let posted: Value = serde_json::from_slice(&reqs[1].body).unwrap();
+    assert_eq!(posted, json!({"verdict": "comment", "body": "noting"}));
+}
+
+#[tokio::test]
+async fn review_refusal_prints_server_message() {
+    let (base, _app) = start(vec![
+        (
+            "GET",
+            "/api/v1/repos/o/r/trails/12/changes",
+            200,
+            j5_changes_list(),
+        ),
+        (
+            "POST",
+            "/api/v1/repos/o/r/trails/12/changes/1/reviews",
+            422,
+            json!({"error": {"code": "invalid", "message": "comments[0]: thread body must not be empty", "details": null}}),
+        ),
+    ])
+    .await;
+    let ctx = ctx_for(&base);
+    let args = ReviewArgs {
+        n: 12,
+        change: None,
+        rev: None,
+        verdict: Verdict::Approve,
+        body: "LGTM".to_string(),
+        comments: vec![j5_comment("a.txt", "head", 1, 1, "")],
+        session: None,
+    };
+    // No retry without the comments: the server's message names comments[0].
+    let (out, code) = review(&ctx, &args, Format::Text).await;
+    assert_eq!(code, 1, "refusal exits 1: {out}");
+    assert!(out.contains("comments[0]"), "server message: {out}");
+}
+
+#[tokio::test]
+async fn merge_posts_exact_body() {
+    let (base, app) = start(vec![
+        (
+            "GET",
+            "/api/v1/repos/o/r/trails/12/changes",
+            200,
+            j5_changes_list(),
+        ),
+        (
+            "GET",
+            "/api/v1/repos/o/r/trails/12/changes/1",
+            200,
+            change_detail(),
+        ),
+        (
+            "POST",
+            "/api/v1/repos/o/r/trails/12/changes/1/merge",
+            200,
+            json!({"sha": J5_SHA, "method": "merge"}),
+        ),
+    ])
+    .await;
+    let ctx = ctx_for(&base);
+    // `change_detail` allows only `merge`, so the default resolves to it.
+    let (out, code) = merge(
+        &ctx,
+        &MergeArgs {
+            n: 12,
+            change: None,
+            method: None,
+        },
+        Format::Text,
+    )
+    .await;
+    assert_eq!(code, 0, "merge: {out}");
+    assert_eq!(
+        out,
+        format!("merged trail #12 change 1 with merge: {J5_SHA}")
+    );
+
+    let reqs = app.recorded.lock().unwrap();
+    assert_eq!(reqs.len(), 3);
+    assert_eq!(reqs[2].auth.as_deref(), Some("Bearer test-token"));
+    let posted: Value = serde_json::from_slice(&reqs[2].body).unwrap();
+    assert_eq!(posted, json!({"method": "merge"}), "exact merge body");
+}
+
+#[tokio::test]
+async fn merge_explicit_method_passes_through() {
+    let (base, app) = start(vec![
+        (
+            "GET",
+            "/api/v1/repos/o/r/trails/12/changes",
+            200,
+            j5_changes_list(),
+        ),
+        (
+            "GET",
+            "/api/v1/repos/o/r/trails/12/changes/1",
+            200,
+            change_detail(),
+        ),
+        (
+            "POST",
+            "/api/v1/repos/o/r/trails/12/changes/1/merge",
+            422,
+            json!({"error": {"code": "invalid", "message": "merge method 'squash' is not allowed by the matching gate rules (allowed: merge)", "details": null}}),
+        ),
+    ])
+    .await;
+    let ctx = ctx_for(&base);
+    let (out, code) = merge(
+        &ctx,
+        &MergeArgs {
+            n: 12,
+            change: None,
+            method: Some("squash".to_string()),
+        },
+        Format::Text,
+    )
+    .await;
+    assert_eq!(code, 1, "refusal exits 1: {out}");
+    assert!(out.contains("not allowed"), "server message: {out}");
+
+    let reqs = app.recorded.lock().unwrap();
+    let posted: Value = serde_json::from_slice(&reqs[2].body).unwrap();
+    assert_eq!(posted, json!({"method": "squash"}));
+}
+
+// ---------------------------------------------------------------------------
+// Clap surface: the verdict flags form one required, mutually exclusive group.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn review_verdict_group_rejects_zero_or_two_flags() {
+    let err = parse(["starforge", "trail", "review", "12"]).unwrap_err();
+    assert_eq!(err.exit_code(), 2, "{err}");
+    let err = parse([
+        "starforge",
+        "trail",
+        "review",
+        "12",
+        "--approve",
+        "--comment",
+    ])
+    .unwrap_err();
+    assert_eq!(err.exit_code(), 2, "{err}");
+    let err = parse([
+        "starforge",
+        "trail",
+        "review",
+        "12",
+        "--approve",
+        "--request-changes",
+        "--comment",
+    ])
+    .unwrap_err();
+    assert_eq!(err.exit_code(), 2, "{err}");
+}
+
+#[test]
+fn review_verdict_group_accepts_one_flag_without_body() {
+    for flag in ["--approve", "--request-changes", "--comment"] {
+        let cli = parse(["starforge", "trail", "review", "12", flag]).unwrap();
+        assert!(
+            matches!(
+                cli.cmd,
+                starforge_cli::cli::Cmd::Trail {
+                    cmd: TrailCmd::Review { .. }
+                }
+            ),
+            "{flag}"
+        );
+    }
+    // `--body` and `--body-file` together stay a usage error.
+    let err = parse([
+        "starforge",
+        "trail",
+        "review",
+        "12",
+        "--approve",
+        "--body",
+        "b",
+        "--body-file",
+        "-",
+    ])
+    .unwrap_err();
+    assert_eq!(err.exit_code(), 2, "{err}");
+}

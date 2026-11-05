@@ -1,6 +1,7 @@
 //! `starforge trail` commands (M2d J3–J5): list/show/create/comment here,
 //! checkout/push in `sync`, review/merge in `decide`.
 
+pub mod decide;
 pub mod read;
 pub mod sync;
 pub mod write;

@@ -494,3 +494,339 @@ async fn checkout_without_remote_names_flag() {
     assert_eq!(code, 1, "missing remote must fail");
     assert!(out.contains("--remote"), "error names --remote: {out}");
 }
+
+// --- J5: `trail review` and `trail merge` against the real server. ---
+//
+// The CLI handlers are called in-process through the library seam. Each test
+// pushes `main` plus `feature/x`, opens a trail with one branch change, and
+// drives `review`/`merge` like a terminal user would.
+use serde_json::{Value as J5Value, json as j5_json};
+use starforge_cli::commands::trail::decide::{
+    InlineComment as J5Comment, MergeArgs as J5Merge, ReviewArgs as J5Review, Verdict as J5Verdict,
+    merge as j5_merge, review as j5_submit_review,
+};
+
+fn j5_comment(path: &str, side: &str, start: i64, end: i64, body: &str) -> J5Comment {
+    J5Comment {
+        path: path.to_string(),
+        side: side.to_string(),
+        start_line: start,
+        end_line: end,
+        body: body.to_string(),
+    }
+}
+
+/// Server, repo, pushed `main` + `feature/x`, trail #1 with one open branch
+/// change, and a writer token. Returns the server, the owner, the working
+/// copy, the server git dir, the repo id, the writer token, and the trail
+/// number.
+async fn j5_setup() -> (
+    TestServer,
+    starforged_core::accounts::User,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    i64,
+    String,
+    i64,
+) {
+    let s = TestServer::start().await;
+    let alice = s.user("alice").await;
+    s.repo(&alice, "proj", Visibility::Private).await;
+    let push_token = s.token(&alice, &[Scope::RepoWrite]).await;
+    let url = s.git_url("alice", "proj", Some(&push_token));
+    let tmp = tempfile::tempdir().unwrap();
+    let tmp_path = tmp.path().to_path_buf();
+    std::mem::forget(tmp);
+    let work = work_repo(&tmp_path, "work", &[("a.txt", "one\n")]).await;
+    git_ok(&work, &["checkout", "-q", "-b", "feature/x"]).await;
+    commit_files(&work, &[("a.txt", b"one\ntwo\n")], "add two").await;
+    git_ok(&work, &["push", "-q", &url, "main", "feature/x"]).await;
+
+    let writer = s.token(&alice, &[Scope::RepoRead, Scope::TrailWrite]).await;
+    let client = reqwest::Client::new();
+    let res = client
+        .post(s.url("/api/v1/repos/alice/proj/trails"))
+        .bearer_auth(&writer)
+        .json(&j5_json!({"title": "feature work", "intent": "ship it"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 201);
+    let n = res.json::<J5Value>().await.unwrap()["number"]
+        .as_i64()
+        .unwrap();
+    let res = client
+        .post(s.url(&format!("/api/v1/repos/alice/proj/trails/{n}/changes")))
+        .bearer_auth(&writer)
+        .json(&j5_json!({"kind": "branch", "head_branch": "feature/x", "base_branch": "main"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 201, "create branch change");
+    let repo_id = s
+        .core
+        .repo_for(Some(&alice), "alice", "proj")
+        .await
+        .unwrap()
+        .repo
+        .id;
+    let server = s.core.repo_path(repo_id);
+    (s, alice, work, server, repo_id, writer, n)
+}
+
+fn j5_ctx(server: &TestServer, token: &str) -> TrailCtx {
+    ctx_for(server, "alice/proj", token)
+}
+
+fn j5_review(n: i64, verdict: J5Verdict, comments: Vec<J5Comment>) -> J5Review {
+    J5Review {
+        n,
+        change: None,
+        rev: None,
+        verdict,
+        body: "LGTM".to_string(),
+        comments,
+        session: None,
+    }
+}
+
+async fn j5_rule(repo_id: i64, db: &starforged_db::Db, approvals: i64, methods: &str) {
+    starforged_db::checks::insert_gate_rule(
+        db,
+        repo_id,
+        None,
+        approvals,
+        false,
+        false,
+        "[]",
+        false,
+        false,
+        false,
+        methods,
+        starforged_db::now(),
+    )
+    .await
+    .unwrap();
+}
+
+fn j5_git_dir(server: &std::path::Path) -> String {
+    format!("--git-dir={}", server.display())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_with_two_comments_opens_two_threads() {
+    let (s, _alice, _work, _server, _repo, writer, n) = j5_setup().await;
+    let ctx = j5_ctx(&s, &writer);
+    let (out, code) = j5_submit_review(
+        &ctx,
+        &j5_review(
+            n,
+            J5Verdict::Approve,
+            vec![
+                j5_comment("a.txt", "head", 1, 2, "first"),
+                j5_comment("b.txt", "base", 3, 3, "second"),
+            ],
+        ),
+        Format::Text,
+    )
+    .await;
+    assert_eq!(code, 0, "review: {out}");
+    assert!(
+        out.contains(&format!("approved trail #{n} change 1 revision 1 (review "))
+            && out.contains("2 inline comments)"),
+        "review names the change, revision, and thread count: {out}"
+    );
+    assert!(!out.contains(&writer), "the token never appears in output");
+
+    let detail = ctx
+        .api
+        .get(&format!("trails/{n}/changes/1"), &[])
+        .await
+        .unwrap();
+    assert_eq!(detail["reviews"].as_array().unwrap().len(), 1);
+    assert_eq!(detail["threads"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invalid_comment_posts_no_review() {
+    let (s, _alice, _work, _server, _repo, writer, n) = j5_setup().await;
+    let ctx = j5_ctx(&s, &writer);
+    // Empty bodies pass the client checks; the server refuses them, naming
+    // the index. Nothing is written and there is no retry.
+    let (out, code) = j5_submit_review(
+        &ctx,
+        &j5_review(
+            n,
+            J5Verdict::Approve,
+            vec![j5_comment("a.txt", "head", 1, 1, "")],
+        ),
+        Format::Text,
+    )
+    .await;
+    assert_eq!(code, 1, "invalid comment exits 1: {out}");
+    assert!(out.contains("comments[0]"), "server names the index: {out}");
+
+    let detail = ctx
+        .api
+        .get(&format!("trails/{n}/changes/1"), &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        detail["reviews"].as_array().unwrap().len(),
+        0,
+        "no review was written"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn merge_waits_for_approval_then_lands() {
+    let (s, _alice, work, server, repo_id, writer, n) = j5_setup().await;
+    j5_rule(repo_id, s.core.db(), 1, "[]").await;
+    let ctx = j5_ctx(&s, &writer);
+    let gd = j5_git_dir(&server);
+    let base_before = git_ok(&work, &[&gd, "rev-parse", "--verify", "refs/heads/main"])
+        .await
+        .trim()
+        .to_owned();
+
+    let (out, code) = j5_merge(
+        &ctx,
+        &J5Merge {
+            n,
+            change: None,
+            method: None,
+        },
+        Format::Text,
+    )
+    .await;
+    assert_eq!(code, 1, "gated merge exits 1: {out}");
+    assert!(out.contains("needs 1 more approval"), "gate reason: {out}");
+    assert_eq!(
+        git_ok(&work, &[&gd, "rev-parse", "--verify", "refs/heads/main"])
+            .await
+            .trim(),
+        base_before,
+        "the base does not move on refusal"
+    );
+
+    let (out, code) = j5_submit_review(
+        &ctx,
+        &j5_review(n, J5Verdict::Approve, vec![]),
+        Format::Text,
+    )
+    .await;
+    assert_eq!(code, 0, "approval: {out}");
+
+    let (out, code) = j5_merge(
+        &ctx,
+        &J5Merge {
+            n,
+            change: None,
+            method: None,
+        },
+        Format::Text,
+    )
+    .await;
+    assert_eq!(code, 0, "merge: {out}");
+    assert!(
+        out.contains(&format!("merged trail #{n} change 1 with merge: ")),
+        "merge names the method: {out}"
+    );
+
+    let trail = ctx.api.get(&format!("trails/{n}"), &[]).await.unwrap();
+    assert_eq!(trail["state"], "merged");
+    let sha = git_ok(&work, &[&gd, "rev-parse", "--verify", "refs/heads/main"])
+        .await
+        .trim()
+        .to_owned();
+    assert_ne!(sha, base_before);
+    let message = git_ok(&work, &[&gd, "log", "--format=%B", "-n", "1", &sha]).await;
+    assert!(
+        message.contains(&format!("Starforge-Trail: alice/proj#{n}")),
+        "merge commit carries the trailer: {message}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn merge_defaults_to_squash_when_only_squash_allowed() {
+    let (s, _alice, work, server, repo_id, writer, n) = j5_setup().await;
+    j5_rule(repo_id, s.core.db(), 0, "[\"squash\"]").await;
+    let ctx = j5_ctx(&s, &writer);
+    let (out, code) = j5_merge(
+        &ctx,
+        &J5Merge {
+            n,
+            change: None,
+            method: None,
+        },
+        Format::Text,
+    )
+    .await;
+    assert_eq!(code, 0, "merge: {out}");
+    assert!(
+        out.contains(&format!("merged trail #{n} change 1 with squash: ")),
+        "plain merge squashes: {out}"
+    );
+    let gd = j5_git_dir(&server);
+    let sha = git_ok(&work, &[&gd, "rev-parse", "--verify", "refs/heads/main"])
+        .await
+        .trim()
+        .to_owned();
+    let parents = git_ok(&work, &[&gd, "rev-list", "--parents", "-n", "1", &sha]).await;
+    assert_eq!(
+        parents.split_whitespace().count(),
+        2,
+        "squash has one parent: {parents}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn merge_disallowed_method_reports_server_message() {
+    let (s, _alice, _work, _server, repo_id, writer, n) = j5_setup().await;
+    j5_rule(repo_id, s.core.db(), 0, "[\"squash\"]").await;
+    let ctx = j5_ctx(&s, &writer);
+    let (out, code) = j5_merge(
+        &ctx,
+        &J5Merge {
+            n,
+            change: None,
+            method: Some("merge".to_string()),
+        },
+        Format::Text,
+    )
+    .await;
+    assert_eq!(code, 1, "disallowed method exits 1: {out}");
+    assert!(
+        out.contains("is not allowed") && out.contains("squash"),
+        "server message: {out}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn merge_with_read_only_token_is_refused() {
+    let (s, alice, _work, _server, _repo, _writer, n) = j5_setup().await;
+    let dave = s.user("dave").await;
+    s.core
+        .set_collaborator(
+            &alice,
+            "alice",
+            "proj",
+            "dave",
+            starforged_core::permission::Permission::Read,
+        )
+        .await
+        .unwrap();
+    let reader = s.token(&dave, &[Scope::RepoRead]).await;
+    let ctx = j5_ctx(&s, &reader);
+    let (out, code) = j5_merge(
+        &ctx,
+        &J5Merge {
+            n,
+            change: None,
+            method: None,
+        },
+        Format::Text,
+    )
+    .await;
+    assert_eq!(code, 1, "read-only merge exits 1: {out}");
+}

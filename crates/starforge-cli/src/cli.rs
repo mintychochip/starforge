@@ -127,7 +127,7 @@ pub enum SessionsCmd {
         ulid: String,
     },
 }
-/// `trail` subcommands (M2d J3–J5: list/show/create/comment/push/checkout are real).
+/// `trail` subcommands (M2d J3–J5: list/show/create/comment/push/checkout/review/merge are real).
 #[derive(Debug, Subcommand)]
 pub enum TrailCmd {
     /// List trails.
@@ -237,7 +237,69 @@ pub enum TrailCmd {
         #[arg(long, value_enum, default_value_t = crate::commands::trail::TextJson::Text)]
         format: crate::commands::trail::TextJson,
     },
+    /// Submit a review on a trail change.
+    Review {
+        /// Trail number.
+        n: i64,
+        /// Approve the change.
+        #[arg(
+            long,
+            conflicts_with_all = ["request_changes", "comment"],
+            required_unless_present_any = ["request_changes", "comment"]
+        )]
+        approve: bool,
+        /// Request changes on the change.
+        #[arg(
+            long = "request-changes",
+            conflicts_with_all = ["approve", "comment"],
+            required_unless_present_any = ["approve", "comment"]
+        )]
+        request_changes: bool,
+        /// Comment on the change without a verdict.
+        #[arg(
+            long,
+            conflicts_with_all = ["approve", "request_changes"],
+            required_unless_present_any = ["approve", "request_changes"]
+        )]
+        comment: bool,
+        /// Review Markdown.
+        #[arg(long, conflicts_with = "body_file")]
+        body: Option<String>,
+        /// Read the review from a file (`-` reads stdin).
+        #[arg(long = "body-file", value_name = "PATH")]
+        body_file: Option<PathBuf>,
+        /// Inline comments: a JSON array, `@<path>`, or `@-` (stdin).
+        #[arg(long)]
+        comments: Option<String>,
+        /// Session ULID evidencing the review.
+        #[arg(long)]
+        session: Option<String>,
+        /// Change number (default: the single open change).
+        #[arg(long)]
+        change: Option<i64>,
+        /// Revision number (default: the current revision).
+        #[arg(long)]
+        rev: Option<i64>,
+        /// Output format.
+        #[arg(long, value_enum, default_value_t = crate::commands::trail::TextJson::Text)]
+        format: crate::commands::trail::TextJson,
+    },
+    /// Merge a trail change.
+    Merge {
+        /// Trail number.
+        n: i64,
+        /// Merge method (default: `merge` when allowed, else the allowed one).
+        #[arg(long)]
+        method: Option<String>,
+        /// Change number (default: the single open change).
+        #[arg(long)]
+        change: Option<i64>,
+        /// Output format.
+        #[arg(long, value_enum, default_value_t = crate::commands::trail::TextJson::Text)]
+        format: crate::commands::trail::TextJson,
+    },
 }
+
 /// CLI errors. Every non-root cause maps to an exit code (0/1/2).
 #[derive(Debug, thiserror::Error)]
 pub enum CliError {
@@ -509,7 +571,7 @@ async fn run_status(paths: CliPaths, dry_run: bool) -> std::process::ExitCode {
     std::process::ExitCode::from(code)
 }
 
-/// `trail`: list/show/create/comment/push/checkout against the resolved server.
+/// `trail`: list/show/create/comment/push/checkout/review/merge against the resolved server.
 async fn run_trail(cmd: TrailCmd, paths: CliPaths, dry_run: bool) -> std::process::ExitCode {
     if dry_run {
         let planned: String = match &cmd {
@@ -519,6 +581,8 @@ async fn run_trail(cmd: TrailCmd, paths: CliPaths, dry_run: bool) -> std::proces
             TrailCmd::Comment { n, .. } => format!("trail comment {n}"),
             TrailCmd::Push { .. } => "trail push".to_string(),
             TrailCmd::Checkout { n, .. } => format!("trail checkout {n}"),
+            TrailCmd::Review { n, .. } => format!("trail review {n}"),
+            TrailCmd::Merge { n, .. } => format!("trail merge {n}"),
         };
         println!("would run `{planned}` (dry run)");
         return std::process::ExitCode::SUCCESS;
@@ -619,6 +683,70 @@ async fn run_trail(cmd: TrailCmd, paths: CliPaths, dry_run: bool) -> std::proces
                 remote,
             };
             crate::commands::trail::sync::checkout(&ctx, &args, format.into()).await
+        }
+        TrailCmd::Review {
+            n,
+            approve,
+            request_changes,
+            comment: _comment,
+            body,
+            body_file,
+            comments,
+            session,
+            change,
+            rev,
+            format,
+        } => {
+            let verdict = if approve {
+                crate::commands::trail::decide::Verdict::Approve
+            } else if request_changes {
+                crate::commands::trail::decide::Verdict::RequestChanges
+            } else {
+                crate::commands::trail::decide::Verdict::Comment
+            };
+            let text = match (body.as_deref(), body_file.as_deref()) {
+                (None, None) => verdict.default_body().to_string(),
+                (body, body_file) => {
+                    match crate::commands::trail::read_body(body, body_file, std::io::stdin()) {
+                        Ok(text) => text,
+                        Err(err) => {
+                            eprintln!("error: {err}");
+                            return std::process::ExitCode::from(1);
+                        }
+                    }
+                }
+            };
+            let inline = match comments.as_deref() {
+                None => Vec::new(),
+                Some(arg) => {
+                    match crate::commands::trail::decide::parse_comments(arg, std::io::stdin()) {
+                        Ok(inline) => inline,
+                        Err(err) => {
+                            eprintln!("error: {err}");
+                            return std::process::ExitCode::from(1);
+                        }
+                    }
+                }
+            };
+            let args = crate::commands::trail::decide::ReviewArgs {
+                n,
+                change,
+                rev,
+                verdict,
+                body: text,
+                comments: inline,
+                session,
+            };
+            crate::commands::trail::decide::review(&ctx, &args, format.into()).await
+        }
+        TrailCmd::Merge {
+            n,
+            method,
+            change,
+            format,
+        } => {
+            let args = crate::commands::trail::decide::MergeArgs { n, change, method };
+            crate::commands::trail::decide::merge(&ctx, &args, format.into()).await
         }
     };
     if code == 0 {
