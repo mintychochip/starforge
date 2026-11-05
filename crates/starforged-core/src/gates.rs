@@ -177,34 +177,48 @@ impl Core {
     ) -> CoreResult<GateResult> {
         let mut failures: Vec<String> = Vec::new();
 
-        // Counting scope: submitted (never dismissed) reviews by write+
-        // authors. Approvals count from the current revision only when this
-        // rule has `dismiss_on_push` (older approvals were dismissed at
-        // revision creation); otherwise earlier-revision approvals keep
-        // counting. `request_changes` blocks from any revision, independent
-        // of the flag — a push never clears a blocking review.
+        // Counting scope: one voice per author. Only authors who currently
+        // hold at least Write ever count. For each such author, only their
+        // latest decisive review (highest id with verdict `approve` or
+        // `request_changes`, in any state) speaks: `comment` reviews are
+        // neutral and never change an author's state. A latest review that
+        // is not `submitted` (dismissed explicitly or by `dismiss_on_push`)
+        // contributes nothing — including an older `request_changes` it
+        // supersedes, which a push never clears on its own. A submitted
+        // `approve` counts one approval, from the current revision only
+        // when this rule has `dismiss_on_push`; a submitted
+        // `request_changes` makes the author a requester, from any revision.
         let current_only = rule.dismiss_on_push != 0;
-        let mut approvals = 0i64;
-        let mut requesters: Vec<String> = Vec::new();
         let reviews = db_changes::reviews_of_change(self.db(), change.id).await?;
-        for review in &reviews {
-            if review.state != "submitted" {
-                continue;
-            }
+        // Latest decisive review per author. `reviews_of_change` returns
+        // id order, so walking backwards takes the highest id first.
+        let mut latest: Vec<(&db_changes::ReviewRow, i64)> = Vec::new();
+        for review in reviews.iter().rev() {
             if !matches!(review.verdict.as_str(), "approve" | "request_changes") {
                 continue;
             }
             let Some(author_id) = review.author_id else {
                 continue;
             };
-            let counting = match self.user_by_id(author_id).await? {
-                Some(author) => self
-                    .permission_on(&access.repo, Some(&author))
-                    .await?
-                    .is_some_and(|p| p >= Permission::Write),
-                None => false,
+            if latest.iter().any(|(_, seen)| *seen == author_id) {
+                continue;
+            }
+            latest.push((review, author_id));
+        }
+        let mut approvals = 0i64;
+        let mut requesters: Vec<String> = Vec::new();
+        for (review, author_id) in latest {
+            if review.state != "submitted" {
+                continue;
+            }
+            let Some(author) = self.user_by_id(author_id).await? else {
+                continue;
             };
-            if !counting {
+            if !self
+                .permission_on(&access.repo, Some(&author))
+                .await?
+                .is_some_and(|p| p >= Permission::Write)
+            {
                 continue;
             }
             match review.verdict.as_str() {
@@ -213,14 +227,7 @@ impl Core {
                         approvals += 1;
                     }
                 }
-                _ => {
-                    let handle = self
-                        .user_by_id(author_id)
-                        .await?
-                        .map(|u| u.handle)
-                        .unwrap_or_else(|| "deleted user".to_owned());
-                    requesters.push(handle);
-                }
+                _ => requesters.push(author.handle),
             }
         }
         if approvals < rule.required_approvals {
@@ -588,6 +595,24 @@ mod tests {
                 .unwrap();
         }
 
+        async fn verdict(&self, author: &User, verdict: &str) {
+            self.core
+                .submit_review(
+                    author,
+                    "alice",
+                    "proj-gates",
+                    self.trail_n,
+                    self.k,
+                    None,
+                    verdict,
+                    "note",
+                    None,
+                    &[],
+                )
+                .await
+                .unwrap();
+        }
+
         fn bare(&self) -> std::path::PathBuf {
             self.core.repo_path(self.repo_id)
         }
@@ -797,6 +822,94 @@ mod tests {
             .await
             .unwrap();
         assert!(h.report().await.passed);
+    }
+
+    #[tokio::test]
+    async fn double_approval_by_one_reviewer_counts_once() {
+        let h = Harness::setup().await;
+        h.rule_n(2, false).await;
+        h.approve(&h.bob.clone()).await;
+        h.approve(&h.bob.clone()).await;
+        let report = h.report().await;
+        assert!(!report.passed);
+        assert_eq!(report.results[0].reason, "needs 1 more approval");
+        h.approve(&h.alice.clone()).await;
+        assert!(h.report().await.passed);
+    }
+
+    #[tokio::test]
+    async fn request_changes_then_approve_by_same_reviewer_clears() {
+        let h = Harness::setup().await;
+        h.rule(None, 1, true, "[]", false, false, false, "[]").await;
+        h.verdict(&h.bob.clone(), "request_changes").await;
+        assert!(!h.report().await.passed);
+        h.approve(&h.bob.clone()).await;
+        assert!(h.report().await.passed);
+    }
+
+    #[tokio::test]
+    async fn approve_then_request_changes_by_same_reviewer_blocks() {
+        let h = Harness::setup().await;
+        h.rule(None, 1, true, "[]", false, false, false, "[]").await;
+        h.approve(&h.bob.clone()).await;
+        assert!(h.report().await.passed);
+        h.verdict(&h.bob.clone(), "request_changes").await;
+        let report = h.report().await;
+        assert!(!report.passed);
+        assert!(
+            report.results[0].reason.contains("needs 1 more approval"),
+            "{}",
+            report.results[0].reason
+        );
+        assert!(
+            report.results[0]
+                .reason
+                .contains("changes requested by bob"),
+            "{}",
+            report.results[0].reason
+        );
+    }
+
+    #[tokio::test]
+    async fn comment_after_request_changes_stays_blocked() {
+        let h = Harness::setup().await;
+        h.rule(None, 0, true, "[]", false, false, false, "[]").await;
+        h.verdict(&h.bob.clone(), "request_changes").await;
+        assert!(!h.report().await.passed);
+        h.verdict(&h.bob.clone(), "comment").await;
+        let report = h.report().await;
+        assert!(!report.passed);
+        assert!(
+            report.results[0]
+                .reason
+                .contains("changes requested by bob"),
+            "{}",
+            report.results[0].reason
+        );
+    }
+
+    #[tokio::test]
+    async fn push_superseded_request_is_neither_vote_nor_block() {
+        let h = Harness::setup().await;
+        h.rule_flags(true, true).await;
+        h.verdict(&h.bob.clone(), "request_changes").await;
+        let tip = push_commit(&h.bare(), "feature", "a.txt", b"a\n", "second rev");
+        h.core
+            .record_branch_move(h.repo_id, "feature", None, &tip)
+            .await
+            .unwrap();
+        h.approve(&h.bob.clone()).await;
+        let tip = push_commit(&h.bare(), "feature", "b.txt", b"b\n", "third rev");
+        h.core
+            .record_branch_move(h.repo_id, "feature", None, &tip)
+            .await
+            .unwrap();
+        // The r2 approval was dismissed by the r3 push, and the r1 request
+        // it superseded no longer speaks: a fresh approval is needed, and
+        // nobody is requesting changes.
+        let report = h.report().await;
+        assert!(!report.passed);
+        assert_eq!(report.results[0].reason, "needs 1 more approval");
     }
 
     #[tokio::test]
