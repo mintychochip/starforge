@@ -127,7 +127,7 @@ pub enum SessionsCmd {
         ulid: String,
     },
 }
-/// `trail` subcommands (M2d J3–J5: list/show/create/comment are real).
+/// `trail` subcommands (M2d J3–J5: list/show/create/comment/push/checkout are real).
 #[derive(Debug, Subcommand)]
 pub enum TrailCmd {
     /// List trails.
@@ -195,6 +195,44 @@ pub enum TrailCmd {
             required_unless_present = "body"
         )]
         body_file: Option<PathBuf>,
+        /// Output format.
+        #[arg(long, value_enum, default_value_t = crate::commands::trail::TextJson::Text)]
+        format: crate::commands::trail::TextJson,
+    },
+    /// Push the current HEAD as a change revision.
+    Push {
+        /// Trail number (`-o trail=N`); omit to create a trail.
+        #[arg(long)]
+        trail: Option<i64>,
+        /// Trail title for a new trail (`-o title=T`).
+        #[arg(long)]
+        title: Option<String>,
+        /// Base branch (default: the remote's HEAD branch).
+        #[arg(long)]
+        base: Option<String>,
+        /// Topic (default: a slug of the current branch).
+        #[arg(long)]
+        topic: Option<String>,
+        /// Git remote name (default: the discovered remote).
+        #[arg(long)]
+        remote: Option<String>,
+        /// Output format.
+        #[arg(long, value_enum, default_value_t = crate::commands::trail::TextJson::Text)]
+        format: crate::commands::trail::TextJson,
+    },
+    /// Check out a trail change.
+    Checkout {
+        /// Trail number.
+        n: i64,
+        /// Change number (default: the single open change).
+        #[arg(long)]
+        change: Option<i64>,
+        /// Revision number (detached HEAD).
+        #[arg(long)]
+        rev: Option<i64>,
+        /// Git remote name (default: the discovered remote).
+        #[arg(long)]
+        remote: Option<String>,
         /// Output format.
         #[arg(long, value_enum, default_value_t = crate::commands::trail::TextJson::Text)]
         format: crate::commands::trail::TextJson,
@@ -471,7 +509,7 @@ async fn run_status(paths: CliPaths, dry_run: bool) -> std::process::ExitCode {
     std::process::ExitCode::from(code)
 }
 
-/// `trail`: list/show/create/comment against the resolved server.
+/// `trail`: list/show/create/comment/push/checkout against the resolved server.
 async fn run_trail(cmd: TrailCmd, paths: CliPaths, dry_run: bool) -> std::process::ExitCode {
     if dry_run {
         let planned: String = match &cmd {
@@ -479,6 +517,8 @@ async fn run_trail(cmd: TrailCmd, paths: CliPaths, dry_run: bool) -> std::proces
             TrailCmd::Show { n, .. } => format!("trail show {n}"),
             TrailCmd::Create { .. } => "trail create".to_string(),
             TrailCmd::Comment { n, .. } => format!("trail comment {n}"),
+            TrailCmd::Push { .. } => "trail push".to_string(),
+            TrailCmd::Checkout { n, .. } => format!("trail checkout {n}"),
         };
         println!("would run `{planned}` (dry run)");
         return std::process::ExitCode::SUCCESS;
@@ -547,6 +587,38 @@ async fn run_trail(cmd: TrailCmd, paths: CliPaths, dry_run: bool) -> std::proces
                 }
             };
             crate::commands::trail::write::comment(&ctx, n, &text, format.into()).await
+        }
+        TrailCmd::Push {
+            trail,
+            title,
+            base,
+            topic,
+            remote,
+            format,
+        } => {
+            let args = crate::commands::trail::sync::PushArgs {
+                trail,
+                title,
+                base,
+                topic,
+                remote,
+            };
+            crate::commands::trail::sync::push(&ctx, &args, format.into()).await
+        }
+        TrailCmd::Checkout {
+            n,
+            change,
+            rev,
+            remote,
+            format,
+        } => {
+            let args = crate::commands::trail::sync::CheckoutArgs {
+                n,
+                change,
+                rev,
+                remote,
+            };
+            crate::commands::trail::sync::checkout(&ctx, &args, format.into()).await
         }
     };
     if code == 0 {

@@ -2,6 +2,7 @@
 //! checkout/push in `sync`, review/merge in `decide`.
 
 pub mod read;
+pub mod sync;
 pub mod write;
 
 use std::ffi::OsString;
@@ -11,7 +12,7 @@ use crate::api::ApiClient;
 use crate::config::CliPaths;
 
 /// Injected context for trail commands: the API client, the repo the command
-/// runs in, the chosen remote URL (if any), and extra env for git subprocesses
+/// runs in, the chosen remote name (if any), and extra env for git subprocesses
 /// (empty in production; hermetic sets in tests). J3 handlers use only `api`.
 #[derive(Debug)]
 pub struct TrailCtx {

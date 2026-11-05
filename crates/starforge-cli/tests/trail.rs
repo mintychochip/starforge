@@ -605,3 +605,148 @@ fn comment_requires_one_body_source() {
     .unwrap_err();
     assert_eq!(err.exit_code(), 2, "{err}");
 }
+
+// --- J4: `trail push` against the stub: the timeout path. ---
+//
+// The stub never records the pushed SHA, so `push_with` with a short deadline
+// exercises the D8 timeout output without sleeping 10 s. Git itself is real:
+// a temp repo pushes to a local bare remote.
+use starforge_cli::commands::trail::sync::{PushArgs, push_with};
+use starforge_cli::queue::TokioSleeper;
+
+fn j4_stub_env(home: &std::path::Path) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    vec![
+        (
+            std::ffi::OsString::from("GIT_CONFIG_NOSYSTEM"),
+            std::ffi::OsString::from("1"),
+        ),
+        (
+            std::ffi::OsString::from("GIT_CONFIG_GLOBAL"),
+            std::ffi::OsString::from("/dev/null"),
+        ),
+        (
+            std::ffi::OsString::from("GIT_TERMINAL_PROMPT"),
+            std::ffi::OsString::from("0"),
+        ),
+        (
+            std::ffi::OsString::from("HOME"),
+            home.as_os_str().to_os_string(),
+        ),
+    ]
+}
+
+fn j4_stub_git(
+    repo: &std::path::Path,
+    env: &[(std::ffi::OsString, std::ffi::OsString)],
+    args: &[&str],
+) {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .envs(env.iter().cloned())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[tokio::test]
+async fn push_timeout_reports_sha_and_exits_zero() {
+    let (base, _app) = start(vec![(
+        "GET",
+        "/api/v1/repos/o/r/changes",
+        200,
+        serde_json::json!({"changes": []}),
+    )])
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let env = j4_stub_env(tmp.path());
+    let repo = tmp.path().join("work");
+    j4_stub_git(tmp.path(), &env, &["init", "-q", "-b", "main", "work"]);
+    j4_stub_git(
+        &repo,
+        &env,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "one",
+        ],
+    );
+    let bare = tmp.path().join("bare.git");
+    j4_stub_git(tmp.path(), &env, &["init", "-q", "--bare", "bare.git"]);
+    j4_stub_git(
+        &repo,
+        &env,
+        &["remote", "add", "origin", bare.to_str().unwrap()],
+    );
+    // An empty repo advertises no HEAD symref; seed `main` and point the
+    // bare HEAD at it so base discovery finds it.
+    j4_stub_git(&repo, &env, &["push", "-q", "origin", "main"]);
+    j4_stub_git(&bare, &env, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+    let sha = String::from_utf8(
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["rev-parse", "HEAD"])
+            .envs(env.iter().cloned())
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    let api = ApiClient::new(&base, "o/r", TOKEN).unwrap();
+    let ctx = TrailCtx::new(api, &repo, Some("origin"), env);
+    let args = PushArgs {
+        trail: None,
+        title: None,
+        base: None,
+        topic: None,
+        remote: None,
+    };
+    let (out, code) = push_with(
+        &ctx,
+        &args,
+        starforge_cli::commands::trail::Format::Text,
+        &TokioSleeper,
+        std::time::Duration::from_millis(10),
+        std::time::Duration::from_millis(200),
+    )
+    .await;
+    assert_eq!(code, 0, "timeout still exits 0: {out}");
+    assert!(
+        out.contains(&format!(
+            "pushed {sha}; the server has not recorded the change yet"
+        )),
+        "timeout names the pushed sha: {out}"
+    );
+
+    let (out, code) = push_with(
+        &ctx,
+        &args,
+        starforge_cli::commands::trail::Format::Json,
+        &TokioSleeper,
+        std::time::Duration::from_millis(10),
+        std::time::Duration::from_millis(200),
+    )
+    .await;
+    assert_eq!(code, 0, "json timeout still exits 0: {out}");
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        value.get("sha").and_then(|v| v.as_str()),
+        Some(sha.as_str())
+    );
+    assert!(value.get("trail").is_some_and(|v| v.is_null()));
+}
