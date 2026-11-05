@@ -706,3 +706,319 @@ async fn change_page_shows_trail_tabs() {
     assert!(page.contains("Changes (1)"), "changes count:\n{page}");
     assert!(page.contains("Sessions (0)"), "sessions count:\n{page}");
 }
+
+/// M2f F5: the inter-revision diff shows only the second push's files, with a
+/// compare picker; unknown revisions 404 and `from == to` is 422.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inter_revision_diff_shows_second_push_only() {
+    let c = Ctx::start().await;
+    let repo_id =
+        c.s.core
+            .repo_for(Some(&c.alice), "alice", "proj")
+            .await
+            .unwrap()
+            .repo
+            .id;
+    let (work, url) = setup_pushed_repo(&c.s, &c.alice).await;
+    push_revision(
+        &c,
+        repo_id,
+        &work,
+        &url,
+        "feat",
+        &[("a.txt", b"first file\n")],
+        "first",
+    )
+    .await;
+    push_revision(
+        &c,
+        repo_id,
+        &work,
+        &url,
+        "feat",
+        &[("b.txt", b"second file\n")],
+        "second",
+    )
+    .await;
+
+    let (alice, _) = c.s.login("alice").await;
+    let page = get_text(&alice, &(c.change(1, 1) + "?from=1&to=2")).await;
+    assert!(
+        page.contains("b.txt"),
+        "inter-revision shows r2 file:\n{page}"
+    );
+    assert!(
+        !page.contains("a.txt"),
+        "inter-revision hides r1-only file:\n{page}"
+    );
+    assert!(
+        page.contains("name=\"from\""),
+        "compare picker from:\n{page}"
+    );
+    assert!(page.contains("name=\"to\""), "compare picker to:\n{page}");
+    assert!(
+        page.contains("Inter-revision diff"),
+        "inter-revision label:\n{page}"
+    );
+    assert!(
+        page.contains("includes base changes when the change was rebased"),
+        "rebase note:\n{page}"
+    );
+
+    let res = alice
+        .get(c.change(1, 1) + "?from=1&to=99")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 404);
+    let res = alice
+        .get(c.change(1, 1) + "?from=2&to=2")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 422);
+}
+
+/// M2f F5: a thread anchored on the displayed revision renders inline under
+/// its diff line; on a later revision where the line is gone it lists below
+/// as outdated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inline_threads_render_under_diff_line() {
+    let c = Ctx::start().await;
+    let repo_id =
+        c.s.core
+            .repo_for(Some(&c.alice), "alice", "proj")
+            .await
+            .unwrap()
+            .repo
+            .id;
+    let (work, url) = setup_pushed_repo(&c.s, &c.alice).await;
+    push_revision(
+        &c,
+        repo_id,
+        &work,
+        &url,
+        "feat",
+        &[("notes.txt", b"alpha\nbeta\n")],
+        "first",
+    )
+    .await;
+
+    let (carol, _) = c.s.login("carol").await;
+    let token = csrf(&carol, &c.change(1, 1)).await;
+    let res = carol
+        .post(c.change(1, 1) + "/threads")
+        .form(&[
+            ("_csrf", token.as_str()),
+            ("path", "notes.txt"),
+            ("side", "head"),
+            ("start", "2"),
+            ("end", "2"),
+            ("body", "inline-marker-xyz"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 303);
+    let thread_id =
+        c.s.core
+            .list_threads(Some(&c.carol), "alice", "proj", 1, 1, None)
+            .await
+            .unwrap()[0]
+            .id;
+
+    let page = get_text(&carol, &(c.change(1, 1) + "?rev=1")).await;
+    assert!(
+        page.contains(&format!("id=\"inline-thread-{thread_id}\"")),
+        "thread renders inline on its revision:\n{page}"
+    );
+    assert!(page.contains("inline-marker-xyz"), "inline body:\n{page}");
+
+    std::fs::remove_file(work.join("notes.txt")).unwrap();
+    commit_files(&work, &[], "drop notes").await;
+    push_for(&work, &url, "main/feat").await;
+    let id = change_id(&c.s, repo_id, c.alice.id, "feat").await;
+    wait_for_revisions(&c.s, id, 2).await;
+
+    let page = get_text(&carol, &c.change(1, 1)).await;
+    assert!(
+        page.contains(&format!("id=\"thread-{thread_id}\"")),
+        "listed below:\n{page}"
+    );
+    assert!(page.contains("Outdated"), "outdated marker:\n{page}");
+    assert!(
+        !page.contains(&format!("id=\"inline-thread-{thread_id}\"")),
+        "no longer inline:\n{page}"
+    );
+}
+
+/// M2f F5: marking a file viewed collapses it; a later revision that changes
+/// the file un-views it while an untouched file stays viewed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn viewed_state_collapses_and_resets() {
+    let c = Ctx::start().await;
+    let repo_id =
+        c.s.core
+            .repo_for(Some(&c.alice), "alice", "proj")
+            .await
+            .unwrap()
+            .repo
+            .id;
+    let (work, url) = setup_pushed_repo(&c.s, &c.alice).await;
+    push_revision(
+        &c,
+        repo_id,
+        &work,
+        &url,
+        "feat",
+        &[("a.txt", b"one\n"), ("keep.txt", b"keep\n")],
+        "first",
+    )
+    .await;
+
+    let (alice, _) = c.s.login("alice").await;
+    let token = csrf(&alice, &c.change(1, 1)).await;
+    for path in ["a.txt", "keep.txt"] {
+        let res = alice
+            .post(c.change(1, 1) + "/viewed")
+            .form(&[("_csrf", token.as_str()), ("path", path), ("viewed", "1")])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 303, "mark {path} viewed");
+    }
+    let page = get_text(&alice, &c.change(1, 1)).await;
+    assert!(
+        !page.contains("one\n"),
+        "viewed file collapses its diff:\n{page}"
+    );
+    assert!(page.contains("Viewed"), "viewed badge:\n{page}");
+
+    commit_files(&work, &[("a.txt", b"one\ntwo\n")], "extend a").await;
+    push_for(&work, &url, "main/feat").await;
+    let id = change_id(&c.s, repo_id, c.alice.id, "feat").await;
+    wait_for_revisions(&c.s, id, 2).await;
+
+    let page = get_text(&alice, &c.change(1, 1)).await;
+    assert!(page.contains("two"), "changed file un-views:\n{page}");
+    assert!(
+        !page.contains("keep\n"),
+        "untouched file stays viewed:\n{page}"
+    );
+}
+
+/// M2f F5: the viewed toggle enforces CSRF, hides from anonymous viewers,
+/// 404s non-readers, and refuses archived repos.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn viewed_toggle_security() {
+    let c = Ctx::start().await;
+    let repo_id =
+        c.s.core
+            .repo_for(Some(&c.alice), "alice", "proj")
+            .await
+            .unwrap()
+            .repo
+            .id;
+    let (work, url) = setup_pushed_repo(&c.s, &c.alice).await;
+    push_revision(
+        &c,
+        repo_id,
+        &work,
+        &url,
+        "feat",
+        &[("a.txt", b"a\n")],
+        "first",
+    )
+    .await;
+
+    let (carol, _) = c.s.login("carol").await;
+    let res = carol
+        .post(c.change(1, 1) + "/viewed")
+        .form(&[("path", "a.txt"), ("viewed", "1")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 403);
+    let res = carol
+        .post(c.change(1, 1) + "/viewed")
+        .form(&[("_csrf", "wrong"), ("path", "a.txt"), ("viewed", "1")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 403);
+
+    let (dave, _) = c.s.login("dave").await;
+    let dashboard = get_text(&dave, &c.s.url("/")).await;
+    let dave_csrf = extract_input(&dashboard, "_csrf");
+    let res = dave
+        .post(c.change(1, 1) + "/viewed")
+        .form(&[
+            ("_csrf", dave_csrf.as_str()),
+            ("path", "a.txt"),
+            ("viewed", "1"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 404);
+
+    c.s.core
+        .set_visibility(&c.alice, "alice", "proj", Visibility::Public)
+        .await
+        .unwrap();
+    let anon = c.s.browser();
+    let res = anon.get(c.change(1, 1)).send().await.unwrap();
+    assert_eq!(res.status(), 200);
+    let page = res.text().await.unwrap();
+    assert!(
+        !page.contains("name=\"viewed\""),
+        "anonymous sees no toggles:\n{page}"
+    );
+
+    c.s.core
+        .archive_repo(&c.alice, "alice", "proj")
+        .await
+        .unwrap();
+    let (alice, _) = c.s.login("alice").await;
+    let token = csrf(&alice, &c.change(1, 1)).await;
+    let res = alice
+        .post(c.change(1, 1) + "/viewed")
+        .form(&[
+            ("_csrf", token.as_str()),
+            ("path", "a.txt"),
+            ("viewed", "1"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 422);
+}
+
+/// M2f F5: a hostile file path renders escaped in the viewed toggle form.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hostile_file_path_escapes_in_viewed_form() {
+    let c = Ctx::start().await;
+    let repo_id =
+        c.s.core
+            .repo_for(Some(&c.alice), "alice", "proj")
+            .await
+            .unwrap()
+            .repo
+            .id;
+    let (work, url) = setup_pushed_repo(&c.s, &c.alice).await;
+    push_revision(
+        &c,
+        repo_id,
+        &work,
+        &url,
+        "feat",
+        &[("<script>alert(1)</script>.txt", b"hostile\n")],
+        "first",
+    )
+    .await;
+
+    let (alice, _) = c.s.login("alice").await;
+    let page = get_text(&alice, &c.change(1, 1)).await;
+    assert!(!page.contains("<script>"), "no raw script element:\n{page}");
+    assert!(page.contains("&#60;script"), "escaped path:\n{page}");
+}

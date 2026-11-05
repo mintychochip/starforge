@@ -1,0 +1,46 @@
+{% if truncated %}<p class="notice">This diff is large; only the first lines are shown.</p>{% endif %}
+{% for f in files %}
+<section class="file{% if f.viewed %} viewed{% endif %}">
+<h3><span class="badge">{{ f.status }}</span> {{ f.path }}{% if f.viewed %} <span class="badge">Viewed</span>{% endif %}</h3>
+{% if show_toggles %}
+<form method="post" action="/{{ head.owner }}/{{ head.name }}/trails/{{ trail_number }}/changes/{{ k }}/viewed" class="inline">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <input type="hidden" name="path" value="{{ f.path }}">
+  {% if f.viewed %}<input type="hidden" name="viewed" value="0"><button type="submit">Mark as unviewed</button>
+  {% else %}<input type="hidden" name="viewed" value="1"><button type="submit">Mark as viewed</button>{% endif %}
+</form>
+{% endif %}
+{% if f.viewed %}
+<p class="muted">Viewed — the diff stays collapsed until the file changes.</p>
+{% else if f.binary %}
+<p class="muted">Binary file</p>
+{% else %}
+<table class="diff"><tbody>
+{% for h in f.hunks %}
+<tr class="hunk"><td colspan="3">{{ h.header }}</td></tr>
+{% for l in h.lines %}<tr class="{{ l.class }}"><td class="ln">{{ l.old }}</td><td class="ln">{{ l.new }}</td><td><pre>{{ l.text }}</pre></td></tr>
+{% for t in l.threads %}
+<tr class="inline-thread"><td colspan="3">
+<article id="inline-thread-{{ t.id }}" class="thread{% if t.resolved %} resolved{% endif %}{% if t.outdated %} outdated{% endif %}">
+<p class="muted">Inline thread{% if t.resolved %} <span class="badge">Resolved</span>{% endif %}{% if t.outdated %} <span class="badge">Outdated</span>{% endif %}</p>
+{% for c in t.comments %}
+<div class="comment"><p><a href="/{{ c.author_handle }}">{{ c.author_handle }}</a> <span class="muted">{{ c.created }}</span></p>
+<div class="prose">{{ c.body_html|safe }}</div></div>
+{% endfor %}
+{% if t.can_resolve %}
+<form method="post" action="/{{ head.owner }}/{{ head.name }}/trails/{{ trail_number }}/changes/{{ k }}/threads/{{ t.id }}/resolve" class="inline">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  {% if t.resolved %}<button type="submit" name="action" value="reopen">Reopen</button>
+  {% else %}<button type="submit" name="action" value="resolve">Resolve</button>{% endif %}
+</form>
+{% endif %}
+{% include "thread_comment_form.html" %}
+</article>
+</td></tr>
+{% endfor %}
+{% endfor %}
+{% endfor %}
+</tbody></table>
+{% endif %}
+</section>
+{% endfor %}

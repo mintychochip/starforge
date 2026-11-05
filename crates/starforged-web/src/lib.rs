@@ -347,6 +347,10 @@ fn page_routes() -> Router<AppState> {
             post(pages::changes::add_thread_comment),
         )
         .route(
+            "/{owner}/{repo}/trails/{number}/changes/{k}/viewed",
+            post(pages::changes::set_viewed),
+        )
+        .route(
             "/{owner}/{repo}/trails/{number}/changes/{k}/state",
             post(pages::changes::set_state),
         )

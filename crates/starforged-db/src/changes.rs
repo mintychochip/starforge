@@ -1133,6 +1133,81 @@ pub async fn comments_of_thread(db: &Db, thread_id: i64) -> DbResult<Vec<ReviewC
     rows.iter().map(comment_from_row).collect()
 }
 
+/// One reader's viewed mark on a change file: the blob the reader saw.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangeFileViewRow {
+    pub user_id: i64,
+    pub change_id: i64,
+    pub path: String,
+    pub blob_sha: String,
+    pub created_at: i64,
+}
+
+fn file_view_from_row(row: &AnyRow) -> DbResult<ChangeFileViewRow> {
+    Ok(ChangeFileViewRow {
+        user_id: row.try_get("user_id")?,
+        change_id: row.try_get("change_id")?,
+        path: row.try_get("path")?,
+        blob_sha: row.try_get("blob_sha")?,
+        created_at: row.try_get("created_at")?,
+    })
+}
+
+/// The reader's viewed marks on the change, in path order.
+pub async fn file_views_of_change(
+    db: &Db,
+    change_id: i64,
+    user_id: i64,
+) -> DbResult<Vec<ChangeFileViewRow>> {
+    let rows = sqlx::query(
+        "SELECT user_id, change_id, path, blob_sha, created_at FROM change_file_views \
+         WHERE change_id = $1 AND user_id = $2 ORDER BY path ASC",
+    )
+    .bind(change_id)
+    .bind(user_id)
+    .fetch_all(db.pool())
+    .await?;
+    rows.iter().map(file_view_from_row).collect()
+}
+
+/// Marks `path` viewed at `blob_sha` (upsert: re-viewing moves the mark to
+/// the new blob).
+pub async fn upsert_file_view(
+    db: &Db,
+    change_id: i64,
+    user_id: i64,
+    path: &str,
+    blob_sha: &str,
+    now: i64,
+) -> DbResult<()> {
+    sqlx::query(
+        "INSERT INTO change_file_views (user_id, change_id, path, blob_sha, created_at) \
+         VALUES ($1, $2, $3, $4, $5) \
+         ON CONFLICT (user_id, change_id, path) DO UPDATE SET blob_sha = $4, created_at = $5",
+    )
+    .bind(user_id)
+    .bind(change_id)
+    .bind(path)
+    .bind(blob_sha)
+    .bind(now)
+    .execute(db.pool())
+    .await?;
+    Ok(())
+}
+
+/// Clears the reader's viewed mark on `path`, if any.
+pub async fn delete_file_view(db: &Db, change_id: i64, user_id: i64, path: &str) -> DbResult<()> {
+    sqlx::query(
+        "DELETE FROM change_file_views WHERE user_id = $1 AND change_id = $2 AND path = $3",
+    )
+    .bind(user_id)
+    .bind(change_id)
+    .bind(path)
+    .execute(db.pool())
+    .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

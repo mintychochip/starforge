@@ -204,6 +204,28 @@ pub struct LimitQuery {
 #[derive(Debug, Deserialize, Default)]
 pub struct RevQuery {
     pub rev: Option<i64>,
+    pub from: Option<i64>,
+    pub to: Option<i64>,
+}
+
+/// Resolves the `from`/`to` inter-revision pair (D8): both or neither, never
+/// mixed with `rev`, never equal. Core maps unknown revisions to 404.
+#[allow(clippy::type_complexity)]
+fn diff_range(query: &RevQuery) -> Result<(Option<i64>, Option<(i64, i64)>), ApiError> {
+    match (query.rev, query.from, query.to) {
+        (rev, None, None) => Ok((rev, None)),
+        (None, Some(from), Some(to)) => {
+            if from == to {
+                return Err(ApiError::Invalid(
+                    "identical revisions have no inter-revision diff".into(),
+                ));
+            }
+            Ok((None, Some((from, to))))
+        }
+        _ => Err(ApiError::Invalid(
+            "from and to must be given together, without rev".into(),
+        )),
+    }
 }
 
 /// `GET /repos/{owner}/{repo}/trails/{n}/changes[?limit=]`.
@@ -261,8 +283,10 @@ pub async fn create_change(
     Ok((StatusCode::CREATED, Json(out)))
 }
 
-/// `GET /repos/{owner}/{repo}/trails/{n}/changes/{k}[?rev=]`: the change with
-/// its revisions, the selected revision's diff, discussion, and capabilities.
+/// `GET /repos/{owner}/{repo}/trails/{n}/changes/{k}[?rev=][?from=&to=]`:
+/// the change with its revisions, the selected diff, discussion, and
+/// capabilities. With `from`/`to` the diff is the tree diff between those
+/// revisions' heads (D8).
 pub async fn get_change(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -270,14 +294,15 @@ pub async fn get_change(
     Query(query): Query<RevQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let viewer = auth.reader()?;
+    let (rev, range) = diff_range(&query)?;
     let detail = state
         .core
-        .get_change(viewer, &owner, &repo, n, k, query.rev)
+        .get_change(viewer, &owner, &repo, n, k, rev.or(range.map(|(_, to)| to)))
         .await?;
     let change = change_json_full(&state, viewer, &owner, &repo, &detail.change).await?;
     let diff = state
         .core
-        .change_diff_json(viewer, &owner, &repo, n, k, query.rev)
+        .change_diff_json(viewer, &owner, &repo, n, k, rev, range)
         .await?;
     let gates = state
         .core
@@ -406,7 +431,7 @@ pub async fn get_revision(
         .ok_or(ApiError::NotFound)?;
     let mut diff = state
         .core
-        .change_diff_json(viewer, &owner, &repo, n, k, Some(r))
+        .change_diff_json(viewer, &owner, &repo, n, k, Some(r), None)
         .await?;
     let mut out = json!({ "revision": revision_json(&selected) });
     out["files"] = diff["files"].take();
@@ -414,17 +439,20 @@ pub async fn get_revision(
     Ok(Json(out))
 }
 
-/// `GET …/changes/{k}/diff[?rev=]`: the selected revision's diff alone.
+/// `GET …/changes/{k}/diff[?rev=][?from=&to=]`: the selected revision's
+/// diff alone, or with `from`/`to` the tree diff between those revisions'
+/// heads (D8). Unknown revisions are 404; `from == to` is 422.
 pub async fn get_diff(
     State(state): State<ApiState>,
     auth: ApiAuth,
     Path((owner, repo, n, k)): Path<(String, String, i64, i64)>,
     Query(query): Query<RevQuery>,
 ) -> Result<Json<Value>, ApiError> {
+    let (rev, range) = diff_range(&query)?;
     Ok(Json(
         state
             .core
-            .change_diff_json(auth.reader()?, &owner, &repo, n, k, query.rev)
+            .change_diff_json(auth.reader()?, &owner, &repo, n, k, rev, range)
             .await?,
     ))
 }

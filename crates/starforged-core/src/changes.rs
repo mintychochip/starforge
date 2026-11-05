@@ -1227,6 +1227,24 @@ pub struct ChangeDetail {
     pub can_close: bool,
 }
 
+/// One file of a change diff (D8): the git file diff plus the viewer's
+/// viewed flag, resolved against the file's blob at the displayed head.
+/// A file counts as viewed while the stored `blob_sha` equals the blob at
+/// the displayed head, so a later revision that changes the file resets it.
+#[derive(Debug, Clone)]
+pub struct DiffFileView {
+    pub file: starforged_git::diff::FileDiff,
+    pub viewed: bool,
+    pub blob_sha: Option<String>,
+}
+
+/// A change diff (D8): the files with viewed flags plus the truncation flag.
+#[derive(Debug, Clone)]
+pub struct ChangeDiff {
+    pub files: Vec<DiffFileView>,
+    pub truncated: bool,
+}
+
 /// Stored `conflict_paths` payloads are JSON arrays; corrupt rows read empty.
 fn parse_paths(raw: &str) -> Vec<String> {
     serde_json::from_str(raw).unwrap_or_default()
@@ -1659,7 +1677,9 @@ impl Core {
             revisions.push(self.revision_view(&row).await?);
         }
         let selected = self.revision_view(&selected_row).await?;
-        let diff = self.diff_for(&access, &selected_row).await?;
+        let diff = self
+            .change_diff_files(viewer, owner, repo, trail_n, k, rev, None)
+            .await?;
         let mut reviews = Vec::new();
         for row in db_changes::reviews_of_change(self.db(), change.id).await? {
             reviews.push(self.review_view(&row).await?);
@@ -1683,10 +1703,16 @@ impl Core {
         })
     }
 
-    /// Unified diff from the revision's merge base to its head, within
-    /// [`MAX_DIFF_LINES`] and [`MAX_CHANGE_DIFF_BYTES`]. Unrelated histories
-    /// diff `base_sha..head_sha` directly. Runs on blocking threads (never a
-    /// worktree) with a 60s timeout.
+    /// Unified diff for one revision (D8): from the revision's merge base to
+    /// its head (unrelated histories diff `base_sha..head_sha` directly).
+    /// With `range = Some((from, to))` two distinct revisions, the tree diff
+    /// between their head commits instead, labeled as such by callers (it
+    /// includes base changes when the change was rebased). Unknown revisions
+    /// are `NotFound`; `from == to` is `Invalid`. Files carry the viewer's
+    /// viewed flags, keyed by each file's blob at the displayed head.
+    /// Within [`MAX_DIFF_LINES`] and [`MAX_CHANGE_DIFF_BYTES`]; runs on
+    /// blocking threads (never a worktree) with a 60s timeout.
+    #[allow(clippy::too_many_arguments)]
     pub async fn change_diff_files(
         &self,
         viewer: Option<&User>,
@@ -1695,40 +1721,150 @@ impl Core {
         trail_n: i64,
         k: i64,
         rev: Option<i64>,
-    ) -> CoreResult<CommitDiff> {
+        range: Option<(i64, i64)>,
+    ) -> CoreResult<ChangeDiff> {
         let (access, _, change) = self.resolve_change(viewer, owner, repo, trail_n, k).await?;
-        let revision = self.resolve_revision(&change, rev).await?;
-        self.diff_for(&access, &revision).await
-    }
-
-    async fn diff_for(
-        &self,
-        access: &RepoAccess,
-        revision: &db_changes::RevisionRow,
-    ) -> CoreResult<CommitDiff> {
-        let repo = self.repo_path(access.repo.id);
-        let (head, base) = (revision.head_sha.clone(), revision.base_sha.clone());
-        let probe = repo.clone();
-        let base_probe = base.clone();
-        let merge_base =
-            tokio::task::spawn_blocking(move || read::merge_base(&probe, &head, &base_probe))
+        let (from_id, head_id, head_sha) = match range {
+            Some((from, to)) => {
+                if from == to {
+                    return Err(CoreError::Invalid(
+                        "identical revisions have no inter-revision diff".into(),
+                    ));
+                }
+                let from_row = db_changes::revision_by_number(self.db(), change.id, from)
+                    .await?
+                    .ok_or(CoreError::NotFound)?;
+                let to_row = db_changes::revision_by_number(self.db(), change.id, to)
+                    .await?
+                    .ok_or(CoreError::NotFound)?;
+                (from_row.head_sha, to_row.head_sha.clone(), to_row.head_sha)
+            }
+            None => {
+                let revision = self.resolve_revision(&change, rev).await?;
+                let repo = self.repo_path(access.repo.id);
+                let (head, base) = (revision.head_sha.clone(), revision.base_sha.clone());
+                let probe = repo.clone();
+                let base_probe = base.clone();
+                let merge_base = tokio::task::spawn_blocking(move || {
+                    read::merge_base(&probe, &head, &base_probe)
+                })
                 .await
                 .map_err(|e| CoreError::Internal(e.to_string()))??;
-        let from = merge_base.unwrap_or(base);
-        let (head_id, from_id) = (revision.head_sha.clone(), from);
-        tokio::time::timeout(
+                let from = merge_base.unwrap_or(base);
+                (from, revision.head_sha.clone(), revision.head_sha.clone())
+            }
+        };
+        let repo = self.repo_path(access.repo.id);
+        let (head_arg, from_arg) = (head_id, from_id);
+        let commit_diff = tokio::time::timeout(
             DIFF_TIMEOUT,
             diff::range_diff(
                 &repo,
-                &from_id,
-                &head_id,
+                &from_arg,
+                &head_arg,
                 MAX_DIFF_LINES,
                 MAX_CHANGE_DIFF_BYTES,
             ),
         )
         .await
         .map_err(|_| CoreError::Internal("diff timed out".into()))?
-        .map_err(CoreError::from)
+        .map_err(CoreError::from)?;
+        self.attach_viewed(viewer, &access, &change, &head_sha, commit_diff)
+            .await
+    }
+
+    /// Resolves each diff file's blob at `head_sha` and marks the viewer's
+    /// stored views: viewed while the stored `blob_sha` equals the blob.
+    /// Anonymous viewers and missing blobs are never viewed.
+    async fn attach_viewed(
+        &self,
+        viewer: Option<&User>,
+        access: &RepoAccess,
+        change: &db_changes::ChangeRow,
+        head_sha: &str,
+        commit_diff: CommitDiff,
+    ) -> CoreResult<ChangeDiff> {
+        let marks: std::collections::HashMap<String, String> = match viewer {
+            None => std::collections::HashMap::new(),
+            Some(user) => db_changes::file_views_of_change(self.db(), change.id, user.id)
+                .await?
+                .into_iter()
+                .map(|row| (row.path, row.blob_sha))
+                .collect(),
+        };
+        let repo = self.repo_path(access.repo.id);
+        let mut files = Vec::with_capacity(commit_diff.files.len());
+        for file in commit_diff.files {
+            let path = file.display_path().to_owned();
+            let head = head_sha.to_owned();
+            let candidate = path.clone();
+            let probe = repo.clone();
+            let blob =
+                tokio::task::spawn_blocking(move || read::blob_ref(&probe, &head, &candidate))
+                    .await
+                    .map_err(|e| CoreError::Internal(e.to_string()))??;
+            let blob_sha = blob.map(|b| b.id);
+            let viewed = blob_sha
+                .as_ref()
+                .is_some_and(|sha| marks.get(&path).is_some_and(|mark| mark == sha));
+            files.push(DiffFileView {
+                file,
+                viewed,
+                blob_sha,
+            });
+        }
+        Ok(ChangeDiff {
+            files,
+            truncated: commit_diff.truncated,
+        })
+    }
+
+    /// Marks `path` viewed (`viewed = true`) or un-viewed (`false`) for the
+    /// signed-in reader (D8). Readers only (non-readers get `NotFound`);
+    /// archived repos refuse (`Invalid`). The mark stores the file's blob at
+    /// the change's current head, so a later revision that changes the file
+    /// resets it while one that leaves it alone keeps it viewed. Unknown
+    /// files are `Invalid`. Viewed state writes no timeline rows and
+    /// dispatches nothing.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn set_file_viewed(
+        &self,
+        user: &User,
+        owner: &str,
+        repo: &str,
+        trail_n: i64,
+        k: i64,
+        path: &str,
+        viewed: bool,
+    ) -> CoreResult<()> {
+        let (access, _, change) = self
+            .resolve_change(Some(user), owner, repo, trail_n, k)
+            .await?;
+        Self::ensure_writable_g4(&access)?;
+        let path = path.trim();
+        if path.is_empty() {
+            return Err(CoreError::Invalid("unknown file".into()));
+        }
+        if path.chars().count() > MAX_THREAD_PATH_CHARS {
+            return Err(CoreError::Invalid("unknown file".into()));
+        }
+        let revision = self.resolve_revision(&change, None).await?;
+        let repo_path = self.repo_path(access.repo.id);
+        let (head, candidate) = (revision.head_sha.clone(), path.to_owned());
+        let blob =
+            tokio::task::spawn_blocking(move || read::blob_ref(&repo_path, &head, &candidate))
+                .await
+                .map_err(|e| CoreError::Internal(e.to_string()))??;
+        let Some(blob) = blob else {
+            return Err(CoreError::Invalid("unknown file".into()));
+        };
+        if viewed {
+            db_changes::upsert_file_view(self.db(), change.id, user.id, path, &blob.id, now())
+                .await?;
+        } else {
+            db_changes::delete_file_view(self.db(), change.id, user.id, path).await?;
+        }
+        Ok(())
     }
 
     /// Submits a review on `r` (default: current) with `comments` inline
@@ -2361,9 +2497,12 @@ impl Core {
 
 impl Core {
     /// The `…/diff` and revision-detail payload: file metadata with unified hunks
-    /// (binary/capped files carry empty hunks, never raw bytes) plus a top-level
-    /// truncation flag. Kept in core because only core may name `git` types —
-    /// the API embeds the value verbatim.
+    /// (binary/capped files carry empty hunks, never raw bytes), the viewer's
+    /// viewed flag per file (D8), plus a top-level truncation flag. Kept in
+    /// core because only core may name `git` types — the API embeds the value
+    /// verbatim. With `range = Some((from, to))` the tree diff between those
+    /// revisions' heads.
+    #[allow(clippy::too_many_arguments)]
     pub async fn change_diff_json(
         &self,
         viewer: Option<&User>,
@@ -2372,31 +2511,33 @@ impl Core {
         trail_n: i64,
         k: i64,
         rev: Option<i64>,
+        range: Option<(i64, i64)>,
     ) -> CoreResult<serde_json::Value> {
         Ok(diff_json(
             &self
-                .change_diff_files(viewer, owner, repo, trail_n, k, rev)
+                .change_diff_files(viewer, owner, repo, trail_n, k, rev, range)
                 .await?,
         ))
     }
 }
 
-fn diff_json(diff: &CommitDiff) -> serde_json::Value {
+fn diff_json(diff: &ChangeDiff) -> serde_json::Value {
     serde_json::json!({
         "files": diff.files.iter().map(file_json).collect::<Vec<_>>(),
         "truncated": diff.truncated,
     })
 }
 
-fn file_json(f: &starforged_git::diff::FileDiff) -> serde_json::Value {
+fn file_json(f: &DiffFileView) -> serde_json::Value {
     use starforged_git::diff::{FileStatus, LineKind};
-    let status = match f.status {
+    let status = match f.file.status {
         FileStatus::Added => "added",
         FileStatus::Deleted => "deleted",
         FileStatus::Modified => "modified",
         FileStatus::Renamed => "renamed",
     };
     let hunks = f
+        .file
         .hunks
         .iter()
         .map(|h| {
@@ -2420,9 +2561,10 @@ fn file_json(f: &starforged_git::diff::FileDiff) -> serde_json::Value {
         })
         .collect::<Vec<_>>();
     serde_json::json!({
-        "path": f.display_path(),
+        "path": f.file.display_path(),
         "status": status,
-        "binary": f.binary,
+        "binary": f.file.binary,
+        "viewed": f.viewed,
         "hunks": hunks,
     })
 }

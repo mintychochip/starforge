@@ -1707,3 +1707,76 @@ async fn thread_path_control_characters_rejected_and_write_nothing() {
         .unwrap();
     assert_eq!(timeline_after.len(), timeline_before);
 }
+
+/// M2f F5: the API diff accepts `from`/`to` revision numbers and diffs their
+/// heads; unknown revisions 404 and `from == to` is 422.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_inter_revision_diff() {
+    let c = Ctx::start().await;
+    let work = c.push_basic().await;
+    let n = c.trail().await;
+    c.create_branch_change(n, &c.bob_rw).await;
+    let client = reqwest::Client::new();
+
+    commit_files(&work, &[("c.txt", b"see\n")], "add cee").await;
+    let url = c.s.git_url(
+        "alice",
+        "proj",
+        Some(&c.s.token(&c.alice, &[Scope::RepoWrite]).await),
+    );
+    git_ok(&work, &["push", "-q", &url, "feature/x"]).await;
+    let start = Instant::now();
+    loop {
+        let revs: Value = client
+            .get(format!("{}/revisions", c.change(n, 1)))
+            .bearer_auth(&c.carol_rw)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if revs["revisions"].as_array().unwrap().len() == 2 {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "timed out waiting for r2"
+        );
+        sleep(Duration::from_millis(50)).await;
+    }
+
+    let diff: Value = client
+        .get(format!("{}/diff?from=1&to=2", c.change(n, 1)))
+        .bearer_auth(&c.carol_rw)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let files = diff["files"].as_array().unwrap();
+    assert!(
+        files.iter().any(|f| f["path"] == "c.txt"),
+        "inter-revision shows r2 file: {diff}"
+    );
+    assert!(
+        !files.iter().any(|f| f["path"] == "b.txt"),
+        "inter-revision hides r1-only file: {diff}"
+    );
+
+    let res = client
+        .get(format!("{}/diff?from=1&to=99", c.change(n, 1)))
+        .bearer_auth(&c.carol_rw)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 404);
+    let res = client
+        .get(format!("{}/diff?from=2&to=2", c.change(n, 1)))
+        .bearer_auth(&c.carol_rw)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 422);
+}

@@ -15,8 +15,18 @@
   <label>Revision <select name="rev">{% for r in revisions %}<option value="{{ r.r }}"{% if r.selected %} selected{% endif %}>r{{ r.r }} {{ r.short }} · {{ r.time }}</option>{% endfor %}</select></label>
   <button type="submit">Show</button>
 </form>
+<form method="get" action="/{{ head.owner }}/{{ head.name }}/trails/{{ trail_number }}/changes/{{ k }}" class="inline" id="compare-picker">
+  <label>From <select name="from">{% for r in revisions %}<option value="{{ r.r }}"{% if r.r == compare_from %} selected{% endif %}>r{{ r.r }} {{ r.short }} · {{ r.time }}</option>{% endfor %}</select></label>
+  <label>To <select name="to">{% for r in revisions %}<option value="{{ r.r }}"{% if r.r == compare_to %} selected{% endif %}>r{{ r.r }} {{ r.short }} · {{ r.time }}</option>{% endfor %}</select></label>
+  <button type="submit">Compare</button>
+</form>
+{% if is_compare %}
+<h3>Inter-revision diff r{{ compare_from }}…r{{ compare_to }}</h3>
+<p class="muted">Tree diff between the two revision heads; it includes base changes when the change was rebased.</p>
+{% else %}
 <h3>Diff (r{{ selected_r }})</h3>
-{% include "diff_files.html" %}
+{% endif %}
+{% include "change_diff.html" %}
 <h3>Reviews</h3>
 <p id="review-summary">Approvals: {{ approvals }} · Requesting changes: {{ request_changes }} (only reviews from writers and above count){% if !reviewers.is_empty() %} · reviewers: {% for h in reviewers %}{{ h }} {% endfor %}{% endif %}</p>
 {% for r in reviews %}
@@ -62,13 +72,7 @@
   {% else %}<button type="submit" name="action" value="resolve">Resolve</button>{% endif %}
 </form>
 {% endif %}
-{% if can_review %}
-<form method="post" action="/{{ head.owner }}/{{ head.name }}/trails/{{ trail_number }}/changes/{{ k }}/threads/{{ t.id }}/comments" id="comment-{{ t.id }}">
-  <input type="hidden" name="_csrf" value="{{ csrf }}">
-  <label>Comment (Markdown) <textarea name="body"></textarea></label>
-  <button type="submit">Comment</button>
-</form>
-{% endif %}
+{% include "thread_comment_form.html" %}
 </article>
 {% endfor %}
 {% if can_review %}

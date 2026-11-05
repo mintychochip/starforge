@@ -455,6 +455,7 @@ pub struct LineView {
     pub old: String,
     pub new: String,
     pub text: String,
+    pub threads: Vec<InlineThreadView>,
 }
 
 pub struct HunkView {
@@ -462,30 +463,67 @@ pub struct HunkView {
     pub lines: Vec<LineView>,
 }
 
+/// One thread rendered inline under its diff line (D8): the full comment
+/// list plus the resolve affordance. The per-thread comment form is the
+/// shared `thread_comment_form.html` partial, keyed by `id` like the
+/// below-list rendering.
+pub struct InlineThreadView {
+    pub id: i64,
+    pub resolved: bool,
+    pub outdated: bool,
+    pub can_resolve: bool,
+    pub comments: Vec<InlineCommentView>,
+}
+
+pub struct InlineCommentView {
+    pub author_handle: String,
+    pub body_html: String,
+    pub created: String,
+}
+
 pub struct FileView {
     pub status: &'static str,
     pub path: String,
     pub binary: bool,
     pub hunks: Vec<HunkView>,
+    /// The viewer marked this blob viewed (D8); the page renders it collapsed.
+    pub viewed: bool,
 }
 
-/// Diff files as `diff_files.html` renders them.
+/// Diff files as `diff_files.html` renders them: no viewed flags, no inline
+/// threads (the commit and compare pages share this path).
 pub fn file_views(files: Vec<FileDiff>) -> Vec<FileView> {
+    file_views_with(
+        files,
+        &std::collections::HashMap::new(),
+        &mut std::collections::HashMap::new(),
+    )
+}
+
+/// Diff files for the change page (D8): `viewed` marks paths the viewer saw
+/// at this blob, and `inline` attaches threads anchored on the displayed
+/// revision to their `(path, side, line)` keys, drained as they attach so
+/// the caller can list whatever never matched below.
+pub fn file_views_with(
+    files: Vec<FileDiff>,
+    viewed: &std::collections::HashMap<String, bool>,
+    inline: &mut std::collections::HashMap<(String, String, i64), Vec<InlineThreadView>>,
+) -> Vec<FileView> {
     files
         .into_iter()
-        .map(|file| FileView {
-            status: match file.status {
+        .map(|file| {
+            let shown = file.display_path().to_owned();
+            let status = match file.status {
                 FileStatus::Added => "added",
                 FileStatus::Deleted => "deleted",
                 FileStatus::Modified => "modified",
                 FileStatus::Renamed => "renamed",
-            },
-            path: match (file.status, &file.old_path) {
+            };
+            let path = match (file.status, &file.old_path) {
                 (FileStatus::Renamed, Some(old)) => format!("{old} → {}", file.display_path()),
-                _ => file.display_path().to_owned(),
-            },
-            binary: file.binary,
-            hunks: file
+                _ => shown.clone(),
+            };
+            let hunks = file
                 .hunks
                 .into_iter()
                 .map(|hunk| HunkView {
@@ -493,20 +531,85 @@ pub fn file_views(files: Vec<FileDiff>) -> Vec<FileView> {
                     lines: hunk
                         .lines
                         .into_iter()
-                        .map(|line| LineView {
-                            class: match line.kind {
-                                LineKind::Context => "ctx",
-                                LineKind::Added => "add",
-                                LineKind::Removed => "del",
-                                LineKind::NoNewline => "nonl",
-                            },
-                            old: line.old_line.map(|n| n.to_string()).unwrap_or_default(),
-                            new: line.new_line.map(|n| n.to_string()).unwrap_or_default(),
-                            text: line.text,
+                        .map(|line| {
+                            let threads = match line.kind {
+                                LineKind::Added => line
+                                    .new_line
+                                    .map(|n| {
+                                        inline
+                                            .remove(&(
+                                                shown.clone(),
+                                                "head".to_owned(),
+                                                i64::from(n),
+                                            ))
+                                            .unwrap_or_default()
+                                    })
+                                    .unwrap_or_default(),
+                                LineKind::Removed => line
+                                    .old_line
+                                    .map(|n| {
+                                        inline
+                                            .remove(&(
+                                                shown.clone(),
+                                                "base".to_owned(),
+                                                i64::from(n),
+                                            ))
+                                            .unwrap_or_default()
+                                    })
+                                    .unwrap_or_default(),
+                                LineKind::Context => {
+                                    let mut attached = line
+                                        .new_line
+                                        .map(|n| {
+                                            inline
+                                                .remove(&(
+                                                    shown.clone(),
+                                                    "head".to_owned(),
+                                                    i64::from(n),
+                                                ))
+                                                .unwrap_or_default()
+                                        })
+                                        .unwrap_or_default();
+                                    let mut base = line
+                                        .old_line
+                                        .map(|n| {
+                                            inline
+                                                .remove(&(
+                                                    shown.clone(),
+                                                    "base".to_owned(),
+                                                    i64::from(n),
+                                                ))
+                                                .unwrap_or_default()
+                                        })
+                                        .unwrap_or_default();
+                                    attached.append(&mut base);
+                                    attached
+                                }
+                                LineKind::NoNewline => Vec::new(),
+                            };
+                            LineView {
+                                class: match line.kind {
+                                    LineKind::Context => "ctx",
+                                    LineKind::Added => "add",
+                                    LineKind::Removed => "del",
+                                    LineKind::NoNewline => "nonl",
+                                },
+                                old: line.old_line.map(|n| n.to_string()).unwrap_or_default(),
+                                new: line.new_line.map(|n| n.to_string()).unwrap_or_default(),
+                                text: line.text,
+                                threads,
+                            }
                         })
                         .collect(),
                 })
-                .collect(),
+                .collect();
+            FileView {
+                status,
+                path,
+                binary: file.binary,
+                hunks,
+                viewed: viewed.get(&shown).copied().unwrap_or(false),
+            }
         })
         .collect()
 }

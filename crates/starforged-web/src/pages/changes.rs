@@ -27,8 +27,8 @@ use crate::auth::{MaybeUser, RequireUser, verify_csrf};
 use crate::error::WebError;
 use crate::markdown;
 use crate::views::{
-    FileView, GatePanel, GatePanelGate, NavUser, RepoHead, STRICT_CSP, TrailTabs, file_views,
-    format_time, nav,
+    FileView, GatePanel, GatePanelGate, InlineCommentView, InlineThreadView, NavUser, RepoHead,
+    STRICT_CSP, TrailTabs, file_views_with, format_time, nav,
 };
 
 /// `X-Robots-Tag: noindex` on every change page, matching the trail pages.
@@ -116,10 +116,20 @@ pub struct ChangePage {
     selected_r: i64,
     files: Vec<FileView>,
     truncated: bool,
+    /// Inter-revision view (D8): when `is_compare`, the diff is the tree diff
+    /// between `compare_from` and `compare_to`, and every thread lists below.
+    /// Otherwise threads anchored on the displayed revision render inline.
+    is_compare: bool,
+    compare_from: i64,
+    compare_to: i64,
+    /// Signed-in readers see per-file viewed toggles; anonymous viewers see none.
+    show_toggles: bool,
     approvals: usize,
     request_changes: usize,
     reviewers: Vec<String>,
     reviews: Vec<ReviewItem>,
+    /// Threads that did not attach inline (or every thread in the
+    /// inter-revision view), in creation order.
     threads: Vec<ThreadItem>,
     panel: GatePanel,
     tabs: TrailTabs,
@@ -234,6 +244,9 @@ pub(crate) async fn gate_panel(
 }
 
 /// Builds the detail view; shared by the viewer and the 422 re-renders.
+/// With `range = Some((from, to))` the diff is the tree diff between those
+/// revisions' heads and every thread lists below; otherwise threads anchored
+/// on the displayed revision render inline under their diff line (D8).
 #[allow(clippy::too_many_arguments)]
 async fn change_view(
     state: &AppState,
@@ -243,17 +256,25 @@ async fn change_view(
     number: i64,
     k: i64,
     rev: Option<i64>,
+    range: Option<(i64, i64)>,
     error: Option<String>,
 ) -> Result<ChangePage, WebError> {
     let user = session.map(|s| &s.user);
     let access: RepoAccess = state.core.repo_for(user, owner, repo).await?;
     let detail: ChangeDetail = state
         .core
-        .get_change(user, owner, repo, number, k, rev)
+        .get_change(
+            user,
+            owner,
+            repo,
+            number,
+            k,
+            rev.or(range.map(|(_, to)| to)),
+        )
         .await?;
     let diff = state
         .core
-        .change_diff_files(user, owner, repo, number, k, rev)
+        .change_diff_files(user, owner, repo, number, k, rev, range)
         .await?;
     let change = &detail.change;
     let revisions = detail
@@ -301,10 +322,23 @@ async fn change_view(
         });
     }
     let viewer_handle = session.map(|s| s.user.handle.as_str());
-    let threads = detail
-        .threads
-        .iter()
-        .map(|t| ThreadItem {
+    let mut items = Vec::new();
+    for t in &detail.threads {
+        let comments = t
+            .comments
+            .iter()
+            .map(|c| ThreadCommentItem {
+                author_handle: c.author_handle.clone(),
+                body_html: markdown::render_prose(&c.body),
+                created: format_time(c.created_at),
+            })
+            .collect::<Vec<_>>();
+        // The thread author (first comment) or triage may resolve.
+        let can_resolve = detail.can_triage
+            || t.comments
+                .first()
+                .is_some_and(|c| Some(c.author_handle.as_str()) == viewer_handle);
+        items.push(ThreadItem {
             id: t.id,
             path: t.path.clone(),
             side: t.side.clone(),
@@ -313,22 +347,66 @@ async fn change_view(
             revision: t.revision,
             resolved: t.resolved,
             outdated: t.outdated,
-            comments: t
-                .comments
-                .iter()
-                .map(|c| ThreadCommentItem {
-                    author_handle: c.author_handle.clone(),
-                    body_html: markdown::render_prose(&c.body),
-                    created: format_time(c.created_at),
-                })
-                .collect(),
-            // The thread author (first comment) or triage may resolve.
-            can_resolve: detail.can_triage
-                || t.comments
-                    .first()
-                    .is_some_and(|c| Some(c.author_handle.as_str()) == viewer_handle),
-        })
-        .collect();
+            comments,
+            can_resolve,
+        });
+    }
+    // Inline threads (D8): only in the default single-revision view, only
+    // for threads anchored on the displayed revision. Attachment drains the
+    // map, so whatever never matched a displayed hunk line falls back
+    // below. The inter-revision view lists every thread below.
+    let mut inline: std::collections::HashMap<(String, String, i64), Vec<InlineThreadView>> =
+        std::collections::HashMap::new();
+    let mut held: std::collections::HashMap<i64, ThreadItem> = std::collections::HashMap::new();
+    let mut below = Vec::new();
+    if range.is_none() {
+        for item in items {
+            if item.revision == detail.selected.r {
+                let view = InlineThreadView {
+                    id: item.id,
+                    resolved: item.resolved,
+                    outdated: item.outdated,
+                    can_resolve: item.can_resolve,
+                    comments: item
+                        .comments
+                        .iter()
+                        .map(|c| InlineCommentView {
+                            author_handle: c.author_handle.clone(),
+                            body_html: c.body_html.clone(),
+                            created: c.created.clone(),
+                        })
+                        .collect(),
+                };
+                inline
+                    .entry((item.path.clone(), item.side.clone(), item.end_line))
+                    .or_default()
+                    .push(view);
+                held.insert(item.id, item);
+            } else {
+                below.push(item);
+            }
+        }
+    } else {
+        below = items;
+    }
+    let viewed = diff
+        .files
+        .iter()
+        .map(|f| (f.file.display_path().to_owned(), f.viewed))
+        .collect::<std::collections::HashMap<_, _>>();
+    let files = file_views_with(
+        diff.files.into_iter().map(|f| f.file).collect(),
+        &viewed,
+        &mut inline,
+    );
+    for threads in inline.into_values() {
+        for view in threads {
+            if let Some(item) = held.remove(&view.id) {
+                below.push(item);
+            }
+        }
+    }
+    below.sort_by_key(|t| t.id);
     let sessions = state.core.trail_sessions(user, owner, repo, number).await?;
     let changes = state
         .core
@@ -382,13 +460,17 @@ async fn change_view(
         updated: format_time(change.updated_at),
         revisions,
         selected_r: detail.selected.r,
-        files: file_views(diff.files),
+        files,
         truncated: diff.truncated,
+        is_compare: range.is_some(),
+        compare_from: range.map(|(from, _)| from).unwrap_or(0),
+        compare_to: range.map(|(_, to)| to).unwrap_or(0),
+        show_toggles: session.is_some(),
         approvals,
         request_changes,
         reviewers: reviewers.into_iter().collect(),
         reviews,
-        threads,
+        threads: below,
         panel,
         tabs,
         can_review: session.is_some(),
@@ -403,15 +485,42 @@ async fn change_view(
 pub struct RevQuery {
     #[serde(default)]
     rev: Option<i64>,
+    #[serde(default)]
+    from: Option<i64>,
+    #[serde(default)]
+    to: Option<i64>,
 }
 
-/// `GET /{owner}/{repo}/trails/{n}/changes/{k}[?rev=]`.
+/// Resolves the revision selector: one revision (`rev`), the inter-revision
+/// pair (`from` + `to`), or neither (the current revision). Mixing `rev`
+/// with the pair, or giving half the pair, is 400.
+#[allow(clippy::type_complexity)]
+fn select_range(query: &RevQuery) -> Result<(Option<i64>, Option<(i64, i64)>), WebError> {
+    match (query.rev, query.from, query.to) {
+        (rev, None, None) => Ok((rev, None)),
+        (None, Some(from), Some(to)) => Ok((None, Some((from, to)))),
+        _ => Err(starforged_core::CoreError::Invalid(
+            "from and to must be given together, without rev".into(),
+        )
+        .into()),
+    }
+}
+
+/// `GET /{owner}/{repo}/trails/{n}/changes/{k}[?rev=][?from=&to=]`.
 pub async fn detail(
     State(state): State<AppState>,
     MaybeUser(session): MaybeUser,
     Path((owner, repo, number, k)): Path<(String, String, i64, i64)>,
     Query(query): Query<RevQuery>,
 ) -> Result<impl IntoResponse, WebError> {
+    let (rev, range) = select_range(&query)?;
+    if let Some((from, to)) = range
+        && from == to
+    {
+        return Err(crate::error::WebError::Unprocessable(
+            "identical revisions have no inter-revision diff".into(),
+        ));
+    }
     let page = change_view(
         &state,
         session.as_ref(),
@@ -419,7 +528,8 @@ pub async fn detail(
         &repo,
         number,
         k,
-        query.rev,
+        rev,
+        range,
         None,
     )
     .await?;
@@ -537,6 +647,7 @@ pub async fn submit_review(
                 number,
                 k,
                 form.r,
+                None,
                 Some(message),
             )
             .await?;
@@ -642,6 +753,7 @@ pub async fn create_thread(
                 number,
                 k,
                 form.r,
+                None,
                 Some(message),
             )
             .await?;
@@ -744,6 +856,7 @@ pub async fn add_thread_comment(
                 number,
                 k,
                 None,
+                None,
                 Some(message),
             )
             .await?;
@@ -833,6 +946,82 @@ pub async fn merge(
                 &repo,
                 number,
                 k,
+                None,
+                None,
+                Some(message),
+            )
+            .await?;
+            Ok((StatusCode::UNPROCESSABLE_ENTITY, detail_headers(), page).into_response())
+        }
+        Err(other) => Err(other.into()),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct ViewedForm {
+    #[serde(rename = "_csrf", default)]
+    csrf: String,
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    viewed: String,
+}
+
+/// `POST …/changes/{k}/viewed`: marks a file viewed (`viewed=1`) or
+/// un-viewed (`viewed=0`) for the signed-in reader (D8). Readers only:
+/// non-readers 404 before the CSRF check. `Invalid` (archived repos,
+/// unknown files, bad values) re-renders with 422.
+pub async fn set_viewed(
+    State(state): State<AppState>,
+    RequireUser(session): RequireUser,
+    Path((owner, repo, number, k)): Path<(String, String, i64, i64)>,
+    Form(form): Form<ViewedForm>,
+) -> Result<Response, WebError> {
+    // Non-readers 404 before the CSRF check, matching the trail pages: a
+    // forged POST must not distinguish "exists" from "missing".
+    let access = state
+        .core
+        .repo_for(Some(&session.user), &owner, &repo)
+        .await?;
+    verify_csrf(&session.csrf_token, &form.csrf)?;
+    let viewed = match form.viewed.as_str() {
+        "1" => true,
+        "0" => false,
+        _ => {
+            let page = change_view(
+                &state,
+                Some(&session),
+                &owner,
+                &repo,
+                number,
+                k,
+                None,
+                None,
+                Some("viewed must be 0 or 1".to_owned()),
+            )
+            .await?;
+            return Ok((StatusCode::UNPROCESSABLE_ENTITY, detail_headers(), page).into_response());
+        }
+    };
+    match state
+        .core
+        .set_file_viewed(&session.user, &owner, &repo, number, k, &form.path, viewed)
+        .await
+    {
+        Ok(()) => Ok(Redirect::to(&format!(
+            "/{}/{}/trails/{number}/changes/{k}",
+            access.repo.owner, access.repo.name
+        ))
+        .into_response()),
+        Err(starforged_core::CoreError::Invalid(message)) => {
+            let page = change_view(
+                &state,
+                Some(&session),
+                &owner,
+                &repo,
+                number,
+                k,
+                None,
                 None,
                 Some(message),
             )

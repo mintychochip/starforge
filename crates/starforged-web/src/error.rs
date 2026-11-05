@@ -13,6 +13,7 @@ pub enum WebError {
     NotFound,
     Forbidden,
     BadRequest(String),
+    Unprocessable(String),
     Internal(String),
 }
 
@@ -53,6 +54,9 @@ impl IntoResponse for WebError {
                 "You do not have permission to do that.".to_owned(),
             ),
             WebError::BadRequest(message) => (StatusCode::BAD_REQUEST, "Invalid request", message),
+            WebError::Unprocessable(message) => {
+                (StatusCode::UNPROCESSABLE_ENTITY, "Invalid request", message)
+            }
             WebError::Internal(message) => {
                 tracing::error!(error = %message, "request failed");
                 (

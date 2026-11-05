@@ -1,0 +1,7 @@
+{% if can_review %}
+<form method="post" action="/{{ head.owner }}/{{ head.name }}/trails/{{ trail_number }}/changes/{{ k }}/threads/{{ t.id }}/comments" id="comment-{{ t.id }}">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <label>Comment (Markdown) <textarea name="body"></textarea></label>
+  <button type="submit">Comment</button>
+</form>
+{% endif %}
