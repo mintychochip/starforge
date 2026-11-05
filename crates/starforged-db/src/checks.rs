@@ -395,40 +395,29 @@ pub async fn gate_rules_for(db: &Db, repo_id: i64) -> DbResult<Vec<GateRuleRow>>
     gate_rules_for_repo(db, repo_id).await
 }
 
-/// Updates the repo's rule for `pattern` (NULL pattern matches NULL) or
-/// inserts it when none exists; returns the current row.
-pub async fn set_gate_rule(
+/// One gate rule by id, scoped to the repo (`None` for a missing id or
+/// another repo's id).
+pub async fn gate_rule_by_id(db: &Db, id: i64, repo_id: i64) -> DbResult<Option<GateRuleRow>> {
+    let row = sqlx::query(select_gate_rule!("WHERE id = $1 AND repo_id = $2"))
+        .bind(id)
+        .bind(repo_id)
+        .fetch_optional(db.pool())
+        .await?;
+    row.map(|row| gate_rule_from_row(&row)).transpose()
+}
+
+/// Updates the rule `id` scoped to the repo (`None` for a missing id or
+/// another repo's id); set fields replace the row's, unset fields stay.
+pub async fn update_gate_rule(
     db: &Db,
+    id: i64,
     repo_id: i64,
-    pattern: Option<&str>,
     update: &GateRuleUpdate<'_>,
     now: i64,
-) -> DbResult<GateRuleRow> {
-    let existing = sqlx::query(select_gate_rule!(
-        "WHERE repo_id = $1 AND (($2 IS NULL AND pattern IS NULL) OR pattern = $2)"
-    ))
-    .bind(repo_id)
-    .bind(pattern)
-    .fetch_optional(db.pool())
-    .await?;
-    let Some(row) = existing else {
-        return insert_gate_rule(
-            db,
-            repo_id,
-            pattern,
-            update.approvals.unwrap_or(0),
-            update.dismiss_on_push.unwrap_or(false),
-            update.block_rc.unwrap_or(true),
-            update.contexts.unwrap_or("[]"),
-            update.up_to_date.unwrap_or(false),
-            update.threads.unwrap_or(false),
-            update.session_ev.unwrap_or(false),
-            update.methods.unwrap_or("[]"),
-            now,
-        )
-        .await;
+) -> DbResult<Option<GateRuleRow>> {
+    let Some(mut rule) = gate_rule_by_id(db, id, repo_id).await? else {
+        return Ok(None);
     };
-    let mut rule = gate_rule_from_row(&row)?;
     if let Some(p) = update.pattern {
         rule.pattern = p.map(str::to_owned);
     }
@@ -476,7 +465,7 @@ pub async fn set_gate_rule(
     .execute(db.pool())
     .await?;
     rule.updated_at = now;
-    Ok(rule)
+    Ok(Some(rule))
 }
 
 pub async fn delete_gate_rule(db: &Db, id: i64, repo_id: i64) -> DbResult<bool> {
@@ -870,12 +859,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gate_rule_upsert_by_pattern() {
-        let (t, _alice, _bob, repo_id) = setup().await;
-        let first = insert_gate_rule(
+    async fn gate_rule_by_id_and_update_hit_miss_and_cross_repo() {
+        let (t, _alice, bob, repo_id) = setup().await;
+        let other_repo = repos::insert(&t.db, &repo(bob, "checks-other"))
+            .await
+            .unwrap();
+        let rule = insert_gate_rule(
             &t.db,
             repo_id,
-            None,
+            Some("main"),
             1,
             false,
             true,
@@ -888,38 +880,84 @@ mod tests {
         )
         .await
         .unwrap();
-        let updated = set_gate_rule(
+        // Hit.
+        let found = gate_rule_by_id(&t.db, rule.id, repo_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.pattern.as_deref(), Some("main"));
+        // Miss and another repo's id are both `None`.
+        assert!(
+            gate_rule_by_id(&t.db, 999_999, repo_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            gate_rule_by_id(&t.db, rule.id, other_repo)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // Scoped update applies set fields and touches `updated_at`.
+        let updated = update_gate_rule(
             &t.db,
+            rule.id,
             repo_id,
-            None,
             &GateRuleUpdate {
                 approvals: Some(2),
+                contexts: Some(r#"["ci/unit"]"#),
                 ..Default::default()
             },
             1_700_000_100,
         )
         .await
+        .unwrap()
         .unwrap();
-        assert_eq!(updated.id, first.id);
+        assert_eq!(updated.id, rule.id);
         assert_eq!(updated.required_approvals, 2);
-        assert!(updated.updated_at > first.updated_at);
-        assert_eq!(gate_rules_for_repo(&t.db, repo_id).await.unwrap().len(), 1);
-        // Unknown pattern inserts.
-        let named = set_gate_rule(
-            &t.db,
-            repo_id,
-            Some("release/*"),
-            &GateRuleUpdate {
-                approvals: Some(1),
-                ..Default::default()
-            },
-            1_700_000_200,
-        )
-        .await
-        .unwrap();
-        assert_ne!(named.id, first.id);
-        assert_eq!(named.pattern.as_deref(), Some("release/*"));
-        assert_eq!(gate_rules_for_repo(&t.db, repo_id).await.unwrap().len(), 2);
+        assert_eq!(updated.required_contexts, r#"["ci/unit"]"#);
+        assert_eq!(updated.pattern.as_deref(), Some("main"));
+        assert!(updated.updated_at > rule.updated_at);
+        // Miss and cross-repo updates are `None` and write nothing.
+        assert!(
+            update_gate_rule(
+                &t.db,
+                999_999,
+                repo_id,
+                &GateRuleUpdate {
+                    approvals: Some(9),
+                    ..Default::default()
+                },
+                1_700_000_200,
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            update_gate_rule(
+                &t.db,
+                rule.id,
+                other_repo,
+                &GateRuleUpdate {
+                    approvals: Some(9),
+                    ..Default::default()
+                },
+                1_700_000_200,
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(
+            gate_rule_by_id(&t.db, rule.id, repo_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .required_approvals,
+            2
+        );
     }
 
     #[tokio::test]

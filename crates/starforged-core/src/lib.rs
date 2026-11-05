@@ -12,6 +12,7 @@ pub mod content;
 pub mod crypto;
 pub mod email_tokens;
 pub mod error;
+pub mod gate_rules;
 pub mod gates;
 pub mod ingest;
 pub mod invites;

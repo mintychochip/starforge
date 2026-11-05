@@ -3,6 +3,7 @@
 pub mod auth;
 mod changes;
 pub mod error;
+mod gate_rules;
 mod moved;
 mod oauth;
 mod repos;
@@ -201,6 +202,14 @@ pub fn router(core: Core, base_url: String) -> Router {
         .route(
             "/repos/{owner}/{repo}/hooks/{id}",
             patch(webhooks::patch_hook).delete(webhooks::delete_hook),
+        )
+        .route(
+            "/repos/{owner}/{repo}/gate-rules",
+            get(gate_rules::list_gate_rules).post(gate_rules::create_gate_rule),
+        )
+        .route(
+            "/repos/{owner}/{repo}/gate-rules/{id}",
+            patch(gate_rules::patch_gate_rule).delete(gate_rules::delete_gate_rule),
         )
         .fallback(|| async { ApiError::NotFound })
         .layer(axum::middleware::from_fn_with_state(

@@ -279,3 +279,177 @@ async fn maintainers_control_refs_for_access_from_settings() {
         "a refused value keeps the old mode"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn merge_gates_section_is_maintain_only_with_crud() {
+    let s = TestServer::start().await;
+    let alice = s.user("alice").await;
+    s.user("mia").await;
+    s.user("ted").await;
+    s.repo(&alice, "proj", Visibility::Private).await;
+    s.core
+        .set_collaborator(&alice, "alice", "proj", "mia", Permission::Maintain)
+        .await
+        .unwrap();
+    s.core
+        .set_collaborator(&alice, "alice", "proj", "ted", Permission::Triage)
+        .await
+        .unwrap();
+
+    // Below maintain the settings page (and the gate controls) stay hidden.
+    let (ted, ted_csrf) = s.login("ted").await;
+    assert_eq!(
+        ted.get(s.url("/alice/proj/settings"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+    let refused = ted
+        .post(s.url("/alice/proj/settings/gate-rules"))
+        .form(&[("_csrf", ted_csrf.as_str()), ("pattern", "main")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 403);
+
+    // A maintainer sees the Merge gates section with an empty rule list.
+    let (mia, mia_csrf) = s.login("mia").await;
+    let settings = get_text(&mia, &s.url("/alice/proj/settings")).await;
+    assert!(settings.contains("Merge gates"), "{settings}");
+    assert!(settings.contains(r#"name="pattern""#), "{settings}");
+
+    // Creating a rule round-trips through the page with a 303.
+    let saved = mia
+        .post(s.url("/alice/proj/settings/gate-rules"))
+        .form(&[
+            ("_csrf", mia_csrf.as_str()),
+            ("pattern", "main"),
+            ("required_approvals", "1"),
+            ("dismiss_on_push", "true"),
+            ("required_contexts", "ci/unit, ci/lint"),
+            ("allowed_methods", "merge, squash"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(saved.status(), 303);
+    assert_eq!(saved.headers()["location"], "/alice/proj/settings");
+    let settings = get_text(&mia, &s.url("/alice/proj/settings")).await;
+    assert!(settings.contains("main"), "{settings}");
+    assert!(settings.contains("ci/unit"), "{settings}");
+
+    // An invalid rule is refused with the page again, not a silent no-op.
+    let bad = mia
+        .post(s.url("/alice/proj/settings/gate-rules"))
+        .form(&[
+            ("_csrf", mia_csrf.as_str()),
+            ("pattern", "no spaces here"),
+            ("required_approvals", "1"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 422);
+    assert!(bad.text().await.unwrap().contains("pattern"));
+
+    // Unknown methods are refused too.
+    let bad = mia
+        .post(s.url("/alice/proj/settings/gate-rules"))
+        .form(&[
+            ("_csrf", mia_csrf.as_str()),
+            ("pattern", "main"),
+            ("allowed_methods", "teleport"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 422);
+
+    // A forged CSRF token is refused.
+    let forged = mia
+        .post(s.url("/alice/proj/settings/gate-rules"))
+        .form(&[("_csrf", "wrong"), ("pattern", "main")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(forged.status(), 403);
+
+    // Editing a rule in place round-trips with a 303 and keeps the list at one row.
+    let rules = s
+        .core
+        .list_gate_rules(Some(&alice), "alice", "proj")
+        .await
+        .unwrap();
+    assert_eq!(rules.len(), 1);
+    let id = rules[0].id;
+    let saved = mia
+        .post(s.url(&format!("/alice/proj/settings/gate-rules/{id}")))
+        .form(&[
+            ("_csrf", mia_csrf.as_str()),
+            ("pattern", "release/*"),
+            ("required_approvals", "2"),
+            ("required_contexts", "ci/unit"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(saved.status(), 303);
+    assert_eq!(saved.headers()["location"], "/alice/proj/settings");
+    let edited = s
+        .core
+        .list_gate_rules(Some(&alice), "alice", "proj")
+        .await
+        .unwrap();
+    assert_eq!(edited.len(), 1);
+    assert_eq!(edited[0].pattern.as_deref(), Some("release/*"));
+    assert_eq!(edited[0].required_approvals, 2);
+    let settings = get_text(&mia, &s.url("/alice/proj/settings")).await;
+    assert!(settings.contains("release/*"), "{settings}");
+
+    // Context names render escaped: markup in, entities out.
+    let saved = mia
+        .post(s.url("/alice/proj/settings/gate-rules"))
+        .form(&[
+            ("_csrf", mia_csrf.as_str()),
+            ("pattern", "escape-me"),
+            ("required_contexts", "<script>alert(1)</script>"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(saved.status(), 303);
+    let settings = get_text(&mia, &s.url("/alice/proj/settings")).await;
+    assert!(
+        !settings.contains("<script>alert(1)</script>"),
+        "{settings}"
+    );
+    assert!(
+        settings.contains("&#60;script&#62;alert(1)&#60;/script&#62;"),
+        "{settings}"
+    );
+
+    // Deleting the rules round-trips with a 303 and clears the list.
+    for rule in s
+        .core
+        .list_gate_rules(Some(&alice), "alice", "proj")
+        .await
+        .unwrap()
+    {
+        let deleted = mia
+            .post(s.url(&format!(
+                "/alice/proj/settings/gate-rules/{}/delete",
+                rule.id
+            )))
+            .form(&[("_csrf", mia_csrf.as_str())])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(deleted.status(), 303);
+        assert_eq!(deleted.headers()["location"], "/alice/proj/settings");
+    }
+    let settings = get_text(&mia, &s.url("/alice/proj/settings")).await;
+    assert!(!settings.contains("ci/unit"), "{settings}");
+    assert!(!settings.contains("release/*"), "{settings}");
+}

@@ -183,6 +183,18 @@ fn page_routes() -> Router<AppState> {
             post(pages::repo_settings::change_refs_for_access),
         )
         .route(
+            "/{owner}/{repo}/settings/gate-rules",
+            post(pages::repo_settings::create_gate_rule),
+        )
+        .route(
+            "/{owner}/{repo}/settings/gate-rules/{id}",
+            post(pages::repo_settings::update_gate_rule),
+        )
+        .route(
+            "/{owner}/{repo}/settings/gate-rules/{id}/delete",
+            post(pages::repo_settings::delete_gate_rule),
+        )
+        .route(
             "/{owner}/{repo}/settings/rename",
             post(pages::repo_settings::rename),
         )

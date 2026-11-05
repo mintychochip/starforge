@@ -22,6 +22,47 @@
   <p class="muted">Members are collaborators with an explicit grant; anyone with read access includes public and internal readers.</p>
   <button type="submit">Change refs/for access</button>
 </form>
+<h2>Merge gates</h2>
+{% if gate_rules.is_empty() %}
+<p class="muted">No merge-gate rules yet. Each rule guards one branch pattern; every rule matching the change's base branch must pass before it can merge.</p>
+{% else %}
+<table class="list">
+<thead><tr><th>Pattern</th><th>Approvals</th><th>Checks</th><th>Methods</th><th>Flags</th><th></th></tr></thead>
+<tbody>
+{% for r in gate_rules %}
+<tr><td><code>{% if let Some(p) = r.pattern %}{{ p }}{% else %}all branches{% endif %}</code></td><td>{{ r.required_approvals }}</td><td>{% if r.required_contexts.is_empty() %}—{% else %}{{ r.required_contexts|join(", ") }}{% endif %}</td><td>{% if r.allowed_methods.is_empty() %}all{% else %}{{ r.allowed_methods|join(", ") }}{% endif %}</td><td>{% if r.dismiss_on_push %}dismiss-on-push {% endif %}{% if r.block_on_request_changes %}block-on-changes {% endif %}{% if r.require_up_to_date %}up-to-date {% endif %}{% if r.require_threads_resolved %}threads-resolved {% endif %}{% if r.require_session_evidence %}session-evidence{% endif %}</td>
+<td><form method="post" action="/{{ head.owner }}/{{ head.name }}/settings/gate-rules/{{ r.id }}/delete" class="inline"><input type="hidden" name="_csrf" value="{{ csrf }}"><button type="submit">Delete</button></form></td></tr>
+<tr><td colspan="6"><form method="post" action="/{{ head.owner }}/{{ head.name }}/settings/gate-rules/{{ r.id }}" class="stack">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <label>Branch pattern <input name="pattern" value="{% if let Some(p) = r.pattern %}{{ p }}{% endif %}" placeholder="all branches"></label>
+  <label>Required approvals <input name="required_approvals" value="{{ r.required_approvals }}"></label>
+  <label class="check"><input type="checkbox" name="dismiss_on_push" value="true"{% if r.dismiss_on_push %} checked{% endif %}> Dismiss approvals on push</label>
+  <label class="check"><input type="checkbox" name="block_on_request_changes" value="true"{% if r.block_on_request_changes %} checked{% endif %}> Block on request changes</label>
+  <label>Required contexts (comma-separated) <input name="required_contexts" value="{{ r.required_contexts|join(", ") }}"></label>
+  <label class="check"><input type="checkbox" name="require_up_to_date" value="true"{% if r.require_up_to_date %} checked{% endif %}> Require up to date</label>
+  <label class="check"><input type="checkbox" name="require_threads_resolved" value="true"{% if r.require_threads_resolved %} checked{% endif %}> Require threads resolved</label>
+  <label class="check"><input type="checkbox" name="require_session_evidence" value="true"{% if r.require_session_evidence %} checked{% endif %}> Require session evidence</label>
+  <label>Allowed methods (comma-separated, blank means all) <input name="allowed_methods" value="{{ r.allowed_methods|join(", ") }}"></label>
+  <button type="submit">Save rule</button>
+</form></td></tr>
+{% endfor %}
+</tbody>
+</table>
+{% endif %}
+<h3>Add a rule</h3>
+<form method="post" action="/{{ head.owner }}/{{ head.name }}/settings/gate-rules" class="stack">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <label>Branch pattern <input name="pattern" placeholder="all branches"></label>
+  <label>Required approvals <input name="required_approvals" value="0"></label>
+  <label class="check"><input type="checkbox" name="dismiss_on_push" value="true"> Dismiss approvals on push</label>
+  <label class="check"><input type="checkbox" name="block_on_request_changes" value="true" checked> Block on request changes</label>
+  <label>Required contexts (comma-separated) <input name="required_contexts"></label>
+  <label class="check"><input type="checkbox" name="require_up_to_date" value="true"> Require up to date</label>
+  <label class="check"><input type="checkbox" name="require_threads_resolved" value="true"> Require threads resolved</label>
+  <label class="check"><input type="checkbox" name="require_session_evidence" value="true"> Require session evidence</label>
+  <label>Allowed methods (comma-separated, blank means all) <input name="allowed_methods"></label>
+  <button type="submit">Add rule</button>
+</form>
 {% if head.can_admin %}
 <h2>Visibility</h2>
 <form method="post" action="/{{ head.owner }}/{{ head.name }}/settings/visibility" class="stack">

@@ -287,7 +287,12 @@ required contexts, an up-to-date head, resolved threads, and session evidence li
 the commits to uploaded agent sessions. The change page's Gates panel — and
 `GET .../trails/{n}/changes/{k}/gates` — shows which rules match and why; evaluation
 writes nothing, and merging re-evaluates everything server-side, so a stale client
-report can never authorize a merge.
+report can never authorize a merge. Admins manage rules from the repository
+settings "Merge gates" section or via `GET`/`POST .../repos/{owner}/{repo}/gate-rules`
+and `PATCH`/`DELETE .../gate-rules/{id}` (reads need `repo:read`, mutations
+`repo:write` on top of maintain): each rule pairs one branch pattern (empty or
+null means all branches, at most one rule per pattern) with approval, context, and
+method requirements, and every change lands exactly one `gate_rule.*` timeline row.
 
 Merging needs write access on a non-archived repo: `POST .../changes/{k}/merge` with
 `{"method": "merge|squash|fast_forward"}`. `merge` writes a two-parent merge commit,

@@ -45,6 +45,17 @@ fn valid_sha(sha: &str) -> bool {
             .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
+/// H2's status-context rule (1–100 chars), reused by gate-rule contexts.
+pub(crate) fn validate_context(context: &str) -> CoreResult<()> {
+    let context_len = context.chars().count();
+    if context_len == 0 || context_len > 100 {
+        return Err(CoreError::Invalid(
+            "context must be 1-100 characters".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_status(
     sha: &str,
     state: &str,
@@ -58,12 +69,7 @@ fn validate_status(
     if !matches!(state, "pending" | "success" | "failure" | "error") {
         return Err(CoreError::Invalid(format!("invalid state '{state}'")));
     }
-    let context_len = context.chars().count();
-    if context_len == 0 || context_len > 100 {
-        return Err(CoreError::Invalid(
-            "context must be 1-100 characters".into(),
-        ));
-    }
+    validate_context(context)?;
     if let Some(url) = target_url
         && !url.is_empty()
         && !(url.starts_with("http://") || url.starts_with("https://"))
