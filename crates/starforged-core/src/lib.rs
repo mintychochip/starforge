@@ -17,6 +17,7 @@ pub mod ingest;
 pub mod invites;
 pub mod jobs;
 pub mod mail;
+pub mod merge;
 pub mod oauth;
 pub mod passwords;
 pub mod permission;
@@ -96,6 +97,10 @@ struct Inner {
     config: CoreConfig,
     /// Wakes one idle job worker when a job is queued.
     job_wakeup: tokio::sync::Notify,
+    /// Test seam for the merge CAS race (see [`merge::PreCasHook`]): `None`
+    /// in production. Integration tests set it to move the base ref between
+    /// gate evaluation and the compare-and-swap.
+    merge_cas_hook: std::sync::Mutex<Option<merge::PreCasHook>>,
 }
 
 impl Core {
@@ -105,6 +110,7 @@ impl Core {
                 db,
                 config,
                 job_wakeup: tokio::sync::Notify::new(),
+                merge_cas_hook: std::sync::Mutex::new(None),
             }),
         }
     }

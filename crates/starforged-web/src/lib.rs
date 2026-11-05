@@ -302,6 +302,10 @@ fn page_routes() -> Router<AppState> {
             "/{owner}/{repo}/trails/{number}/changes/{k}/state",
             post(pages::changes::set_state),
         )
+        .route(
+            "/{owner}/{repo}/trails/{number}/changes/{k}/merge",
+            post(pages::changes::merge),
+        )
         .route("/{owner}/{repo}/compare", get(pages::compare::pick))
         .route(
             "/{owner}/{repo}/compare/{*spec}",

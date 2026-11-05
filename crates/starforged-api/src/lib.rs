@@ -182,6 +182,10 @@ pub fn router(core: Core, base_url: String) -> Router {
             get(changes::get_gates),
         )
         .route(
+            "/repos/{owner}/{repo}/trails/{n}/changes/{k}/merge",
+            post(changes::merge_change),
+        )
+        .route(
             "/repos/{owner}/{repo}/statuses/{sha}",
             post(statuses::submit_status).get(statuses::list_statuses),
         )

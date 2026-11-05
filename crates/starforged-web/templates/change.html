@@ -99,6 +99,12 @@
   <button type="submit" name="state" value="open">Reopen change</button>
 </form>
 {% endif %}
-{% if can_triage %}<p class="muted">Dismiss controls are visible because you have triage access. Gate counting and merge land in M2c.</p>{% endif %}
-<p><button disabled title="{{ merge_title }}">Merge</button></p>
+{% if can_triage %}<p class="muted">Dismiss controls are visible because you have triage access.</p>{% endif %}
+{% if show_merge_form %}
+<form method="post" action="/{{ head.owner }}/{{ head.name }}/trails/{{ trail_number }}/changes/{{ k }}/merge" class="inline" id="merge-change">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <label>Method <select name="method">{% for m in merge_methods %}<option value="{{ m }}">{{ m }}</option>{% endfor %}</select></label>
+  {% if merge_enabled %}<button type="submit">Merge</button>{% else %}<button type="submit" disabled title="{{ merge_title }}">Merge</button>{% endif %}
+</form>
+{% else %}<p><button disabled title="{{ merge_title }}">Merge</button></p>{% endif %}
 {% endblock %}

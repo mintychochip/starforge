@@ -15,7 +15,6 @@ use starforged_core::tokens::Scope;
 use tokio::time::sleep;
 
 const SCAN_TIMEOUT: Duration = Duration::from_secs(20);
-const MERGE_TITLE: &str = "Merging lands in M2c";
 
 struct Ctx {
     s: TestServer,
@@ -179,11 +178,15 @@ async fn change_page_renders_revision_diff_and_mergeability() {
     assert!(page.contains("hello feature"), "diff hunk:\n{page}");
     assert!(page.contains("name=\"rev\""), "revision selector:\n{page}");
     assert!(page.contains("clean"), "mergeability badge:\n{page}");
+    // H4: no gate rules means gates pass, so the merge form is live.
     assert!(page.contains("Merge"), "merge button:\n{page}");
-    assert!(page.contains("disabled"), "merge button disabled:\n{page}");
     assert!(
-        page.contains(MERGE_TITLE),
-        "merge button carries the M2c reason:\n{page}"
+        page.contains(r#"<button type="submit">Merge</button>"#),
+        "merge button live while gates pass:\n{page}"
+    );
+    assert!(
+        page.contains(r#"name="method""#),
+        "merge method select:\n{page}"
     );
 }
 

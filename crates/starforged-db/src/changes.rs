@@ -496,6 +496,29 @@ pub async fn set_change_state(db: &Db, change_id: i64, state: &str, now: i64) ->
     Ok(())
 }
 
+/// Marks the change merged with its merge method and merge commit. Only the
+/// merge path (M2c) writes `state = 'merged'`; closes/reopens go through
+/// [`set_change_state`].
+pub async fn set_merged(
+    db: &Db,
+    change_id: i64,
+    method: &str,
+    commit: &str,
+    now: i64,
+) -> DbResult<()> {
+    sqlx::query(
+        "UPDATE changes SET state = 'merged', merge_method = $1, merge_commit = $2, \
+         updated_at = $3 WHERE id = $4",
+    )
+    .bind(method)
+    .bind(commit)
+    .bind(now)
+    .bind(change_id)
+    .execute(db.pool())
+    .await?;
+    Ok(())
+}
+
 pub async fn set_mergeability(db: &Db, change_id: i64, status: &str, paths: &str) -> DbResult<()> {
     sqlx::query("UPDATE changes SET mergeability = $1, conflict_paths = $2 WHERE id = $3")
         .bind(status)

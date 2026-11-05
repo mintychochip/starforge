@@ -269,6 +269,19 @@ pub async fn set_state(
     Ok(())
 }
 
+/// Marks the trail merged (`merged_at` = now). Only the merge path (M2c)
+/// writes `state = 'merged'`; closes/reopens go through [`set_state`].
+pub async fn set_merged(db: &Db, id: i64, now: i64) -> DbResult<()> {
+    sqlx::query(
+        "UPDATE trails SET state = 'merged', merged_at = $1, updated_at = $1 WHERE id = $2",
+    )
+    .bind(now)
+    .bind(id)
+    .execute(db.pool())
+    .await?;
+    Ok(())
+}
+
 pub async fn set_ready(db: &Db, id: i64, ready: i64, now: i64) -> DbResult<()> {
     sqlx::query("UPDATE trails SET ready = $1, updated_at = $2 WHERE id = $3")
         .bind(ready)

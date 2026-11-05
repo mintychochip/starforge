@@ -389,6 +389,47 @@ pub fn merge_base(repo: &Path, a: &str, b: &str) -> Result<Option<String>, GitEr
         .map(|id| id.to_string()))
 }
 
+/// True when `ancestor` is reachable from `head` (`merge-base --is-ancestor`;
+/// exit `0` is true, `1` is false). Both must be full object ids (argv-only,
+/// never a shell string). Any other failure — bad repo, missing object, an
+/// unparseable exit — is `Err`. Blocking (a read-only probe, like the gix
+/// paths above); callers run it on the blocking pool.
+pub fn is_ancestor(repo: &Path, ancestor: &str, head: &str) -> Result<bool, GitError> {
+    use crate::refpolicy::is_oid;
+    if !is_oid(ancestor) || !is_oid(head) {
+        return Err(GitError::Failed {
+            command: "merge-base --is-ancestor".to_owned(),
+            stderr: "merge-base needs full object ids".to_owned(),
+        });
+    }
+    let output = std::process::Command::new("git")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+        .arg("-C")
+        .arg(repo)
+        .arg("merge-base")
+        .arg("--is-ancestor")
+        .arg(ancestor)
+        .arg(head)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(GitError::Io)?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(GitError::Failed {
+            command: "merge-base --is-ancestor".to_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        }),
+    }
+}
+
 /// Local branches, the most recently committed tip first, then by name. Branches whose tip is not a
 /// commit are skipped.
 pub fn branch_list(repo: &Path) -> Result<Vec<BranchInfo>, GitError> {

@@ -1,11 +1,12 @@
-//! Change web UI (spec §6.2, §8, M2b G5): change detail with revision
-//! selector, unified diff, review summary and forms, file/line threads,
-//! plus triage-gated dismiss and creator-or-triage state controls. Reads
-//! 404 for non-readers so change numbers stay undiscoverable; mutations
-//! answer 403 below their threshold. Review bodies and thread comments
-//! render through [`crate::markdown::render_prose`]; everything else
-//! relies on askama escaping. The merge button is always disabled: merge
-//! execution and gates belong to M2c.
+//! Change web UI (spec §6.2, §8, M2b G5 + M2c H4): change detail with
+//! revision selector, unified diff, review summary and forms, file/line
+//! threads, plus triage-gated dismiss and creator-or-triage state controls.
+//! Reads 404 for non-readers so change numbers stay undiscoverable;
+//! mutations answer 403 below their threshold. Review bodies and thread
+//! comments render through [`crate::markdown::render_prose`]; everything
+//! else relies on askama escaping. The merge form offers the gate-rule
+//! allowed methods and submits only while the freshly evaluated gate set
+//! passes; the server re-checks everything at merge time.
 
 use std::collections::BTreeSet;
 
@@ -49,9 +50,10 @@ fn short_sha(sha: &str) -> String {
     sha.chars().take(7).collect()
 }
 
-/// The literal disabled-merge reason. Merging (gates + execution) is M2c.
+/// The literal disabled-merge reason: every requirement (open change, write
+/// access, passing gates, an allowed method) must hold to enable the button.
 const MERGE_TITLE: &str =
-    "Merging lands in M2c — gates and merge execution are not implemented yet.";
+    "Merge needs an open change, write access, passing gates, and an allowed method.";
 
 pub struct RevisionOption {
     r: i64,
@@ -125,6 +127,9 @@ pub struct ChangePage {
     can_close: bool,
     is_open: bool,
     merge_title: &'static str,
+    merge_methods: Vec<String>,
+    show_merge_form: bool,
+    merge_enabled: bool,
     error: Option<String>,
 }
 
@@ -234,6 +239,17 @@ async fn change_view(
         .core
         .evaluate_gates(user, owner, repo, number, k)
         .await?;
+    // The merge form offers the matching rules' allowed methods (all three
+    // when no rule matches). The button enables only while the fresh gate
+    // set passes; the POST re-checks everything server-side anyway.
+    let merge_methods = state
+        .core
+        .allowed_merge_methods(user, owner, repo, number, k)
+        .await?;
+    let show_merge_form = access.permission >= Permission::Write
+        && access.repo.archived_at.is_none()
+        && change.state == "open";
+    let merge_enabled = show_merge_form && gates.passed && !merge_methods.is_empty();
     Ok(ChangePage {
         nav_user: nav(session),
         head: RepoHead::new(&access, "trails", None),
@@ -274,6 +290,9 @@ async fn change_view(
         can_close: detail.can_close,
         is_open: change.state == "open",
         merge_title: MERGE_TITLE,
+        merge_methods,
+        show_merge_form,
+        merge_enabled,
         error,
     })
 }
@@ -663,4 +682,60 @@ pub async fn set_state(
         access.repo.owner, access.repo.name
     ))
     .into_response())
+}
+
+#[derive(Deserialize)]
+pub struct MergeForm {
+    #[serde(rename = "_csrf", default)]
+    csrf: String,
+    #[serde(default)]
+    method: String,
+}
+
+/// `POST …/merge`: server-side merge with the requested method. The form
+/// only enables while the fresh gate set passes, but the POST re-checks
+/// everything (gates, permission, method) — a stale page authorizes
+/// nothing. Gate and conflict failures re-render the change with `422`.
+pub async fn merge(
+    State(state): State<AppState>,
+    RequireUser(session): RequireUser,
+    Path((owner, repo, number, k)): Path<(String, String, i64, i64)>,
+    Form(form): Form<MergeForm>,
+) -> Result<Response, WebError> {
+    // Non-readers 404 before the CSRF check, matching the trail pages: a
+    // forged POST must not distinguish "exists" from "missing".
+    let access = state
+        .core
+        .repo_for(Some(&session.user), &owner, &repo)
+        .await?;
+    verify_csrf(&session.csrf_token, &form.csrf)?;
+    match state
+        .core
+        .merge_change(&session.user, &owner, &repo, number, k, &form.method)
+        .await
+    {
+        Ok(_) => Ok(Redirect::to(&format!(
+            "/{}/{}/trails/{number}/changes/{k}",
+            access.repo.owner, access.repo.name
+        ))
+        .into_response()),
+        Err(
+            starforged_core::CoreError::Invalid(message)
+            | starforged_core::CoreError::Conflict(message),
+        ) => {
+            let page = change_view(
+                &state,
+                Some(&session),
+                &owner,
+                &repo,
+                number,
+                k,
+                None,
+                Some(message),
+            )
+            .await?;
+            Ok((StatusCode::UNPROCESSABLE_ENTITY, detail_headers(), page).into_response())
+        }
+        Err(other) => Err(other.into()),
+    }
 }

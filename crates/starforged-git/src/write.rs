@@ -98,6 +98,119 @@ async fn plumbing(
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
+/// How long one server-side write (`commit-tree`, `rev-parse`, `update-ref`)
+/// may take; the caller sees a failed write, never a hang.
+pub const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Builds a commit object without touching any ref: `commit-tree <tree>
+/// (-p <parent>)* -m <msg>` with `author` as author and committer (argv-only;
+/// `tree` and every parent must pass [`crate::refpolicy::is_oid`]). Returns
+/// the new commit id.
+pub async fn commit_tree(
+    repo: &Path,
+    tree: &str,
+    parents: &[&str],
+    message: &str,
+    author: Identity<'_>,
+) -> Result<String, GitError> {
+    if !crate::refpolicy::is_oid(tree) || !parents.iter().all(|p| crate::refpolicy::is_oid(p)) {
+        return Err(GitError::Failed {
+            command: "commit-tree".to_owned(),
+            stderr: "commit-tree needs full object ids".to_owned(),
+        });
+    }
+    let date = format!("@{} +0000", author.time);
+    let env = [
+        ("GIT_AUTHOR_NAME", author.name),
+        ("GIT_AUTHOR_EMAIL", author.email),
+        ("GIT_AUTHOR_DATE", date.as_str()),
+        ("GIT_COMMITTER_NAME", author.name),
+        ("GIT_COMMITTER_EMAIL", author.email),
+        ("GIT_COMMITTER_DATE", date.as_str()),
+    ];
+    let mut args: Vec<&str> = vec!["commit-tree", tree];
+    for parent in parents {
+        args.push("-p");
+        args.push(parent);
+    }
+    args.push("-m");
+    args.push(message);
+    let fut = plumbing(repo, &args, None, &env);
+    tokio::time::timeout(WRITE_TIMEOUT, fut)
+        .await
+        .map_err(|_| GitError::Failed {
+            command: "commit-tree".to_owned(),
+            stderr: "commit-tree timed out".to_owned(),
+        })?
+}
+
+/// Tree object id of commit `sha` (`rev-parse <sha>^{tree}`, argv-only; `sha`
+/// must pass [`crate::refpolicy::is_oid`], so the `^{tree}` suffix cannot be
+/// attacker-controlled).
+pub async fn rev_parse_tree(repo: &Path, sha: &str) -> Result<String, GitError> {
+    if !crate::refpolicy::is_oid(sha) {
+        return Err(GitError::Failed {
+            command: "rev-parse".to_owned(),
+            stderr: "rev-parse needs a full object id".to_owned(),
+        });
+    }
+    let spec = format!("{sha}^{{tree}}");
+    let args = ["rev-parse", spec.as_str()];
+    let fut = plumbing(repo, &args, None, &[]);
+    tokio::time::timeout(WRITE_TIMEOUT, fut)
+        .await
+        .map_err(|_| GitError::Failed {
+            command: "rev-parse".to_owned(),
+            stderr: "rev-parse timed out".to_owned(),
+        })?
+}
+
+/// Compare-and-swaps `refs/heads/<branch>` from `old` to `new` (`update-ref
+/// <name> <new> <old>`, argv-only). `Ok(true)` when the ref moved; `Ok(false)`
+/// when the ref moved under us — git reports `… is at <actual> but expected
+/// <old>` (verified against real git), which is a retryable race, never a
+/// hard error. Any other failure (bad name, missing ref, timeout) is `Err`.
+/// Only `refs/heads/` refs move here; trail refs go through [`set_ref`].
+pub async fn update_ref_cas(
+    repo: &Path,
+    name: &str,
+    new: &str,
+    old: &str,
+) -> Result<bool, GitError> {
+    if !name.starts_with("refs/heads/") {
+        return Err(GitError::Failed {
+            command: "update-ref".to_owned(),
+            stderr: format!("refusing to CAS non-branch ref {name:?}"),
+        });
+    }
+    if !crate::refpolicy::is_oid(new) || !crate::refpolicy::is_oid(old) {
+        return Err(GitError::Failed {
+            command: "update-ref".to_owned(),
+            stderr: "update-ref needs full object ids".to_owned(),
+        });
+    }
+    let args = ["update-ref", name, new, old];
+    let fut = plumbing(repo, &args, None, &[]);
+    match tokio::time::timeout(WRITE_TIMEOUT, fut).await {
+        Err(_) => Err(GitError::Failed {
+            command: "update-ref".to_owned(),
+            stderr: "update-ref timed out".to_owned(),
+        }),
+        Ok(Ok(_)) => Ok(true),
+        Ok(Err(GitError::Failed { command, stderr })) if is_cas_mismatch(&stderr) => {
+            let _ = command;
+            Ok(false)
+        }
+        Ok(Err(other)) => Err(other),
+    }
+}
+
+/// True when git refused an `update-ref` because the ref moved: `… is at
+/// <actual> but expected <old>`.
+fn is_cas_mismatch(stderr: &str) -> bool {
+    stderr.contains("but expected")
+}
+
 /// Points a server-only `refs/trails/*` ref at `sha`. Argv-only (`update-ref`
 /// takes no rev spec); the name must stay inside `refs/trails/` and the sha
 /// must pass [`crate::refpolicy::is_oid`], so client input can never escape

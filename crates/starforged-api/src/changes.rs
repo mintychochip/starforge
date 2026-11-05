@@ -22,6 +22,7 @@ use starforged_core::changes::{
     ChangeDetail, ChangeView, ReviewView, RevisionView, ThreadCommentView, ThreadView,
 };
 use starforged_core::gates::GateReport;
+use starforged_core::merge::MergeRequest;
 use starforged_core::tokens::Scope;
 
 use crate::ApiState;
@@ -272,6 +273,26 @@ pub async fn get_gates(
         .evaluate_gates(viewer, &owner, &repo, n, k)
         .await?;
     Ok(Json(report))
+}
+
+/// `POST /repos/{owner}/{repo}/trails/{n}/changes/{k}/merge` (200):
+/// server-side merge. Needs `TrailWrite` scope plus ≥ `Write` repo
+/// permission (enforced by [`Core::merge_change`], which re-resolves the
+/// base tip and re-evaluates gates at merge time). Unknown or disallowed
+/// methods and failing gates answer `422`; conflicts and CAS races `409`.
+pub async fn merge_change(
+    State(state): State<ApiState>,
+    auth: ApiAuth,
+    Path((owner, repo, n, k)): Path<(String, String, i64, i64)>,
+    body: Result<Json<MergeRequest>, JsonRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let auth = auth.require(Scope::TrailWrite)?;
+    let Json(req) = body.map_err(|e| ApiError::Invalid(e.body_text()))?;
+    let outcome = state
+        .core
+        .merge_change(&auth.user, &owner, &repo, n, k, &req.method)
+        .await?;
+    Ok(Json(json!({"sha": outcome.sha, "method": outcome.method})))
 }
 
 #[derive(Deserialize)]
