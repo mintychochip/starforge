@@ -965,6 +965,26 @@ async fn agent_workflow_sweep() {
         "review names the change: {out}"
     );
 
+    // The author's `trail show` now renders the review and its inline thread.
+    let (out, code) = show(&actx, 1, Format::Text).await;
+    assert_eq!(code, 0, "show: {out}");
+    assert!(
+        out.contains("request_changes by bob on revision 1"),
+        "show names the verdict and reviewer: {out}"
+    );
+    assert!(
+        out.contains("Needs work"),
+        "show shows the review body: {out}"
+    );
+    assert!(
+        out.contains("widget.txt:1-1 (head, revision 1)"),
+        "show names the inline thread: {out}"
+    );
+    assert!(
+        out.contains("please revise"),
+        "show shows the inline comment: {out}"
+    );
+
     // 3. The author pushes revision 2.
     commit_files(
         &author_dir,
@@ -1078,7 +1098,7 @@ async fn agent_workflow_sweep() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn missing_credentials_name_the_login_hint() {
     // No `STARFORGE_TOKEN` and no stored credentials: resolution fails with
-    // the `starforge auth login` hint (run_trail prints it and exits 1).
+    // the `starforge auth login` hint.
     let home = tempfile::tempdir().unwrap();
     let paths = starforge_cli::config::CliPaths::from_home(home.path().to_path_buf());
     let err = starforge_cli::auth::resolve_token(&paths, "forge.example", |_| None).unwrap_err();
@@ -1087,4 +1107,17 @@ async fn missing_credentials_name_the_login_hint() {
             .contains("run `starforge auth login forge.example`"),
         "login hint: {err}"
     );
+
+    // And a real trail command with refused credentials exits 1 naming it.
+    let s = TestServer::start().await;
+    let alice = s.user("alice").await;
+    s.repo(&alice, "proj", Visibility::Private).await;
+    let ctx = ctx_for(&s, "alice/proj", "no-such-token");
+    let (out, code) = list(&ctx, &open_list_args(), Format::Text).await;
+    assert_eq!(code, 1, "refused list exits 1: {out}");
+    assert!(
+        out.contains("run `starforge auth login "),
+        "login hint: {out}"
+    );
+    assert!(!out.contains("no-such-token"), "token never appears");
 }

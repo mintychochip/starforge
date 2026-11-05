@@ -251,13 +251,22 @@ starforge trail review 12 --request-changes --comments '[{"path":"a.txt","side":
 starforge trail merge 12
 ```
 
+`show` prints the header, the intent, one line per change, then — under each
+change with any — its reviews (`#id verdict by author on revision R`, with
+`(dismissed)` when dismissed, plus the body) and its inline threads
+(`#id path:start-end (side, revision R)`, with `resolved`/`outdated` flags,
+plus each comment as `author: body`), then the trail comments.
 `show --format json` returns `{trail, changes: [{change, status}]}`, where
-`change.gates` is the gate report (`passed` plus per-rule results) and
-`status` the combined commit status. `--format agent` frames every
-third-party-written field — the title, the intent, each comment and review
-body — in nonce-tagged `<untrusted-data>` blocks with hostile markup
-escaped, so an agent reading the trail cannot be steered by attacker-written
-text it is then asked to act on (for example by running `trail merge`).
+`change.gates` is the gate report (`passed` plus per-rule results),
+`status` the combined commit status, and the change detail keeps its
+`reviews` and `threads` (only `files` and `truncated` are stripped).
+`--format agent` keeps the same structure and frames every review body
+(source `trail #N change K review <id>`) and every thread-comment body
+(source `trail #N change K thread <tid> comment <cid>`), each with its
+author, in nonce-tagged `<untrusted-data>` blocks. Frame delimiters are
+escaped, so a hostile body can neither close nor open a frame, and an agent
+reading the trail cannot be steered by attacker-written text it is then
+asked to act on (for example by running `trail merge`).
 
 `push` defaults the base to the remote's HEAD branch and the topic to a slug
 of the current branch (`--base`/`--topic` override; `--trail N` files the
@@ -267,8 +276,10 @@ recorded the change within 10 s it prints `pushed <sha>; ...` instead and
 still exits `0`. `checkout` creates the branch `trail/<n>/<k>` at the head
 (fast-forwarding an ancestor, refusing on divergence and touching nothing),
 or detaches at `--rev R` for an immutable revision. Without `--change` the
-single open change wins, erroring when there are zero or several. Without
-`--method`, `merge` uses `merge` when allowed, else the single allowed
+single open change wins, erroring when there are zero or several — except
+`checkout`, which also accepts the only change when none is open, since
+inspecting a merged change is legitimate. Without `--method`, `merge` uses
+`merge` when allowed, else the single allowed
 method. Git authenticates with your own remote configuration — the CLI never
 hands its API token to git — so push and fetch use your usual credentials
 and prompts. Exits are `0` on success, `1` on any failure; usage errors keep

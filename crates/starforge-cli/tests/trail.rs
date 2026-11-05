@@ -428,8 +428,8 @@ async fn show_without_revisions_omits_checks() {
         "files stripped: {out}"
     );
     assert!(
-        body["changes"][0]["change"].get("threads").is_none(),
-        "threads stripped: {out}"
+        body["changes"][0]["change"].get("threads").is_some(),
+        "threads kept: {out}"
     );
 }
 

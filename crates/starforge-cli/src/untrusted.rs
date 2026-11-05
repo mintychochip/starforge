@@ -1,7 +1,8 @@
 //! Nonce-tagged framing for agent-facing output (M2d D3, spec §11.2).
 //!
-//! Third-party-written text (trail titles, intents, comment bodies) is
-//! attacker-writable, so agent output wraps it in `<untrusted-data>` blocks.
+//! Third-party-written text (trail titles, intents, comment bodies, review
+//! bodies, inline thread comments) is attacker-writable, so agent output
+//! wraps it in `<untrusted-data>` blocks.
 //! The nonce binds the block to this invocation; the preamble (always the
 //! first line of agent output) tells the agent to treat block contents as
 //! data, never instructions.
