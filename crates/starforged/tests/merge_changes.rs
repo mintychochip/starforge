@@ -606,6 +606,54 @@ async fn single_base_move_retries_to_success() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fast_forward_retry_refuses_rewind_after_base_moves() {
+    let c = Ctx::start().await;
+    let (work, _url) = c.push_basic().await;
+    let server = c.server().await;
+    let n = c.trail().await;
+    c.create_branch_change(n, "feature/x", "main").await;
+    let base_before = server_rev(&work, &server, "refs/heads/main").await;
+    let head = server_rev(&work, &server, "refs/heads/feature/x").await;
+    // The hook advances the base once past the head's history; the retry
+    // must refuse rather than drag the branch back to the head.
+    c.s.core
+        .set_merge_cas_hook(Some(once_hook(server.clone(), "refs/heads/main")));
+    let (status, body) = c.post_merge(n, 1, &c.alice_repo, "fast_forward").await;
+    c.s.core.set_merge_cas_hook(None);
+    assert_eq!(status, 409, "{body}");
+    let message = body["error"]["message"].as_str().unwrap_or("");
+    assert!(message.contains("no longer an ancestor"), "{body}");
+    // The base was NOT rewound: the racer's commit is still the tip, still
+    // built on the old base.
+    let tip = server_rev(&work, &server, "refs/heads/main").await;
+    assert_ne!(tip, head);
+    let subject = server_message(&work, &server, &tip).await;
+    assert!(subject.starts_with("hook advance"), "{subject}");
+    let gd = git_dir_arg(&server);
+    assert!(
+        git(
+            &work,
+            &[&gd, "merge-base", "--is-ancestor", &base_before, &tip],
+        )
+        .await
+        .status
+        .success()
+    );
+    // Nothing merged: the change is still open.
+    let client = reqwest::Client::new();
+    let detail: Value = client
+        .get(c.change(n, 1))
+        .bearer_auth(&c.alice_rw)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(detail["change"]["state"], "open");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn trail_merges_only_after_last_open_change_merges() {
     let c = Ctx::start().await;
     let url = c.s.git_url(

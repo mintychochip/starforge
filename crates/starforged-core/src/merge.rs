@@ -109,6 +109,72 @@ fn conflict_summary(paths: &[String]) -> String {
     }
 }
 
+/// Pure squash selection over newest-first `range_log` output: keeps the
+/// newest `max` commits, lists their subjects oldest-first, dedupes their
+/// `Starforge-Session` trailers in order of appearance, and counts how many
+/// older commits fell outside the cap (`total` is the true range size, which
+/// `range_log` reports even when it truncates the list). `max` is a
+/// parameter — not the constant — so tests can exercise truncation with a
+/// lowered cap instead of pushing a thousand commits.
+fn select_squash_parts(
+    commits: &[starforged_git::read::CommitInfo],
+    total: usize,
+    max: usize,
+) -> (Vec<String>, Vec<String>, usize) {
+    let take = commits.len().min(max);
+    let mut subjects = Vec::new();
+    let mut sessions = Vec::new();
+    let mut seen = HashSet::new();
+    for commit in commits[..take].iter().rev() {
+        if let Some(subject) = commit.message.lines().next().map(str::trim)
+            && !subject.is_empty()
+        {
+            subjects.push(subject.to_owned());
+        }
+        for trailer in crate::gates::session_trailers(&commit.message) {
+            if seen.insert(trailer.clone()) {
+                sessions.push(trailer);
+            }
+        }
+    }
+    (subjects, sessions, total.saturating_sub(take))
+}
+
+/// Renders the squash commit message: title, squashed subjects oldest-first,
+/// an omission marker when the range exceeded the cap (so the history gap is
+/// visible, like [`conflict_summary`]), the distinct session trailers, then
+/// the `Change:` line and the `Starforge-Trail:` trailer.
+#[allow(clippy::too_many_arguments)]
+fn compose_squash_message(
+    trail_title: &str,
+    trail_n: i64,
+    k: i64,
+    stamp: &str,
+    subjects: &[String],
+    sessions: &[String],
+    omitted: usize,
+) -> String {
+    let mut message = format!("{trail_title} (#{trail_n})\n\n");
+    if !subjects.is_empty() {
+        message.push_str(&subjects.join("\n"));
+        message.push('\n');
+    }
+    if omitted > 0 {
+        let noun = if omitted == 1 { "commit" } else { "commits" };
+        message.push_str(&format!("…and {omitted} earlier {noun} omitted\n"));
+    }
+    if !subjects.is_empty() || omitted > 0 {
+        message.push('\n');
+    }
+    for session in sessions {
+        message.push_str(&format!("Starforge-Session: {session}\n"));
+    }
+    message.push_str(&format!(
+        "Change: {stamp}/{k}\n\nStarforge-Trail: {stamp}\n"
+    ));
+    message
+}
+
 impl Core {
     /// Sets (or clears) the merge CAS test seam. `None` in production.
     pub fn set_merge_cas_hook(&self, hook: Option<PreCasHook>) {
@@ -206,38 +272,36 @@ impl Core {
         .map_err(CoreError::from)
     }
 
-    /// Subjects (oldest-first) and distinct `Starforge-Session` trailers (in
-    /// order of appearance) for the `merge_base..head` range.
+    /// True when `head` contains `base` (blocking `merge-base --is-ancestor`
+    /// probe). Checked before the first CAS attempt and again on retry: a
+    /// fast-forward that stops being one must refuse, never rewind the base.
+    async fn is_fast_forwardable(&self, repo_id: i64, base: &str, head: &str) -> CoreResult<bool> {
+        let repo = self.repo_path(repo_id);
+        let (ancestor, tip) = (base.to_owned(), head.to_owned());
+        tokio::task::spawn_blocking(move || read::is_ancestor(&repo, &ancestor, &tip))
+            .await
+            .map_err(|e| CoreError::Internal(e.to_string()))?
+            .map_err(CoreError::from)
+    }
+
+    /// Subjects (oldest-first), distinct `Starforge-Session` trailers (in
+    /// order of appearance), and the count of older commits beyond
+    /// [`MAX_SQUASH_COMMITS`] for the `merge_base..head` range.
     async fn squash_parts(
         &self,
         repo_id: i64,
         merge_base: &str,
         head: &str,
-    ) -> CoreResult<(Vec<String>, Vec<String>)> {
+    ) -> CoreResult<(Vec<String>, Vec<String>, usize)> {
         let repo = self.repo_path(repo_id);
         let (from, to) = (merge_base.to_owned(), head.to_owned());
-        let (commits, _total) = tokio::task::spawn_blocking(move || {
-            read::range_log(&repo, &from, &to, MAX_SQUASH_COMMITS + 1)
+        let (commits, total) = tokio::task::spawn_blocking(move || {
+            read::range_log(&repo, &from, &to, MAX_SQUASH_COMMITS)
         })
         .await
         .map_err(|e| CoreError::Internal(e.to_string()))?
         .map_err(CoreError::from)?;
-        let mut subjects = Vec::new();
-        let mut sessions = Vec::new();
-        let mut seen = HashSet::new();
-        for commit in commits.iter().rev() {
-            if let Some(subject) = commit.message.lines().next().map(str::trim)
-                && !subject.is_empty()
-            {
-                subjects.push(subject.to_owned());
-            }
-            for trailer in crate::gates::session_trailers(&commit.message) {
-                if seen.insert(trailer.clone()) {
-                    sessions.push(trailer);
-                }
-            }
-        }
-        Ok((subjects, sessions))
+        Ok(select_squash_parts(&commits, total, MAX_SQUASH_COMMITS))
     }
 
     /// Builds (but does not point any ref at) the merge commit for `method`
@@ -308,16 +372,17 @@ impl Core {
                 let tree = write::rev_parse_tree(&repo_path, head)
                     .await
                     .map_err(CoreError::from)?;
-                let (subjects, sessions) = self.squash_parts(repo_id, merge_base, head).await?;
-                let mut message = format!("{trail_title} (#{trail_n})\n\n");
-                if !subjects.is_empty() {
-                    message.push_str(&subjects.join("\n"));
-                    message.push_str("\n\n");
-                }
-                for session in &sessions {
-                    message.push_str(&format!("Starforge-Session: {session}\n"));
-                }
-                message.push_str(&format!("{change_line}\n\n{trail_trailer}\n"));
+                let (subjects, sessions, omitted) =
+                    self.squash_parts(repo_id, merge_base, head).await?;
+                let message = compose_squash_message(
+                    trail_title,
+                    trail_n,
+                    k,
+                    &stamp,
+                    &subjects,
+                    &sessions,
+                    omitted,
+                );
                 write::commit_tree(&repo_path, &tree, &[base], &message, identity)
                     .await
                     .map_err(CoreError::from)
@@ -426,19 +491,14 @@ impl Core {
             )));
         }
 
-        if method == "fast_forward" {
-            let repo_path = self.repo_path(access.repo.id);
-            let (ancestor, tip) = (base_tip.clone(), head.clone());
-            let is_ff =
-                tokio::task::spawn_blocking(move || read::is_ancestor(&repo_path, &ancestor, &tip))
-                    .await
-                    .map_err(|e| CoreError::Internal(e.to_string()))?
-                    .map_err(CoreError::from)?;
-            if !is_ff {
-                return Err(CoreError::Invalid(format!(
-                    "cannot fast-forward: base branch '{base_branch}' is not an ancestor of the change head"
-                )));
-            }
+        if method == "fast_forward"
+            && !self
+                .is_fast_forwardable(access.repo.id, &base_tip, &head)
+                .await?
+        {
+            return Err(CoreError::Invalid(format!(
+                "cannot fast-forward: base branch '{base_branch}' is not an ancestor of the change head"
+            )));
         }
 
         // Builds the merge commit below, twice (first attempt and retry):
@@ -487,6 +547,18 @@ impl Core {
                     "base branch '{base_branch}' is missing"
                 )));
             };
+            // A fast-forward that stopped being one must refuse, never rewind
+            // the base: pointing the ref at the head now would discard the
+            // racer's commits. Checked before the rebuild, so nothing writes.
+            if method == "fast_forward"
+                && !self
+                    .is_fast_forwardable(access.repo.id, &tip, &head)
+                    .await?
+            {
+                return Err(CoreError::Conflict(format!(
+                    "base branch '{base_branch}' moved during merge and is no longer an ancestor of the change head"
+                )));
+            }
             new_sha = if method == "fast_forward" {
                 head.clone()
             } else {
@@ -667,6 +739,99 @@ impl Core {
             )
             .await?;
         }
+        self.dispatch(
+            trail.repo_id,
+            "change.merged",
+            serde_json::json!({
+                "trail": trail.number,
+                "change": change.number,
+                "method": method,
+                "commit": new_sha,
+            }),
+        )
+        .await;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use starforged_git::read::CommitInfo;
+
+    fn commit(id: &str, message: &str) -> CommitInfo {
+        CommitInfo {
+            id: id.to_owned(),
+            summary: message.lines().next().unwrap_or("").to_owned(),
+            message: message.to_owned(),
+            author_name: "test".to_owned(),
+            author_email: "test@example.test".to_owned(),
+            author_time: 1_700_000_000,
+            parents: Vec::new(),
+        }
+    }
+
+    /// Newest-first input, like `range_log` returns: keeps the newest `max`,
+    /// subjects oldest-first, trailers deduped in order of appearance.
+    #[test]
+    fn squash_selection_orders_and_dedupes() {
+        let commits = vec![
+            commit("3", "three\n\nStarforge-Session: B\n"),
+            commit("2", "two\n\nStarforge-Session: A\n"),
+            commit("1", "one\n\nStarforge-Session: A\n"),
+        ];
+        let (subjects, sessions, omitted) = select_squash_parts(&commits, 3, 1024);
+        assert_eq!(subjects, vec!["one", "two", "three"]);
+        assert_eq!(sessions, vec!["A", "B"]);
+        assert_eq!(omitted, 0);
+    }
+
+    /// A lowered cap truncates the oldest commits and counts them, so the
+    /// history gap stays visible without pushing a thousand commits.
+    #[test]
+    fn squash_selection_truncates_oldest_with_count() {
+        let commits = vec![
+            commit("5", "five"),
+            commit("4", "four"),
+            commit("3", "three"),
+            commit("2", "two"),
+            commit("1", "one"),
+        ];
+        let (subjects, _, omitted) = select_squash_parts(&commits, 5, 3);
+        assert_eq!(subjects, vec!["three", "four", "five"]);
+        assert_eq!(omitted, 2);
+    }
+
+    #[test]
+    fn squash_message_marks_truncation() {
+        let message = compose_squash_message(
+            "feature work",
+            1,
+            1,
+            "alice/proj#1",
+            &["three".to_owned(), "four".to_owned(), "five".to_owned()],
+            &[],
+            2,
+        );
+        assert_eq!(
+            message,
+            "feature work (#1)\n\nthree\nfour\nfive\n…and 2 earlier commits omitted\n\nChange: alice/proj#1/1\n\nStarforge-Trail: alice/proj#1\n"
+        );
+    }
+
+    #[test]
+    fn squash_message_singular_marker_and_no_marker() {
+        let singular = compose_squash_message("t", 9, 2, "o/r#9", &["s".to_owned()], &[], 1);
+        assert!(
+            singular.contains("…and 1 earlier commit omitted\n"),
+            "{singular}"
+        );
+        let full =
+            compose_squash_message("t", 9, 2, "o/r#9", &["s".to_owned()], &["U".to_owned()], 0);
+        assert!(!full.contains("omitted"), "{full}");
+        assert_eq!(
+            full,
+            "t (#9)\n\ns\n\nStarforge-Session: U\nChange: o/r#9/2\n\nStarforge-Trail: o/r#9\n"
+        );
     }
 }
