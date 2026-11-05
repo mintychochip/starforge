@@ -230,8 +230,7 @@ state; `merged` is refused — only the merge path may set it), `GET`/`POST
 mutation needs `trail:write` on top, so a curator token carries `"repo:read trail:write"`.
 Errors use the shared `{"error": {"code", "message"}}` envelope.
 
-Not yet: checks, gate rules, and server-side merge (M2c); `trail` CLI commands (M2d);
-trail deletion (close covers M2a).
+Not yet: `trail` CLI commands (M2d); trail deletion (close covers M2a).
 
 ## Changes and reviews
 
@@ -258,14 +257,58 @@ request changes, comment) and open file/line threads, but only reviews from writ
 above count toward merge; triage dismisses reviews, the thread author or triage resolves
 them, and the creator or triage closes and reopens. Threads anchored at older revisions
 are marked outdated. The change page (`/{owner}/{repo}/trails/{n}/changes/{k}`, `?rev=`
-selects the revision) shows all of this with role-gated controls; the Merge button stays
-disabled — merging lands in M2c.
+selects the revision) shows all of this with role-gated controls. The merge form
+offers the methods the matching gate rules allow and stays disabled until every gate
+passes; the server re-checks gates, permission, and method at merge time, so a stale
+page authorizes nothing. Gate and conflict failures re-render the change with `422`.
 
 The JSON API mirrors the page: `GET`/`POST .../trails/{n}/changes` (triage to track a
 branch), `GET`/`PATCH .../changes/{k}` (close/reopen; `merged` is refused), `.../state`,
 `.../diff`, `.../revisions[/{r}]`, `.../reviews` (`POST .../{id}/dismiss` for triage),
 and `.../threads` (`POST .../{t}/resolve`, `.../{t}/comments`). Reads need `repo:read`,
 mutations need `trail:write`; strangers get `404` so change numbers stay undiscoverable.
+
+## Commit statuses, gates, merging, and webhooks
+
+CI pushes per-commit statuses: `POST /api/v1/repos/{owner}/{repo}/statuses/{sha}` with
+`{"state": "pending|success|failure|error", "context": "ci/unit"}` (plus an optional
+`description` of at most 140 chars and an `http(s)` `target_url`). Posting needs write
+access (`repo:write` on top of read); reads need `repo:read`.
+`GET .../commits/{sha}/combined-status` folds every latest-per-context row into one
+state (`error` beats `failure` beats `pending` beats `success`; an unknown SHA is
+`pending` with nothing behind it). A bad SHA, state, or context answers `422`.
+
+Gate rules make merging fail closed. Each rule is stored on the repository with a
+branch glob (empty matches every branch); every rule matching the change's base must
+pass, and zero matching rules means only clean mergeability is required. A rule can
+demand N writer approvals (only write+ reviews count; dismiss-on-push drops
+older-revision votes, while request-changes blocks on rules that ask it to), green
+required contexts, an up-to-date head, resolved threads, and session evidence linking
+the commits to uploaded agent sessions. The change page's Gates panel — and
+`GET .../trails/{n}/changes/{k}/gates` — shows which rules match and why; evaluation
+writes nothing, and merging re-evaluates everything server-side, so a stale client
+report can never authorize a merge.
+
+Merging needs write access on a non-archived repo: `POST .../changes/{k}/merge` with
+`{"method": "merge|squash|fast_forward"}`. `merge` writes a two-parent merge commit,
+`squash` condenses the head into one commit (subject lines first, then one
+`Starforge-Session:` trailer per session in order of appearance), and `fast_forward`
+moves the ref only when the head already contains the base; every commit carries a
+`Starforge-Trail: <owner>/<repo>#<n>` trailer. The change flips to `merged`, and its
+trail closes once no open change remains. Conflicts answer `409` with the fresh SHAs;
+failing gates answer `422` with the reasons.
+
+Repository webhooks (`/{owner}/{repo}/settings/hooks`, maintain access and up)
+subscribe to events such as `change.merged` or `status.updated` (empty means all).
+The secret shows once at creation and rests sealed under the server key; every
+delivery signs the exact JSON bytes, verifiable as
+`X-Starforge-Signature: sha256=<hex>` over HMAC-SHA256 with that secret. Only
+`https` URLs are accepted (`http` for localhost); loopback and private ranges are
+refused, bodies cap at 64 KiB, and failures retry on a 1m/5m/30m/2h ladder before the
+hook is marked failed.
+
+Not yet: `trail merge` on the CLI (M2d), gate-rule management screens, per-context
+soft gates, check retries, deployments, and mirrors.
 
 ## Development
 
