@@ -895,13 +895,13 @@ mod tests {
         h.verdict(&h.bob.clone(), "request_changes").await;
         let tip = push_commit(&h.bare(), "feature", "a.txt", b"a\n", "second rev");
         h.core
-            .record_branch_move(h.repo_id, "feature", None, &tip)
+            .record_branch_move(h.repo_id, "feature", None, &tip, None)
             .await
             .unwrap();
         h.approve(&h.bob.clone()).await;
         let tip = push_commit(&h.bare(), "feature", "b.txt", b"b\n", "third rev");
         h.core
-            .record_branch_move(h.repo_id, "feature", None, &tip)
+            .record_branch_move(h.repo_id, "feature", None, &tip, None)
             .await
             .unwrap();
         // The r2 approval was dismissed by the r3 push, and the r1 request
@@ -1020,7 +1020,7 @@ mod tests {
             &format!("add evidence\n\nStarforge-Session: {ULID_A}\n"),
         );
         h.core
-            .record_branch_move(h.repo_id, "feature", None, &tip)
+            .record_branch_move(h.repo_id, "feature", None, &tip, None)
             .await
             .unwrap();
         let report = h.report().await;
@@ -1041,7 +1041,7 @@ mod tests {
             &format!("more evidence\n\nStarforge-Session: {ULID_B}\n"),
         );
         h.core
-            .record_branch_move(h.repo_id, "feature", None, &tip)
+            .record_branch_move(h.repo_id, "feature", None, &tip, None)
             .await
             .unwrap();
         let report = h.report().await;
@@ -1116,7 +1116,7 @@ mod tests {
         assert!(h.report().await.passed);
         let tip = push_commit(&h.bare(), "feature", "next.txt", b"next\n", "second rev");
         h.core
-            .record_branch_move(h.repo_id, "feature", None, &tip)
+            .record_branch_move(h.repo_id, "feature", None, &tip, None)
             .await
             .unwrap();
         // The old approval no longer counts.
@@ -1149,7 +1149,7 @@ mod tests {
         h.approve(&h.bob.clone()).await;
         let tip = push_commit(&h.bare(), "feature", "next.txt", b"next\n", "second rev");
         h.core
-            .record_branch_move(h.repo_id, "feature", None, &tip)
+            .record_branch_move(h.repo_id, "feature", None, &tip, None)
             .await
             .unwrap();
         let trail = db_trails::trail_by_number(h.core.db(), h.repo_id, h.trail_n)
@@ -1177,7 +1177,7 @@ mod tests {
         assert!(h.report().await.passed);
         let tip = push_commit(&h.bare(), "feature", "next.txt", b"next\n", "second rev");
         h.core
-            .record_branch_move(h.repo_id, "feature", None, &tip)
+            .record_branch_move(h.repo_id, "feature", None, &tip, None)
             .await
             .unwrap();
         // Earlier-revision approvals keep counting when the flag is off.
@@ -1220,7 +1220,7 @@ mod tests {
         assert!(!h.report().await.passed);
         let tip = push_commit(&h.bare(), "feature", "next.txt", b"next\n", "second rev");
         h.core
-            .record_branch_move(h.repo_id, "feature", None, &tip)
+            .record_branch_move(h.repo_id, "feature", None, &tip, None)
             .await
             .unwrap();
         // The blocking review survives the push and still blocks.
@@ -1277,7 +1277,7 @@ mod tests {
         assert!(failures[0].contains("unable to verify"), "{}", failures[0]);
         // The same history under the production cap verifies fine (no trailers).
         h.core
-            .record_branch_move(h.repo_id, "feature", None, &head)
+            .record_branch_move(h.repo_id, "feature", None, &head, None)
             .await
             .unwrap();
         h.rule(None, 0, false, "[]", false, false, true, "[]").await;
@@ -1325,7 +1325,7 @@ mod tests {
         h.approve(&h.bob.clone()).await;
         let tip = push_commit(&h.bare(), "feature", "next.txt", b"next\n", "second rev");
         h.core
-            .record_branch_move(h.repo_id, "feature", None, &tip)
+            .record_branch_move(h.repo_id, "feature", None, &tip, None)
             .await
             .unwrap();
         h.approve(&h.alice.clone()).await;
@@ -1357,7 +1357,7 @@ mod tests {
         h.approve(&h.bob.clone()).await;
         let tip = push_commit(&h.bare(), "feature", "next.txt", b"next\n", "second rev");
         h.core
-            .record_branch_move(h.repo_id, "feature", None, &tip)
+            .record_branch_move(h.repo_id, "feature", None, &tip, None)
             .await
             .unwrap();
         h.approve(&h.alice.clone()).await;

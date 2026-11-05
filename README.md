@@ -366,13 +366,16 @@ trail closes once no open change remains. Conflicts and CAS races answer `409` w
 fresh SHAs; failing gates answer `422` with the reasons.
 
 Repository webhooks (`/{owner}/{repo}/settings/hooks`, maintain access and up)
-subscribe to events such as `change.merged` or `status.updated` (empty means all).
-The secret shows once at creation and rests sealed under the server key; every
-delivery signs the exact JSON bytes, verifiable as
-`X-Starforge-Signature: sha256=<hex>` over HMAC-SHA256 with that secret. Only
-`https` URLs are accepted (`http` for localhost); loopback and private ranges are
-refused, bodies cap at 64 KiB, and failures retry on a 1m/5m/30m/2h ladder before the
-hook is marked failed.
+subscribe to event types `push`, `trail`, `review`, `check`, and `session`
+(empty means all). The secret shows once at creation and rests sealed under
+the server key; every delivery is one JSON envelope — `event`, `action`,
+`cause`, `at`, `repository`, `sender`, plus the subject under its event
+key — signed as `X-Starforge-Signature-256: sha256=<hex>` over HMAC-SHA256
+of the exact bytes with that secret. Verify with e.g.
+`echo -n "$body" | openssl dgst -sha256 -hmac "$secret"`. Only `https`
+URLs are accepted (`http` for localhost); loopback and private ranges are
+refused, bodies cap at 64 KiB, and failures retry on a 1m/5m/30m/2h ladder
+before the hook is marked failed.
 
 Not yet: gate-rule management screens, per-context soft gates, check retries, deployments, and mirrors.
 

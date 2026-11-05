@@ -735,9 +735,12 @@ impl Core {
                 .await?;
         }
         // The Trail merges when no open change remains. A closed trail stays
-        // closed: only an open trail transitions.
+        // closed: only an open trail transitions. Exactly one event fires:
+        // `merged` when this merge flipped the trail, else `updated` with a
+        // `change_merged` cause.
         let siblings = db_changes::changes_of_trail(self.db(), trail.id).await?;
-        if trail.state == "open" && !siblings.iter().any(|c| c.state == "open") {
+        let flipped = trail.state == "open" && !siblings.iter().any(|c| c.state == "open");
+        if flipped {
             db_trails::set_merged(self.db(), trail.id, now()).await?;
             self.change_timeline(
                 trail.repo_id,
@@ -755,15 +758,25 @@ impl Core {
             )
             .await?;
         }
-        self.dispatch(
+        let revision = match change.current_revision_id {
+            Some(id) => db_changes::revision_by_id(self.db(), id)
+                .await?
+                .map(|row| row.number)
+                .unwrap_or(0),
+            None => 0,
+        };
+        let (action, cause) = if flipped {
+            (Some("merged"), None)
+        } else {
+            (Some("updated"), Some("change_merged"))
+        };
+        self.dispatch_trail_event(
             trail.repo_id,
-            "change.merged",
-            serde_json::json!({
-                "trail": trail.number,
-                "change": change.number,
-                "method": method,
-                "commit": new_sha,
-            }),
+            Some(user.handle.clone()),
+            action,
+            cause,
+            trail.number,
+            Some(serde_json::json!({"k": change.number, "revision": revision})),
         )
         .await;
         Ok(())

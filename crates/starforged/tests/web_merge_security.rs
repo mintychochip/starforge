@@ -1388,7 +1388,7 @@ impl Sink {
                         inner.hits.lock().unwrap().push(Hit {
                             event: get("x-starforge-event"),
                             delivery: get("x-starforge-delivery"),
-                            signature: get("x-starforge-signature"),
+                            signature: get("x-starforge-signature-256"),
                             body: body.to_vec(),
                         });
                         (axum::http::StatusCode::OK, "ok".to_string())
@@ -1618,7 +1618,7 @@ async fn xss_corpus() {
         .form(&[
             ("_csrf", hook_csrf.as_str()),
             ("url", evil_url.as_str()),
-            ("events", "status.updated"),
+            ("events", "check"),
         ])
         .send()
         .await
@@ -1991,15 +1991,20 @@ async fn e2e_gate_blocks_and_webhook() {
         .unwrap();
     assert_eq!(res.status(), 200, "gate now passes");
 
-    // Webhook fires on change.merged with a valid signature, recorded.
+    // Webhook fires on trail/merged with a valid signature, recorded.
     c.s.core.run_due_jobs().await.unwrap();
     {
         let hits = sink.hits.lock().unwrap();
         let merged = hits
             .iter()
-            .filter(|h| h.event.as_deref() == Some("change.merged"))
+            .filter(|h| h.event.as_deref() == Some("trail"))
+            .filter(|h| {
+                serde_json::from_slice::<serde_json::Value>(&h.body)
+                    .map(|b| b["action"] == "merged")
+                    .unwrap_or(false)
+            })
             .count();
-        assert!(merged > 0, "change.merged delivered");
+        assert!(merged > 0, "trail/merged delivered");
         for hit in hits.iter() {
             let sig = hit.signature.as_deref().expect("signature header");
             assert_eq!(
@@ -2022,7 +2027,7 @@ async fn e2e_gate_blocks_and_webhook() {
     assert!(
         deliveries
             .iter()
-            .any(|d| d.event == "change.merged" && d.status_code == Some(200)),
+            .any(|d| d.event == "trail" && d.status_code == Some(200)),
         "delivery recorded: {deliveries:?}"
     );
 }

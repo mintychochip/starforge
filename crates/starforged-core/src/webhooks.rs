@@ -1,4 +1,4 @@
-//! Repository webhooks (spec §6.5, M2c H5): CRUD on [`Core`], fan-out into
+//! Repository webhooks (spec §10.4, M2e K1): CRUD on [`Core`], fan-out into
 //! the job queue, and signed delivery with the retry ladder.
 //!
 //! Secrets are random 32-byte hex strings, shown in plaintext exactly once at
@@ -6,7 +6,17 @@
 //! via `rustls`/`lettre`) under the server `webhook_key`, stored as
 //! `v1:<base64(nonce‖ciphertext)>` in `webhooks.secret_encrypted` — the exact
 //! shape the H1 schema comment promises. Delivery signs the exact JSON bytes
-//! with HMAC-SHA256 (`ring::hmac`) as `X-Starforge-Signature: sha256=<hex>`.
+//! with HMAC-SHA256 (`ring::hmac`) as
+//! `X-Starforge-Signature-256: sha256=<hex>`.
+//!
+//! Every delivery is `POST` with `Content-Type: application/json`,
+//! `User-Agent: starforged/<version>`, `X-Starforge-Event`, and
+//! `X-Starforge-Delivery` (the job id, stable across retries of one
+//! delivery), and its body is the one D1 envelope: `event`, `action`,
+//! `cause` (both always present, string or null), `at` (RFC 3339 UTC),
+//! `repository` (`owner`, `name`, `full_name`, `url`), `sender` (the acting
+//! user's `handle`, or null when system-originated), and exactly one subject
+//! object under the key named by `event`.
 //!
 //! Delivery is SSRF-gated: the host resolves at delivery time, non-globally-
 //! reachable addresses (loopback, RFC 1918, link-local incl. the metadata
@@ -18,9 +28,9 @@
 //!
 //! Permissions: every mutation and every read needs ≥ `Maintain` on the repo
 //! (readers get `Forbidden`, never a leak-shaped `NotFound`). An archived
-//! repository refuses new hooks. Fan-out ([`Core::dispatch`]) never fails the
-//! caller: enqueue errors are logged, and delivery itself always runs on a
-//! worker — never inline in the request path.
+//! repository refuses new hooks. Fan-out ([`Core::dispatch_event`]) never
+//! fails the caller: enqueue errors are logged, and delivery itself always
+//! runs on a worker — never inline in the request path.
 
 use std::time::Duration;
 
@@ -36,16 +46,46 @@ use crate::jobs::{Job, MAX_ATTEMPTS};
 use crate::permission::Permission;
 use crate::{Core, CoreError, CoreResult};
 
-/// Events a hook may subscribe to. An empty subscription means all of them.
-pub const WEBHOOK_EVENTS: [&str; 7] = [
-    "trail.opened",
-    "trail.closed",
-    "change.opened",
-    "revision.pushed",
-    "review.submitted",
-    "change.merged",
-    "status.updated",
-];
+/// Events a hook may subscribe to (spec §10.4 D4). An empty subscription
+/// means all of them.
+pub const EVENT_TYPES: [&str; 5] = ["push", "trail", "review", "check", "session"];
+
+/// One webhook event (spec §10.4 D1–D3). `event` is one of [`EVENT_TYPES`];
+/// `subject` is the JSON for the key named by `event`.
+pub struct HookEvent {
+    pub event: &'static str,
+    /// `opened`/`updated`/… (`trail`, `review`, `session`); always `None` for
+    /// `push` and `check`.
+    pub action: Option<&'static str>,
+    /// Only with action `updated`: why the trail changed (D3).
+    pub cause: Option<&'static str>,
+    /// Acting user's handle; `None` when system-originated.
+    pub sender: Option<String>,
+    /// The subject JSON, filed under the key named by `event`.
+    pub subject: serde_json::Value,
+}
+
+/// Normalizes one stored subscription: parses the JSON array, keeps only
+/// [`EVENT_TYPES`], de-duplicates, and keeps order. Unparseable input reads
+/// as empty (subscribe to all); dispatch skips those rows instead (see
+/// [`parse_subscription`]).
+pub fn normalize_events(events: Vec<String>) -> Vec<String> {
+    let mut out = Vec::with_capacity(events.len());
+    for event in events {
+        if EVENT_TYPES.contains(&event.as_str()) && !out.contains(&event) {
+            out.push(event);
+        }
+    }
+    out
+}
+
+/// The normalized subscription of one stored `events` cell, or `None` when
+/// the cell is not a JSON array at all (dispatch skips such hooks with a
+/// warning; the DTO reads them as empty).
+fn parse_subscription(raw: &str) -> Option<Vec<String>> {
+    let parsed: Vec<String> = serde_json::from_str(raw).ok()?;
+    Some(normalize_events(parsed))
+}
 
 /// Delivery timeout per attempt (spec: 10 s).
 const DELIVERY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -66,12 +106,13 @@ pub struct WebhookDto {
 }
 
 fn dto_of(row: &db_checks::WebhookRow) -> CoreResult<WebhookDto> {
-    let events: Vec<String> =
-        serde_json::from_str(&row.events).map_err(|e| CoreError::Internal(e.to_string()))?;
+    // Stored subscriptions pass through the one normalizing fn: legacy names
+    // (pre-0014 rows) drop out and duplicates collapse.
+    let parsed: Vec<String> = serde_json::from_str(&row.events).unwrap_or_default();
     Ok(WebhookDto {
         id: row.id,
         url: row.url.clone(),
-        events,
+        events: normalize_events(parsed),
         active: row.active != 0,
         last_status: row.last_status,
         last_error: row.last_error.clone(),
@@ -109,14 +150,15 @@ fn check_url(url: &str) -> CoreResult<()> {
     }
 }
 
-/// Every event must be known; an empty list subscribes to all. De-duplicated,
-/// order-preserving.
+/// Every event must be one of [`EVENT_TYPES`]; an empty list subscribes to
+/// all. De-duplicated, order-preserving.
 fn check_events(events: &[String]) -> CoreResult<Vec<String>> {
     let mut out = Vec::with_capacity(events.len());
     for event in events {
-        if !WEBHOOK_EVENTS.contains(&event.as_str()) {
+        if !EVENT_TYPES.contains(&event.as_str()) {
             return Err(CoreError::Invalid(format!(
-                "unknown webhook event '{event}'"
+                "unknown webhook event '{event}' (expected one of: {})",
+                EVENT_TYPES.join(", ")
             )));
         }
         if !out.contains(event) {
@@ -124,6 +166,31 @@ fn check_events(events: &[String]) -> CoreResult<Vec<String>> {
         }
     }
     Ok(out)
+}
+
+/// Unix seconds → `YYYY-MM-DDTHH:MM:SSZ` (Howard Hinnant's civil-from-days;
+/// no new dependency for one envelope field).
+fn rfc3339_utc(secs: i64) -> String {
+    let days = secs.div_euclid(86_400);
+    let rest = secs.rem_euclid(86_400);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    if m <= 2 {
+        y += 1;
+    }
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+        rest / 3600,
+        rest % 3600 / 60,
+        rest % 60
+    )
 }
 
 struct OneNonce([u8; 12]);
@@ -328,69 +395,148 @@ impl Core {
         dto_of(&row)
     }
 
-    /// Fan-out: enqueues one `WebhookDelivery` job per active hook whose
-    /// subscription matches `event` (empty subscription = all events). The
-    /// payload gains `event`, `repo` (`owner/name`), and `at` here; delivery
-    /// itself always runs on a worker. Never fails the caller: every error
-    /// is logged and swallowed.
-    pub async fn dispatch(&self, repo_id: i64, event: &str, data: serde_json::Value) {
-        if let Err(err) = self.dispatch_inner(repo_id, event, data).await {
-            tracing::warn!(repo = repo_id, event, error = %err, "webhook fan-out failed");
+    /// Fan-out: builds the D1 envelope (action, cause, `at`, `repository`,
+    /// `sender`, the subject under its key) and enqueues one
+    /// `WebhookDelivery` job per active hook subscribed to `ev.event`
+    /// (empty subscription = all). Delivery itself always runs on a worker.
+    /// Never fails the caller: every error is logged and swallowed.
+    pub async fn dispatch_event(&self, repo_id: i64, ev: HookEvent) {
+        if let Err(err) = self.dispatch_event_inner(repo_id, &ev).await {
+            tracing::warn!(repo = repo_id, event = ev.event, error = %err, "webhook fan-out failed");
         }
     }
 
-    async fn dispatch_inner(
-        &self,
-        repo_id: i64,
-        event: &str,
-        data: serde_json::Value,
-    ) -> CoreResult<()> {
-        if !WEBHOOK_EVENTS.contains(&event) {
+    async fn dispatch_event_inner(&self, repo_id: i64, ev: &HookEvent) -> CoreResult<()> {
+        if !EVENT_TYPES.contains(&ev.event) {
             return Err(CoreError::Invalid(format!(
-                "unknown webhook event '{event}'"
+                "unknown webhook event '{}'",
+                ev.event
             )));
         }
         let repo = db_repos::by_id(self.db(), repo_id)
             .await?
             .ok_or(CoreError::NotFound)?;
-        let mut body = data.as_object().cloned().unwrap_or_default();
-        body.insert(
-            "event".to_owned(),
-            serde_json::Value::String(event.to_owned()),
-        );
-        body.insert(
-            "repo".to_owned(),
-            serde_json::Value::String(format!("{}/{}", repo.owner_handle, repo.name)),
-        );
-        body.insert("at".to_owned(), serde_json::Value::from(now()));
+        let base = self.config().base_url.trim_end_matches('/');
+        let body = serde_json::json!({
+            "event": ev.event,
+            "action": ev.action,
+            "cause": ev.cause,
+            "at": rfc3339_utc(now()),
+            "repository": {
+                "owner": repo.owner_handle,
+                "name": repo.name,
+                "full_name": format!("{}/{}", repo.owner_handle, repo.name),
+                "url": format!("{base}/{}/{}", repo.owner_handle, repo.name),
+            },
+            "sender": ev.sender.as_ref().map(|handle| serde_json::json!({"handle": handle})),
+            ev.event: ev.subject,
+        });
         let payload =
             serde_json::to_string(&body).map_err(|e| CoreError::Internal(e.to_string()))?;
         for hook in db_checks::webhooks_of_repo(self.db(), repo_id).await? {
             if hook.active == 0 {
                 continue;
             }
-            let subscribed: Vec<String> = match serde_json::from_str(&hook.events) {
-                Ok(events) => events,
-                Err(err) => {
-                    tracing::warn!(hook = hook.id, error = %err, "webhook has unreadable events; skipping");
-                    continue;
-                }
+            let Some(subscribed) = parse_subscription(&hook.events) else {
+                tracing::warn!(hook = hook.id, "webhook has unreadable events; skipping");
+                continue;
             };
-            if !subscribed.is_empty() && !subscribed.iter().any(|e| e == event) {
+            if !subscribed.is_empty() && !subscribed.iter().any(|e| e == ev.event) {
                 continue;
             }
             if let Err(err) = self
                 .enqueue(&Job::WebhookDelivery {
                     webhook_id: hook.id,
-                    event: event.to_owned(),
+                    event: ev.event.to_owned(),
                     payload: payload.clone(),
                 })
                 .await
             {
-                tracing::warn!(hook = hook.id, event, error = %err, "webhook enqueue failed");
+                tracing::warn!(hook = hook.id, event = ev.event, error = %err, "webhook enqueue failed");
             }
         }
         Ok(())
+    }
+
+    /// Convenience fan-out for every `trail` event (D3): looks up the repo
+    /// and trail, builds the trail subject (plus `change` when one caused
+    /// the event), and dispatches. Never fails the caller: lookup failures
+    /// only warn.
+    pub async fn dispatch_trail_event(
+        &self,
+        repo_id: i64,
+        sender: Option<String>,
+        action: Option<&'static str>,
+        cause: Option<&'static str>,
+        trail_number: i64,
+        change: Option<serde_json::Value>,
+    ) {
+        let subject = match self.trail_subject(repo_id, trail_number, change).await {
+            Ok(subject) => subject,
+            Err(err) => {
+                tracing::warn!(repo = repo_id, trail = trail_number, error = %err, "webhook trail subject failed; skipping fan-out");
+                return;
+            }
+        };
+        self.dispatch_event(
+            repo_id,
+            HookEvent {
+                event: "trail",
+                action,
+                cause,
+                sender,
+                subject,
+            },
+        )
+        .await;
+    }
+
+    /// The D2 `trail` subject: number, title, state, ready, author, and the
+    /// absolute web URL, plus `change` (`k`, `revision`) when one caused it.
+    async fn trail_subject(
+        &self,
+        repo_id: i64,
+        trail_number: i64,
+        change: Option<serde_json::Value>,
+    ) -> CoreResult<serde_json::Value> {
+        let repo = db_repos::by_id(self.db(), repo_id)
+            .await?
+            .ok_or_else(|| CoreError::Internal("trail webhook has no repo".into()))?;
+        let Some(trail) = db_trails::trail_by_number(self.db(), repo_id, trail_number).await?
+        else {
+            return Err(CoreError::Internal("trail webhook has no trail".into()));
+        };
+        let author = match trail.author_id {
+            None => "deleted user".to_owned(),
+            Some(id) => self
+                .user_by_id(id)
+                .await?
+                .map(|user| user.handle)
+                .unwrap_or_else(|| "deleted user".to_owned()),
+        };
+        let base = self.config().base_url.trim_end_matches('/');
+        let mut subject = serde_json::json!({
+            "number": trail.number,
+            "title": trail.title,
+            "state": trail.state,
+            "ready": trail.ready != 0,
+            "author": author,
+            "url": format!("{base}/{}/{}/trails/{}", repo.owner_handle, repo.name, trail.number),
+        });
+        if let Some(change) = change {
+            subject["change"] = change;
+        }
+        Ok(subject)
+    }
+
+    /// The acting user's handle, or `None` when the account is gone (or the
+    /// lookup fails): those senders read as system-originated.
+    pub(crate) async fn sender_of(&self, user_id: i64) -> Option<String> {
+        self.user_by_id(user_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|user| user.handle)
     }
 
     /// Worker: POSTs `payload` to the hook with the `X-Starforge-*` headers,
@@ -689,9 +835,13 @@ async fn post_hook(
     let mut response = client
         .post(url)
         .header("content-type", "application/json")
+        .header(
+            "user-agent",
+            format!("starforged/{}", env!("CARGO_PKG_VERSION")),
+        )
         .header("x-starforge-event", event)
         .header("x-starforge-delivery", job_id.to_string())
-        .header("x-starforge-signature", signature)
+        .header("x-starforge-signature-256", signature)
         .body(payload.to_owned())
         .send()
         .await
@@ -870,7 +1020,7 @@ mod tests {
         let payload = "{\"a\":1}".to_owned();
         core.enqueue(&Job::WebhookDelivery {
             webhook_id: hook_id,
-            event: "status.updated".into(),
+            event: "check".into(),
             payload: payload.clone(),
         })
         .await
@@ -881,7 +1031,7 @@ mod tests {
             .into_iter()
             .find(|row| row.kind == "webhook_delivery")
             .unwrap();
-        core.deliver_webhook(job.id, hook_id, "status.updated", &payload)
+        core.deliver_webhook(job.id, hook_id, "check", &payload)
             .await
     }
 

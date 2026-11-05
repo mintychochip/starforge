@@ -278,10 +278,13 @@ impl Core {
             "",
         )
         .await?;
-        self.dispatch(
+        self.dispatch_trail_event(
             access.repo.id,
-            "trail.opened",
-            serde_json::json!({"trail": row.number}),
+            Some(user.handle.clone()),
+            Some("opened"),
+            None,
+            row.number,
+            None,
         )
         .await;
         self.trail_view(&row).await
@@ -545,10 +548,13 @@ impl Core {
         )
         .await?;
         if state == "closed" {
-            self.dispatch(
+            self.dispatch_trail_event(
                 access.repo.id,
-                "trail.closed",
-                serde_json::json!({"trail": number}),
+                Some(user.handle.clone()),
+                Some("closed"),
+                None,
+                number,
+                None,
             )
             .await;
         }

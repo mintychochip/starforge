@@ -80,6 +80,8 @@ pub async fn list_hooks(
 
 /// `POST /repos/{owner}/{repo}/hooks` (201): creates a hook and returns it
 /// with the plaintext `secret` — the only response that ever carries one.
+/// `events` must be a subset of `push, trail, review, check, session`
+/// (empty means all); anything else is `422`.
 pub async fn create_hook(
     State(state): State<ApiState>,
     auth: ApiAuth,

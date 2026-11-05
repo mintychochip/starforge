@@ -17,14 +17,14 @@
 //! `receive.hideRefs`); the consumed `refs/for/*` pseudo-ref is deleted by
 //! the scan after a successful ingest.
 
+use crate::gates::pattern_matches;
+use crate::jobs::Job;
+use crate::webhooks::HookEvent;
+use crate::{Core, CoreError, CoreResult};
 use starforged_db::{
     changes as db_changes, checks as db_checks, now, repos as db_repos, trails as db_trails,
 };
 use starforged_git::{merge, read, refpolicy, write};
-
-use crate::gates::pattern_matches;
-use crate::jobs::Job;
-use crate::{Core, CoreError, CoreResult};
 
 /// Addressing for one accepted `refs/for` line, from the pre-receive sidecar
 /// (`base`/`topic` already validated there) or the scan's optionless fallback.
@@ -178,14 +178,13 @@ impl Core {
                     }),
                 )
                 .await?;
-                self.dispatch(
+                self.dispatch_trail_event(
                     repo_id,
-                    "change.opened",
-                    serde_json::json!({
-                        "trail": trail_number,
-                        "change": row.number,
-                        "kind": "agit",
-                    }),
+                    self.sender_of(user_id).await,
+                    Some("updated"),
+                    Some("change_opened"),
+                    trail_number,
+                    Some(serde_json::json!({"k": row.number, "revision": revision.number})),
                 )
                 .await;
                 (row, revision)
@@ -205,14 +204,13 @@ impl Core {
                 {
                     tracing::warn!(repo_id, change = row.number, error = %err, "trail ref write failed; the mergeability job replays it");
                 }
-                self.dispatch(
+                self.dispatch_trail_event(
                     repo_id,
-                    "change.opened",
-                    serde_json::json!({
-                        "trail": trail_number,
-                        "change": row.number,
-                        "kind": "agit",
-                    }),
+                    self.sender_of(user_id).await,
+                    Some("updated"),
+                    Some("change_opened"),
+                    trail_number,
+                    Some(serde_json::json!({"k": row.number, "revision": revision.number})),
                 )
                 .await;
                 (row, revision)
@@ -235,15 +233,13 @@ impl Core {
             change_id: change.id,
         })
         .await?;
-        self.dispatch(
+        self.dispatch_trail_event(
             repo_id,
-            "revision.pushed",
-            serde_json::json!({
-                "trail": trail_number,
-                "change": change.number,
-                "revision": revision.number,
-                "sha": head_sha,
-            }),
+            self.sender_of(user_id).await,
+            Some("updated"),
+            Some("revision_pushed"),
+            trail_number,
+            Some(serde_json::json!({"k": change.number, "revision": revision.number})),
         )
         .await;
         Ok(Some((change.number, revision.number)))
@@ -260,6 +256,7 @@ impl Core {
         branch: &str,
         old: Option<&str>,
         new: &str,
+        pusher_id: Option<i64>,
     ) -> CoreResult<()> {
         if branch.is_empty() {
             return Err(CoreError::Invalid("branch name must not be empty".into()));
@@ -319,15 +316,16 @@ impl Core {
                 change_id: change.id,
             })
             .await?;
-            self.dispatch(
+            self.dispatch_trail_event(
                 repo_id,
-                "revision.pushed",
-                serde_json::json!({
-                    "trail": trail.number,
-                    "change": change.number,
-                    "revision": revision.number,
-                    "sha": new,
-                }),
+                match pusher_id {
+                    Some(id) => self.sender_of(id).await,
+                    None => None,
+                },
+                Some("updated"),
+                Some("revision_pushed"),
+                trail.number,
+                Some(serde_json::json!({"k": change.number, "revision": revision.number})),
             )
             .await;
         }
@@ -1313,27 +1311,22 @@ impl Core {
         .await?;
         self.enqueue(&Job::ChangeMergeability { change_id: row.id })
             .await?;
-        self.dispatch(
+        self.dispatch_trail_event(
             access.repo.id,
-            "change.opened",
-            serde_json::json!({
-                "trail": trail.number,
-                "change": row.number,
-                "kind": "branch",
-                "head": head,
-                "base": base,
-            }),
+            Some(user.handle.clone()),
+            Some("updated"),
+            Some("change_opened"),
+            trail.number,
+            Some(serde_json::json!({"k": row.number, "revision": revision.number})),
         )
         .await;
-        self.dispatch(
+        self.dispatch_trail_event(
             access.repo.id,
-            "revision.pushed",
-            serde_json::json!({
-                "trail": trail.number,
-                "change": row.number,
-                "revision": revision.number,
-                "sha": head_tip,
-            }),
+            Some(user.handle.clone()),
+            Some("updated"),
+            Some("revision_pushed"),
+            trail.number,
+            Some(serde_json::json!({"k": row.number, "revision": revision.number})),
         )
         .await;
         self.change_view(
@@ -1568,15 +1561,24 @@ impl Core {
             }),
         )
         .await?;
-        self.dispatch(
+        self.dispatch_event(
             access.repo.id,
-            "review.submitted",
-            serde_json::json!({
-                "trail": trail.number,
-                "change": change.number,
-                "revision": revision.number,
-                "verdict": verdict,
-            }),
+            HookEvent {
+                event: "review",
+                action: Some("submitted"),
+                cause: None,
+                sender: Some(user.handle.clone()),
+                subject: serde_json::json!({
+                    "id": row.id,
+                    "trail": trail.number,
+                    "change": change.number,
+                    "revision": revision.number,
+                    "verdict": verdict,
+                    "state": row.state.clone(),
+                    "author": user.handle.clone(),
+                    "body": body.clone(),
+                }),
+            },
         )
         .await;
         let review = self.review_view(&row).await?;

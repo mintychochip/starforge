@@ -1053,4 +1053,48 @@ mod tests {
         assert_eq!(latest.len(), 1);
         assert_eq!(latest[0].creator_id, None);
     }
+
+    /// Migration 0014 rewrites legacy subscription names to the spec event
+    /// types. It runs the migration file's own SQL text against legacy rows,
+    /// twice: the second run is a no-op.
+    #[tokio::test]
+    async fn migration_0014_rewrites_legacy_event_names() {
+        let (t, _alice, _bob, repo_id) = setup().await;
+        // A legacy row, written with raw SQL to bypass event validation.
+        sqlx::query(
+            "INSERT INTO webhooks (repo_id, url, secret_encrypted, events, active, created_at) \
+             VALUES ($1, $2, '', $3, 1, $4)",
+        )
+        .bind(repo_id)
+        .bind("https://example.com/hook")
+        .bind(r#"["trail.opened","change.merged","review.submitted","status.updated"]"#)
+        .bind(1_700_000_000)
+        .execute(t.db.pool())
+        .await
+        .unwrap();
+        // The statement is identical on both engines, so either file's text
+        // exercises what ships; `TestDb` already applied it once (no-op).
+        let migrate = include_str!("../migrations/sqlite/0014_webhook_events.sql");
+        for _ in 0..2 {
+            sqlx::query(migrate).execute(t.db.pool()).await.unwrap();
+        }
+        let hooks = webhooks_for_repo(&t.db, repo_id).await.unwrap();
+        assert_eq!(hooks.len(), 1);
+        assert_eq!(hooks[0].events, r#"["trail","trail","review","check"]"#);
+        // The read path de-duplicates, order-preserving (no serde_json in
+        // this crate; split the flat array by hand).
+        let mut normalized: Vec<&str> = Vec::new();
+        for event in hooks[0]
+            .events
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .split(',')
+        {
+            let event = event.trim_matches('"');
+            if !normalized.contains(&event) {
+                normalized.push(event);
+            }
+        }
+        assert_eq!(normalized, vec!["trail", "review", "check"]);
+    }
 }

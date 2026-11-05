@@ -1,5 +1,7 @@
-//! H5: webhooks — CRUD permissions, event filter, signed delivery, retry
-//! ladder, disable, dead-endpoint safety, and a push→review→merge end-to-end.
+//! Webhooks: CRUD permissions, secret-once, the spec §10.4 event model
+//! (five event types, one envelope, `X-Starforge-Signature-256`), signed
+//! delivery, the retry ladder, disable, dead-endpoint safety, and a
+//! push→review→merge end-to-end.
 mod common;
 
 use std::collections::HashMap;
@@ -15,6 +17,8 @@ struct Hit {
     event: Option<String>,
     delivery: Option<String>,
     signature: Option<String>,
+    legacy_signature: Option<String>,
+    user_agent: Option<String>,
     body: Vec<u8>,
 }
 
@@ -53,7 +57,9 @@ impl Sink {
                         inner.hits.lock().unwrap().push(Hit {
                             event: get("x-starforge-event"),
                             delivery: get("x-starforge-delivery"),
-                            signature: get("x-starforge-signature"),
+                            signature: get("x-starforge-signature-256"),
+                            legacy_signature: get("x-starforge-signature"),
+                            user_agent: get("user-agent"),
                             body: body.to_vec(),
                         });
                         (axum::http::StatusCode::OK, "ok".to_string())
@@ -73,6 +79,15 @@ impl Sink {
             .unwrap()
             .iter()
             .filter_map(|h| h.event.clone())
+            .collect()
+    }
+
+    fn bodies(&self) -> Vec<Value> {
+        self.hits
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|h| serde_json::from_slice::<Value>(&h.body).unwrap())
             .collect()
     }
 }
@@ -176,6 +191,65 @@ impl Ctx {
     }
 }
 
+/// Verifies the delivery wire format (spec D1): the new signature header over
+/// the exact body, no legacy header, a `starforged/` user agent. Returns the
+/// parsed envelope.
+fn check_delivery(hit: &Hit, secret: &str) -> Value {
+    assert_eq!(
+        hit.legacy_signature, None,
+        "the old X-Starforge-Signature header must be absent"
+    );
+    let ua = hit.user_agent.as_deref().expect("User-Agent header");
+    assert!(ua.starts_with("starforged/"), "User-Agent: {ua}");
+    assert!(hit.delivery.is_some(), "delivery id header present");
+    let sig = hit
+        .signature
+        .as_deref()
+        .expect("X-Starforge-Signature-256 header");
+    assert!(sig.starts_with("sha256="), "{sig}");
+    assert_eq!(
+        sig,
+        &format!("sha256={}", hmac_sha256_hex(secret, &hit.body)),
+        "signature verifies over the exact body"
+    );
+    serde_json::from_slice::<Value>(&hit.body).unwrap()
+}
+
+/// The D1 envelope shared by every event: the subject lives under the key
+/// named by `event`, `action`/`cause` are always present (possibly null),
+/// `at` is RFC 3339 UTC, and `sender` names the acting user.
+fn check_envelope(
+    body: &Value,
+    event: &str,
+    action: Option<&str>,
+    cause: Option<&str>,
+    sender: &str,
+    repo_url: &str,
+) -> Value {
+    assert_eq!(body["event"], event);
+    match action {
+        Some(a) => assert_eq!(body["action"], a),
+        None => assert!(body["action"].is_null(), "action is null: {body}"),
+    }
+    match cause {
+        Some(c) => assert_eq!(body["cause"], c),
+        None => assert!(body["cause"].is_null(), "cause is null: {body}"),
+    }
+    let at = body["at"].as_str().expect("at is a string");
+    assert!(
+        at.contains('T') && at.ends_with('Z'),
+        "at is RFC 3339 UTC: {at}"
+    );
+    assert_eq!(body["sender"], json!({"handle": sender}));
+    assert_eq!(body["repository"]["owner"], "alice");
+    assert_eq!(body["repository"]["name"], "proj");
+    assert_eq!(body["repository"]["full_name"], "alice/proj");
+    assert_eq!(body["repository"]["url"], repo_url);
+    let subject = body[event].clone();
+    assert!(subject.is_object(), "subject under '{event}': {body}");
+    subject
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn crud_permissions_and_secret_shown_once() {
     let c = Ctx::start().await;
@@ -218,9 +292,7 @@ async fn crud_permissions_and_secret_shown_once() {
     assert_eq!(created["active"], true);
 
     // Maintainer creates too.
-    let bob_created = c
-        .create_hook(&c.bob_rw, &sink_url, &["status.updated"])
-        .await;
+    let bob_created = c.create_hook(&c.bob_rw, &sink_url, &["check"]).await;
     assert!(bob_created["secret"].as_str().is_some());
 
     // List never contains any secret.
@@ -294,14 +366,58 @@ async fn crud_permissions_and_secret_shown_once() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hook_create_rejects_legacy_event_names() {
+    let c = Ctx::start().await;
+    let client = reqwest::Client::new();
+    let (sink_url, _sink) = Sink::spawn(false).await;
+
+    // Every legacy name is unknown now: a clean cutover, no dual support.
+    for legacy in [
+        "trail.opened",
+        "trail.closed",
+        "change.opened",
+        "revision.pushed",
+        "review.submitted",
+        "change.merged",
+        "status.updated",
+    ] {
+        let res = client
+            .post(c.hooks())
+            .bearer_auth(&c.alice_rw)
+            .json(&json!({"url": sink_url, "events": [legacy]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 422, "legacy event {legacy} rejected");
+    }
+
+    // The five spec types are accepted.
+    for events in [
+        vec!["push"],
+        vec!["trail"],
+        vec!["review"],
+        vec!["check"],
+        vec!["session"],
+        vec!["trail", "check"],
+    ] {
+        let res = client
+            .post(c.hooks())
+            .bearer_auth(&c.alice_rw)
+            .json(&json!({"url": sink_url, "events": events}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 201, "events {events:?} accepted");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn event_filter_and_signed_delivery() {
     let c = Ctx::start().await;
     let client = reqwest::Client::new();
     let (sink_url, sink) = Sink::spawn(false).await;
 
-    let created = c
-        .create_hook(&c.alice_rw, &sink_url, &["status.updated"])
-        .await;
+    let created = c.create_hook(&c.alice_rw, &sink_url, &["check"]).await;
     let secret = created["secret"].as_str().unwrap().to_owned();
 
     // A trail open must NOT fan out to this hook.
@@ -332,21 +448,14 @@ async fn event_filter_and_signed_delivery() {
     let hits = sink.hits.lock().unwrap().clone();
     assert_eq!(hits.len(), 1, "only the subscribed event delivers");
     let hit = &hits[0];
-    assert_eq!(hit.event.as_deref(), Some("status.updated"));
-    assert!(hit.delivery.is_some(), "delivery id header present");
-    let body = serde_json::from_slice::<Value>(&hit.body).unwrap();
-    assert_eq!(body["event"], "status.updated");
-    assert_eq!(body["repo"], "alice/proj");
-    assert_eq!(body["sha"], sha);
-    assert_eq!(body["state"], "success");
-    assert!(body["at"].is_number());
-    let sig = hit.signature.as_deref().expect("signature header");
-    assert!(sig.starts_with("sha256="), "{sig}");
-    assert_eq!(
-        sig,
-        &format!("sha256={}", hmac_sha256_hex(&secret, &hit.body)),
-        "signature verifies over the exact body"
-    );
+    assert_eq!(hit.event.as_deref(), Some("check"));
+    let body = check_delivery(hit, &secret);
+    let repo_url = format!("{}/alice/proj", c.s.base);
+    let subject = check_envelope(&body, "check", None, None, "alice", &repo_url);
+    assert_eq!(subject["sha"], sha);
+    assert_eq!(subject["context"], "ci/unit");
+    assert_eq!(subject["state"], "success");
+    assert_eq!(subject["creator"], "alice");
 
     // Delivery row recorded with the 2xx status.
     let hook_id = created["id"].as_i64().unwrap();
@@ -354,8 +463,289 @@ async fn event_filter_and_signed_delivery() {
         .await
         .unwrap();
     assert_eq!(deliveries.len(), 1);
-    assert_eq!(deliveries[0].event, "status.updated");
+    assert_eq!(deliveries[0].event, "check");
     assert_eq!(deliveries[0].status_code, Some(200));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn emitters_deliver_the_spec_envelope() {
+    let c = Ctx::start().await;
+    let client = reqwest::Client::new();
+    let (sink_url, sink) = Sink::spawn(false).await;
+    let created = c.create_hook(&c.alice_rw, &sink_url, &[]).await;
+    let secret = created["secret"].as_str().unwrap().to_owned();
+    let repo_url = format!("{}/alice/proj", c.s.base);
+
+    // Push the branches every change below tracks.
+    let url = c.s.git_url(
+        "alice",
+        "proj",
+        Some(&c.s.token(&c.alice, &[Scope::RepoWrite]).await),
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    let work = work_repo(tmp.path(), "work", &[("a.txt", "one\n")]).await;
+    for branch in ["feature/a", "feature/c1", "feature/c2"] {
+        git_ok(&work, &["checkout", "-q", "-b", branch]).await;
+        commit_files(&work, &[("a.txt", format!("{branch}\n").as_bytes())], "add").await;
+    }
+    git_ok(
+        &work,
+        &[
+            "push",
+            "-q",
+            &url,
+            "main",
+            "feature/a",
+            "feature/c1",
+            "feature/c2",
+        ],
+    )
+    .await;
+    let tip_a = git_ok(&work, &["rev-parse", "feature/a"])
+        .await
+        .trim()
+        .to_owned();
+
+    let trail_rw =
+        c.s.token(&c.alice, &[Scope::RepoRead, Scope::TrailWrite])
+            .await;
+    let full =
+        c.s.token(
+            &c.alice,
+            &[Scope::RepoRead, Scope::RepoWrite, Scope::TrailWrite],
+        )
+        .await;
+
+    // Trail A: open, one branch change, review, status, merge (flips merged).
+    let res = client
+        .post(c.s.url("/api/v1/repos/alice/proj/trails"))
+        .bearer_auth(&trail_rw)
+        .json(&json!({"title": "feature work", "intent": "ship it"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 201);
+    let a = res.json::<Value>().await.unwrap()["number"]
+        .as_i64()
+        .unwrap();
+    let res = client
+        .post(c.s.url(&format!("/api/v1/repos/alice/proj/trails/{a}/changes")))
+        .bearer_auth(&full)
+        .json(&json!({"kind": "branch", "head_branch": "feature/a", "base_branch": "main"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 201, "{}", res.text().await.unwrap());
+    let res = client
+        .post(c.s.url(&format!(
+            "/api/v1/repos/alice/proj/trails/{a}/changes/1/reviews"
+        )))
+        .bearer_auth(&full)
+        .json(&json!({"verdict": "approve", "body": "lgtm"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 201);
+    let res = client
+        .post(c.s.url(&format!("/api/v1/repos/alice/proj/statuses/{tip_a}")))
+        .bearer_auth(&c.alice_rw)
+        .json(&json!({"state": "success", "context": "ci/unit"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 201);
+    let res = client
+        .post(c.s.url(&format!(
+            "/api/v1/repos/alice/proj/trails/{a}/changes/1/merge"
+        )))
+        .bearer_auth(&full)
+        .json(&json!({"method": "merge"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200, "{}", res.text().await.unwrap());
+
+    // Trail B: open, then close.
+    let res = client
+        .post(c.s.url("/api/v1/repos/alice/proj/trails"))
+        .bearer_auth(&trail_rw)
+        .json(&json!({"title": "wontfix", "intent": "no"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 201);
+    let b = res.json::<Value>().await.unwrap()["number"]
+        .as_i64()
+        .unwrap();
+    c.s.core
+        .set_trail_state(&c.alice, "alice", "proj", b, "closed")
+        .await
+        .unwrap();
+
+    // Trail C: two changes; merging the first leaves the trail open.
+    let res = client
+        .post(c.s.url("/api/v1/repos/alice/proj/trails"))
+        .bearer_auth(&trail_rw)
+        .json(&json!({"title": "two changes", "intent": "both"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 201);
+    let n = res.json::<Value>().await.unwrap()["number"]
+        .as_i64()
+        .unwrap();
+    for head in ["feature/c1", "feature/c2"] {
+        let res = client
+            .post(c.s.url(&format!("/api/v1/repos/alice/proj/trails/{n}/changes")))
+            .bearer_auth(&full)
+            .json(&json!({"kind": "branch", "head_branch": head, "base_branch": "main"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 201, "{}", res.text().await.unwrap());
+    }
+    let res = client
+        .post(c.s.url(&format!(
+            "/api/v1/repos/alice/proj/trails/{n}/changes/1/merge"
+        )))
+        .bearer_auth(&full)
+        .json(&json!({"method": "merge"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200, "{}", res.text().await.unwrap());
+
+    c.s.core.run_due_jobs().await.unwrap();
+    let hits = sink.hits.lock().unwrap().clone();
+    let bodies: Vec<Value> = hits
+        .iter()
+        .map(|hit| check_delivery(hit, &secret))
+        .collect();
+    // Every delivery carries the spec envelope with the right subject key.
+    let find = |event: &str, action: Option<&str>, cause: Option<&str>| -> Value {
+        bodies
+            .iter()
+            .find(|b| {
+                b["event"] == event
+                    && match action {
+                        Some(a) => b["action"] == a,
+                        None => b["action"].is_null(),
+                    }
+                    && match cause {
+                        Some(x) => b["cause"] == x,
+                        None => b["cause"].is_null(),
+                    }
+            })
+            .unwrap_or_else(|| panic!("missing {event}/{action:?}/{cause:?} in {bodies:?}"))
+            .clone()
+    };
+
+    let subject = check_envelope(
+        &find("trail", Some("opened"), None),
+        "trail",
+        Some("opened"),
+        None,
+        "alice",
+        &repo_url,
+    );
+    assert_eq!(subject["number"], a);
+    assert_eq!(subject["title"], "feature work");
+    assert_eq!(subject["state"], "open");
+    assert_eq!(subject["author"], "alice");
+    assert_eq!(subject["url"], format!("{repo_url}/trails/{a}"));
+    assert!(subject.get("change").is_none());
+
+    let subject = check_envelope(
+        &find("trail", Some("updated"), Some("change_opened")),
+        "trail",
+        Some("updated"),
+        Some("change_opened"),
+        "alice",
+        &repo_url,
+    );
+    assert_eq!(subject["number"], a);
+    assert_eq!(subject["change"]["k"], 1);
+    assert_eq!(subject["change"]["revision"], 1);
+
+    let subject = check_envelope(
+        &find("trail", Some("updated"), Some("revision_pushed")),
+        "trail",
+        Some("updated"),
+        Some("revision_pushed"),
+        "alice",
+        &repo_url,
+    );
+    assert_eq!(subject["number"], a);
+    assert_eq!(subject["change"]["k"], 1);
+
+    let subject = check_envelope(
+        &find("review", Some("submitted"), None),
+        "review",
+        Some("submitted"),
+        None,
+        "alice",
+        &repo_url,
+    );
+    assert_eq!(subject["trail"], a);
+    assert_eq!(subject["change"], 1);
+    assert_eq!(subject["revision"], 1);
+    assert_eq!(subject["verdict"], "approve");
+    assert_eq!(subject["author"], "alice");
+    assert_eq!(subject["body"], "lgtm");
+
+    let subject = check_envelope(
+        &find("check", None, None),
+        "check",
+        None,
+        None,
+        "alice",
+        &repo_url,
+    );
+    assert_eq!(subject["sha"], tip_a);
+    assert_eq!(subject["context"], "ci/unit");
+    assert_eq!(subject["state"], "success");
+    assert_eq!(subject["creator"], "alice");
+
+    // The merge that empties the trail emits exactly one event: merged.
+    let merged = bodies
+        .iter()
+        .filter(|b| b["event"] == "trail" && b["action"] == "merged")
+        .count();
+    assert_eq!(merged, 1, "exactly one merged event: {bodies:?}");
+    let subject = check_envelope(
+        &find("trail", Some("merged"), None),
+        "trail",
+        Some("merged"),
+        None,
+        "alice",
+        &repo_url,
+    );
+    assert_eq!(subject["number"], a);
+    assert_eq!(subject["state"], "merged");
+    assert_eq!(subject["change"]["k"], 1);
+
+    let subject = check_envelope(
+        &find("trail", Some("closed"), None),
+        "trail",
+        Some("closed"),
+        None,
+        "alice",
+        &repo_url,
+    );
+    assert_eq!(subject["number"], b);
+
+    // Merging one of two open changes keeps the trail open: updated.
+    let subject = check_envelope(
+        &find("trail", Some("updated"), Some("change_merged")),
+        "trail",
+        Some("updated"),
+        Some("change_merged"),
+        "alice",
+        &repo_url,
+    );
+    assert_eq!(subject["number"], n);
+    assert_eq!(subject["state"], "open");
+    assert_eq!(subject["change"]["k"], 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -366,8 +756,18 @@ async fn retry_ladder_then_terminal_failure() {
     let hook_id = created["id"].as_i64().unwrap();
 
     // One event → one job.
+    use starforged_core::webhooks::HookEvent;
     c.s.core
-        .dispatch(1, "status.updated", json!({"sha": "a"}))
+        .dispatch_event(
+            1,
+            HookEvent {
+                event: "check",
+                action: None,
+                cause: None,
+                sender: None,
+                subject: json!({"sha": "a"}),
+            },
+        )
         .await;
     let jobs = c.webhook_jobs().await;
     assert_eq!(jobs.len(), 1);
@@ -448,8 +848,18 @@ async fn disable_stops_delivery_and_dead_endpoint_does_not_wedge() {
         .await
         .unwrap();
     assert_eq!(res.status(), 200);
+    use starforged_core::webhooks::HookEvent;
     c.s.core
-        .dispatch(1, "status.updated", json!({"sha": "b"}))
+        .dispatch_event(
+            1,
+            HookEvent {
+                event: "check",
+                action: None,
+                cause: None,
+                sender: None,
+                subject: json!({"sha": "b"}),
+            },
+        )
         .await;
     c.s.core.run_due_jobs().await.unwrap();
     assert!(sink.hits.lock().unwrap().is_empty());
@@ -461,7 +871,16 @@ async fn disable_stops_delivery_and_dead_endpoint_does_not_wedge() {
         .await;
     let dead_id = dead["id"].as_i64().unwrap();
     c.s.core
-        .dispatch(1, "status.updated", json!({"sha": "c"}))
+        .dispatch_event(
+            1,
+            HookEvent {
+                event: "check",
+                action: None,
+                cause: None,
+                sender: None,
+                subject: json!({"sha": "c"}),
+            },
+        )
         .await;
     for _ in 0..5 {
         c.s.core.run_due_jobs().await.unwrap();
@@ -482,13 +901,21 @@ async fn disable_stops_delivery_and_dead_endpoint_does_not_wedge() {
     );
 
     // A healthy hook still delivers afterwards: the queue is not wedged.
-    c.create_hook(&c.alice_rw, &sink_url, &["status.updated"])
-        .await;
+    c.create_hook(&c.alice_rw, &sink_url, &["check"]).await;
     c.s.core
-        .dispatch(1, "status.updated", json!({"sha": "d"}))
+        .dispatch_event(
+            1,
+            HookEvent {
+                event: "check",
+                action: None,
+                cause: None,
+                sender: None,
+                subject: json!({"sha": "d"}),
+            },
+        )
         .await;
     c.s.core.run_due_jobs().await.unwrap();
-    assert_eq!(sink.events(), vec!["status.updated".to_string()]);
+    assert_eq!(sink.events(), vec!["check".to_string()]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -577,24 +1004,23 @@ async fn end_to_end_push_review_merge_fan_out() {
     let mut got = sink.events();
     got.sort();
     got.dedup();
-    for want in [
-        "trail.opened",
-        "change.opened",
-        "review.submitted",
-        "change.merged",
-        "status.updated",
-    ] {
+    for want in ["trail", "review", "check"] {
         assert!(got.contains(&want.to_string()), "missing {want} in {got:?}");
     }
-    // Every delivery verifies against the hook secret from create.
+    // Trail, review, and check events all verify against the hook secret.
     for hit in sink.hits.lock().unwrap().iter() {
-        let sig = hit.signature.as_deref().expect("signature header");
-        assert_eq!(
-            sig,
-            &format!("sha256={}", hmac_sha256_hex(&secret, &hit.body)),
-            "delivery signature verifies"
-        );
+        check_delivery(hit, &secret);
     }
+    // The single-change merge flips the trail: exactly one merged event.
+    let bodies = sink.bodies();
+    assert_eq!(
+        bodies
+            .iter()
+            .filter(|b| b["event"] == "trail" && b["action"] == "merged")
+            .count(),
+        1,
+        "exactly one merged event: {bodies:?}"
+    );
     let hook_id =
         c.s.core
             .list_webhooks(Some(&c.alice), "alice", "proj")
@@ -630,6 +1056,10 @@ async fn settings_page_shows_secret_once() {
     let (mia, _) = c.s.login("alice").await;
     let page = get_text(&mia, &c.s.url("/alice/proj/settings/hooks")).await;
     assert!(page.contains("Webhooks"), "{page}");
+    // The five spec event types are the subscription checkboxes.
+    for event in ["push", "trail", "review", "check", "session"] {
+        assert!(page.contains(&format!("value=\"{event}\"")), "{page}");
+    }
     let csrf = extract_input(&page, "_csrf");
 
     // Create via the form: the secret shows once in the response...
@@ -638,7 +1068,7 @@ async fn settings_page_shows_secret_once() {
         .form(&HashMap::from([
             ("_csrf", csrf.as_str()),
             ("url", sink_url.as_str()),
-            ("events", "status.updated"),
+            ("events", "check"),
         ]))
         .send()
         .await

@@ -594,7 +594,7 @@ async fn threads_create_list_resolve_comment_with_outdated() {
             .repo
             .id;
     c.s.core
-        .record_branch_move(repo_id, "feature/x", None, new_tip.trim())
+        .record_branch_move(repo_id, "feature/x", None, new_tip.trim(), None)
         .await
         .unwrap();
     let stale = client
@@ -1060,7 +1060,7 @@ async fn thread_outdated_counts_final_line_without_newline() {
             .repo
             .id;
     c.s.core
-        .record_branch_move(repo_id, "feature/eol", None, new_tip.trim())
+        .record_branch_move(repo_id, "feature/eol", None, new_tip.trim(), None)
         .await
         .unwrap();
 

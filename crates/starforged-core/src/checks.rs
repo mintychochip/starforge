@@ -17,6 +17,7 @@ use starforged_git::{read, refpolicy};
 
 use crate::accounts::User;
 use crate::permission::Permission;
+use crate::webhooks::HookEvent;
 use crate::{Core, CoreError, CoreResult};
 
 /// One commit status: the latest row for its `(sha, context)`.
@@ -160,10 +161,22 @@ impl Core {
             actor = %user.handle,
             "status submitted"
         );
-        self.dispatch(
+        self.dispatch_event(
             access.repo.id,
-            "status.updated",
-            serde_json::json!({"sha": sha, "context": context, "state": state}),
+            HookEvent {
+                event: "check",
+                action: None,
+                cause: None,
+                sender: Some(user.handle.clone()),
+                subject: serde_json::json!({
+                    "sha": sha,
+                    "context": context,
+                    "state": state,
+                    "target_url": url,
+                    "description": description,
+                    "creator": user.handle,
+                }),
+            },
         )
         .await;
         status_dto(self, row).await

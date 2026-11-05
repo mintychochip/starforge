@@ -14,7 +14,7 @@ use axum_extra::extract::Form;
 use serde::Deserialize;
 use starforged_core::permission::Permission;
 use starforged_core::sessions::WebSession;
-use starforged_core::webhooks::{WEBHOOK_EVENTS, WebhookDto};
+use starforged_core::webhooks::{EVENT_TYPES, WebhookDto};
 use starforged_core::{CoreError, CoreResult};
 
 use crate::AppState;
@@ -148,7 +148,7 @@ async fn page(
         head: RepoHead::new(&access, "settings", None),
         settings_page: "hooks",
         hooks,
-        all_events: WEBHOOK_EVENTS.to_vec(),
+        all_events: EVENT_TYPES.to_vec(),
         created_url,
         created_secret,
         error,

@@ -598,7 +598,13 @@ async fn scan_push_changes(
             continue;
         }
         if let Err(err) = core
-            .record_branch_move(repo_id, branch, old.as_deref(), new)
+            .record_branch_move(
+                repo_id,
+                branch,
+                old.as_deref(),
+                new,
+                pusher.as_ref().map(|u| u.id),
+            )
             .await
         {
             tracing::warn!(repo_id, branch, error = %err, "push scan: branch move ingest failed");
@@ -611,7 +617,13 @@ async fn scan_push_changes(
             continue;
         };
         if let Err(err) = core
-            .record_branch_move(repo_id, branch, Some(*old), &"0".repeat(40))
+            .record_branch_move(
+                repo_id,
+                branch,
+                Some(*old),
+                &"0".repeat(40),
+                pusher.as_ref().map(|u| u.id),
+            )
             .await
         {
             tracing::warn!(repo_id, branch, error = %err, "push scan: branch delete ingest failed");
