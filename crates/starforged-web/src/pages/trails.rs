@@ -17,13 +17,15 @@ use serde::Deserialize;
 use starforged_core::CoreError;
 use starforged_core::permission::Permission;
 use starforged_core::sessions::WebSession;
-use starforged_core::trails::TrailFilterInput;
+use starforged_core::trails::{TokenTotals, TrailFilterInput, TrailSessions};
 
 use crate::AppState;
 use crate::auth::{MaybeUser, RequireUser, verify_csrf};
 use crate::error::WebError;
 use crate::markdown;
-use crate::views::{NavUser, RepoHead, STRICT_CSP, format_age, format_time, nav};
+use crate::views::{
+    GatePanel, NavUser, RepoHead, STRICT_CSP, SessionChip, TrailTabs, format_age, format_time, nav,
+};
 
 /// Trails per web page; the API stays keyset-based.
 const PAGE_SIZE: i64 = 30;
@@ -420,11 +422,11 @@ pub struct TrailChangeItem {
     mergeability: String,
 }
 
-#[derive(Template, WebTemplate)]
-#[template(path = "trail.html")]
-pub struct TrailPage {
-    nav_user: Option<NavUser>,
-    head: RepoHead,
+/// The D6 header shared by every Trail tab (`trail_header.html`): tabs with
+/// live counts, intent, labels, assignees, reviewers, and a gate panel per
+/// open change.
+pub struct TrailHeader {
+    tabs: TrailTabs,
     csrf: String,
     number: i64,
     title: String,
@@ -439,15 +441,185 @@ pub struct TrailPage {
     closed: Option<String>,
     intent_html: String,
     intent_raw: String,
-    comments: Vec<CommentItem>,
-    timeline: Vec<TimelineItem>,
     changes: Vec<TrailChangeItem>,
-    can_create_change: bool,
+    gate_panels: Vec<GatePanel>,
     can_edit: bool,
     can_triage: bool,
     can_comment: bool,
+    can_create_change: bool,
+    can_link: bool,
     is_open: bool,
+}
+
+#[derive(Template, WebTemplate)]
+#[template(path = "trail.html")]
+pub struct TrailPage {
+    nav_user: Option<NavUser>,
+    head: RepoHead,
+    header: TrailHeader,
+    tabs: TrailTabs,
+    comments: Vec<CommentItem>,
+    timeline: Vec<TimelineItem>,
     error: Option<String>,
+}
+
+/// One change row on the D6 changes list page, with its gate summary.
+pub struct ChangeListItem {
+    k: i64,
+    kind: String,
+    head_branch: Option<String>,
+    base_branch: String,
+    current_revision: i64,
+    state: String,
+    mergeability: String,
+    gates_passed: bool,
+    gate_summary: String,
+}
+
+#[derive(Template, WebTemplate)]
+#[template(path = "trail_changes.html")]
+pub struct TrailChangesPage {
+    nav_user: Option<NavUser>,
+    head: RepoHead,
+    header: TrailHeader,
+    tabs: TrailTabs,
+    items: Vec<ChangeListItem>,
+    error: Option<String>,
+}
+
+/// One Trail commit with its readable sessions on the D5 Sessions tab.
+pub struct SessionGroupView {
+    sha: String,
+    short: String,
+    subject: String,
+    change: i64,
+    revision: i64,
+    first_seen: String,
+    sessions: Vec<SessionChip>,
+    totals: TokenTotals,
+}
+
+#[derive(Template, WebTemplate)]
+#[template(path = "trail_sessions.html")]
+pub struct TrailSessionsPage {
+    nav_user: Option<NavUser>,
+    head: RepoHead,
+    header: TrailHeader,
+    tabs: TrailTabs,
+    groups: Vec<SessionGroupView>,
+    linked: Vec<SessionChip>,
+    totals: TokenTotals,
+    error: Option<String>,
+}
+
+/// Builds the D6 header shared by every Trail tab, plus the viewer's
+/// readable linked sessions (D5) for the Sessions tab and per-change
+/// session evidence. Shared by the viewer, the tab pages, and the 422
+/// re-renders.
+pub(crate) async fn header_data(
+    state: &AppState,
+    session: Option<&WebSession>,
+    owner: &str,
+    repo: &str,
+    number: i64,
+    active: &str,
+) -> Result<(RepoHead, TrailHeader, TrailSessions), WebError> {
+    let user = session.map(|s| &s.user);
+    let access = state.core.repo_for(user, owner, repo).await?;
+    let detail = state
+        .core
+        .trail_by_number(user, owner, repo, number)
+        .await?;
+    let trail = &detail.trail;
+    let changes = state
+        .core
+        .list_changes(user, owner, repo, number, None)
+        .await?;
+    let sessions = state.core.trail_sessions(user, owner, repo, number).await?;
+    let mut seen: Vec<&str> = sessions
+        .commits
+        .iter()
+        .flat_map(|g| g.sessions.iter().map(|s| s.ulid.as_str()))
+        .chain(sessions.linked.iter().map(|s| s.ulid.as_str()))
+        .collect();
+    seen.sort_unstable();
+    seen.dedup();
+    let mut gate_panels = Vec::new();
+    for c in &changes {
+        if c.state != "open" {
+            continue;
+        }
+        let change_detail = state
+            .core
+            .get_change(user, owner, repo, number, c.k, None)
+            .await?;
+        let (approvals, request_changes) =
+            super::changes::count_votes(state, &access, &change_detail.reviews).await?;
+        let session_count: usize = sessions
+            .commits
+            .iter()
+            .filter(|g| g.change == c.k)
+            .map(|g| g.sessions.len())
+            .sum();
+        gate_panels.push(
+            super::changes::gate_panel(
+                state,
+                session,
+                &access,
+                &change_detail,
+                approvals,
+                request_changes,
+                session_count,
+            )
+            .await?,
+        );
+    }
+    let head = RepoHead::new(&access, "trails", None);
+    let header = TrailHeader {
+        tabs: TrailTabs {
+            owner: access.repo.owner.clone(),
+            repo: access.repo.name.clone(),
+            number,
+            active: active.to_owned(),
+            changes_count: changes.len(),
+            sessions_count: seen.len(),
+        },
+        csrf: session.map(|s| s.csrf_token.clone()).unwrap_or_default(),
+        number: trail.number,
+        title: trail.title.clone(),
+        state: trail.state.clone(),
+        ready: trail.ready,
+        author_handle: trail.author_handle.clone(),
+        labels: trail.labels.clone(),
+        assignees: trail.assignees.clone(),
+        review_requests: trail.review_requests.clone(),
+        created: format_time(trail.created_at),
+        updated: format_time(trail.updated_at),
+        closed: trail.closed_at.map(format_time),
+        intent_html: markdown::render_prose(&trail.intent),
+        intent_raw: trail.intent.clone(),
+        changes: changes
+            .into_iter()
+            .map(|c| TrailChangeItem {
+                k: c.k,
+                kind: c.kind,
+                head_branch: c.head_branch,
+                base_branch: c.base_branch,
+                current_revision: c.current_revision,
+                state: c.state,
+                mergeability: c.mergeability,
+            })
+            .collect(),
+        gate_panels,
+        can_edit: detail.can_edit,
+        can_triage: detail.can_triage,
+        can_comment: session.is_some(),
+        can_create_change: detail.can_triage,
+        can_link: detail.can_triage
+            || session.is_some_and(|s| detail.trail.author_id == Some(s.user.id)),
+        is_open: trail.state == "open",
+    };
+    Ok((head, header, sessions))
 }
 
 /// Builds the detail view; shared by the viewer and the 422 re-renders.
@@ -465,7 +637,6 @@ pub(crate) async fn detail_view(
         .core
         .trail_by_number(user, owner, repo, number)
         .await?;
-    let trail = &detail.trail;
     let mut handles: HashMap<i64, String> = HashMap::new();
     for id in detail.timeline.iter().filter_map(|event| event.actor_id) {
         if let Entry::Vacant(slot) = handles.entry(id) {
@@ -509,45 +680,129 @@ pub(crate) async fn detail_view(
             }),
         })
         .collect();
+    let (head, header, _) =
+        header_data(state, session, owner, repo, number, "conversation").await?;
     Ok(TrailPage {
         nav_user: session.map(NavUser::from_session),
-        head: RepoHead::new(&access, "trails", None),
-        csrf: session.map(|s| s.csrf_token.clone()).unwrap_or_default(),
-        number: trail.number,
-        title: trail.title.clone(),
-        state: trail.state.clone(),
-        ready: trail.ready,
-        author_handle: trail.author_handle.clone(),
-        labels: trail.labels.clone(),
-        assignees: trail.assignees.clone(),
-        review_requests: trail.review_requests.clone(),
-        created: format_time(trail.created_at),
-        updated: format_time(trail.updated_at),
-        closed: trail.closed_at.map(format_time),
-        intent_html: markdown::render_prose(&trail.intent),
-        intent_raw: trail.intent.clone(),
+        head,
+        tabs: header.tabs.clone(),
+        header,
         comments,
         timeline,
-        changes: state
+        error,
+    })
+}
+
+/// Builds the D6 changes list page: every change with its gate summary.
+pub(crate) async fn changes_view(
+    state: &AppState,
+    session: Option<&WebSession>,
+    owner: &str,
+    repo: &str,
+    number: i64,
+    error: Option<String>,
+) -> Result<TrailChangesPage, WebError> {
+    let user = session.map(|s| &s.user);
+    let (head, header, _) = header_data(state, session, owner, repo, number, "changes").await?;
+    let mut items = Vec::new();
+    for c in state
+        .core
+        .list_changes(user, owner, repo, number, None)
+        .await?
+    {
+        let gates = state
             .core
-            .list_changes(user, owner, repo, number, None)
-            .await?
-            .into_iter()
-            .map(|c| TrailChangeItem {
-                k: c.k,
-                kind: c.kind,
-                head_branch: c.head_branch,
-                base_branch: c.base_branch,
-                current_revision: c.current_revision,
-                state: c.state,
-                mergeability: c.mergeability,
-            })
-            .collect(),
-        can_edit: detail.can_edit,
-        can_triage: detail.can_triage,
-        can_comment: session.is_some(),
-        can_create_change: detail.can_triage,
-        is_open: trail.state == "open",
+            .evaluate_gates(user, owner, repo, number, c.k)
+            .await?;
+        let summary = if gates.results.is_empty() {
+            "No gate rules match this change — gates pass.".to_owned()
+        } else if gates.passed {
+            "All gates pass.".to_owned()
+        } else {
+            gates
+                .results
+                .iter()
+                .filter(|g| !g.passed)
+                .map(|g| g.reason.clone())
+                .collect::<Vec<_>>()
+                .join("; ")
+        };
+        items.push(ChangeListItem {
+            k: c.k,
+            kind: c.kind,
+            head_branch: c.head_branch,
+            base_branch: c.base_branch,
+            current_revision: c.current_revision,
+            state: c.state,
+            mergeability: c.mergeability,
+            gates_passed: gates.passed,
+            gate_summary: summary,
+        });
+    }
+    Ok(TrailChangesPage {
+        nav_user: session.map(NavUser::from_session),
+        head,
+        tabs: header.tabs.clone(),
+        header,
+        items,
+        error,
+    })
+}
+
+/// Builds the D5 Sessions tab: commit groups with per-group totals, the
+/// hand-linked group, and Trail-wide totals — all §6.4-filtered by Core.
+pub(crate) async fn sessions_view(
+    state: &AppState,
+    session: Option<&WebSession>,
+    owner: &str,
+    repo: &str,
+    number: i64,
+    error: Option<String>,
+) -> Result<TrailSessionsPage, WebError> {
+    let (head, header, sessions) =
+        header_data(state, session, owner, repo, number, "sessions").await?;
+    let owner_name = header.tabs.owner.clone();
+    let repo_name = header.tabs.repo.clone();
+    let mut groups = Vec::new();
+    for g in &sessions.commits {
+        let chips = g
+            .sessions
+            .iter()
+            .map(|s| SessionChip::from_link_row(&owner_name, &repo_name, s, ""))
+            .collect::<Vec<_>>();
+        let mut totals = TokenTotals::default();
+        for s in &g.sessions {
+            totals.input += s.totals.input;
+            totals.output += s.totals.output;
+            totals.cache_read += s.totals.cache_read;
+            totals.cache_write += s.totals.cache_write;
+            totals.reasoning += s.totals.reasoning;
+            totals.total += s.totals.total;
+        }
+        groups.push(SessionGroupView {
+            sha: g.sha.clone(),
+            short: g.sha.chars().take(7).collect(),
+            subject: g.subject.clone(),
+            change: g.change,
+            revision: g.revision,
+            first_seen: format_time(g.first_seen_at),
+            sessions: chips,
+            totals,
+        });
+    }
+    let linked = sessions
+        .linked
+        .iter()
+        .map(|s| SessionChip::from_link_row(&owner_name, &repo_name, s, ""))
+        .collect();
+    Ok(TrailSessionsPage {
+        nav_user: session.map(NavUser::from_session),
+        head,
+        tabs: header.tabs.clone(),
+        header,
+        groups,
+        linked,
+        totals: sessions.totals,
         error,
     })
 }
@@ -587,6 +842,14 @@ fn timeline_text(kind: &str, payload: &str, actor: &str) -> String {
             let who = field("user").unwrap_or("someone");
             format!("{actor} removed the review request for {who}")
         }
+        "trail.session_linked" => {
+            let ulid = field("session").unwrap_or("a session");
+            format!("{actor} linked session {ulid}")
+        }
+        "trail.session_unlinked" => {
+            let ulid = field("session").unwrap_or("a session");
+            format!("{actor} unlinked session {ulid}")
+        }
         "trail.edit" => {
             let fields = value
                 .get("fields")
@@ -614,6 +877,113 @@ pub async fn detail(
 ) -> Result<impl IntoResponse, WebError> {
     let page = detail_view(&state, session.as_ref(), &owner, &repo, number, None).await?;
     Ok((detail_headers(), page))
+}
+
+/// `GET /{owner}/{repo}/trails/{number}/changes`: the D6 changes list page.
+/// Non-readers 404, exactly like the conversation page.
+pub async fn changes_list(
+    State(state): State<AppState>,
+    MaybeUser(session): MaybeUser,
+    Path((owner, repo, number)): Path<(String, String, i64)>,
+) -> Result<impl IntoResponse, WebError> {
+    let page = changes_view(&state, session.as_ref(), &owner, &repo, number, None).await?;
+    Ok((detail_headers(), page))
+}
+
+/// `GET /{owner}/{repo}/trails/{number}/sessions`: the D5 Sessions tab.
+/// Every row is §6.4-filtered for the viewer by Core; non-readers 404.
+pub async fn sessions(
+    State(state): State<AppState>,
+    MaybeUser(session): MaybeUser,
+    Path((owner, repo, number)): Path<(String, String, i64)>,
+) -> Result<impl IntoResponse, WebError> {
+    let page = sessions_view(&state, session.as_ref(), &owner, &repo, number, None).await?;
+    Ok((detail_headers(), page))
+}
+
+#[derive(Deserialize)]
+pub struct TrailSessionLinkForm {
+    #[serde(rename = "_csrf", default)]
+    csrf: String,
+    #[serde(default)]
+    session: String,
+}
+
+/// `POST /{owner}/{repo}/trails/{number}/sessions`: links a session by hand
+/// (D3). Non-readers 404 before the CSRF check; `Invalid`/`Conflict`
+/// re-render the tab with 422.
+pub async fn link_session(
+    State(state): State<AppState>,
+    RequireUser(session): RequireUser,
+    Path((owner, repo, number)): Path<(String, String, i64)>,
+    Form(form): Form<TrailSessionLinkForm>,
+) -> Result<Response, WebError> {
+    let access = state
+        .core
+        .repo_for(Some(&session.user), &owner, &repo)
+        .await?;
+    verify_csrf(&session.csrf_token, &form.csrf)?;
+    match state
+        .core
+        .link_trail_session(&session.user, &owner, &repo, number, form.session.trim())
+        .await
+    {
+        Ok(()) => Ok(Redirect::to(&format!(
+            "/{}/{}/trails/{number}/sessions",
+            access.repo.owner, access.repo.name
+        ))
+        .into_response()),
+        Err(
+            starforged_core::CoreError::Invalid(message)
+            | starforged_core::CoreError::Conflict(message),
+        ) => {
+            let page =
+                sessions_view(&state, Some(&session), &owner, &repo, number, Some(message)).await?;
+            Ok((StatusCode::UNPROCESSABLE_ENTITY, detail_headers(), page).into_response())
+        }
+        Err(other) => Err(other.into()),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct TrailSessionUnlinkForm {
+    #[serde(rename = "_csrf", default)]
+    csrf: String,
+}
+
+/// `POST /{owner}/{repo}/trails/{number}/sessions/{ulid}/unlink`: removes a
+/// hand link (D3). Same visibility and error rules as the link form.
+pub async fn unlink_session(
+    State(state): State<AppState>,
+    RequireUser(session): RequireUser,
+    Path((owner, repo, number, ulid)): Path<(String, String, i64, String)>,
+    Form(form): Form<TrailSessionUnlinkForm>,
+) -> Result<Response, WebError> {
+    let access = state
+        .core
+        .repo_for(Some(&session.user), &owner, &repo)
+        .await?;
+    verify_csrf(&session.csrf_token, &form.csrf)?;
+    match state
+        .core
+        .unlink_trail_session(&session.user, &owner, &repo, number, ulid.trim())
+        .await
+    {
+        Ok(()) => Ok(Redirect::to(&format!(
+            "/{}/{}/trails/{number}/sessions",
+            access.repo.owner, access.repo.name
+        ))
+        .into_response()),
+        Err(
+            starforged_core::CoreError::Invalid(message)
+            | starforged_core::CoreError::Conflict(message),
+        ) => {
+            let page =
+                sessions_view(&state, Some(&session), &owner, &repo, number, Some(message)).await?;
+            Ok((StatusCode::UNPROCESSABLE_ENTITY, detail_headers(), page).into_response())
+        }
+        Err(other) => Err(other.into()),
+    }
 }
 
 #[derive(Deserialize)]

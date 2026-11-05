@@ -2,6 +2,7 @@
 {% block title %}Change {{ k }} · #{{ trail_number }} {{ head.owner }}/{{ head.name }}{% endblock %}
 {% block content %}
 {% include "repo_head.html" %}
+{% include "trail_tabs.html" %}
 <h2>Change {{ k }} <span class="badge">{{ kind }}</span> <span class="badge">{{ state }}</span></h2>
 <p class="muted">current revision r{{ current_revision }}</p>
 <p class="muted">on <a href="/{{ head.owner }}/{{ head.name }}/trails/{{ trail_number }}">trail #{{ trail_number }}</a>
@@ -9,13 +10,7 @@
  · opened by {% if creator_handle == "deleted user" %}deleted user{% else %}<a href="/{{ creator_handle }}">{{ creator_handle }}</a>{% endif %}
  · <span class="muted">{{ created }} · updated {{ updated }}</span></p>
 {% if let Some(e) = error %}<p class="notice">{{ e }}</p>{% endif %}
-<p>Mergeability: <span class="badge">{{ mergeability }}</span>
-{% if !conflict_paths.is_empty() %}<span class="muted">conflicting paths:</span>
-<ul>{% for p in conflict_paths %}<li><code>{{ p }}</code></li>{% endfor %}</ul>{% endif %}</p>
-<h3>Gates</h3>
-{% if gates.is_empty() %}<p class="muted" id="gates-empty">No gate rules match this change — gates pass.</p>
-{% else %}<p id="gates-banner">{% if gates_passed %}<span class="badge">All gates pass</span>{% else %}<span class="badge">Gates failing</span>{% endif %}</p>
-<ul id="gates-list">{% for g in gates %}<li id="gate-{{ loop.index }}">{% if g.passed %}<span class="badge">Pass</span>{% else %}<span class="badge">Fail</span>{% endif %} <code>{{ g.rule }}</code> — {{ g.reason }}</li>{% endfor %}</ul>{% endif %}
+{% include "gate_panel.html" %}
 <form method="get" action="/{{ head.owner }}/{{ head.name }}/trails/{{ trail_number }}/changes/{{ k }}" class="inline" id="revision-selector">
   <label>Revision <select name="rev">{% for r in revisions %}<option value="{{ r.r }}"{% if r.selected %} selected{% endif %}>r{{ r.r }} {{ r.short }} · {{ r.time }}</option>{% endfor %}</select></label>
   <button type="submit">Show</button>
@@ -100,11 +95,4 @@
 </form>
 {% endif %}
 {% if can_triage %}<p class="muted">Dismiss controls are visible because you have triage access.</p>{% endif %}
-{% if show_merge_form %}
-<form method="post" action="/{{ head.owner }}/{{ head.name }}/trails/{{ trail_number }}/changes/{{ k }}/merge" class="inline" id="merge-change">
-  <input type="hidden" name="_csrf" value="{{ csrf }}">
-  <label>Method <select name="method">{% for m in merge_methods %}<option value="{{ m }}">{{ m }}</option>{% endfor %}</select></label>
-  {% if merge_enabled %}<button type="submit">Merge</button>{% else %}<button type="submit" disabled title="{{ merge_title }}">Merge</button>{% endif %}
-</form>
-{% else %}<p><button disabled title="{{ merge_title }}">Merge</button></p>{% endif %}
 {% endblock %}

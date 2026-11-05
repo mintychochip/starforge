@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block title %}Changes · #{{ header.number }} {{ header.title }} · {{ head.owner }}/{{ head.name }}{% endblock %}
+{% block content %}
+{% include "repo_head.html" %}
+{% include "trail_header.html" %}
+<h3>Changes ({{ tabs.changes_count }})</h3>
+{% if items.is_empty() %}<p class="muted">No changes yet.</p>{% else %}
+<ul>
+{% for ch in items %}<li id="change-{{ ch.k }}"><a href="/{{ head.owner }}/{{ head.name }}/trails/{{ header.number }}/changes/{{ ch.k }}">change {{ ch.k }}</a> <span class="badge">{{ ch.kind }}</span> <span class="badge">{{ ch.state }}</span>{% if let Some(h) = ch.head_branch %} <code>{{ h }}</code>{% endif %} onto <code>{{ ch.base_branch }}</code> · r{{ ch.current_revision }} · <span class="badge">{{ ch.mergeability }}</span> · {% if ch.gates_passed %}<span class="badge">Gates pass</span>{% else %}<span class="badge">Gates failing</span>{% endif %} — {{ ch.gate_summary }}</li>
+{% endfor %}
+</ul>
+{% endif %}
+{% endblock %}

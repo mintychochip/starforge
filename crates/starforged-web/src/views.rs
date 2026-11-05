@@ -221,18 +221,32 @@ impl From<CommitInfo> for CommitRow {
     }
 }
 
-/// One linked session in the commit Sessions panel (`sessions_panel.html`)
-/// and the commits-list count badge (`commits.html`).
+/// One linked session in the commit Sessions panel (`sessions_panel.html`),
+/// the commits-list count badge (`commits.html`), and the Trail Sessions
+/// tab (`trail_sessions.html`, via the shared `session_row.html` partial).
 pub struct SessionChip {
     /// Session ULID (only ever populated for sessions the viewer may read).
     pub ulid: String,
     /// `agent_name agent_version`, e.g. `pi 2.1`.
     pub agent: String,
     pub started: String,
-    /// Link confidence: `exact` or `heuristic`.
+    /// Link confidence: `exact`, `heuristic`, or `explicit`. Empty when the
+    /// row is not a commit link (the Sessions tab passes `""` for no badge).
     pub confidence: String,
-    /// Link provenance: `trailer` or `cli_claim`.
+    /// Link provenance: `trailer` or `cli_claim`. Empty renders no badge.
     pub source: String,
+    /// Uploader handle (`deleted user` when the account is gone).
+    pub uploader: String,
+    /// Comma-joined model names, e.g. `m1`.
+    pub models: String,
+    /// Prompt preview, truncated to 120 chars by Core.
+    pub title: String,
+    pub input: i64,
+    pub output: i64,
+    pub cache_read: i64,
+    pub cache_write: i64,
+    pub reasoning: i64,
+    pub total: i64,
     /// Viewer URL, with `#turn-<seq_start>` when the claim carries a range.
     pub href: String,
 }
@@ -250,6 +264,89 @@ impl SessionChip {
         source: &str,
         seq_start: Option<i64>,
     ) -> SessionChip {
+        SessionChip::from_parts(
+            owner,
+            repo,
+            ulid,
+            agent_name,
+            agent_version,
+            started_at,
+            confidence,
+            source,
+            seq_start,
+            "",
+            "",
+            "",
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+    }
+
+    /// Full D5 row from a [`SessionLinkRow`](starforged_core::trails::SessionLinkRow).
+    /// `source` is the link provenance (`trailer`/`cli_claim`); pass `""`
+    /// for Sessions-tab rows, which badge confidence only.
+    pub fn from_link_row(
+        owner: &str,
+        repo: &str,
+        row: &starforged_core::trails::SessionLinkRow,
+        source: &str,
+    ) -> SessionChip {
+        SessionChip::from_parts(
+            owner,
+            repo,
+            &row.ulid,
+            &row.agent,
+            &row.agent_version,
+            row.started_at,
+            &row.confidence,
+            source,
+            row.seq_start,
+            &row.uploader,
+            &row.models,
+            &row.title,
+            row.totals.input,
+            row.totals.output,
+            row.totals.cache_read,
+            row.totals.cache_write,
+            row.totals.reasoning,
+            row.totals.total,
+        )
+    }
+
+    /// Full D5 commit-panel row.
+    pub fn from_panel_row(
+        owner: &str,
+        repo: &str,
+        panel: &starforged_core::trails::CommitPanelRow,
+    ) -> SessionChip {
+        SessionChip::from_link_row(owner, repo, &panel.row, &panel.source)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_parts(
+        owner: &str,
+        repo: &str,
+        ulid: &str,
+        agent_name: &str,
+        agent_version: &str,
+        started_at: i64,
+        confidence: &str,
+        source: &str,
+        seq_start: Option<i64>,
+        uploader: &str,
+        models: &str,
+        title: &str,
+        input: i64,
+        output: i64,
+        cache_read: i64,
+        cache_write: i64,
+        reasoning: i64,
+        total: i64,
+    ) -> SessionChip {
         let mut href = format!("/{owner}/{repo}/sessions/{ulid}");
         if let Some(seq) = seq_start {
             href.push_str(&format!("#turn-{seq}"));
@@ -260,9 +357,76 @@ impl SessionChip {
             started: format_time(started_at),
             confidence: confidence.to_owned(),
             source: source.to_owned(),
+            uploader: uploader.to_owned(),
+            models: display_models(models),
+            title: title.to_owned(),
+            input,
+            output,
+            cache_read,
+            cache_write,
+            reasoning,
+            total,
             href,
         }
     }
+}
+
+/// Stored `models` is a JSON string array (`["m1"]`); render it joined.
+/// Anything else renders verbatim.
+fn display_models(raw: &str) -> String {
+    serde_json::from_str::<Vec<String>>(raw)
+        .map(|models| models.join(", "))
+        .unwrap_or_else(|_| raw.to_owned())
+}
+
+/// The Trail tabs shared by the Conversation, Changes, Sessions, and change
+/// pages (`trail_tabs.html`, D6): counts are live per viewer.
+#[derive(Clone)]
+pub struct TrailTabs {
+    pub owner: String,
+    pub repo: String,
+    pub number: i64,
+    /// `conversation`, `changes`, or `sessions`.
+    pub active: String,
+    pub changes_count: usize,
+    pub sessions_count: usize,
+}
+
+/// One gate outcome line in a gate panel.
+pub struct GatePanelGate {
+    pub rule: String,
+    pub passed: bool,
+    pub reason: String,
+}
+
+/// The D6 header gate panel for one open change, shared by the change page
+/// and every Trail tab (`gate_panel.html`). Built by
+/// [`crate::pages::changes::gate_panel`]: approvals counted like the change
+/// page, gates freshly evaluated, merge offered exactly while the viewer may
+/// merge (write+, open, passing, allowed method).
+pub struct GatePanel {
+    pub owner: String,
+    pub repo: String,
+    pub trail_number: i64,
+    pub k: i64,
+    pub csrf: String,
+    pub kind: String,
+    pub head_branch: Option<String>,
+    pub base_branch: String,
+    pub state: String,
+    pub current_revision: i64,
+    pub mergeability: String,
+    pub conflict_paths: Vec<String>,
+    pub approvals: usize,
+    pub request_changes: usize,
+    pub gates_passed: bool,
+    pub gates: Vec<GatePanelGate>,
+    pub merge_methods: Vec<String>,
+    pub show_merge_form: bool,
+    pub merge_enabled: bool,
+    pub merge_title: &'static str,
+    /// Readable sessions linked through the change's commits (D5 evidence).
+    pub session_count: usize,
 }
 
 /// One blamed line: its 1-based file number and escaped text.

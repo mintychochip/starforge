@@ -179,22 +179,10 @@ pub async fn commit(
         truncated: diff.truncated,
         sessions: state
             .core
-            .readable_links_for_commit(&access, session.as_ref().map(|s| &s.user), &info.id)
+            .readable_session_rows_for_commit(&access, session.as_ref().map(|s| &s.user), &info.id)
             .await?
             .iter()
-            .map(|(link, session_row)| {
-                SessionChip::new(
-                    &access.repo.owner,
-                    &access.repo.name,
-                    &link.session_ulid,
-                    &session_row.agent_name,
-                    &session_row.agent_version,
-                    session_row.started_at,
-                    &link.confidence,
-                    &link.source,
-                    link.seq_start,
-                )
-            })
+            .map(|panel| SessionChip::from_panel_row(&access.repo.owner, &access.repo.name, panel))
             .collect(),
     })
 }

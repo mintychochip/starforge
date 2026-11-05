@@ -17,7 +17,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum_extra::extract::Form;
 use serde::Deserialize;
-use starforged_core::changes::ChangeDetail;
+use starforged_core::changes::{ChangeDetail, ReviewView};
 use starforged_core::permission::Permission;
 use starforged_core::repos::RepoAccess;
 use starforged_core::sessions::WebSession;
@@ -26,7 +26,10 @@ use crate::AppState;
 use crate::auth::{MaybeUser, RequireUser, verify_csrf};
 use crate::error::WebError;
 use crate::markdown;
-use crate::views::{FileView, NavUser, RepoHead, STRICT_CSP, file_views, format_time, nav};
+use crate::views::{
+    FileView, GatePanel, GatePanelGate, NavUser, RepoHead, STRICT_CSP, TrailTabs, file_views,
+    format_time, nav,
+};
 
 /// `X-Robots-Tag: noindex` on every change page, matching the trail pages.
 fn noindex_headers() -> HeaderMap {
@@ -107,8 +110,6 @@ pub struct ChangePage {
     state: String,
     creator_handle: String,
     current_revision: i64,
-    mergeability: String,
-    conflict_paths: Vec<String>,
     created: String,
     updated: String,
     revisions: Vec<RevisionOption>,
@@ -120,23 +121,116 @@ pub struct ChangePage {
     reviewers: Vec<String>,
     reviews: Vec<ReviewItem>,
     threads: Vec<ThreadItem>,
-    gates_passed: bool,
-    gates: Vec<GateItem>,
+    panel: GatePanel,
+    tabs: TrailTabs,
     can_review: bool,
     can_triage: bool,
     can_close: bool,
     is_open: bool,
-    merge_title: &'static str,
-    merge_methods: Vec<String>,
-    show_merge_form: bool,
-    merge_enabled: bool,
     error: Option<String>,
 }
 
-pub struct GateItem {
-    rule: String,
-    passed: bool,
-    reason: String,
+/// Counting votes for a change: live (non-dismissed) `approve`s and
+/// `request_changes` from authors holding Write+ (the same rule the change
+/// page has always used). Shared with the Trail header gate panels.
+pub(crate) async fn count_votes(
+    state: &AppState,
+    access: &RepoAccess,
+    reviews: &[ReviewView],
+) -> Result<(usize, usize), WebError> {
+    let mut approvals = 0;
+    let mut request_changes = 0;
+    for r in reviews {
+        let author = state.core.user_by_handle(&r.author_handle).await?;
+        let counting = state
+            .core
+            .permission_on(&access.repo, author.as_ref())
+            .await?
+            .is_some_and(|p| p >= Permission::Write);
+        if r.state != "dismissed" && counting {
+            match r.verdict.as_str() {
+                "approve" => approvals += 1,
+                "request_changes" => request_changes += 1,
+                _ => {}
+            }
+        }
+    }
+    Ok((approvals, request_changes))
+}
+
+/// The D6 header gate panel for one open change: approvals counted like the
+/// change page, gates freshly evaluated (no new gate logic), merge offered
+/// exactly while the viewer may merge.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn gate_panel(
+    state: &AppState,
+    session: Option<&WebSession>,
+    access: &RepoAccess,
+    detail: &ChangeDetail,
+    approvals: usize,
+    request_changes: usize,
+    session_count: usize,
+) -> Result<GatePanel, WebError> {
+    let user = session.map(|s| &s.user);
+    let change = &detail.change;
+    let gates = state
+        .core
+        .evaluate_gates(
+            user,
+            &access.repo.owner,
+            &access.repo.name,
+            change.trail_number,
+            change.k,
+        )
+        .await?;
+    // The merge form offers the matching rules' allowed methods (all three
+    // when no rule matches). The button enables only while the fresh gate
+    // set passes; the POST re-checks everything server-side anyway.
+    let merge_methods = state
+        .core
+        .allowed_merge_methods(
+            user,
+            &access.repo.owner,
+            &access.repo.name,
+            change.trail_number,
+            change.k,
+        )
+        .await?;
+    let show_merge_form = access.permission >= Permission::Write
+        && access.repo.archived_at.is_none()
+        && change.state == "open";
+    let merge_enabled = show_merge_form && gates.passed && !merge_methods.is_empty();
+    Ok(GatePanel {
+        owner: access.repo.owner.clone(),
+        repo: access.repo.name.clone(),
+        trail_number: change.trail_number,
+        k: change.k,
+        csrf: session.map(|s| s.csrf_token.clone()).unwrap_or_default(),
+        kind: change.kind.clone(),
+        head_branch: change.head_branch.clone(),
+        base_branch: change.base_branch.clone(),
+        state: change.state.clone(),
+        current_revision: change.current_revision,
+        mergeability: change.mergeability.clone(),
+        conflict_paths: change.conflict_paths.clone(),
+        approvals,
+        request_changes,
+        gates_passed: gates.passed,
+        gates: gates
+            .results
+            .into_iter()
+            .map(|g| GatePanelGate {
+                rule: g.rule,
+                passed: g.passed,
+                reason: g.reason,
+            })
+            .collect(),
+        merge_methods,
+        show_merge_form,
+        merge_enabled,
+        merge_title: MERGE_TITLE,
+        session_count,
+    })
 }
 
 /// Builds the detail view; shared by the viewer and the 422 re-renders.
@@ -235,21 +329,43 @@ async fn change_view(
                     .is_some_and(|c| Some(c.author_handle.as_str()) == viewer_handle),
         })
         .collect();
-    let gates = state
+    let sessions = state.core.trail_sessions(user, owner, repo, number).await?;
+    let changes = state
         .core
-        .evaluate_gates(user, owner, repo, number, k)
+        .list_changes(user, owner, repo, number, None)
         .await?;
-    // The merge form offers the matching rules' allowed methods (all three
-    // when no rule matches). The button enables only while the fresh gate
-    // set passes; the POST re-checks everything server-side anyway.
-    let merge_methods = state
-        .core
-        .allowed_merge_methods(user, owner, repo, number, k)
-        .await?;
-    let show_merge_form = access.permission >= Permission::Write
-        && access.repo.archived_at.is_none()
-        && change.state == "open";
-    let merge_enabled = show_merge_form && gates.passed && !merge_methods.is_empty();
+    let session_count: usize = sessions
+        .commits
+        .iter()
+        .filter(|g| g.change == change.k)
+        .map(|g| g.sessions.len())
+        .sum();
+    let panel = gate_panel(
+        state,
+        session,
+        &access,
+        &detail,
+        approvals,
+        request_changes,
+        session_count,
+    )
+    .await?;
+    let mut seen: Vec<&str> = sessions
+        .commits
+        .iter()
+        .flat_map(|g| g.sessions.iter().map(|s| s.ulid.as_str()))
+        .chain(sessions.linked.iter().map(|s| s.ulid.as_str()))
+        .collect();
+    seen.sort_unstable();
+    seen.dedup();
+    let tabs = TrailTabs {
+        owner: access.repo.owner.clone(),
+        repo: access.repo.name.clone(),
+        number,
+        active: "changes".to_owned(),
+        changes_count: changes.len(),
+        sessions_count: seen.len(),
+    };
     Ok(ChangePage {
         nav_user: nav(session),
         head: RepoHead::new(&access, "trails", None),
@@ -262,8 +378,6 @@ async fn change_view(
         state: change.state.clone(),
         creator_handle: change.creator_handle.clone(),
         current_revision: change.current_revision,
-        mergeability: change.mergeability.clone(),
-        conflict_paths: change.conflict_paths.clone(),
         created: format_time(change.created_at),
         updated: format_time(change.updated_at),
         revisions,
@@ -275,24 +389,12 @@ async fn change_view(
         reviewers: reviewers.into_iter().collect(),
         reviews,
         threads,
-        gates_passed: gates.passed,
-        gates: gates
-            .results
-            .into_iter()
-            .map(|g| GateItem {
-                rule: g.rule,
-                passed: g.passed,
-                reason: g.reason,
-            })
-            .collect(),
+        panel,
+        tabs,
         can_review: session.is_some(),
         can_triage: detail.can_triage,
         can_close: detail.can_close,
         is_open: change.state == "open",
-        merge_title: MERGE_TITLE,
-        merge_methods,
-        show_merge_form,
-        merge_enabled,
         error,
     })
 }

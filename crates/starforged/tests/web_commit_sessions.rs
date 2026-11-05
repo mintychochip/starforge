@@ -338,3 +338,96 @@ async fn quarantined_link_omitted_for_member_shown_for_admin() {
     assert!(html.contains("Sessions"), "admin panel missing in:\n{html}");
     assert!(html.contains(ULID_QUAR), "admin link missing in:\n{html}");
 }
+
+/// M2f F3: the commit Sessions panel shows agent, models, token totals, the
+/// title preview, and link confidence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn panel_shows_models_totals_preview_and_confidence() {
+    let s = TestServer::start().await;
+    let (sha, _tmp) = push_repo_with_message(&s, "linked work").await;
+    let alice = s.core.user_by_handle("alice").await.unwrap().unwrap();
+    let token = s.token(&alice, &[Scope::SessionUpload]).await;
+    let session_id = upload_session(&s, &token, "alice", "proj", ULID_LINKED).await;
+    let access = s
+        .core
+        .repo_for(Some(&alice), "alice", "proj")
+        .await
+        .unwrap();
+    db_sessions::upsert_claim_link(
+        s.core.db(),
+        access.repo.id,
+        session_id,
+        ULID_LINKED,
+        &sha,
+        "exact",
+        Some(5),
+        Some(9),
+    )
+    .await
+    .unwrap();
+    let (alice_client, _) = s.login("alice").await;
+    let html = get_text(&alice_client, &s.url(&format!("/alice/proj/commit/{sha}"))).await;
+    assert!(html.contains("m1"), "models missing in:\n{html}");
+    assert!(
+        html.contains("panel fixture"),
+        "title preview missing in:\n{html}"
+    );
+    assert!(html.contains("exact"), "confidence missing in:\n{html}");
+    assert!(
+        html.contains("total 30"),
+        "token totals missing in:\n{html}"
+    );
+}
+
+/// M2f F3 XSS: a hostile session title renders escaped in the commit panel.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hostile_session_title_escapes_in_panel() {
+    const HOSTILE: &str = "01ARZ3NDEKTSV4RRFFQ69G5FCC";
+    let s = TestServer::start().await;
+    let (sha, _tmp) = push_repo_with_message(&s, "linked work").await;
+    let alice = s.core.user_by_handle("alice").await.unwrap().unwrap();
+    let token = s.token(&alice, &[Scope::SessionUpload]).await;
+    let client = reqwest::Client::new();
+    let mut meta = meta_body(HOSTILE);
+    meta["title"] = Value::String("<script>alert(9)</script>".to_owned());
+    let res = client
+        .put(s.url(&format!("/api/v1/repos/alice/proj/sessions/{HOSTILE}")))
+        .bearer_auth(&token)
+        .json(&meta)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 201, "hostile upload");
+    let access = s
+        .core
+        .repo_for(Some(&alice), "alice", "proj")
+        .await
+        .unwrap();
+    let session_id = db_sessions::session_by_ulid(s.core.db(), access.repo.id, HOSTILE)
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+    db_sessions::upsert_claim_link(
+        s.core.db(),
+        access.repo.id,
+        session_id,
+        HOSTILE,
+        &sha,
+        "exact",
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let (alice_client, _) = s.login("alice").await;
+    let html = get_text(&alice_client, &s.url(&format!("/alice/proj/commit/{sha}"))).await;
+    assert!(
+        !html.contains("<script>alert(9)"),
+        "live script in:\n{html}"
+    );
+    assert!(
+        html.contains("&#60;script&#62;alert(9)"),
+        "escaped title in:\n{html}"
+    );
+}

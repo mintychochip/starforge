@@ -147,6 +147,13 @@ pub struct CommitSessions {
     pub first_seen_at: i64,
     pub sessions: Vec<SessionLinkRow>,
 }
+/// One D5 commit-panel row: the session fields plus the link provenance
+/// (`trailer` or `cli_claim`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitPanelRow {
+    pub row: SessionLinkRow,
+    pub source: String,
+}
 
 /// D5 data: the Trail's readable linked sessions, grouped. `linked` holds
 /// the explicit hand links; `totals` roll up distinct sessions.
@@ -1449,6 +1456,29 @@ impl Core {
             }
         }
         Ok(totals)
+    }
+
+    /// D5 commit-panel rows: every link filed under `sha` that `viewer` may
+    /// read (§6.4), oldest first, as [`SessionLinkRow`]s plus the link
+    /// provenance. Unreadable links are omitted entirely, like
+    /// [`Core::readable_links_for_commit`]; uploads that never arrived are
+    /// skipped.
+    pub async fn readable_session_rows_for_commit(
+        &self,
+        access: &crate::repos::RepoAccess,
+        viewer: Option<&User>,
+        sha: &str,
+    ) -> CoreResult<Vec<CommitPanelRow>> {
+        let mut rows = Vec::new();
+        for (link, session) in self.readable_links_for_commit(access, viewer, sha).await? {
+            rows.push(CommitPanelRow {
+                source: link.source.clone(),
+                row: self
+                    .session_link_row(&link.confidence, link.seq_start, &session)
+                    .await?,
+            });
+        }
+        Ok(rows)
     }
 }
 

@@ -279,6 +279,18 @@ fn page_routes() -> Router<AppState> {
             get(pages::trails::detail),
         )
         .route(
+            "/{owner}/{repo}/trails/{number}/changes",
+            get(pages::trails::changes_list),
+        )
+        .route(
+            "/{owner}/{repo}/trails/{number}/sessions",
+            get(pages::trails::sessions).post(pages::trails::link_session),
+        )
+        .route(
+            "/{owner}/{repo}/trails/{number}/sessions/{ulid}/unlink",
+            post(pages::trails::unlink_session),
+        )
+        .route(
             "/{owner}/{repo}/trails/{number}/comment",
             post(pages::trails::comment),
         )

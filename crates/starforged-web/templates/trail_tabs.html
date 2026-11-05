@@ -1,0 +1,5 @@
+<nav class="trail-tabs" aria-label="Trail sections">
+<a href="/{{ tabs.owner }}/{{ tabs.repo }}/trails/{{ tabs.number }}"{% if tabs.active == "conversation" %} aria-current="page"{% endif %}>Conversation</a>
+<a href="/{{ tabs.owner }}/{{ tabs.repo }}/trails/{{ tabs.number }}/changes"{% if tabs.active == "changes" %} aria-current="page"{% endif %}>Changes ({{ tabs.changes_count }})</a>
+<a href="/{{ tabs.owner }}/{{ tabs.repo }}/trails/{{ tabs.number }}/sessions"{% if tabs.active == "sessions" %} aria-current="page"{% endif %}>Sessions ({{ tabs.sessions_count }})</a>
+</nav>

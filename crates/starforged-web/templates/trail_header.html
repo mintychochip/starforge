@@ -1,0 +1,96 @@
+{% include "trail_tabs.html" %}
+<h2>#{{ header.number }} {{ header.title }}</h2>
+<p><span class="badge">{{ header.state }}</span>{% if header.ready %} <span class="badge">ready</span>{% endif %}
+opened by {% if header.author_handle == "deleted user" %}deleted user{% else %}<a href="/{{ header.author_handle }}">{{ header.author_handle }}</a>{% endif %} · <span class="muted">{{ header.created }}</span></p>
+{% if let Some(e) = error %}<p class="notice">{{ e }}</p>{% endif %}
+<div class="labels">
+{% for l in header.labels %}<span class="badge">{{ l }}</span>{% if header.can_triage %}
+  <form method="post" action="/{{ head.owner }}/{{ head.name }}/trails/{{ header.number }}/labels" class="inline">
+    <input type="hidden" name="_csrf" value="{{ header.csrf }}">
+    <input type="hidden" name="action" value="remove">
+    <input type="hidden" name="name" value="{{ l }}">
+    <button type="submit" aria-label="Remove label {{ l }}">×</button>
+  </form>{% endif %} {% endfor %}
+{% if header.can_triage %}
+  <form method="post" action="/{{ head.owner }}/{{ head.name }}/trails/{{ header.number }}/labels" class="inline" id="add-label">
+    <input type="hidden" name="_csrf" value="{{ header.csrf }}">
+    <input type="hidden" name="action" value="add">
+    <input type="text" name="name" placeholder="new label" maxlength="50">
+    <button type="submit">Add label</button>
+  </form>
+{% endif %}
+</div>
+<div class="assignees">
+  Assignees:{% for a in header.assignees %} <a href="/{{ a }}">{{ a }}</a>{% if header.can_triage %}
+  <form method="post" action="/{{ head.owner }}/{{ head.name }}/trails/{{ header.number }}/assignees" class="inline">
+    <input type="hidden" name="_csrf" value="{{ header.csrf }}">
+    <input type="hidden" name="action" value="remove">
+    <input type="hidden" name="handle" value="{{ a }}">
+    <button type="submit" aria-label="Unassign {{ a }}">×</button>
+  </form>{% endif %}{% endfor %}
+{% if header.can_triage %}
+  <form method="post" action="/{{ head.owner }}/{{ head.name }}/trails/{{ header.number }}/assignees" class="inline" id="add-assignee">
+    <input type="hidden" name="_csrf" value="{{ header.csrf }}">
+    <input type="text" name="handle" placeholder="assignee handle">
+    <button type="submit">Assign</button>
+  </form>
+{% endif %}
+</div>
+<div class="reviewers">
+  Reviewers:{% for r in header.review_requests %} <a href="/{{ r }}">{{ r }}</a>{% if header.can_triage %}
+  <form method="post" action="/{{ head.owner }}/{{ head.name }}/trails/{{ header.number }}/review-requests" class="inline">
+    <input type="hidden" name="_csrf" value="{{ header.csrf }}">
+    <input type="hidden" name="action" value="remove">
+    <input type="hidden" name="handle" value="{{ r }}">
+    <button type="submit" aria-label="Remove review request {{ r }}">×</button>
+  </form>{% endif %}{% endfor %}
+{% if header.can_triage %}
+  <form method="post" action="/{{ head.owner }}/{{ head.name }}/trails/{{ header.number }}/review-requests" class="inline" id="add-reviewer">
+    <input type="hidden" name="_csrf" value="{{ header.csrf }}">
+    <input type="text" name="handle" placeholder="reviewer handle">
+    <button type="submit">Request review</button>
+  </form>
+{% endif %}
+{% if header.can_edit %}
+<details id="edit-trail">
+  <summary>Edit trail</summary>
+  <form method="post" action="/{{ head.owner }}/{{ head.name }}/trails/{{ header.number }}/edit">
+    <input type="hidden" name="_csrf" value="{{ header.csrf }}">
+    <label>Title <input type="text" name="title" value="{{ header.title }}" maxlength="200"></label>
+    <label>Intent <textarea name="intent" rows="6">{{ header.intent_raw }}</textarea></label>
+{% if header.can_triage %}
+    <label>Ready
+      <select name="ready" id="trail-ready">
+        <option value="false"{% if !header.ready %} selected{% endif %}>not ready</option>
+        <option value="true"{% if header.ready %} selected{% endif %}>ready</option>
+      </select>
+    </label>
+{% endif %}
+    <button type="submit">Save</button>
+  </form>
+</details>
+{% endif %}
+{% if header.can_triage %}
+<div class="actions">
+{% if header.is_open %}
+  <form method="post" action="/{{ head.owner }}/{{ head.name }}/trails/{{ header.number }}/state" class="inline" id="close-trail">
+    <input type="hidden" name="_csrf" value="{{ header.csrf }}">
+    <input type="hidden" name="state" value="closed">
+    <button type="submit">Close trail</button>
+  </form>
+{% else %}
+  <form method="post" action="/{{ head.owner }}/{{ head.name }}/trails/{{ header.number }}/state" class="inline" id="reopen-trail">
+    <input type="hidden" name="_csrf" value="{{ header.csrf }}">
+    <input type="hidden" name="state" value="open">
+    <button type="submit">Reopen trail</button>
+  </form>
+{% endif %}
+</div>
+{% endif %}
+{% for panel in header.gate_panels %}{% include "gate_panel.html" %}{% endfor %}
+<div class="intent">{{ header.intent_html|safe }}</div>
+<dl class="muted">
+  <dt>Created</dt><dd>{{ header.created }}</dd>
+  <dt>Updated</dt><dd>{{ header.updated }}</dd>
+{% if let Some(c) = header.closed %}<dt>Closed</dt><dd>{{ c }}</dd>{% endif %}
+</dl>

@@ -1,0 +1,3 @@
+<li><a href="{{ s.href }}"><code>{{ s.ulid }}</code></a> {{ s.agent }} · {{ s.models }} · {{ s.started }}{% if !s.uploader.is_empty() %} · {{ s.uploader }}{% endif %} <span class="badge">{{ s.confidence }}</span>{% if !s.source.is_empty() %} <span class="badge">{{ s.source }}</span>{% endif %}
+<br><span class="muted">{{ s.title }}</span>
+<br><span class="muted">Tokens total {{ s.total }} (in {{ s.input }} · out {{ s.output }} · cache read {{ s.cache_read }} · cache write {{ s.cache_write }} · reasoning {{ s.reasoning }})</span></li>

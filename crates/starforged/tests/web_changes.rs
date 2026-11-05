@@ -139,6 +139,27 @@ async fn change_id(s: &TestServer, repo_id: i64, user_id: i64, topic: &str) -> i
         .id
 }
 
+/// Bounded poll until the `ChangeMergeability` job resolves `clean`: the job
+/// is enqueued by the async post-receive scan, so a single `run_due_jobs()`
+/// right after a push can miss it and the page would render `unknown`.
+async fn wait_for_clean_mergeability(s: &TestServer, change_id: i64) {
+    let start = Instant::now();
+    loop {
+        s.core.run_due_jobs().await.unwrap();
+        let row = starforged_db::changes::change_by_id(s.core.db(), change_id)
+            .await
+            .unwrap()
+            .expect("change exists");
+        if row.mergeability == "clean" {
+            return;
+        }
+        assert!(
+            start.elapsed() < SCAN_TIMEOUT,
+            "mergeability never went clean (last: {})",
+            row.mergeability
+        );
+    }
+}
 /// Pushes one commit as `refs/for/main/<topic>` and waits for ingestion.
 async fn push_revision(
     c: &Ctx,
@@ -185,7 +206,8 @@ async fn change_page_renders_revision_diff_and_mergeability() {
         "add feature",
     )
     .await;
-    c.s.core.run_due_jobs().await.unwrap();
+    let id = change_id(&c.s, repo_id, c.alice.id, "feat").await;
+    wait_for_clean_mergeability(&c.s, id).await;
 
     let (alice, _) = c.s.login("alice").await;
     let page = get_text(&alice, &c.change(1, 1)).await;
@@ -646,4 +668,41 @@ async fn change_page_renders_gate_panel() {
         .unwrap();
     let page = get_text(&alice, &c.change(1, 1)).await;
     assert!(page.contains("All gates pass"), "passing banner:\n{page}");
+}
+
+/// M2f F3: the change page shows the Trail tabs with live counts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn change_page_shows_trail_tabs() {
+    let c = Ctx::start().await;
+    let repo_id =
+        c.s.core
+            .repo_for(Some(&c.alice), "alice", "proj")
+            .await
+            .unwrap()
+            .repo
+            .id;
+    let (work, url) = setup_pushed_repo(&c.s, &c.alice).await;
+    push_revision(
+        &c,
+        repo_id,
+        &work,
+        &url,
+        "feat",
+        &[("feature.txt", b"hello feature\n")],
+        "add feature",
+    )
+    .await;
+    c.s.core.run_due_jobs().await.unwrap();
+    let (alice, _) = c.s.login("alice").await;
+    let page = get_text(&alice, &c.change(1, 1)).await;
+    assert!(
+        page.contains("href=\"/alice/proj/trails/1/changes\""),
+        "changes tab link:\n{page}"
+    );
+    assert!(
+        page.contains("href=\"/alice/proj/trails/1/sessions\""),
+        "sessions tab link:\n{page}"
+    );
+    assert!(page.contains("Changes (1)"), "changes count:\n{page}");
+    assert!(page.contains("Sessions (0)"), "sessions count:\n{page}");
 }
