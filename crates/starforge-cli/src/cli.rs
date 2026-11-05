@@ -49,7 +49,10 @@ pub enum Cmd {
     /// Import a session bundle.
     Import,
     /// Show the session trail.
-    Trail,
+    Trail {
+        #[command(subcommand)]
+        cmd: TrailCmd,
+    },
     /// Git `prepare-commit-msg` hook entry point (invoked by installed hooks).
     #[command(hide = true, name = "_hook-prepare-commit-msg")]
     HookPrepare {
@@ -124,6 +127,79 @@ pub enum SessionsCmd {
         ulid: String,
     },
 }
+/// `trail` subcommands (M2d J3–J5: list/show/create/comment are real).
+#[derive(Debug, Subcommand)]
+pub enum TrailCmd {
+    /// List trails.
+    List {
+        /// Trail state filter (`all` omits the filter).
+        #[arg(long, default_value = "open", value_parser = ["open", "closed", "merged", "all"])]
+        state: String,
+        /// Filter by label.
+        #[arg(long)]
+        label: Option<String>,
+        /// Filter by assignee handle.
+        #[arg(long)]
+        assignee: Option<String>,
+        /// Filter by author handle.
+        #[arg(long)]
+        author: Option<String>,
+        /// Page size (1–100).
+        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u32).range(1..=100))]
+        limit: u32,
+        /// List trails updated before this id.
+        #[arg(long)]
+        after: Option<i64>,
+        /// Output format.
+        #[arg(long, value_enum, default_value_t = crate::commands::trail::TextJson::Text)]
+        format: crate::commands::trail::TextJson,
+    },
+    /// Show a trail with its changes and comments.
+    Show {
+        /// Trail number.
+        n: i64,
+        /// Output format (`agent` frames third-party text as untrusted data).
+        #[arg(long, value_enum, default_value_t = crate::commands::trail::Format::Text)]
+        format: crate::commands::trail::Format,
+    },
+    /// Create a trail.
+    Create {
+        /// Trail title.
+        #[arg(long)]
+        title: String,
+        /// Intent Markdown.
+        #[arg(long, conflicts_with = "body_file")]
+        body: Option<String>,
+        /// Read intent from a file (`-` reads stdin).
+        #[arg(long = "body-file", value_name = "PATH")]
+        body_file: Option<PathBuf>,
+        /// Output format.
+        #[arg(long, value_enum, default_value_t = crate::commands::trail::TextJson::Text)]
+        format: crate::commands::trail::TextJson,
+    },
+    /// Comment on a trail.
+    Comment {
+        /// Trail number.
+        n: i64,
+        /// Comment Markdown.
+        #[arg(
+            long,
+            required_unless_present = "body_file",
+            conflicts_with = "body_file"
+        )]
+        body: Option<String>,
+        /// Read the comment from a file (`-` reads stdin).
+        #[arg(
+            long = "body-file",
+            value_name = "PATH",
+            required_unless_present = "body"
+        )]
+        body_file: Option<PathBuf>,
+        /// Output format.
+        #[arg(long, value_enum, default_value_t = crate::commands::trail::TextJson::Text)]
+        format: crate::commands::trail::TextJson,
+    },
+}
 /// CLI errors. Every non-root cause maps to an exit code (0/1/2).
 #[derive(Debug, thiserror::Error)]
 pub enum CliError {
@@ -150,7 +226,13 @@ impl CliError {
 /// Must not be called from inside a Tokio runtime (it blocks on one for the
 /// async device flow); async contexts use [`run_async`] instead.
 pub fn run(cli: Cli, paths: CliPaths) -> std::process::ExitCode {
-    if let Cmd::Auth { .. } | Cmd::Status | Cmd::Sync | Cmd::Doctor | Cmd::HookPrePush = &cli.cmd {
+    if let Cmd::Auth { .. }
+    | Cmd::Status
+    | Cmd::Sync
+    | Cmd::Doctor
+    | Cmd::HookPrePush
+    | Cmd::Trail { .. } = &cli.cmd
+    {
         // fall through to async dispatch below
     } else {
         return sync_stub(cli, paths);
@@ -183,7 +265,7 @@ fn sync_stub(cli: Cli, paths: CliPaths) -> std::process::ExitCode {
         Cmd::Sync => unreachable!("sync dispatches via run_async"),
         Cmd::Export => stub_err(CliError::Unimplemented("export")),
         Cmd::Import => stub_err(CliError::Unimplemented("import")),
-        Cmd::Trail => stub_err(CliError::Unimplemented("trail")),
+        Cmd::Trail { .. } => unreachable!("trail dispatches via run_async"),
     }
 }
 
@@ -311,7 +393,7 @@ pub async fn run_async(cli: Cli, paths: CliPaths) -> std::process::ExitCode {
         Cmd::Sessions { cmd } => run_sessions(cmd, dry_run),
         Cmd::Export => stub_err(CliError::Unimplemented("export")),
         Cmd::Import => stub_err(CliError::Unimplemented("import")),
-        Cmd::Trail => stub_err(CliError::Unimplemented("trail")),
+        Cmd::Trail { cmd } => run_trail(cmd, paths, dry_run).await,
         Cmd::HookPrepare { msg_file } => run_hook_prepare(paths, msg_file),
         Cmd::HookPostCommit => run_hook_post_commit(paths),
         Cmd::HookPrePush => run_hook_pre_push_async(paths).await,
@@ -387,6 +469,101 @@ async fn run_status(paths: CliPaths, dry_run: bool) -> std::process::ExitCode {
         eprintln!("{out}");
     }
     std::process::ExitCode::from(code)
+}
+
+/// `trail`: list/show/create/comment against the resolved server.
+async fn run_trail(cmd: TrailCmd, paths: CliPaths, dry_run: bool) -> std::process::ExitCode {
+    if dry_run {
+        let planned: String = match &cmd {
+            TrailCmd::List { .. } => "trail list".to_string(),
+            TrailCmd::Show { n, .. } => format!("trail show {n}"),
+            TrailCmd::Create { .. } => "trail create".to_string(),
+            TrailCmd::Comment { n, .. } => format!("trail comment {n}"),
+        };
+        println!("would run `{planned}` (dry run)");
+        return std::process::ExitCode::SUCCESS;
+    }
+    let Some(repo) = cwd_repo() else {
+        return std::process::ExitCode::from(1);
+    };
+    let ctx = match crate::commands::trail::TrailCtx::resolve(&repo, &paths).await {
+        Ok(ctx) => ctx,
+        Err(err) => {
+            eprintln!("error: {err}");
+            return std::process::ExitCode::from(1);
+        }
+    };
+    let (out, code) = match cmd {
+        TrailCmd::List {
+            state,
+            label,
+            assignee,
+            author,
+            limit,
+            after,
+            format,
+        } => {
+            let args = crate::commands::trail::read::ListArgs {
+                state,
+                label,
+                assignee,
+                author,
+                limit,
+                after,
+            };
+            crate::commands::trail::read::list(&ctx, &args, format.into()).await
+        }
+        TrailCmd::Show { n, format } => crate::commands::trail::read::show(&ctx, n, format).await,
+        TrailCmd::Create {
+            title,
+            body,
+            body_file,
+            format,
+        } => {
+            let intent = match body_source(body.as_deref(), body_file.as_deref()) {
+                Ok(intent) => intent,
+                Err(err) => {
+                    eprintln!("error: {err}");
+                    return std::process::ExitCode::from(1);
+                }
+            };
+            crate::commands::trail::write::create(&ctx, &title, &intent, format.into()).await
+        }
+        TrailCmd::Comment {
+            n,
+            body,
+            body_file,
+            format,
+        } => {
+            let text = match crate::commands::trail::read_body(
+                body.as_deref(),
+                body_file.as_deref(),
+                std::io::stdin(),
+            ) {
+                Ok(text) => text,
+                Err(err) => {
+                    eprintln!("error: {err}");
+                    return std::process::ExitCode::from(1);
+                }
+            };
+            crate::commands::trail::write::comment(&ctx, n, &text, format.into()).await
+        }
+    };
+    if code == 0 {
+        println!("{out}");
+    } else {
+        eprintln!("{out}");
+    }
+    std::process::ExitCode::from(code)
+}
+
+/// `create` intent: no body flags means an empty intent (the server decides);
+/// otherwise exactly one source wins.
+fn body_source(body: Option<&str>, body_file: Option<&std::path::Path>) -> Result<String, String> {
+    match (body, body_file) {
+        (None, None) => Ok(String::new()),
+        _ => crate::commands::trail::read_body(body, body_file, std::io::stdin()),
+    }
 }
 
 /// Host key for credential lookup from a server `api_url`: lowercased host

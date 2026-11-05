@@ -6,3 +6,4 @@ pub mod hooks;
 pub mod sessions;
 pub mod status;
 pub mod sync;
+pub mod trail;
