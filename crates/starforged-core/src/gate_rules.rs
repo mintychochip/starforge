@@ -168,10 +168,11 @@ fn normalize(base: &GateRuleDto, input: &GateRuleInput) -> CoreResult<Normalized
         *ctx = ctx.trim().to_owned();
     }
     for ctx in &contexts {
-        validate_context(ctx).map_err(|_| {
-            CoreError::Invalid(format!(
-                "invalid required_contexts entry '{ctx}' (each must be 1-255 characters)"
-            ))
+        validate_context(ctx).map_err(|e| match e {
+            CoreError::Invalid(reason) => {
+                CoreError::Invalid(format!("invalid required_contexts entry {ctx:?}: {reason}"))
+            }
+            other => other,
         })?;
     }
     let mut seen = std::collections::HashSet::new();

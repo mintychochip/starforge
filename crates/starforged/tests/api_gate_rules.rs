@@ -848,3 +848,44 @@ async fn merge_refused_until_rule_is_satisfiable() {
     assert_eq!(res.status(), 200, "satisfiable gates must merge");
     assert_eq!(res.json::<Value>().await.unwrap()["method"], "merge");
 }
+
+/// A control character inside a required context rejects the rule (422) and
+/// stores nothing: gate contexts surface in CLI output like status contexts.
+/// The message states the real reason with the entry Debug-escaped, so no raw
+/// newline reaches the error text.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn control_character_context_rejected_and_stores_nothing() {
+    let c = Ctx::start().await;
+    let mut body = valid_body();
+    body["pattern"] = json!("ctx-control");
+    body["required_contexts"] = json!(["ci/\nunit"]);
+    let (status, rejected) = c.create(&c.bob_trail, &body).await;
+    assert_eq!(status, 422, "{rejected}");
+    let message = rejected["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("control characters"),
+        "message must state the real reason: {rejected}"
+    );
+    assert!(
+        !message.contains('\n'),
+        "message must not carry a raw newline: {rejected:?}"
+    );
+    assert!(
+        message.contains("ci/\\nunit"),
+        "entry must show escaped: {rejected:?}"
+    );
+
+    let client = reqwest::Client::new();
+    let res = client
+        .get(c.rules())
+        .bearer_auth(&c.bob_trail)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let list = res.json::<Value>().await.unwrap();
+    assert!(
+        list["gate_rules"].as_array().unwrap().is_empty(),
+        "rejected rule wrote no row: {list}"
+    );
+}

@@ -976,6 +976,9 @@ fn check_thread_anchor(
     if path.is_empty() || path.chars().count() > MAX_THREAD_PATH_CHARS {
         return Err(CoreError::Invalid("thread path is invalid".into()));
     }
+    if path.chars().any(char::is_control) {
+        return Err(CoreError::Invalid("thread path is invalid".into()));
+    }
     if !matches!(side, "base" | "head") {
         return Err(CoreError::Invalid(format!("invalid thread side '{side}'")));
     }
@@ -2121,4 +2124,35 @@ fn file_json(f: &starforged_git::diff::FileDiff) -> serde_json::Value {
         "binary": f.binary,
         "hunks": hunks,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::check_thread_anchor;
+
+    #[test]
+    fn thread_anchor_rejects_interior_control_characters() {
+        for path in ["a\nb.rs", "a\rb.rs", "a\tb.rs", "a\u{7f}b.rs"] {
+            let err = check_thread_anchor(path, "head", 1, 1, "body")
+                .unwrap_err()
+                .to_string();
+            assert_eq!(err, "thread path is invalid", "{path:?}");
+        }
+    }
+
+    #[test]
+    fn thread_anchor_accepts_normal_paths() {
+        for path in [
+            "a.rs",
+            "src/main.rs",
+            "dir/sub.dir:file-name_test.rs",
+            "ci/unit:linux-x86_64.txt",
+        ] {
+            let (kept, side, body) = check_thread_anchor(path, "head", 1, 2, "nit")
+                .unwrap_or_else(|_| panic!("{path:?} must pass"));
+            assert_eq!(kept, path);
+            assert_eq!(side, "head");
+            assert_eq!(body, "nit");
+        }
+    }
 }

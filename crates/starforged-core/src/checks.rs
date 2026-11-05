@@ -47,12 +47,19 @@ fn valid_sha(sha: &str) -> bool {
             .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
-/// H2's status-context rule (1–255 chars), reused by gate-rule contexts.
+/// H2's status-context rule (1–255 chars, no control characters), reused by
+/// gate-rule contexts. Control characters are refused so a newline-bearing
+/// context cannot impersonate a line of trusted CLI output.
 pub(crate) fn validate_context(context: &str) -> CoreResult<()> {
     let context_len = context.chars().count();
     if context_len == 0 || context_len > 255 {
         return Err(CoreError::Invalid(
             "context must be 1-255 characters".into(),
+        ));
+    }
+    if context.chars().any(char::is_control) {
+        return Err(CoreError::Invalid(
+            "context must not contain control characters".into(),
         ));
     }
     Ok(())
@@ -258,5 +265,36 @@ impl Core {
             state: state.to_owned(),
             statuses,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_context;
+
+    #[test]
+    fn context_rejects_interior_control_characters() {
+        for context in ["ci/\nunit", "ci\tlint", "ci\ru", "ci\u{7f}unit"] {
+            let err = validate_context(context).unwrap_err().to_string();
+            assert_eq!(
+                err, "context must not contain control characters",
+                "{context:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn context_accepts_normal_names_with_punctuation() {
+        for context in [
+            "ci/unit",
+            "ci/unit:linux-x86_64",
+            "lint.ok",
+            "a-b_c.d:e/f",
+            &"c".repeat(255),
+        ] {
+            assert!(validate_context(context).is_ok(), "{context:?} must pass");
+        }
+        assert!(validate_context("").is_err());
+        assert!(validate_context(&"c".repeat(256)).is_err());
     }
 }

@@ -251,6 +251,8 @@ starforge trail review 12 --request-changes --comments '[{"path":"a.txt","side":
 starforge trail merge 12
 ```
 
+Without `--body`/`--body-file`, `trail review` posts a one-line body restating the verdict ("Approved.", "Changes requested.", or "Commented."), because the server rejects empty review bodies.
+
 `show` prints the header, the intent, one line per change, then — under each
 change with any — its reviews (`#id verdict by author on revision R`, with
 `(dismissed)` when dismissed, plus the body) and its inline threads
@@ -326,8 +328,8 @@ mutations need `trail:write`; strangers get `404` so change numbers stay undisco
 ## Commit statuses, gates, merging, and webhooks
 
 CI pushes per-commit statuses: `POST /api/v1/repos/{owner}/{repo}/statuses/{sha}` with
-`{"state": "pending|success|failure|error", "context": "ci/unit"}` (plus an optional
-`description` of at most 1024 chars and an `http(s)` `target_url` of at most 2048 chars).
+`{"state": "pending|success|failure|error", "context": "ci/unit"}` (context names are
+1-255 characters without control characters; plus an optional `description` of at most 1024 chars and an `http(s)` `target_url` of at most 2048 chars).
 Posting needs write access (`repo:write` on top of read) and answers `201`, like GitHub's;
 reads need `repo:read`. `GET .../commits/{ref}/status` folds every latest-per-context row
 into one state (`error` beats `failure` beats `pending` beats `success`; an unknown SHA is

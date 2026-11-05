@@ -601,3 +601,46 @@ async fn error_envelope_carries_details() {
     assert_eq!(body["error"]["code"], "not_found", "{body}");
     assert_eq!(body["error"].get("details"), Some(&Value::Null), "{body}");
 }
+
+/// Control characters in status contexts are rejected (422) and write no row:
+/// a newline-bearing context could otherwise impersonate a line of trusted CLI
+/// output. Interior placement defeats any trimming.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn status_context_control_characters_rejected() {
+    let c = Ctx::start().await;
+    let client = reqwest::Client::new();
+    const SHA: &str = "dddddddddddddddddddddddddddddddddddddddd";
+
+    for context in ["ci/\nunit", "ci\tlint"] {
+        let res = client
+            .post(c.statuses(SHA))
+            .bearer_auth(&c.alice_repo)
+            .json(&post_body("success", context))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 422, "context {context:?} must be rejected");
+    }
+    let body: Value = client
+        .get(c.statuses(SHA))
+        .bearer_auth(&c.alice_repo)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        body["statuses"].as_array().unwrap().is_empty(),
+        "rejected contexts wrote no row: {body}"
+    );
+
+    let res = client
+        .post(c.statuses(SHA))
+        .bearer_auth(&c.alice_repo)
+        .json(&post_body("success", "ci/unit:linux-x86_64"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 201, "normal context must pass");
+}
