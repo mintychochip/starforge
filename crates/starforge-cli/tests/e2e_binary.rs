@@ -324,3 +324,38 @@ async fn real_binary_enable_commit_sync() {
         "second sync makes zero requests"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Trail smoke (M2d J6): the real binary lists its eight subcommands and fails
+// closed outside any repository. No network beyond process spawn.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn trail_help_lists_eight_subcommands() {
+    let home = TempDir::new().unwrap();
+    let path = bin_path();
+    let dir = TempDir::new().unwrap();
+    let out = starforge(dir.path(), home.path(), &path, &["trail", "--help"]);
+    assert!(out.status.success(), "trail --help exits 0");
+    let text = String::from_utf8(out.stdout).unwrap();
+    for cmd in [
+        "list", "show", "create", "comment", "push", "checkout", "review", "merge",
+    ] {
+        assert!(text.contains(cmd), "help lists `{cmd}`: {text}");
+    }
+}
+
+#[test]
+fn trail_list_outside_repo_exits_1() {
+    let home = TempDir::new().unwrap();
+    let path = bin_path();
+    // A bare directory: not a git repository, so discovery finds no server.
+    let dir = TempDir::new().unwrap();
+    let out = starforge(dir.path(), home.path(), &path, &["trail", "list"]);
+    assert_eq!(out.status.code(), Some(1), "trail list exits 1");
+    let err = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        err.contains("no server configured"),
+        "discovery names the missing server: {err}"
+    );
+}

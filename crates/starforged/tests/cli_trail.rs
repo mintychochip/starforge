@@ -830,3 +830,261 @@ async fn merge_with_read_only_token_is_refused() {
     .await;
     assert_eq!(code, 1, "read-only merge exits 1: {out}");
 }
+
+// --- J6: full agent-workflow sweep: two users, real git, HTTP CI status. ---
+//
+// Author (alice) creates a trail and pushes two revisions with the push
+// defaults (remote HEAD base, branch-slug topic); reviewer (bob) checks out,
+// requests changes with an inline comment, then approves; the merge refuses
+// while the request stands and lands after the approval; CI posts a success
+// status over plain HTTP; `show --format json` reports passing gates and a
+// success combined status; the author merges; the trail reads merged and
+// lists under `--state merged`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agent_workflow_sweep() {
+    let s = TestServer::start().await;
+    let alice = s.user("alice").await;
+    let bob = s.user("bob").await;
+    s.repo(&alice, "proj", Visibility::Public).await;
+    let author_api = s.token(&alice, &[Scope::RepoRead, Scope::TrailWrite]).await;
+    let push_token = s.token(&alice, &[Scope::RepoWrite]).await;
+    let ci_token = s.token(&alice, &[Scope::RepoRead, Scope::RepoWrite]).await;
+    let reviewer_api = s.token(&bob, &[Scope::RepoRead, Scope::TrailWrite]).await;
+    let reviewer_git = s.token(&bob, &[Scope::RepoRead]).await;
+    // Approvals only count from writers, so the reviewer joins as one.
+    s.core
+        .set_collaborator(
+            &alice,
+            "alice",
+            "proj",
+            "bob",
+            starforged_core::permission::Permission::Write,
+        )
+        .await
+        .unwrap();
+
+    // One gate rule over plain HTTP with a `repo:write` maintainer token: 1
+    // approval plus the CI context. `block_on_request_changes` stays at its
+    // default (true): the reviewer's later approval clears their own
+    // request for changes, so the loop below passes without a dismissal.
+    let http = reqwest::Client::new();
+    let res = http
+        .post(s.url("/api/v1/repos/alice/proj/gate-rules"))
+        .bearer_auth(&ci_token)
+        .json(&j5_json!({
+            "required_approvals": 1,
+            "required_contexts": ["ci/unit"],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 201, "gate rule created");
+
+    // The author's clone pushes `main`, then works on a feature branch.
+    let tmp = tempfile::tempdir().unwrap();
+    let author_dir = work_repo(tmp.path(), "author", &[("README.md", "# proj\n")]).await;
+    let origin = s.git_url("alice", "proj", Some(&push_token));
+    git_ok(&author_dir, &["remote", "add", "origin", &origin]).await;
+    git_ok(&author_dir, &["push", "-q", &origin, "main"]).await;
+    let actx = j4_ctx(&s, "alice/proj", &author_api, &author_dir, tmp.path());
+
+    // 1. `trail create`, then `trail push --trail 1` with all push defaults.
+    let (out, code) = create(&actx, "Widget", "adds a widget", Format::Text).await;
+    assert_eq!(code, 0, "create: {out}");
+    assert!(
+        out.contains("created trail #1: "),
+        "create names the trail: {out}"
+    );
+    git_ok(&author_dir, &["checkout", "-q", "-b", "feature/widget"]).await;
+    commit_files(&author_dir, &[("widget.txt", b"gadget")], "add widget").await;
+    let (sleeper, interval, deadline) = j4_poll();
+    let (out, code) = push_with(
+        &actx,
+        &j4_push(Some(1), None, None, None),
+        Format::Text,
+        &sleeper,
+        interval,
+        deadline,
+    )
+    .await;
+    assert_eq!(code, 0, "push: {out}");
+    assert!(
+        out.contains("trail #1 change 1 revision 1"),
+        "push names the change: {out}"
+    );
+    // The push defaulted the base to the remote HEAD branch.
+    let detail = actx.api.get("trails/1/changes/1", &[]).await.unwrap();
+    assert_eq!(detail["change"]["base_branch"], "main");
+    let rev1 = detail["selected"]["head_sha"].as_str().unwrap().to_string();
+
+    // 2. The reviewer checks out and requests changes with an inline comment.
+    let clone_url = s.git_url("alice", "proj", Some(&reviewer_git));
+    git_ok(tmp.path(), &["clone", "-q", &clone_url, "reviewer"]).await;
+    let reviewer_dir = tmp.path().join("reviewer");
+    let rctx = j4_ctx(&s, "alice/proj", &reviewer_api, &reviewer_dir, tmp.path());
+    let (out, code) = checkout(
+        &rctx,
+        &CheckoutArgs {
+            n: 1,
+            change: None,
+            rev: None,
+            remote: None,
+        },
+        Format::Text,
+    )
+    .await;
+    assert_eq!(code, 0, "checkout: {out}");
+    assert!(
+        out.contains(&format!("on trail/1/1 at {}", &rev1[..7])),
+        "checkout names the branch and short sha: {out}"
+    );
+    assert_eq!(
+        git_ok(&reviewer_dir, &["branch", "--show-current"])
+            .await
+            .trim(),
+        "trail/1/1",
+        "checkout creates trail/<n>/<k>"
+    );
+    let (out, code) = j5_submit_review(
+        &rctx,
+        &J5Review {
+            n: 1,
+            change: None,
+            rev: None,
+            verdict: J5Verdict::RequestChanges,
+            body: "Needs work".to_string(),
+            comments: vec![j5_comment("widget.txt", "head", 1, 1, "please revise")],
+            session: None,
+        },
+        Format::Text,
+    )
+    .await;
+    assert_eq!(code, 0, "request-changes: {out}");
+    assert!(
+        out.contains("requested changes on trail #1 change 1 revision 1"),
+        "review names the change: {out}"
+    );
+
+    // 3. The author pushes revision 2.
+    commit_files(
+        &author_dir,
+        &[("widget.txt", b"gadget v2")],
+        "improve widget",
+    )
+    .await;
+    let (out, code) = push_with(
+        &actx,
+        &j4_push(Some(1), None, None, None),
+        Format::Text,
+        &sleeper,
+        interval,
+        deadline,
+    )
+    .await;
+    assert_eq!(code, 0, "second push: {out}");
+    assert!(
+        out.contains("trail #1 change 1 revision 2"),
+        "second push is revision 2: {out}"
+    );
+
+    // The open request for changes still blocks the merge before approval.
+    let (out, code) = j5_merge(
+        &actx,
+        &J5Merge {
+            n: 1,
+            change: None,
+            method: None,
+        },
+        Format::Text,
+    )
+    .await;
+    assert_eq!(code, 1, "gated merge exits 1: {out}");
+    assert!(
+        out.contains("changes requested by bob"),
+        "merge names the requester: {out}"
+    );
+
+    // 4. The reviewer approves the new revision.
+    let (out, code) = j5_submit_review(
+        &rctx,
+        &j5_review(1, J5Verdict::Approve, vec![]),
+        Format::Text,
+    )
+    .await;
+    assert_eq!(code, 0, "approve: {out}");
+
+    // 5. CI posts a `success` status for the head over plain HTTP.
+    let detail = actx.api.get("trails/1/changes/1", &[]).await.unwrap();
+    let head = detail["selected"]["head_sha"].as_str().unwrap();
+    let res = http
+        .post(s.url(&format!("/api/v1/repos/alice/proj/statuses/{head}")))
+        .bearer_auth(&ci_token)
+        .json(&j5_json!({"state": "success", "context": "ci/unit"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 201, "status POST answers 201");
+
+    // 6. `show --format json` reports passing gates and a success status.
+    let (out, code) = show(&actx, 1, Format::Json).await;
+    assert_eq!(code, 0, "show json: {out}");
+    let report: J5Value = serde_json::from_str(&out).unwrap();
+    let changes = report["changes"].as_array().unwrap();
+    assert_eq!(changes.len(), 1, "one change: {out}");
+    assert!(
+        changes[0]["change"]["gates"]["passed"].as_bool() == Some(true),
+        "gates passed: {out}"
+    );
+    assert_eq!(changes[0]["status"]["state"], "success");
+
+    // 7. The author merges (the default picks `merge` when allowed).
+    let (out, code) = j5_merge(
+        &actx,
+        &J5Merge {
+            n: 1,
+            change: None,
+            method: None,
+        },
+        Format::Text,
+    )
+    .await;
+    assert_eq!(code, 0, "merge: {out}");
+    assert!(
+        out.contains("merged trail #1 change 1 with merge: "),
+        "merge names the method: {out}"
+    );
+
+    // 8. The trail reads `merged` and lists under `--state merged`.
+    let (out, code) = show(&actx, 1, Format::Text).await;
+    assert_eq!(code, 0, "show: {out}");
+    assert!(out.contains("merged"), "show reports merged: {out}");
+    let (out, code) = list(
+        &actx,
+        &ListArgs {
+            state: "merged".to_string(),
+            label: None,
+            assignee: None,
+            author: None,
+            limit: 30,
+            after: None,
+        },
+        Format::Text,
+    )
+    .await;
+    assert_eq!(code, 0, "list merged: {out}");
+    assert!(out.contains("#1"), "merged list names the trail: {out}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn missing_credentials_name_the_login_hint() {
+    // No `STARFORGE_TOKEN` and no stored credentials: resolution fails with
+    // the `starforge auth login` hint (run_trail prints it and exits 1).
+    let home = tempfile::tempdir().unwrap();
+    let paths = starforge_cli::config::CliPaths::from_home(home.path().to_path_buf());
+    let err = starforge_cli::auth::resolve_token(&paths, "forge.example", |_| None).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("run `starforge auth login forge.example`"),
+        "login hint: {err}"
+    );
+}

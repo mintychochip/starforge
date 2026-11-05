@@ -145,8 +145,8 @@ heuristic linking fires once per batch of new session activity. Auth is
 `STARFORGE_TOKEN` when set, else `starforge auth login` (device flow) storing
 per-host tokens in `~/.config/starforge/credentials.toml` (mode `0600`).
 Every command honors `--dry-run` (print, don't write) and `--verbose`;
-`sessions publish`/`unpublish`/`delete`, `export`/`import`, and `trail` are
-not in M1c and exit non-zero. Exit codes: `0` ok, `1` operational error,
+`sessions publish`/`unpublish`/`delete` and `export`/`import` are not in M1c
+and exit non-zero. Exit codes: `0` ok, `1` operational error,
 `2` `sync` finished with items still queued.
 
 ## Session capture and ingest
@@ -230,7 +230,51 @@ state; `merged` is refused — only the merge path may set it), `GET`/`POST
 mutation needs `trail:write` on top, so a curator token carries `"repo:read trail:write"`.
 Errors use the shared `{"error": {"code", "message"}}` envelope.
 
-Not yet: `trail` CLI commands (M2d); trail deletion (close covers M2a).
+Not yet: trail deletion (close covers M2a).
+
+### Trails from the command line (M2d)
+
+`starforge trail` drives a trail end to end from the terminal. Every command
+takes `--format text|json` (default `text`); `show` also accepts `agent`, and
+`json` prints the pretty-printed response the command acted on:
+
+```bash
+starforge trail list --state open
+starforge trail show 12
+starforge trail show 12 --format agent
+starforge trail create --title "Faster sync" --body "Why this exists"
+starforge trail comment 12 --body "Needs a test"
+starforge trail push --trail 12
+starforge trail checkout 12
+starforge trail review 12 --approve
+starforge trail review 12 --request-changes --comments '[{"path":"a.txt","side":"head","start_line":1,"end_line":2,"body":"nit"}]'
+starforge trail merge 12
+```
+
+`show --format json` returns `{trail, changes: [{change, status}]}`, where
+`change.gates` is the gate report (`passed` plus per-rule results) and
+`status` the combined commit status. `--format agent` frames every
+third-party-written field — the title, the intent, each comment and review
+body — in nonce-tagged `<untrusted-data>` blocks with hostile markup
+escaped, so an agent reading the trail cannot be steered by attacker-written
+text it is then asked to act on (for example by running `trail merge`).
+
+`push` defaults the base to the remote's HEAD branch and the topic to a slug
+of the current branch (`--base`/`--topic` override; `--trail N` files the
+revision under that trail and `--title` names a new one). After a successful
+push it prints `trail #N change K revision R: <url>`; if the server has not
+recorded the change within 10 s it prints `pushed <sha>; ...` instead and
+still exits `0`. `checkout` creates the branch `trail/<n>/<k>` at the head
+(fast-forwarding an ancestor, refusing on divergence and touching nothing),
+or detaches at `--rev R` for an immutable revision. Without `--change` the
+single open change wins, erroring when there are zero or several. Without
+`--method`, `merge` uses `merge` when allowed, else the single allowed
+method. Git authenticates with your own remote configuration — the CLI never
+hands its API token to git — so push and fetch use your usual credentials
+and prompts. Exits are `0` on success, `1` on any failure; usage errors keep
+clap's `2`.
+
+Not yet: webhook alignment and web gaps arrive in M2e.
 
 ## Changes and reviews
 
@@ -284,7 +328,9 @@ A bad SHA, state, or context answers `422`. Every API error body is
 Gate rules make merging fail closed. Each rule is stored on the repository with a
 branch glob (empty matches every branch); every rule matching the change's base must
 pass, and zero matching rules means only clean mergeability is required. A rule can
-demand N writer approvals (only write+ reviews count; dismiss-on-push drops
+demand N writer approvals (only write+ reviews count; each reviewer counts
+once, by their latest approve or request-changes verdict, so a later approval
+clears that reviewer's own request for changes; dismiss-on-push drops
 older-revision votes, while request-changes blocks on rules that ask it to), green
 required contexts, an up-to-date head, resolved threads, and session evidence linking
 the commits to uploaded agent sessions. The change page's Gates panel — and
@@ -315,8 +361,7 @@ delivery signs the exact JSON bytes, verifiable as
 refused, bodies cap at 64 KiB, and failures retry on a 1m/5m/30m/2h ladder before the
 hook is marked failed.
 
-Not yet: `trail merge` on the CLI (M2d), gate-rule management screens, per-context
-soft gates, check retries, deployments, and mirrors.
+Not yet: gate-rule management screens, per-context soft gates, check retries, deployments, and mirrors.
 
 ## Development
 
