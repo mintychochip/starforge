@@ -14,7 +14,8 @@ use std::sync::{Arc, Mutex};
 
 use common::*;
 use serde_json::{Value, json};
-use starforged_core::accounts::User;
+use starforged_core::CoreError;
+use starforged_core::accounts::{CreateUser, User};
 use starforged_core::permission::{Permission, Visibility};
 use starforged_core::tokens::Scope;
 
@@ -36,7 +37,10 @@ const PAYLOADS: &[&str] = &[
 /// every legitimate hook/delivery/trail/dashboard template, so any occurrence
 /// is attacker markup rendered live. Escaped text (`&#60;img …`) passes — it
 /// is inert — and so does a bare `javascript:` scheme inside escaped text;
-/// only a live link (`<a href="javascript:…`) can execute.
+/// only a live link (`<a href="javascript:…`) can execute. `<details>` is
+/// deliberately absent here: the trail page uses it legitimately, so the
+/// `<details>` corpus vector is pinned per payload (raw absent, escaped
+/// present) plus the live-handler scan below.
 fn assert_no_live_markup(page: &str, surface: &str) {
     let lower = page.to_lowercase();
     for raw in [
@@ -52,6 +56,88 @@ fn assert_no_live_markup(page: &str, surface: &str) {
     ] {
         assert!(!lower.contains(raw), "{raw} live on {surface}");
     }
+    assert!(!has_live_handler(&lower), "live event handler on {surface}");
+}
+
+/// True when a real (unescaped) tag carries an `on*=` handler attribute.
+/// Escaped text never contains a raw `<`, so only spans inside `<…>` count;
+/// the templates use no inline handlers anywhere.
+fn has_live_handler(lower: &str) -> bool {
+    let bytes = lower.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'<' {
+            i += 1;
+            continue;
+        }
+        let mut j = i + 1;
+        while j < bytes.len() && bytes[j] != b'>' {
+            j += 1;
+        }
+        if has_handler_attr(&lower[i..j.min(bytes.len())]) {
+            return true;
+        }
+        i = j + 1;
+    }
+    false
+}
+
+fn has_handler_attr(tag: &str) -> bool {
+    let bytes = tag.as_bytes();
+    let mut i = 0;
+    while i + 3 < bytes.len() {
+        if bytes[i] == b' '
+            && bytes[i + 1] == b'o'
+            && bytes[i + 2] == b'n'
+            && bytes[i + 3].is_ascii_alphabetic()
+        {
+            let mut j = i + 4;
+            while j < bytes.len() && bytes[j].is_ascii_alphabetic() {
+                j += 1;
+            }
+            let mut k = j;
+            while k < bytes.len() && bytes[k] == b' ' {
+                k += 1;
+            }
+            if k < bytes.len() && bytes[k] == b'=' {
+                return true;
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
+/// Mirror of askama's `Html` escaper (`"`→`&#34;`, `&`→`&#38;`,
+/// `'`→`&#39;`, `<`→`&#60;`, `>`→`&#62;`).
+fn escape_html(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("&#34;"),
+            '&' => out.push_str("&#38;"),
+            '\'' => out.push_str("&#39;"),
+            '<' => out.push_str("&#60;"),
+            '>' => out.push_str("&#62;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// Every corpus vector must be inert on the page: its raw form absent and
+/// its escaped form present (proving the payload actually rendered).
+fn assert_payload_escaped(page: &str, payload: &str, surface: &str) {
+    assert!(
+        !page.contains(payload),
+        "raw payload renders on {surface}: {payload:?}"
+    );
+    assert!(
+        page.contains(&escape_html(payload)),
+        "escaped payload missing on {surface}: {payload:?}"
+    );
 }
 
 #[derive(Debug, Clone)]
@@ -575,11 +661,17 @@ async fn matrix_web() {
     let open_hook = c.create_hook(&alice_full, "open", &sink_url).await;
     let open_hook_id = open_hook["id"].as_i64().unwrap();
     let open_row = c.seed_delivery("open", open_hook_id).await;
+    let innie_hook = c.create_hook(&alice_full, "innie", &sink_url).await;
+    let innie_hook_id = innie_hook["id"].as_i64().unwrap();
+    let innie_row = c.seed_delivery("innie", innie_hook_id).await;
     let n = c
         .create_trail(&alice_full, "proj", "web matrix trail")
         .await;
     let open_n = c
         .create_trail(&alice_full, "open", "open matrix trail")
+        .await;
+    let innie_n = c
+        .create_trail(&alice_full, "innie", "innie matrix trail")
         .await;
 
     let anon = c.s.browser();
@@ -638,7 +730,9 @@ async fn matrix_web() {
         ("bob", 403, 403, 403, 303),
         ("wendy", 403, 403, 403, 303),
         ("mia", 200, 200, 303, 303),
+        ("adam", 200, 200, 303, 303),
         ("alice", 200, 200, 303, 303),
+        ("root", 200, 200, 303, 303),
     ] {
         let (browser, csrf) = c.s.login(handle).await;
         let res = browser.get(c.web_hooks("proj")).send().await.unwrap();
@@ -698,6 +792,89 @@ async fn matrix_web() {
                 .unwrap();
             assert_eq!(res.status(), 303, "{handle} POST review-request remove");
         }
+    }
+
+    // Internal repo: every signed-in user reads, so even dave lands on
+    // 403 (never 404); the thresholds are otherwise identical to proj.
+    for (handle, want_list, want_detail, want_redeliver, want_review) in [
+        ("dave", 403, 403, 403, 403),
+        ("carol", 403, 403, 403, 403),
+        ("bob", 403, 403, 403, 303),
+        ("wendy", 403, 403, 403, 303),
+        ("mia", 200, 200, 303, 303),
+        ("adam", 200, 200, 303, 303),
+        ("alice", 200, 200, 303, 303),
+        ("root", 200, 200, 303, 303),
+    ] {
+        let (browser, csrf) = c.s.login(handle).await;
+        let res = browser.get(c.web_hooks("innie")).send().await.unwrap();
+        assert_eq!(res.status(), want_list, "{handle} GET hooks page (innie)");
+        let res = browser
+            .get(c.web_delivery("innie", innie_hook_id, innie_row))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            want_detail,
+            "{handle} GET delivery detail (innie)"
+        );
+        let res = browser
+            .post(c.web_delivery("innie", innie_hook_id, innie_row) + "/redeliver")
+            .form(&[("_csrf", csrf.as_str())])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            want_redeliver,
+            "{handle} POST redeliver (innie)"
+        );
+        if want_redeliver == 303 {
+            c.s.core.run_due_jobs().await.unwrap();
+        }
+        let res = browser
+            .post(c.web_trail("innie", innie_n) + "/review-requests")
+            .form(&[
+                ("_csrf", csrf.as_str()),
+                ("action", "add"),
+                ("handle", "wendy"),
+            ])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            want_review,
+            "{handle} POST review-request add (innie)"
+        );
+        if want_review == 303 {
+            let res = browser
+                .post(c.web_trail("innie", innie_n) + "/review-requests")
+                .form(&[
+                    ("_csrf", csrf.as_str()),
+                    ("action", "remove"),
+                    ("handle", "wendy"),
+                ])
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                res.status(),
+                303,
+                "{handle} POST review-request remove (innie)"
+            );
+        }
+        assert_eq!(
+            browser
+                .get(c.web_trail("innie", innie_n))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200,
+            "{handle} reads the internal trail"
+        );
     }
 
     // Public repo: dave reads, so the gates answer 403 instead of 404.
@@ -944,10 +1121,57 @@ async fn xss_corpus() {
     let row = c.seed_delivery("proj", hook_id).await;
     let page = get_text(&browser, &c.web_delivery("proj", hook_id, row)).await;
     assert_no_live_markup(&page, "delivery detail");
-    assert!(page.contains("&#60;script"), "receiver body escaped");
-    assert!(page.contains("x-evil"), "response headers rendered");
+    assert_payload_escaped(
+        &page,
+        "<script>alert(delivery)</script>",
+        "delivery response body",
+    );
+    assert_payload_escaped(
+        &page,
+        "<script>alert(evil-header)</script>",
+        "delivery response header",
+    );
 
-    // Reviewer handles render as inert text on the trail page.
+    // A hostile Trail title flows into a logged REQUEST body
+    // (`trail`/`opened`) and renders escaped on the same page.
+    let hostile_title = "<img src=x onerror=alert(request)>";
+    c.create_trail(&alice_full, "proj", hostile_title).await;
+    c.s.core.run_due_jobs().await.unwrap();
+    let rows =
+        c.s.core
+            .list_deliveries(&c.alice, "alice", "proj", hook_id, None)
+            .await
+            .unwrap();
+    let mut request_row = None;
+    for summary in &rows {
+        let detail =
+            c.s.core
+                .get_delivery(&c.alice, "alice", "proj", hook_id, summary.id)
+                .await
+                .unwrap();
+        if detail.request_body.contains(hostile_title) {
+            request_row = Some(summary.id);
+            break;
+        }
+    }
+    let request_row = request_row.expect("logged attempt carrying the hostile title");
+    let page = get_text(&browser, &c.web_delivery("proj", hook_id, request_row)).await;
+    assert_no_live_markup(&page, "delivery request body");
+    assert_payload_escaped(&page, hostile_title, "delivery request body");
+
+    // Reviewer handles render as inert text on the trail page. Handles
+    // cannot carry markup in the first place: the charset is `[a-z0-9-]`.
+    let bad =
+        c.s.core
+            .create_user(CreateUser {
+                handle: "<script>alert(handle)</script>".into(),
+                ..Default::default()
+            })
+            .await;
+    assert!(
+        matches!(bad, Err(CoreError::Invalid(_))),
+        "hostile handle rejected, got {bad:?}"
+    );
     let n = c
         .create_trail(&alice_full, "proj", "reviewers render")
         .await;
@@ -1021,10 +1245,19 @@ async fn xss_corpus() {
     let (wendy, _) = c.s.login("wendy").await;
     let page = get_text(&wendy, &c.s.url("/")).await;
     assert_no_live_markup(&page, "dashboard");
-    assert!(
-        page.contains("&#60;script"),
-        "hostile titles escaped on dashboard"
-    );
+    for payload in PAYLOADS {
+        if escape_html(payload) == *payload {
+            // No escapable characters (the U+202E bidi control): renders
+            // verbatim as inert text — no tag, no handler, no link — so
+            // the page-level scan above is its coverage.
+            assert!(
+                page.contains(payload),
+                "payload renders on dashboard: {payload:?}"
+            );
+        } else {
+            assert_payload_escaped(&page, payload, "dashboard");
+        }
+    }
 }
 
 /// Every new form refuses a forged CSRF token, and the state is unchanged.
@@ -1080,7 +1313,12 @@ async fn csrf_matrix() {
     );
 
     // Review-request add/remove without/with a foreign token: 403, and the
-    // request list is unchanged.
+    // request list is unchanged — including a pre-seeded request, which a
+    // forged REMOVE must leave in place.
+    c.s.core
+        .request_review(&c.alice, "alice", "proj", n, "wendy")
+        .await
+        .unwrap();
     let (bob_browser, _) = c.s.login("bob").await;
     let client = reqwest::Client::new();
     let bob_t = c.tok(&c.bob, FULL).await;
@@ -1104,7 +1342,11 @@ async fn csrf_matrix() {
         .json()
         .await
         .unwrap();
-    assert_eq!(detail["review_requests"], json!([]), "no request written");
+    assert_eq!(
+        detail["review_requests"],
+        json!(["wendy"]),
+        "seeded request survives forged forms"
+    );
 }
 
 /// One scripted flow drives all five event types; every signature verifies,
@@ -1188,6 +1430,14 @@ async fn all_events_end_to_end() {
         })
     })
     .await;
+    // The change_opened above proves the refs/for pass finished, so one
+    // final drain leaves no room for a late push: the window holds none.
+    c.s.core.run_due_jobs().await.unwrap();
+    let got = delivered_from(&c, &sink, &secret, from).await;
+    assert!(
+        got.iter().all(|b| b["event"] != "push"),
+        "refs/for pushes never emit push: {got:?}"
+    );
 
     // A review, a status, and the merge that flips the first trail merged.
     let bob_t = c.tok(&c.bob, FULL).await;

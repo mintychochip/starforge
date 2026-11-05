@@ -429,9 +429,13 @@ The body is one envelope:
 
 `action` and `cause` are always present (string or `null`); `sender` is
 `null` for system-originated events; exactly one subject key matches
-`event`. Verify a delivery with e.g.
-`echo -n "$body" | openssl dgst -sha256 -hmac "$secret"` and compare with
-the `X-Starforge-Signature-256` header.
+`event`. Verify a delivery with e.g. (openssl prints `(stdin)= <hex>`,
+while the header carries `sha256=<hex>`):
+
+```sh
+sig=$(echo -n "$body" | openssl dgst -sha256 -hmac "$secret")
+[ "$sig" = "(stdin)= ${header#sha256=}" ] # $header is X-Starforge-Signature-256
+```
 
 The five events, with their subjects:
 
