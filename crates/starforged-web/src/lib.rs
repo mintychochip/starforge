@@ -179,6 +179,14 @@ fn page_routes() -> Router<AppState> {
             post(pages::webhooks::toggle),
         )
         .route(
+            "/{owner}/{repo}/settings/hooks/{id}/deliveries/{row}",
+            get(pages::webhooks::show_delivery),
+        )
+        .route(
+            "/{owner}/{repo}/settings/hooks/{id}/deliveries/{row}/redeliver",
+            post(pages::webhooks::redeliver),
+        )
+        .route(
             "/{owner}/{repo}/settings/refs-for-access",
             post(pages::repo_settings::change_refs_for_access),
         )

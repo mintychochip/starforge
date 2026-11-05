@@ -32,7 +32,7 @@
 //! fails the caller: enqueue errors are logged, and delivery itself always
 //! runs on a worker — never inline in the request path.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use ring::aead::{self, BoundKey, Nonce, NonceSequence, OpeningKey, SealingKey, UnboundKey};
@@ -65,10 +65,9 @@ pub struct HookEvent {
     pub subject: serde_json::Value,
 }
 
-/// Normalizes one stored subscription: parses the JSON array, keeps only
-/// [`EVENT_TYPES`], de-duplicates, and keeps order. Unparseable input reads
-/// as empty (subscribe to all); dispatch skips those rows instead (see
-/// [`parse_subscription`]).
+/// Keeps only [`EVENT_TYPES`], de-duplicated, order-preserving. An empty
+/// input reads as empty (subscribe to all); dispatch and the DTO decide
+/// what an empty result means via [`Subscription`].
 pub fn normalize_events(events: Vec<String>) -> Vec<String> {
     let mut out = Vec::with_capacity(events.len());
     for event in events {
@@ -79,26 +78,56 @@ pub fn normalize_events(events: Vec<String>) -> Vec<String> {
     out
 }
 
-/// The normalized subscription of one stored `events` cell, or `None` when
-/// the cell is not a JSON array at all (dispatch skips such hooks with a
-/// warning; the DTO reads them as empty).
-fn parse_subscription(raw: &str) -> Option<Vec<String>> {
-    let parsed: Vec<String> = serde_json::from_str(raw).ok()?;
-    Some(normalize_events(parsed))
+/// One stored subscription, classified (M2e K3 fold-in A): the single parser
+/// the dispatch path and the DTO both use. `All` is a stored `[]`; `Set`
+/// holds the known types (unknown names dropped, order kept); `Invalid`
+/// is an unparseable cell, or a non-empty stored list with no known type.
+/// Dispatch delivers on `All` and on a matching `Set`, never on `Invalid`.
+pub enum Subscription {
+    All,
+    Set(Vec<String>),
+    Invalid,
+}
+
+/// The one subscription parser: see [`Subscription`].
+pub fn classify_subscription(raw: &str) -> Subscription {
+    let parsed: Vec<String> = match serde_json::from_str(raw) {
+        Ok(parsed) => parsed,
+        Err(_) => return Subscription::Invalid,
+    };
+    let kept = normalize_events(parsed.clone());
+    if kept.is_empty() {
+        if parsed.is_empty() {
+            Subscription::All
+        } else {
+            Subscription::Invalid
+        }
+    } else {
+        Subscription::Set(kept)
+    }
 }
 
 /// Delivery timeout per attempt (spec: 10 s).
 const DELIVERY_TIMEOUT: Duration = Duration::from_secs(10);
 /// Max response body the worker reads per delivery (spec: bodies ≤ 64 KiB).
 const MAX_BODY_BYTES: usize = 64 * 1024;
+/// Max response body stored per logged attempt (D5: the first 16 KiB,
+/// UTF-8-lossy).
+const MAX_STORED_BODY_BYTES: usize = 16 * 1024;
+/// Max response headers stored per logged attempt (D5).
+const MAX_STORED_HEADERS: usize = 50;
+/// Max stored length of one response header value (D5: 1 KiB).
+const MAX_STORED_HEADER_VALUE_BYTES: usize = 1024;
 
 /// One webhook for API and settings-page rendering. The secret is never here:
-/// creation returns it once; lists carry `has_secret` only.
+/// creation returns it once; lists carry `has_secret` only. An invalid
+/// stored subscription reads as `events: []` plus `subscription_invalid`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WebhookDto {
     pub id: i64,
     pub url: String,
     pub events: Vec<String>,
+    pub subscription_invalid: bool,
     pub active: bool,
     pub last_status: Option<i64>,
     pub last_error: Option<String>,
@@ -106,13 +135,20 @@ pub struct WebhookDto {
 }
 
 fn dto_of(row: &db_checks::WebhookRow) -> CoreResult<WebhookDto> {
-    // Stored subscriptions pass through the one normalizing fn: legacy names
-    // (pre-0014 rows) drop out and duplicates collapse.
-    let parsed: Vec<String> = serde_json::from_str(&row.events).unwrap_or_default();
+    // Stored subscriptions pass through the one classifier: legacy names
+    // (pre-0014 rows) drop out, duplicates collapse, and cells with no
+    // known type (or no JSON at all) report invalid instead of looking
+    // like "all".
+    let (events, subscription_invalid) = match classify_subscription(&row.events) {
+        Subscription::All => (Vec::new(), false),
+        Subscription::Set(kept) => (kept, false),
+        Subscription::Invalid => (Vec::new(), true),
+    };
     Ok(WebhookDto {
         id: row.id,
         url: row.url.clone(),
-        events: normalize_events(parsed),
+        events,
+        subscription_invalid,
         active: row.active != 0,
         last_status: row.last_status,
         last_error: row.last_error.clone(),
@@ -437,18 +473,27 @@ impl Core {
             if hook.active == 0 {
                 continue;
             }
-            let Some(subscribed) = parse_subscription(&hook.events) else {
-                tracing::warn!(hook = hook.id, "webhook has unreadable events; skipping");
-                continue;
-            };
-            if !subscribed.is_empty() && !subscribed.iter().any(|e| e == ev.event) {
-                continue;
+            match classify_subscription(&hook.events) {
+                Subscription::Invalid => {
+                    tracing::warn!(
+                        hook = hook.id,
+                        "webhook has an invalid subscription; skipping"
+                    );
+                    continue;
+                }
+                Subscription::All => {}
+                Subscription::Set(subscribed) => {
+                    if !subscribed.iter().any(|e| e == ev.event) {
+                        continue;
+                    }
+                }
             }
             if let Err(err) = self
                 .enqueue(&Job::WebhookDelivery {
                     webhook_id: hook.id,
                     event: ev.event.to_owned(),
                     payload: payload.clone(),
+                    redelivery: false,
                 })
                 .await
             {
@@ -595,17 +640,32 @@ impl Core {
     }
 
     /// Worker: POSTs `payload` to the hook with the `X-Starforge-*` headers,
-    /// records the delivery, and applies the retry ladder. Missing or
-    /// disabled hooks complete silently. A corrupt secret, like an exhausted
-    /// ladder, is terminal: the failure is recorded and the job completes, so
-    /// a dead endpoint never wedges the queue.
+    /// and writes exactly one delivery-log row for the attempt — success,
+    /// HTTP error, transport error, SSRF denial, and corrupt secret alike —
+    /// then applies the retry ladder. Missing or disabled hooks complete
+    /// silently (no row, no retry). A corrupt secret, an SSRF denial, or an
+    /// exhausted ladder is terminal: the failure is recorded and the job
+    /// completes, so a dead endpoint never wedges the queue. Every attempt
+    /// refreshes the hook's `last_status`/`last_error`; only terminal
+    /// failures write `webhook.failed` timeline and audit rows.
     pub(crate) async fn deliver_webhook(
         &self,
         job_id: i64,
         webhook_id: i64,
         event: &str,
         payload: &str,
+        redelivery: bool,
     ) -> CoreResult<()> {
+        let delivery_id = job_id.to_string();
+        // The claim already bumped `attempts`, so it is the 1-based number
+        // of this attempt; a vanished job row still logs as attempt 1.
+        let attempt_no = db_jobs::by_id(self.db(), job_id)
+            .await?
+            .map(|row| row.attempts)
+            .unwrap_or(1)
+            .max(1);
+        let action = envelope_action(payload);
+        let started = Instant::now();
         let Some(hook) = db_checks::webhook_by_id(self.db(), webhook_id).await? else {
             return Ok(());
         };
@@ -615,92 +675,217 @@ impl Core {
         let secret = match open_secret(&self.config().webhook_key.0, &hook.secret_encrypted) {
             Ok(secret) => secret,
             Err(err) => {
-                self.record_terminal(
+                // No signature without a secret: store the headers the
+                // attempt would have sent, minus the signature.
+                let request_headers = request_headers_json(event, &delivery_id, None);
+                let error = format!("cannot decrypt the webhook secret: {err}");
+                self.record_terminal_attempt(
                     &hook,
+                    &delivery_id,
+                    attempt_no,
                     event,
+                    action.as_deref(),
+                    &request_headers,
                     payload,
                     None,
-                    &format!("cannot decrypt the webhook secret: {err}"),
+                    None,
+                    None,
+                    &error,
+                    started.elapsed(),
+                    redelivery,
                 )
                 .await?;
                 return Ok(());
             }
         };
         let signature = format!("sha256={}", hmac_sha256_hex(&secret, payload.as_bytes()));
+        let request_headers = request_headers_json(event, &delivery_id, Some(&signature));
         // Resolve and classify before touching the network: denials
         // (unresolvable or non-global hosts) are deterministic, so they are
-        // terminal — fail-closed, with no request and no retry.
+        // terminal — fail-closed, with no request and no retry. The denied
+        // attempt stores the request it would have sent, the error, and a
+        // null status.
         let parsed = url::Url::parse(&hook.url)
             .map_err(|_| CoreError::Internal("stored webhook url is invalid".into()))?;
         let (pinned, target) =
             match resolve_target(&parsed, self.config().allow_loopback_webhooks).await {
                 Ok(resolved) => resolved,
                 Err(err) => {
-                    self.record_terminal(&hook, event, payload, None, &err)
-                        .await?;
+                    self.record_terminal_attempt(
+                        &hook,
+                        &delivery_id,
+                        attempt_no,
+                        event,
+                        action.as_deref(),
+                        &request_headers,
+                        payload,
+                        None,
+                        None,
+                        None,
+                        &err,
+                        started.elapsed(),
+                        redelivery,
+                    )
+                    .await?;
                     return Ok(());
                 }
             };
+        let send_started = Instant::now();
         match post_hook(
             &hook.url,
             pinned.as_deref(),
             target,
-            job_id,
-            event,
+            &request_headers,
             payload,
-            &signature,
         )
         .await
         {
-            Ok(status) if (200..300).contains(&status) => {
-                db_checks::insert_delivery(
-                    self.db(),
-                    webhook_id,
+            Ok(response) if (200..300).contains(&response.status) => {
+                self.record_attempt(
+                    &hook,
+                    &delivery_id,
+                    attempt_no,
                     event,
+                    action.as_deref(),
+                    &request_headers,
                     payload,
-                    Some(status),
+                    Some(response.status),
+                    Some(&response.headers_json),
+                    Some(&response.stored_body()),
                     None,
-                    now(),
+                    send_started.elapsed(),
+                    redelivery,
                 )
                 .await?;
-                db_checks::set_webhook_result(self.db(), webhook_id, Some(status), None).await?;
                 Ok(())
             }
-            Ok(status) => {
-                self.fail_delivery(
+            Ok(response) => {
+                let error = format!("webhook returned HTTP {}", response.status);
+                self.fail_attempt(
                     job_id,
                     &hook,
+                    &delivery_id,
+                    attempt_no,
                     event,
+                    action.as_deref(),
+                    &request_headers,
                     payload,
-                    Some(status),
-                    &format!("webhook returned HTTP {status}"),
+                    Some(response.status),
+                    Some(&response.headers_json),
+                    Some(&response.stored_body()),
+                    &error,
+                    send_started.elapsed(),
+                    redelivery,
                 )
                 .await
             }
             Err(err) => {
-                self.fail_delivery(job_id, &hook, event, payload, None, &err)
-                    .await
+                self.fail_attempt(
+                    job_id,
+                    &hook,
+                    &delivery_id,
+                    attempt_no,
+                    event,
+                    action.as_deref(),
+                    &request_headers,
+                    payload,
+                    None,
+                    None,
+                    None,
+                    &err,
+                    send_started.elapsed(),
+                    redelivery,
+                )
+                .await
             }
         }
     }
 
+    /// Writes one delivery-log row and refreshes the hook's last-result
+    /// fields to this attempt's outcome.
+    #[allow(clippy::too_many_arguments)]
+    async fn record_attempt(
+        &self,
+        hook: &db_checks::WebhookRow,
+        delivery_id: &str,
+        attempt_no: i64,
+        event: &str,
+        action: Option<&str>,
+        request_headers: &str,
+        payload: &str,
+        status: Option<i64>,
+        response_headers: Option<&str>,
+        response_body: Option<&str>,
+        error: Option<&str>,
+        elapsed: Duration,
+        redelivery: bool,
+    ) -> CoreResult<()> {
+        db_checks::insert_delivery(
+            self.db(),
+            &db_checks::DeliveryAttempt {
+                webhook_id: hook.id,
+                delivery_id,
+                attempt: attempt_no,
+                event,
+                action,
+                request_headers,
+                payload,
+                status_code: status,
+                response_headers,
+                response_body,
+                error,
+                duration_ms: elapsed.as_millis().min(i64::MAX as u128) as i64,
+                redelivery,
+                now: now(),
+            },
+        )
+        .await?;
+        db_checks::set_webhook_result(self.db(), hook.id, status, error).await?;
+        Ok(())
+    }
+
     /// A failed attempt: terminal (this was the last rung) records the
-    /// outcome; anything earlier returns `Err` so the queue retries it.
-    async fn fail_delivery(
+    /// `webhook.failed` timeline and audit rows; anything earlier returns
+    /// `Err` so the queue retries it. Either way the attempt is logged.
+    #[allow(clippy::too_many_arguments)]
+    async fn fail_attempt(
         &self,
         job_id: i64,
         hook: &db_checks::WebhookRow,
+        delivery_id: &str,
+        attempt_no: i64,
         event: &str,
+        action: Option<&str>,
+        request_headers: &str,
         payload: &str,
         status: Option<i64>,
+        response_headers: Option<&str>,
+        response_body: Option<&str>,
         error: &str,
+        elapsed: Duration,
+        redelivery: bool,
     ) -> CoreResult<()> {
+        self.record_attempt(
+            hook,
+            delivery_id,
+            attempt_no,
+            event,
+            action,
+            request_headers,
+            payload,
+            status,
+            response_headers,
+            response_body,
+            Some(error),
+            elapsed,
+            redelivery,
+        )
+        .await?;
         let terminal = db_jobs::by_id(self.db(), job_id)
             .await?
             .is_none_or(|row| row.attempts >= MAX_ATTEMPTS);
         if terminal {
-            self.record_terminal(hook, event, payload, status, error)
-                .await?;
+            self.record_terminal_signal(hook, event, error).await?;
             Ok(())
         } else {
             Err(CoreError::Internal(format!(
@@ -709,27 +894,54 @@ impl Core {
         }
     }
 
-    /// Records a terminal outcome: one `webhook_deliveries` row, the hook's
-    /// `last_status`/`last_error`, and a `webhook.failed` timeline row.
-    async fn record_terminal(
+    /// Records a terminal outcome that never reached the network (corrupt
+    /// secret, SSRF denial): the logged attempt plus the `webhook.failed`
+    /// timeline and audit rows.
+    #[allow(clippy::too_many_arguments)]
+    async fn record_terminal_attempt(
+        &self,
+        hook: &db_checks::WebhookRow,
+        delivery_id: &str,
+        attempt_no: i64,
+        event: &str,
+        action: Option<&str>,
+        request_headers: &str,
+        payload: &str,
+        status: Option<i64>,
+        response_headers: Option<&str>,
+        response_body: Option<&str>,
+        error: &str,
+        elapsed: Duration,
+        redelivery: bool,
+    ) -> CoreResult<()> {
+        self.record_attempt(
+            hook,
+            delivery_id,
+            attempt_no,
+            event,
+            action,
+            request_headers,
+            payload,
+            status,
+            response_headers,
+            response_body,
+            Some(error),
+            elapsed,
+            redelivery,
+        )
+        .await?;
+        self.record_terminal_signal(hook, event, error).await?;
+        Ok(())
+    }
+
+    /// The terminal signal: one repo-scoped `webhook.failed` timeline row
+    /// plus one audit row. Non-terminal attempts write only their log row.
+    async fn record_terminal_signal(
         &self,
         hook: &db_checks::WebhookRow,
         event: &str,
-        payload: &str,
-        status: Option<i64>,
         error: &str,
     ) -> CoreResult<()> {
-        db_checks::insert_delivery(
-            self.db(),
-            hook.id,
-            event,
-            payload,
-            status,
-            Some(error),
-            now(),
-        )
-        .await?;
-        db_checks::set_webhook_result(self.db(), hook.id, status, Some(error)).await?;
         let detail = serde_json::json!({"id": hook.id, "event": event, "error": error}).to_string();
         db_trails::insert_timeline(
             self.db(),
@@ -750,6 +962,235 @@ impl Core {
         .await?;
         Ok(())
     }
+
+    /// Logged attempts of one hook (≥ `Maintain`), newest first; at most
+    /// `limit` (which clamps to 1–100, default 20). Readers get
+    /// `Forbidden`; a missing hook (or one from another repo) is `NotFound`.
+    pub async fn list_deliveries(
+        &self,
+        user: &User,
+        owner: &str,
+        repo: &str,
+        hook_id: i64,
+        limit: Option<i64>,
+    ) -> CoreResult<Vec<DeliverySummary>> {
+        let hook = self.hook_in_repo(user, owner, repo, hook_id).await?;
+        let limit = limit.unwrap_or(20).clamp(1, 100);
+        let mut out = Vec::new();
+        for row in db_checks::recent_deliveries(self.db(), hook.id, limit).await? {
+            out.push(DeliverySummary::of(&row));
+        }
+        Ok(out)
+    }
+
+    /// One logged attempt of this hook in full (≥ `Maintain`): the summary
+    /// plus the stored request and response. A row from another hook (or a
+    /// missing one) is `NotFound`.
+    pub async fn get_delivery(
+        &self,
+        user: &User,
+        owner: &str,
+        repo: &str,
+        hook_id: i64,
+        delivery_row: i64,
+    ) -> CoreResult<DeliveryDetail> {
+        let hook = self.hook_in_repo(user, owner, repo, hook_id).await?;
+        let Some(row) = db_checks::delivery_by_id(self.db(), delivery_row).await? else {
+            return Err(CoreError::NotFound);
+        };
+        if row.webhook_id != hook.id {
+            return Err(CoreError::NotFound);
+        }
+        Ok(DeliveryDetail::of(&row))
+    }
+
+    /// Replays a logged attempt as a NEW delivery (D6): the stored request
+    /// body is re-sent under a new delivery id, re-signed with the hook's
+    /// current secret, through the same SSRF gate and retry ladder. The
+    /// new attempts carry `redelivery = 1`. Needs ≥ `Maintain` on a
+    /// non-archived repo and an active hook (else `Invalid`); writes one
+    /// repo-scoped `webhook.redelivered` timeline row and one audit row.
+    /// Returns the new delivery id.
+    pub async fn redeliver(
+        &self,
+        user: &User,
+        owner: &str,
+        repo: &str,
+        hook_id: i64,
+        delivery_row: i64,
+    ) -> CoreResult<String> {
+        let access = self
+            .require_repo(Some(user), owner, repo, Permission::Maintain)
+            .await?;
+        if access.repo.archived_at.is_some() {
+            return Err(CoreError::Invalid("repository is archived".into()));
+        }
+        let Some(hook) = db_checks::webhook_by_id(self.db(), hook_id).await? else {
+            return Err(CoreError::NotFound);
+        };
+        if hook.repo_id != access.repo.id {
+            return Err(CoreError::NotFound);
+        }
+        if hook.active == 0 {
+            return Err(CoreError::Invalid("webhook is inactive".into()));
+        }
+        let Some(logged) = db_checks::delivery_by_id(self.db(), delivery_row).await? else {
+            return Err(CoreError::NotFound);
+        };
+        if logged.webhook_id != hook.id {
+            return Err(CoreError::NotFound);
+        }
+        let job = Job::WebhookDelivery {
+            webhook_id: hook.id,
+            event: logged.event.clone(),
+            payload: logged.payload.clone(),
+            redelivery: true,
+        };
+        let delivery_id = self.enqueue_returning(&job).await?.to_string();
+        let detail = serde_json::json!({
+            "hook": hook.id,
+            "row": logged.id,
+            "delivery_id": delivery_id,
+        })
+        .to_string();
+        db_trails::insert_timeline(
+            self.db(),
+            access.repo.id,
+            None,
+            "webhook.redelivered",
+            Some(user.id),
+            &detail,
+            now(),
+        )
+        .await?;
+        self.audit(
+            Some(user.id),
+            "webhook.redelivered",
+            &webhook_target(owner, repo, hook.id),
+            &detail,
+        )
+        .await?;
+        Ok(delivery_id)
+    }
+
+    /// The hook when it belongs to this repo (≥ `Maintain`), else
+    /// `Forbidden`/`NotFound`.
+    async fn hook_in_repo(
+        &self,
+        user: &User,
+        owner: &str,
+        repo: &str,
+        hook_id: i64,
+    ) -> CoreResult<db_checks::WebhookRow> {
+        let access = self
+            .require_repo(Some(user), owner, repo, Permission::Maintain)
+            .await?;
+        let Some(hook) = db_checks::webhook_by_id(self.db(), hook_id).await? else {
+            return Err(CoreError::NotFound);
+        };
+        if hook.repo_id != access.repo.id {
+            return Err(CoreError::NotFound);
+        }
+        Ok(hook)
+    }
+}
+
+/// One logged delivery attempt, newest first (D5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeliverySummary {
+    pub id: i64,
+    pub delivery_id: String,
+    pub attempt: i64,
+    pub event: String,
+    pub action: Option<String>,
+    pub status_code: Option<i64>,
+    pub error: Option<String>,
+    pub duration_ms: i64,
+    pub redelivery: bool,
+    pub delivered_at: i64,
+}
+
+/// One logged attempt in full: the summary plus the stored request and
+/// response. Request headers always hold exactly the headers sent (the
+/// signature included, never the secret); the response body is the first
+/// 16 KiB, UTF-8-lossy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeliveryDetail {
+    #[serde(flatten)]
+    pub summary: DeliverySummary,
+    pub request_headers: String,
+    pub request_body: String,
+    pub response_headers: Option<String>,
+    pub response_body: Option<String>,
+}
+
+impl DeliverySummary {
+    fn of(row: &db_checks::WebhookDeliveryRow) -> DeliverySummary {
+        DeliverySummary {
+            id: row.id,
+            delivery_id: row.delivery_id.clone().unwrap_or_default(),
+            attempt: row.attempt.unwrap_or(0),
+            event: row.event.clone(),
+            action: row.action.clone(),
+            status_code: row.status_code,
+            error: row.error.clone(),
+            duration_ms: row.duration_ms.unwrap_or(0),
+            redelivery: row.redelivery != 0,
+            delivered_at: row.delivered_at,
+        }
+    }
+}
+
+impl DeliveryDetail {
+    fn of(row: &db_checks::WebhookDeliveryRow) -> DeliveryDetail {
+        DeliveryDetail {
+            summary: DeliverySummary::of(row),
+            request_headers: row.request_headers.clone().unwrap_or_else(|| "{}".into()),
+            request_body: row.payload.clone(),
+            response_headers: row.response_headers.clone(),
+            response_body: row.response_body.clone(),
+        }
+    }
+}
+
+/// The `action` filed in the delivery envelope, if it parses and is a
+/// string (D1 always sends it, null or otherwise).
+fn envelope_action(payload: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(payload)
+        .ok()?
+        .get("action")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+/// Exactly the headers one attempt sends, as a JSON object: content type,
+/// user agent, event, delivery id, and the signature when the secret
+/// opened (never the secret itself).
+fn request_headers_json(event: &str, delivery_id: &str, signature: Option<&str>) -> String {
+    let mut headers = serde_json::Map::with_capacity(5);
+    headers.insert(
+        "content-type".into(),
+        serde_json::Value::String("application/json".into()),
+    );
+    headers.insert(
+        "user-agent".into(),
+        serde_json::Value::String(format!("starforged/{}", env!("CARGO_PKG_VERSION"))),
+    );
+    headers.insert(
+        "x-starforge-event".into(),
+        serde_json::Value::String(event.to_owned()),
+    );
+    headers.insert(
+        "x-starforge-delivery".into(),
+        serde_json::Value::String(delivery_id.to_owned()),
+    );
+    if let Some(signature) = signature {
+        headers.insert(
+            "x-starforge-signature-256".into(),
+            serde_json::Value::String(signature.to_owned()),
+        );
+    }
+    serde_json::Value::Object(headers).to_string()
 }
 
 /// Delivery-time SSRF gate: literal IPs and every resolved address are
@@ -863,20 +1304,37 @@ async fn resolve_target(
         .ok_or_else(|| format!("webhook host {host} resolves to no allowed address"))
 }
 
-/// POSTs the exact `payload` bytes with the `X-Starforge-*` headers to the
-/// pinned `target` (no re-resolve, no redirects). Returns the HTTP status;
-/// transport failures (including the 10 s timeout) and over-cap bodies are
-/// `Err`. The error text never contains the secret or the signature.
-#[allow(clippy::too_many_arguments)]
+/// One attempt's HTTP response: the status, the stored response headers
+/// (JSON object), and the full body read (capped at [`MAX_BODY_BYTES`]).
+struct PostResponse {
+    status: i64,
+    headers_json: String,
+    body: Vec<u8>,
+}
+
+impl PostResponse {
+    /// The first [`MAX_STORED_BODY_BYTES`], UTF-8-lossy, for the log row.
+    fn stored_body(&self) -> String {
+        let end = self.body.len().min(MAX_STORED_BODY_BYTES);
+        String::from_utf8_lossy(&self.body[..end]).into_owned()
+    }
+}
+
+/// POSTs the exact `payload` bytes with the stored `request_headers` (parsed
+/// back, so the row holds exactly the headers sent) to the pinned `target`
+/// (no re-resolve, no redirects). Returns the status with the response
+/// headers and body — success and error bodies alike, read up to the 64 KiB
+/// cap. Transport failures (including the 10 s timeout) and over-cap bodies
+/// are `Err`. The error text never contains the secret or the signature.
 async fn post_hook(
     url: &str,
     pinned: Option<&str>,
     target: std::net::SocketAddr,
-    job_id: i64,
-    event: &str,
+    request_headers: &str,
     payload: &str,
-    signature: &str,
-) -> Result<i64, String> {
+) -> Result<PostResponse, String> {
+    let stored: serde_json::Map<String, serde_json::Value> = serde_json::from_str(request_headers)
+        .map_err(|_| "stored webhook request headers are invalid".to_owned())?;
     let mut builder = reqwest::Client::builder()
         .timeout(DELIVERY_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none());
@@ -887,45 +1345,70 @@ async fn post_hook(
     let client = builder
         .build()
         .map_err(|e| format!("building the webhook client failed: {e}"))?;
-    let mut response = client
-        .post(url)
-        .header("content-type", "application/json")
-        .header(
-            "user-agent",
-            format!("starforged/{}", env!("CARGO_PKG_VERSION")),
-        )
-        .header("x-starforge-event", event)
-        .header("x-starforge-delivery", job_id.to_string())
-        .header("x-starforge-signature-256", signature)
-        .body(payload.to_owned())
-        .send()
-        .await
-        .map_err(|e| {
-            if e.is_timeout() {
-                "webhook delivery timed out after 10s".to_owned()
-            } else {
-                format!("webhook delivery failed: {e}")
-            }
-        })?;
-    let status = response.status();
-    if !status.is_success() {
-        // Never read error bodies: the status alone records the outcome.
-        return Ok(i64::from(status.as_u16()));
+    let mut request = client.post(url).body(payload.to_owned());
+    for (name, value) in &stored {
+        let value = value.as_str().unwrap_or("");
+        request = request.header(name.as_str(), value);
     }
-    // Bound the success-body read chunk by chunk: never more than 64 KiB.
-    let mut total = 0usize;
+    let mut response = request.send().await.map_err(|e| {
+        if e.is_timeout() {
+            "webhook delivery timed out after 10s".to_owned()
+        } else {
+            format!("webhook delivery failed: {e}")
+        }
+    })?;
+    let status = i64::from(response.status().as_u16());
+    let headers_json = response_headers_json(response.headers());
+    // Bound the body read chunk by chunk: never more than 64 KiB, for
+    // success and error responses alike.
+    let mut body = Vec::new();
     loop {
         let chunk = response
             .chunk()
             .await
             .map_err(|e| format!("webhook delivery failed: {e}"))?;
         let Some(bytes) = chunk else { break };
-        total += bytes.len();
-        if total > MAX_BODY_BYTES {
+        if body.len() + bytes.len() > MAX_BODY_BYTES {
             return Err("webhook response body exceeds the 64 KiB cap".to_owned());
         }
+        body.extend_from_slice(&bytes);
     }
-    Ok(i64::from(status.as_u16()))
+    Ok(PostResponse {
+        status,
+        headers_json,
+        body,
+    })
+}
+
+/// The response headers for the log row: a JSON object of at most
+/// [`MAX_STORED_HEADERS`] headers, each value truncated to
+/// [`MAX_STORED_HEADER_VALUE_BYTES`] bytes, repeated names joined with
+/// ", ". Nothing from the receiver is trusted beyond this capped preview.
+fn response_headers_json(headers: &reqwest::header::HeaderMap) -> String {
+    let mut out = serde_json::Map::with_capacity(headers.keys_len().min(MAX_STORED_HEADERS));
+    for name in headers.keys().take(MAX_STORED_HEADERS) {
+        let mut values = Vec::new();
+        for value in headers.get_all(name) {
+            let text = String::from_utf8_lossy(value.as_bytes());
+            let end = floor_char_boundary(&text, MAX_STORED_HEADER_VALUE_BYTES);
+            values.push(text[..end].to_owned());
+        }
+        out.insert(
+            name.as_str().to_owned(),
+            serde_json::Value::String(values.join(", ")),
+        );
+    }
+    serde_json::Value::Object(out).to_string()
+}
+
+/// The longest prefix of `text` that fits in `max` bytes and ends on a
+/// UTF-8 boundary.
+fn floor_char_boundary(text: &str, max: usize) -> usize {
+    let mut end = text.len().min(max);
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
 }
 
 #[cfg(test)]
@@ -1077,6 +1560,7 @@ mod tests {
             webhook_id: hook_id,
             event: "check".into(),
             payload: payload.clone(),
+            redelivery: false,
         })
         .await
         .unwrap();
@@ -1086,7 +1570,7 @@ mod tests {
             .into_iter()
             .find(|row| row.kind == "webhook_delivery")
             .unwrap();
-        core.deliver_webhook(job.id, hook_id, "check", &payload)
+        core.deliver_webhook(job.id, hook_id, "check", &payload, false)
             .await
     }
 

@@ -17,7 +17,7 @@ use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use starforged_core::tokens::Scope;
-use starforged_core::webhooks::WebhookDto;
+use starforged_core::webhooks::{DeliverySummary, WebhookDto};
 
 use crate::ApiState;
 use crate::auth::ApiAuth;
@@ -29,6 +29,7 @@ pub struct WebhookJson {
     pub id: i64,
     pub url: String,
     pub events: Vec<String>,
+    pub subscription_invalid: bool,
     pub active: bool,
     pub last_status: Option<i64>,
     pub last_error: Option<String>,
@@ -41,12 +42,47 @@ fn webhook_json(view: &WebhookDto) -> WebhookJson {
         id: view.id,
         url: view.url.clone(),
         events: view.events.clone(),
+        subscription_invalid: view.subscription_invalid,
         active: view.active,
         last_status: view.last_status,
         last_error: view.last_error.clone(),
         has_secret: true,
         created_at: rfc3339(view.created_at),
     }
+}
+
+#[derive(Serialize)]
+struct DeliverySummaryJson {
+    id: i64,
+    delivery_id: String,
+    attempt: i64,
+    event: String,
+    action: Option<String>,
+    status_code: Option<i64>,
+    error: Option<String>,
+    duration_ms: i64,
+    redelivery: bool,
+    delivered_at: String,
+}
+
+fn delivery_summary_json(view: &DeliverySummary) -> DeliverySummaryJson {
+    DeliverySummaryJson {
+        id: view.id,
+        delivery_id: view.delivery_id.clone(),
+        attempt: view.attempt,
+        event: view.event.clone(),
+        action: view.action.clone(),
+        status_code: view.status_code,
+        error: view.error.clone(),
+        duration_ms: view.duration_ms,
+        redelivery: view.redelivery,
+        delivered_at: rfc3339(view.delivered_at),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct DeliveriesQuery {
+    pub limit: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -129,4 +165,70 @@ pub async fn delete_hook(
         .delete_webhook(&auth.user, &owner, &repo, id)
         .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// `GET /repos/{owner}/{repo}/hooks/{id}/deliveries[?limit=]` (200): the
+/// hook's logged attempts, newest first (maintainer-only).
+pub async fn list_deliveries(
+    State(state): State<ApiState>,
+    auth: ApiAuth,
+    Path((owner, repo, id)): Path<(String, String, i64)>,
+    axum::extract::Query(query): axum::extract::Query<DeliveriesQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let auth = auth.require(Scope::RepoWrite)?;
+    let views = state
+        .core
+        .list_deliveries(&auth.user, &owner, &repo, id, query.limit)
+        .await?;
+    Ok(Json(json!({
+        "deliveries": views.iter().map(delivery_summary_json).collect::<Vec<_>>(),
+    })))
+}
+
+/// `GET /repos/{owner}/{repo}/hooks/{id}/deliveries/{row}` (200): one
+/// logged attempt in full (maintainer-only).
+pub async fn get_delivery(
+    State(state): State<ApiState>,
+    auth: ApiAuth,
+    Path((owner, repo, id, row)): Path<(String, String, i64, i64)>,
+) -> Result<Json<Value>, ApiError> {
+    let auth = auth.require(Scope::RepoWrite)?;
+    let view = state
+        .core
+        .get_delivery(&auth.user, &owner, &repo, id, row)
+        .await?;
+    let mut rendered = serde_json::to_value(delivery_summary_json(&view.summary))
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    rendered["request_headers"] =
+        serde_json::from_str(&view.request_headers).unwrap_or(Value::Null);
+    rendered["request_body"] = Value::String(view.request_body.clone());
+    rendered["response_headers"] = view
+        .response_headers
+        .as_deref()
+        .and_then(|raw| serde_json::from_str(raw).ok())
+        .unwrap_or(Value::Null);
+    rendered["response_body"] = view
+        .response_body
+        .clone()
+        .map(Value::String)
+        .unwrap_or(Value::Null);
+    Ok(Json(rendered))
+}
+
+/// `POST /repos/{owner}/{repo}/hooks/{id}/deliveries/{row}/redeliver`
+/// (202): replays the logged attempt as a new delivery (maintainer-only).
+pub async fn redeliver(
+    State(state): State<ApiState>,
+    auth: ApiAuth,
+    Path((owner, repo, id, row)): Path<(String, String, i64, i64)>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let auth = auth.require(Scope::RepoWrite)?;
+    let delivery_id = state
+        .core
+        .redeliver(&auth.user, &owner, &repo, id, row)
+        .await?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(json!({ "delivery_id": delivery_id })),
+    ))
 }

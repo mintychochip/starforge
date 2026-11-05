@@ -789,13 +789,16 @@ async fn retry_ladder_then_terminal_failure() {
             "backoff rung {} ≈ {delay}s, got skew {skew}",
             i + 1
         );
-        // No delivery row until the terminal outcome.
-        assert!(
-            starforged_db::checks::recent_deliveries(c.s.core.db(), hook_id, 10)
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        // Every attempt writes exactly one row: attempts 1..=i+1 logged,
+        // all under one delivery id.
+        let logged = starforged_db::checks::recent_deliveries(c.s.core.db(), hook_id, 10)
+            .await
+            .unwrap();
+        assert_eq!(logged.len(), i + 1, "one row per attempt");
+        let mut attempts: Vec<i64> = logged.iter().map(|d| d.attempt.unwrap()).collect();
+        attempts.sort_unstable();
+        assert_eq!(attempts, (1..=(i as i64 + 1)).collect::<Vec<_>>());
+        assert!(logged.iter().all(|d| d.status_code == Some(500)));
         c.make_due("webhook_delivery").await;
     }
 
@@ -809,9 +812,22 @@ async fn retry_ladder_then_terminal_failure() {
     let deliveries = starforged_db::checks::recent_deliveries(c.s.core.db(), hook_id, 10)
         .await
         .unwrap();
-    assert_eq!(deliveries.len(), 1);
-    assert!(deliveries[0].status_code == Some(500));
-    assert!(deliveries[0].error.as_deref().unwrap_or("").contains("500"));
+    assert_eq!(deliveries.len(), 5, "one row per attempt: {deliveries:?}");
+    let mut attempts: Vec<i64> = deliveries.iter().map(|d| d.attempt.unwrap()).collect();
+    attempts.sort_unstable();
+    assert_eq!(attempts, vec![1, 2, 3, 4, 5]);
+    let first = deliveries[0].delivery_id.clone().unwrap();
+    assert!(
+        deliveries
+            .iter()
+            .all(|d| d.delivery_id.as_deref() == Some(first.as_str()))
+    );
+    assert!(deliveries.iter().all(|d| d.status_code == Some(500)));
+    let newest = deliveries
+        .iter()
+        .max_by_key(|d| d.attempt.unwrap())
+        .unwrap();
+    assert!(newest.error.as_deref().unwrap_or("").contains("500"));
 
     let hooks =
         c.s.core
@@ -892,8 +908,8 @@ async fn disable_stops_delivery_and_dead_endpoint_does_not_wedge() {
         .unwrap();
     assert_eq!(
         deliveries.len(),
-        1,
-        "dead endpoint records terminal failure"
+        5,
+        "dead endpoint logs every attempt, then goes terminal"
     );
     assert!(
         deliveries[0].status_code.is_none(),
@@ -937,6 +953,17 @@ async fn end_to_end_push_review_merge_fan_out() {
     git_ok(&work, &["checkout", "-q", "-b", "feature/x"]).await;
     commit_files(&work, &[("a.txt", b"one\ntwo\n")], "add two").await;
     git_ok(&work, &["push", "-q", &url, "main", "feature/x"]).await;
+    // The push's two events (main + feature/x creates) arrive asynchronously;
+    // wait for them before driving the lifecycle over HTTP.
+    let pushed = delivered_until(&c, &sink, &secret, 0, |got| {
+        got.iter().filter(|b| b["event"] == "push").count() == 2
+    })
+    .await;
+    assert_eq!(
+        pushed.iter().filter(|b| b["event"] == "push").count(),
+        2,
+        "one push event per created branch: {pushed:?}"
+    );
 
     let trail_rw =
         c.s.token(&c.alice, &[Scope::RepoRead, Scope::TrailWrite])
@@ -1127,6 +1154,37 @@ async fn delivered_from(c: &Ctx, sink: &Sink, secret: &str, from: usize) -> Vec<
         .skip(from)
         .map(|hit| check_delivery(hit, secret))
         .collect()
+}
+
+/// Polling variant of [`delivered_from`]: after a real `git push`, the
+/// server's post-receive processing (which enqueues the push events) can
+/// still be running when the push command returns, so one `run_due_jobs`
+/// may find nothing to run. Loops `run_due_jobs` + collect with 50 ms
+/// sleeps until `ready` holds or 10 s pass, then returns what arrived —
+/// the caller's assert shows the real content on timeout.
+async fn delivered_until(
+    c: &Ctx,
+    sink: &Sink,
+    secret: &str,
+    from: usize,
+    mut ready: impl FnMut(&[Value]) -> bool,
+) -> Vec<Value> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        c.s.core.run_due_jobs().await.unwrap();
+        let got: Vec<Value> = sink
+            .hits
+            .lock()
+            .unwrap()
+            .iter()
+            .skip(from)
+            .map(|hit| check_delivery(hit, secret))
+            .collect();
+        if ready(&got) || std::time::Instant::now() >= deadline {
+            return got;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 }
 
 fn hits(sink: &Sink) -> usize {
@@ -1397,8 +1455,11 @@ async fn trail_label_assignee_change_state_events() {
     core.create_branch_change(&c.alice, "alice", "proj", t.number, "feature/k", "main")
         .await
         .unwrap();
-    delivered_from(&c, &sink, &secret, from).await;
-    // Branch pushes also emit push events; skip past them.
+    // Branch pushes also emit push events; wait for both, then skip past them.
+    delivered_until(&c, &sink, &secret, from, |got| {
+        got.iter().filter(|b| b["event"] == "push").count() == 2
+    })
+    .await;
     from = hits(&sink);
 
     core.set_change_state(&c.alice, "alice", "proj", t.number, 1, "closed")
@@ -1482,7 +1543,12 @@ async fn review_dismissal_events() {
         .await
         .unwrap();
     let mut from = hits(&sink);
-    delivered_from(&c, &sink, &secret, from).await;
+    // The branch push's events arrive asynchronously; wait for both before
+    // the dismissal steps below assert exact counts.
+    delivered_until(&c, &sink, &secret, from, |got| {
+        got.iter().filter(|b| b["event"] == "push").count() == 2
+    })
+    .await;
     from = hits(&sink);
 
     // Explicit dismissal names the dismisser as sender.
@@ -1600,7 +1666,10 @@ async fn push_events_cover_create_update_delete_tag_and_skip_non_branch_refs() {
         .await
         .trim()
         .to_owned();
-    let got = delivered_from(&c, &sink, &secret, 0).await;
+    let got = delivered_until(&c, &sink, &secret, 0, |got| {
+        got.iter().filter(|b| b["event"] == "push").count() == 2
+    })
+    .await;
     let pushes: Vec<&Value> = got.iter().filter(|b| b["event"] == "push").collect();
     assert_eq!(
         pushes.len(),
@@ -1625,7 +1694,10 @@ async fn push_events_cover_create_update_delete_tag_and_skip_non_branch_refs() {
         .await
         .trim()
         .to_owned();
-    let got = delivered_from(&c, &sink, &secret, from).await;
+    let got = delivered_until(&c, &sink, &secret, from, |got| {
+        got.iter().filter(|b| b["event"] == "push").count() == 1
+    })
+    .await;
     let pushes: Vec<&Value> = got.iter().filter(|b| b["event"] == "push").collect();
     assert_eq!(pushes.len(), 1, "one push event for the update: {got:?}");
     let subject = check_envelope(pushes[0], "push", None, None, "alice", &repo_url);
@@ -1643,7 +1715,10 @@ async fn push_events_cover_create_update_delete_tag_and_skip_non_branch_refs() {
         .await
         .trim()
         .to_owned();
-    let got = delivered_from(&c, &sink, &secret, from).await;
+    let got = delivered_until(&c, &sink, &secret, from, |got| {
+        got.iter().filter(|b| b["event"] == "push").count() == 1
+    })
+    .await;
     let pushes: Vec<&Value> = got.iter().filter(|b| b["event"] == "push").collect();
     assert_eq!(pushes.len(), 1, "tag pushes emit push: {got:?}");
     let subject = check_envelope(pushes[0], "push", None, None, "alice", &repo_url);
@@ -1655,7 +1730,10 @@ async fn push_events_cover_create_update_delete_tag_and_skip_non_branch_refs() {
 
     // Branch delete.
     git_ok(&work, &["push", "-q", &url, ":refs/heads/feature/p"]).await;
-    let got = delivered_from(&c, &sink, &secret, from).await;
+    let got = delivered_until(&c, &sink, &secret, from, |got| {
+        got.iter().filter(|b| b["event"] == "push").count() == 1
+    })
+    .await;
     let pushes: Vec<&Value> = got.iter().filter(|b| b["event"] == "push").collect();
     assert_eq!(pushes.len(), 1, "branch deletes emit push: {got:?}");
     let subject = check_envelope(pushes[0], "push", None, None, "alice", &repo_url);
@@ -1668,7 +1746,14 @@ async fn push_events_cover_create_update_delete_tag_and_skip_non_branch_refs() {
 
     // A refs/for push ingests a trail change and never emits push.
     git_ok(&work, &["push", "-q", &url, "HEAD:refs/for/main"]).await;
-    let got = delivered_from(&c, &sink, &secret, from).await;
+    let got = delivered_until(&c, &sink, &secret, from, |got| {
+        got.iter().any(|b| {
+            b["event"] == "trail"
+                && (b["action"] == "opened"
+                    || (b["action"] == "updated" && b["cause"] == "change_opened"))
+        })
+    })
+    .await;
     assert!(
         got.iter().all(|b| b["event"] != "push"),
         "refs/for pushes never emit push: {got:?}"
@@ -1882,4 +1967,440 @@ fn check_envelope_session<'a>(body: &'a Value, action: &str, repo_url: &str) -> 
     assert_eq!(body["repository"]["full_name"], "alice/pub");
     assert_eq!(body["repository"]["url"], repo_url);
     &body["session"]
+}
+
+// ==== K3: per-attempt delivery log + redelivery (plus subscription-invalid fold-in) ====
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// A receiver that fails the first `fail_first` POSTs with 500, then answers
+/// 200 with `success_body`. Records every hit's headers and raw body.
+#[derive(Clone)]
+struct FlakySink {
+    hits: Arc<Mutex<Vec<Hit>>>,
+    remaining_failures: Arc<AtomicUsize>,
+    success_body: Vec<u8>,
+}
+
+impl FlakySink {
+    async fn spawn(fail_first: usize, success_body: Vec<u8>) -> (String, FlakySink) {
+        let sink = FlakySink {
+            hits: Arc::new(Mutex::new(Vec::new())),
+            remaining_failures: Arc::new(AtomicUsize::new(fail_first)),
+            success_body,
+        };
+        let inner = sink.clone();
+        let app = axum::Router::new().route(
+            "/hook",
+            axum::routing::post(
+                move |headers: axum::http::HeaderMap, body: axum::body::Bytes| {
+                    let inner = inner.clone();
+                    async move {
+                        let get = |name: &str| {
+                            headers
+                                .get(name)
+                                .and_then(|v| v.to_str().ok())
+                                .map(str::to_owned)
+                        };
+                        let hit = Hit {
+                            event: get("x-starforge-event"),
+                            delivery: get("x-starforge-delivery"),
+                            signature: get("x-starforge-signature-256"),
+                            legacy_signature: get("x-starforge-signature"),
+                            user_agent: get("user-agent"),
+                            body: body.to_vec(),
+                        };
+                        if inner.remaining_failures.load(Ordering::SeqCst) > 0 {
+                            inner.remaining_failures.fetch_sub(1, Ordering::SeqCst);
+                            inner.hits.lock().unwrap().push(hit);
+                            return (
+                                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                                axum::body::Body::from("boom"),
+                            );
+                        }
+                        inner.hits.lock().unwrap().push(hit);
+                        (
+                            axum::http::StatusCode::OK,
+                            axum::body::Body::from(inner.success_body.clone()),
+                        )
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(axum::serve(listener, app).into_future());
+        (format!("http://{addr}/hook"), sink)
+    }
+}
+
+async fn dispatch_check(c: &Ctx) {
+    use starforged_core::webhooks::HookEvent;
+    c.s.core
+        .dispatch_event(
+            1,
+            HookEvent {
+                event: "check",
+                action: None,
+                cause: None,
+                sender: Some("alice".to_owned()),
+                subject: json!({"sha": "abc", "context": "ci", "state": "success"}),
+            },
+        )
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn per_attempt_rows_two_failures_then_success() {
+    let c = Ctx::start().await;
+    // The sink answers 20 KiB on success; only the first 16 KiB is stored.
+    let (sink_url, sink) = FlakySink::spawn(2, vec![b'x'; 20 * 1024]).await;
+    let created = c.create_hook(&c.alice_rw, &sink_url, &[]).await;
+    let hook_id = created["id"].as_i64().unwrap();
+    let secret = created["secret"].as_str().unwrap().to_owned();
+
+    dispatch_check(&c).await;
+    // Fail, fail, succeed: drive the ladder manually due.
+    c.s.core.run_due_jobs().await.unwrap();
+    c.make_due("webhook_delivery").await;
+    c.s.core.run_due_jobs().await.unwrap();
+    c.make_due("webhook_delivery").await;
+    c.s.core.run_due_jobs().await.unwrap();
+
+    assert_eq!(sink.hits.lock().unwrap().len(), 3);
+    let rows =
+        c.s.core
+            .list_deliveries(&c.alice, "alice", "proj", hook_id, None)
+            .await
+            .unwrap();
+    assert_eq!(rows.len(), 3, "one row per attempt: {rows:?}");
+    // Newest first.
+    assert_eq!(rows[0].attempt, 3);
+    assert_eq!(rows[1].attempt, 2);
+    assert_eq!(rows[2].attempt, 1);
+    let first_delivery = rows[2].delivery_id.clone();
+    assert!(!first_delivery.is_empty());
+    assert!(rows.iter().all(|r| r.delivery_id == first_delivery));
+    assert_eq!(rows[2].status_code, Some(500));
+    assert_eq!(rows[1].status_code, Some(500));
+    assert_eq!(rows[0].status_code, Some(200));
+    for row in &rows {
+        assert_eq!(row.event, "check");
+        assert!(row.duration_ms >= 0, "duration recorded: {row:?}");
+        assert!(!row.redelivery);
+        let detail =
+            c.s.core
+                .get_delivery(&c.alice, "alice", "proj", hook_id, row.id)
+                .await
+                .unwrap();
+        let headers: Value = serde_json::from_str(&detail.request_headers).unwrap();
+        let sig = headers["x-starforge-signature-256"]
+            .as_str()
+            .expect("stored request headers carry the signature");
+        assert_eq!(
+            sig,
+            &format!(
+                "sha256={}",
+                hmac_sha256_hex(&secret, detail.request_body.as_bytes())
+            )
+        );
+        assert!(!detail.request_body.is_empty(), "request body stored");
+        let stored = detail.response_body.as_deref().unwrap_or("");
+        assert!(stored.len() <= 16 * 1024, "response body capped at 16 KiB");
+        assert!(
+            !stored.is_empty() || detail.summary.status_code != Some(200),
+            "2xx stores its body: {detail:?}"
+        );
+    }
+    // The terminal success stored only the first 16 KiB of the 20 KiB body.
+    let detail =
+        c.s.core
+            .get_delivery(&c.alice, "alice", "proj", hook_id, rows[0].id)
+            .await
+            .unwrap();
+    assert_eq!(
+        detail.response_body.as_deref().unwrap_or("").len(),
+        16 * 1024
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ssrf_denial_writes_error_row_with_request() {
+    let c = Ctx::start().await;
+    let (sink_url, _sink) = Sink::spawn(false).await;
+    let created = c.create_hook(&c.alice_rw, &sink_url, &[]).await;
+    let hook_id = created["id"].as_i64().unwrap();
+    // Point the hook at a denied address straight in the db (create-time
+    // validation would 422 it); the sealed secret stays valid.
+    sqlx::query("UPDATE webhooks SET url = $1 WHERE id = $2")
+        .bind("http://10.0.0.1/hook")
+        .bind(hook_id)
+        .execute(c.s.core.db().pool())
+        .await
+        .unwrap();
+    dispatch_check(&c).await;
+    c.s.core.run_due_jobs().await.unwrap();
+    let rows =
+        c.s.core
+            .list_deliveries(&c.alice, "alice", "proj", hook_id, None)
+            .await
+            .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status_code, None);
+    assert!(!rows[0].error.as_deref().unwrap_or("").is_empty());
+    let detail =
+        c.s.core
+            .get_delivery(&c.alice, "alice", "proj", hook_id, rows[0].id)
+            .await
+            .unwrap();
+    assert!(
+        !detail.request_body.is_empty(),
+        "denied attempt stores its request"
+    );
+    assert!(!detail.request_headers.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn redeliver_replays_body_under_new_id() {
+    let c = Ctx::start().await;
+    let client = reqwest::Client::new();
+    let (sink_url, sink) = Sink::spawn(false).await;
+    let created = c.create_hook(&c.alice_rw, &sink_url, &[]).await;
+    let hook_id = created["id"].as_i64().unwrap();
+    let secret = created["secret"].as_str().unwrap().to_owned();
+    dispatch_check(&c).await;
+    c.s.core.run_due_jobs().await.unwrap();
+    assert_eq!(sink.hits.lock().unwrap().len(), 1);
+
+    let rows =
+        c.s.core
+            .list_deliveries(&c.alice, "alice", "proj", hook_id, None)
+            .await
+            .unwrap();
+    assert_eq!(rows.len(), 1);
+
+    // Redeliver over the API: 202 with a new delivery id.
+    let res = client
+        .post(format!(
+            "{}/{}/deliveries/{}/redeliver",
+            c.hooks(),
+            hook_id,
+            rows[0].id
+        ))
+        .bearer_auth(&c.alice_rw)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 202);
+    let redelivered: Value = res.json().await.unwrap();
+    let new_id = redelivered["delivery_id"].as_str().unwrap().to_owned();
+    assert_ne!(new_id, rows[0].delivery_id);
+
+    c.s.core.run_due_jobs().await.unwrap();
+    let hits = sink.hits.lock().unwrap().clone();
+    assert_eq!(hits.len(), 2, "redelivery reaches the receiver");
+    assert_eq!(hits[0].body, hits[1].body, "identical body replayed");
+    assert_eq!(hits[1].delivery.as_deref(), Some(new_id.as_str()));
+    let body: Value = check_delivery(&hits[1], &secret);
+    assert_eq!(body["event"], "check");
+
+    let rows =
+        c.s.core
+            .list_deliveries(&c.alice, "alice", "proj", hook_id, None)
+            .await
+            .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].delivery_id, new_id);
+    assert!(rows[0].redelivery);
+
+    // Exactly one timeline row and one audit row per redelivery.
+    let timeline: Vec<(String,)> =
+        sqlx::query_as("SELECT kind FROM timeline_events WHERE kind = 'webhook.redelivered'")
+            .fetch_all(c.s.core.db().pool())
+            .await
+            .unwrap();
+    assert_eq!(timeline.len(), 1);
+    let audit: Vec<(String,)> =
+        sqlx::query_as("SELECT action FROM audit_log WHERE action = 'webhook.redelivered'")
+            .fetch_all(c.s.core.db().pool())
+            .await
+            .unwrap();
+    assert_eq!(audit.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn redeliver_refuses_bad_states() {
+    let c = Ctx::start().await;
+    let client = reqwest::Client::new();
+    let (sink_url, _sink) = Sink::spawn(false).await;
+    let created = c.create_hook(&c.alice_rw, &sink_url, &[]).await;
+    let hook_id = created["id"].as_i64().unwrap();
+    dispatch_check(&c).await;
+    c.s.core.run_due_jobs().await.unwrap();
+    let rows =
+        c.s.core
+            .list_deliveries(&c.alice, "alice", "proj", hook_id, None)
+            .await
+            .unwrap();
+    let redeliver = |token: &str| {
+        client
+            .post(format!(
+                "{}/{}/deliveries/{}/redeliver",
+                c.hooks(),
+                hook_id,
+                rows[0].id
+            ))
+            .bearer_auth(token)
+            .send()
+    };
+
+    // Below maintain: 403.
+    let res = redeliver(&c.carol_rw).await.unwrap();
+    assert_eq!(res.status(), 403);
+
+    // Inactive hook: 422.
+    let res = client
+        .patch(format!("{}/{}", c.hooks(), hook_id))
+        .bearer_auth(&c.alice_rw)
+        .json(&json!({"active": false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let res = redeliver(&c.alice_rw).await.unwrap();
+    assert_eq!(res.status(), 422);
+
+    // Reactivate, then archive the repo: 422.
+    let res = client
+        .patch(format!("{}/{}", c.hooks(), hook_id))
+        .bearer_auth(&c.alice_rw)
+        .json(&json!({"active": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    c.s.core
+        .archive_repo(&c.alice, "alice", "proj")
+        .await
+        .unwrap();
+    let res = redeliver(&c.alice_rw).await.unwrap();
+    assert_eq!(res.status(), 422);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invalid_subscriptions_receive_nothing_and_report() {
+    let c = Ctx::start().await;
+    let (sink_url, sink) = Sink::spawn(false).await;
+    // A hook whose stored subscription names no known event, and one whose
+    // stored cell is not JSON at all (written straight to the db, bypassing
+    // the create-time validation).
+    let sealed = c.create_hook(&c.alice_rw, &sink_url, &[]).await;
+    let hook_id = sealed["id"].as_i64().unwrap();
+    sqlx::query("UPDATE webhooks SET events = $1 WHERE id = $2")
+        .bind(r#"["foo"]"#)
+        .bind(hook_id)
+        .execute(c.s.core.db().pool())
+        .await
+        .unwrap();
+    let other = c.create_hook(&c.alice_rw, &sink_url, &[]).await;
+    let other_id = other["id"].as_i64().unwrap();
+    sqlx::query("UPDATE webhooks SET events = $1 WHERE id = $2")
+        .bind("not json")
+        .bind(other_id)
+        .execute(c.s.core.db().pool())
+        .await
+        .unwrap();
+
+    dispatch_check(&c).await;
+    c.s.core.run_due_jobs().await.unwrap();
+    assert!(
+        sink.hits.lock().unwrap().is_empty(),
+        "invalid subscriptions receive nothing"
+    );
+
+    for id in [hook_id, other_id] {
+        let hooks =
+            c.s.core
+                .list_webhooks(Some(&c.alice), "alice", "proj")
+                .await
+                .unwrap();
+        let hook = hooks.iter().find(|h| h.id == id).unwrap();
+        assert!(hook.events.is_empty(), "invalid reads as no events");
+        assert!(hook.subscription_invalid, "invalid is reported");
+    }
+    let client = reqwest::Client::new();
+    let res = client
+        .get(c.hooks())
+        .bearer_auth(&c.alice_rw)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let list: Value = res.json().await.unwrap();
+    for hook in list["hooks"].as_array().unwrap() {
+        assert_eq!(hook["events"], json!([]));
+        assert_eq!(hook["subscription_invalid"], true);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delivery_detail_page_escapes_receiver_body() {
+    let c = Ctx::start().await;
+    let evil = "<script>alert(1)</script>".as_bytes().to_vec();
+    let (sink_url, _sink) = FlakySink::spawn(0, evil).await;
+    let created = c.create_hook(&c.alice_rw, &sink_url, &[]).await;
+    let hook_id = created["id"].as_i64().unwrap();
+    dispatch_check(&c).await;
+    c.s.core.run_due_jobs().await.unwrap();
+    let rows =
+        c.s.core
+            .list_deliveries(&c.alice, "alice", "proj", hook_id, None)
+            .await
+            .unwrap();
+    assert_eq!(rows.len(), 1);
+
+    let (browser, _) = c.s.login("alice").await;
+    let page = get_text(
+        &browser,
+        &c.s.url(&format!(
+            "/alice/proj/settings/hooks/{}/deliveries/{}",
+            hook_id, rows[0].id
+        )),
+    )
+    .await;
+    assert!(
+        page.contains("&#60;script&#62;"),
+        "receiver body is escaped: {page}"
+    );
+    assert!(
+        !page.contains("<script>alert(1)"),
+        "raw receiver body never renders: {page}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn redeliver_form_requires_csrf() {
+    let c = Ctx::start().await;
+    let (sink_url, _sink) = Sink::spawn(false).await;
+    let created = c.create_hook(&c.alice_rw, &sink_url, &[]).await;
+    let hook_id = created["id"].as_i64().unwrap();
+    dispatch_check(&c).await;
+    c.s.core.run_due_jobs().await.unwrap();
+    let rows =
+        c.s.core
+            .list_deliveries(&c.alice, "alice", "proj", hook_id, None)
+            .await
+            .unwrap();
+
+    let (browser, _) = c.s.login("alice").await;
+    let res = browser
+        .post(c.s.url(&format!(
+            "/alice/proj/settings/hooks/{}/deliveries/{}/redeliver",
+            hook_id, rows[0].id
+        )))
+        .form(&[("unrelated", "x")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 403, "redeliver without CSRF is forbidden");
 }

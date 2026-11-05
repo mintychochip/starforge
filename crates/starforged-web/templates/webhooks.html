@@ -9,19 +9,35 @@
 <p class="success">Webhook for <code>{{ url }}</code> created. Copy the secret now — it is shown only once: <code id="new-hook-secret">secret-{{ secret }}-end</code></p>
 {% endif %}
 {% endif %}
-{% if hooks.is_empty() %}
+{% if logs.is_empty() %}
 <p class="muted">No webhooks yet. New deliveries sign the exact JSON body with HMAC-SHA256.</p>
 {% else %}
 <table class="list">
 <thead><tr><th>URL</th><th>Events</th><th>Status</th><th>Last delivery</th><th></th></tr></thead>
 <tbody>
-{% for h in hooks %}
-<tr><td><code>{{ h.url }}</code></td><td>{% if h.events.is_empty() %}all{% else %}{{ h.events|join(", ") }}{% endif %}</td><td>{% if h.active %}enabled{% else %}disabled{% endif %}</td><td>{% if let Some(s) = h.last_status %}{{ s }}{% if let Some(e) = h.last_error %} · {{ e }}{% endif %}{% else %}never{% endif %}</td>
-<td><form method="post" action="/{{ head.owner }}/{{ head.name }}/settings/hooks/{{ h.id }}/toggle" class="inline"><input type="hidden" name="_csrf" value="{{ csrf }}"><button type="submit">{% if h.active %}Disable{% else %}Enable{% endif %}</button></form>
-<form method="post" action="/{{ head.owner }}/{{ head.name }}/settings/hooks/{{ h.id }}/delete" class="inline"><input type="hidden" name="_csrf" value="{{ csrf }}"><button type="submit">Delete</button></form></td></tr>
+{% for log in logs %}
+<tr><td><code>{{ log.hook.url }}</code></td><td>{% if log.hook.subscription_invalid %}<span class="error">invalid subscription</span>{% else if log.hook.events.is_empty() %}all{% else %}{{ log.hook.events|join(", ") }}{% endif %}</td><td>{% if log.hook.active %}enabled{% else %}disabled{% endif %}</td><td>{% if let Some(s) = log.hook.last_status %}{{ s }}{% if let Some(e) = log.hook.last_error %} · {{ e }}{% endif %}{% else %}never{% endif %}</td>
+<td><form method="post" action="/{{ head.owner }}/{{ head.name }}/settings/hooks/{{ log.hook.id }}/toggle" class="inline"><input type="hidden" name="_csrf" value="{{ csrf }}"><button type="submit">{% if log.hook.active %}Disable{% else %}Enable{% endif %}</button></form>
+<form method="post" action="/{{ head.owner }}/{{ head.name }}/settings/hooks/{{ log.hook.id }}/delete" class="inline"><input type="hidden" name="_csrf" value="{{ csrf }}"><button type="submit">Delete</button></form></td></tr>
 {% endfor %}
 </tbody>
 </table>
+{% for log in logs %}
+<h3>Recent deliveries · <code>{{ log.hook.url }}</code></h3>
+{% if log.deliveries.is_empty() %}
+<p class="muted">No deliveries logged yet.</p>
+{% else %}
+<table class="list">
+<thead><tr><th>Time</th><th>Event</th><th>Status</th><th>Duration</th><th></th></tr></thead>
+<tbody>
+{% for d in log.deliveries %}
+<tr><td>{{ crate::views::format_time(*d.delivered_at) }}</td><td><code>{{ d.event }}</code>{% if let Some(a) = d.action %} {{ a }}{% endif %}</td><td>{% if let Some(s) = d.status_code %}{{ s }}{% else if let Some(e) = d.error %}{{ e }}{% else %}—{% endif %}{% if d.redelivery %} · redelivery{% endif %}</td><td>{{ d.duration_ms }} ms</td>
+<td><a href="/{{ head.owner }}/{{ head.name }}/settings/hooks/{{ log.hook.id }}/deliveries/{{ d.id }}">detail</a></td></tr>
+{% endfor %}
+</tbody>
+</table>
+{% endif %}
+{% endfor %}
 {% endif %}
 <h2>Add a webhook</h2>
 <form method="post" action="/{{ head.owner }}/{{ head.name }}/settings/hooks" class="stack">

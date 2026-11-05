@@ -376,6 +376,22 @@ of the exact bytes with that secret. Verify with e.g.
 URLs are accepted (`http` for localhost); loopback and private ranges are
 refused, bodies cap at 64 KiB, and failures retry on a 1m/5m/30m/2h ladder
 before the hook is marked failed.
+Every attempt writes one row to the delivery log — success, HTTP error,
+transport error, timeout, SSRF denial, and corrupt secret alike — holding
+the delivery id (stable across retries of one job), the 1-based attempt
+number, the exact request headers (signature included, never the secret)
+and body, the response status, headers (at most 50, each value cut to
+1 KiB), and body (the first 16 KiB), plus the duration in milliseconds from
+send to the end of the body. Rows older than 30 days fall out in the hourly
+cleanup. The settings page lists the last 20 attempts under each hook with
+a link to each attempt's request and response; the API mirrors it at
+`GET .../hooks/{id}/deliveries[?limit=]` and `.../deliveries/{row}`.
+`POST .../deliveries/{row}/redeliver` (maintain, active hook,
+non-archived repo; `202 {"delivery_id"}`) replays the stored body as a new
+delivery — a new id, re-signed with the current secret, through the same
+SSRF gate — and writes one `webhook.redelivered` timeline and audit row. A
+hook whose stored subscription names no known event type receives nothing
+and renders as `events: []` with an invalid-subscription flag.
 
 Not yet: gate-rule management screens, per-context soft gates, check retries, deployments, and mirrors.
 

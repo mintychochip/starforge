@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block title %}Delivery {{ delivery.summary.id }} · {{ head.owner }}/{{ head.name }}{% endblock %}
+{% block content %}
+{% include "repo_head.html" %}
+{% include "repo_settings_nav.html" %}
+{% if let Some(e) = error %}<p class="error">{{ e }}</p>{% endif %}
+{% if let Some(id) = redelivered %}<p class="success">Redelivered as <code>{{ id }}</code>.</p>{% endif %}
+<h2>Delivery {{ delivery.summary.id }} · <code>{{ hook.url }}</code></h2>
+<dl>
+<dt>Delivery id</dt><dd><code>{{ delivery.summary.delivery_id }}</code></dd>
+<dt>Attempt</dt><dd>{{ delivery.summary.attempt }}</dd>
+<dt>Event</dt><dd><code>{{ delivery.summary.event }}</code>{% if let Some(a) = delivery.summary.action %} {{ a }}{% endif %}</dd>
+<dt>Status</dt><dd>{% if let Some(s) = delivery.summary.status_code %}{{ s }}{% else %}—{% endif %}</dd>
+<dt>Error</dt><dd>{% if let Some(e) = delivery.summary.error %}{{ e }}{% else %}—{% endif %}</dd>
+<dt>Duration</dt><dd>{{ delivery.summary.duration_ms }} ms</dd>
+<dt>Redelivery</dt><dd>{% if delivery.summary.redelivery %}yes{% else %}no{% endif %}</dd>
+<dt>Time</dt><dd>{{ crate::views::format_time(*delivery.summary.delivered_at) }}</dd>
+</dl>
+<h3>Request</h3>
+<h4>Headers</h4>
+<pre><code>{{ delivery.request_headers }}</code></pre>
+<h4>Body</h4>
+<pre><code>{{ delivery.request_body }}</code></pre>
+<h3>Response</h3>
+<h4>Status</h4>
+<p>{% if let Some(s) = delivery.summary.status_code %}{{ s }}{% else %}no response{% endif %}</p>
+<h4>Headers</h4>
+{% if let Some(h) = delivery.response_headers %}<pre><code>{{ h }}</code></pre>{% else %}<p class="muted">No response headers recorded.</p>{% endif %}
+<h4>Body</h4>
+{% if let Some(b) = delivery.response_body %}<pre><code>{{ b }}</code></pre>{% else %}<p class="muted">No response body recorded.</p>{% endif %}
+<h3>Redeliver</h3>
+<form method="post" action="/{{ head.owner }}/{{ head.name }}/settings/hooks/{{ hook.id }}/deliveries/{{ delivery.summary.id }}/redeliver" class="stack">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <button type="submit">Redeliver this attempt</button>
+</form>
+{% endblock %}

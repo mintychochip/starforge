@@ -65,10 +65,14 @@ pub enum Job {
     ChangeMergeability { change_id: i64 },
     /// One signed webhook delivery (H5). Never deduplicated: every event fans
     /// out to its own job so retries never collapse distinct deliveries.
+    /// `redelivery` marks jobs replayed from the log (D6); it defaults so
+    /// already-queued payloads still decode.
     WebhookDelivery {
         webhook_id: i64,
         event: String,
         payload: String,
+        #[serde(default)]
+        redelivery: bool,
     },
 }
 
@@ -142,6 +146,25 @@ impl Core {
         .await?;
         self.inner.job_wakeup.notify_one();
         Ok(())
+    }
+    /// Queues `job` to run now and returns its id (jobs without a dedupe
+    /// key always land a fresh row).
+    pub async fn enqueue_returning(&self, job: &Job) -> CoreResult<i64> {
+        let payload = serde_json::to_string(job).map_err(|e| CoreError::Internal(e.to_string()))?;
+        let dedupe_key = job.dedupe_key();
+        let id = jobs::insert(
+            self.db(),
+            &NewJob {
+                kind: job.kind(),
+                payload: &payload,
+                dedupe_key: dedupe_key.as_deref(),
+                run_at: now(),
+            },
+        )
+        .await?
+        .ok_or_else(|| CoreError::Internal("job insert was deduplicated".into()))?;
+        self.inner.job_wakeup.notify_one();
+        Ok(id)
     }
 
     /// Runs every due job in this task and returns how many ran. `serve` uses workers; tests call this.
@@ -219,7 +242,11 @@ impl Core {
                 webhook_id,
                 event,
                 payload,
-            } => self.deliver_webhook(id, *webhook_id, event, payload).await,
+                redelivery,
+            } => {
+                self.deliver_webhook(id, *webhook_id, event, payload, *redelivery)
+                    .await
+            }
             // M2/M5 own delivery; M1d only records the enqueue.
             Job::SessionWebhookOutbox { .. } => Ok(()),
             Job::SendEmail { to, subject, body } => {
@@ -246,6 +273,8 @@ impl Core {
         starforged_db::email_tokens::delete_expired(self.db(), ts).await?;
         starforged_db::invites::delete_expired_before(self.db(), ts - 30 * DAY).await?;
         starforged_db::oauth::delete_expired(self.db(), ts).await?;
+        // Delivery attempts older than 30 days fall out of the log (D5).
+        starforged_db::checks::prune_deliveries_before(self.db(), ts - 30 * DAY).await?;
         // Every link in a message is dead 7 days after it was sent (invites live longest), so a failed
         // message's body is kept no longer than that.
         for row in jobs::failed_of_kind_before(self.db(), "send_email", ts - 7 * DAY).await? {

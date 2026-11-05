@@ -208,6 +208,18 @@ pub fn router(core: Core, base_url: String) -> Router {
             patch(webhooks::patch_hook).delete(webhooks::delete_hook),
         )
         .route(
+            "/repos/{owner}/{repo}/hooks/{id}/deliveries",
+            get(webhooks::list_deliveries),
+        )
+        .route(
+            "/repos/{owner}/{repo}/hooks/{id}/deliveries/{row}",
+            get(webhooks::get_delivery),
+        )
+        .route(
+            "/repos/{owner}/{repo}/hooks/{id}/deliveries/{row}/redeliver",
+            post(webhooks::redeliver),
+        )
+        .route(
             "/repos/{owner}/{repo}/gate-rules",
             get(gate_rules::list_gate_rules).post(gate_rules::create_gate_rule),
         )

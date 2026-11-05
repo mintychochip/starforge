@@ -70,11 +70,39 @@ pub struct WebhookRow {
 pub struct WebhookDeliveryRow {
     pub id: i64,
     pub webhook_id: i64,
+    pub delivery_id: Option<String>,
+    pub attempt: Option<i64>,
     pub event: String,
+    pub action: Option<String>,
     pub payload: String,
+    pub request_headers: Option<String>,
     pub status_code: Option<i64>,
+    pub response_headers: Option<String>,
+    pub response_body: Option<String>,
     pub error: Option<String>,
+    pub duration_ms: Option<i64>,
+    pub redelivery: i64,
     pub delivered_at: i64,
+}
+
+/// One attempt's stored request, response, and outcome (M2e K3): every
+/// delivery attempt the worker makes writes exactly one row.
+#[derive(Debug, Clone)]
+pub struct DeliveryAttempt<'a> {
+    pub webhook_id: i64,
+    pub delivery_id: &'a str,
+    pub attempt: i64,
+    pub event: &'a str,
+    pub action: Option<&'a str>,
+    pub request_headers: &'a str,
+    pub payload: &'a str,
+    pub status_code: Option<i64>,
+    pub response_headers: Option<&'a str>,
+    pub response_body: Option<&'a str>,
+    pub error: Option<&'a str>,
+    pub duration_ms: i64,
+    pub redelivery: bool,
+    pub now: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -161,8 +189,9 @@ macro_rules! select_webhook {
 macro_rules! select_delivery {
     ($tail:literal) => {
         concat!(
-            "SELECT id, webhook_id, event, payload, status_code, error, delivered_at ",
-            "FROM webhook_deliveries ",
+            "SELECT id, webhook_id, delivery_id, attempt, event, action, payload, ",
+            "request_headers, status_code, response_headers, response_body, error, ",
+            "duration_ms, redelivery, delivered_at FROM webhook_deliveries ",
             $tail
         )
     };
@@ -219,10 +248,18 @@ fn delivery_from_row(row: &AnyRow) -> DbResult<WebhookDeliveryRow> {
     Ok(WebhookDeliveryRow {
         id: row.try_get("id")?,
         webhook_id: row.try_get("webhook_id")?,
+        delivery_id: row.try_get("delivery_id")?,
+        attempt: row.try_get("attempt")?,
         event: row.try_get("event")?,
+        action: row.try_get("action")?,
         payload: row.try_get("payload")?,
+        request_headers: row.try_get("request_headers")?,
         status_code: row.try_get("status_code")?,
+        response_headers: row.try_get("response_headers")?,
+        response_body: row.try_get("response_body")?,
         error: row.try_get("error")?,
+        duration_ms: row.try_get("duration_ms")?,
+        redelivery: row.try_get("redelivery")?,
         delivered_at: row.try_get("delivered_at")?,
     })
 }
@@ -578,30 +615,56 @@ pub async fn set_webhook_result(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Records one delivery attempt (M2e K3): success, HTTP error, transport
+/// error, and SSRF denial alike write exactly one row.
 pub async fn insert_delivery(
     db: &Db,
-    webhook_id: i64,
-    event: &str,
-    payload: &str,
-    status: Option<i64>,
-    error: Option<&str>,
-    now: i64,
+    attempt: &DeliveryAttempt<'_>,
 ) -> DbResult<WebhookDeliveryRow> {
     let row = sqlx::query(
-        "INSERT INTO webhook_deliveries (webhook_id, event, payload, status_code, error, delivered_at) \
-         VALUES ($1, $2, $3, $4, $5, $6) \
-         RETURNING id, webhook_id, event, payload, status_code, error, delivered_at",
+        "INSERT INTO webhook_deliveries (webhook_id, delivery_id, attempt, event, action, payload, \
+         request_headers, status_code, response_headers, response_body, error, duration_ms, \
+         redelivery, delivered_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
+         RETURNING id, webhook_id, delivery_id, attempt, event, action, payload, request_headers, \
+         status_code, response_headers, response_body, error, duration_ms, redelivery, delivered_at",
     )
-    .bind(webhook_id)
-    .bind(event)
-    .bind(payload)
-    .bind(status)
-    .bind(error)
-    .bind(now)
+    .bind(attempt.webhook_id)
+    .bind(attempt.delivery_id)
+    .bind(attempt.attempt)
+    .bind(attempt.event)
+    .bind(attempt.action)
+    .bind(attempt.payload)
+    .bind(attempt.request_headers)
+    .bind(attempt.status_code)
+    .bind(attempt.response_headers)
+    .bind(attempt.response_body)
+    .bind(attempt.error)
+    .bind(attempt.duration_ms)
+    .bind(bool_to_int(attempt.redelivery))
+    .bind(attempt.now)
     .fetch_one(db.pool())
     .await?;
     delivery_from_row(&row)
+}
+
+/// One logged attempt by id, if it still exists.
+pub async fn delivery_by_id(db: &Db, id: i64) -> DbResult<Option<WebhookDeliveryRow>> {
+    let row = sqlx::query(select_delivery!("WHERE id = $1"))
+        .bind(id)
+        .fetch_optional(db.pool())
+        .await?;
+    row.as_ref().map(delivery_from_row).transpose()
+}
+
+/// Deletes logged attempts older than `before` (unix seconds); returns how
+/// many rows went away. The hourly cleanup calls this with 30 days ago.
+pub async fn prune_deliveries_before(db: &Db, before: i64) -> DbResult<u64> {
+    let done = sqlx::query("DELETE FROM webhook_deliveries WHERE delivered_at < $1")
+        .bind(before)
+        .execute(db.pool())
+        .await?;
+    Ok(done.rows_affected())
 }
 
 /// The newest `limit` deliveries of the hook, newest first.
@@ -996,24 +1059,46 @@ mod tests {
         assert_eq!(hooks[0].last_status, Some(200));
         let delivery = insert_delivery(
             &t.db,
-            hook.id,
-            "check",
-            r#"{"sha":"abc"}"#,
-            Some(200),
-            None,
-            1_700_000_010,
+            &DeliveryAttempt {
+                webhook_id: hook.id,
+                delivery_id: "7",
+                attempt: 1,
+                event: "check",
+                action: None,
+                request_headers: "{}",
+                payload: r#"{"sha":"abc"}"#,
+                status_code: Some(200),
+                response_headers: Some("{}"),
+                response_body: Some("ok"),
+                error: None,
+                duration_ms: 3,
+                redelivery: false,
+                now: 1_700_000_010,
+            },
         )
         .await
         .unwrap();
         assert_eq!(delivery.webhook_id, hook.id);
+        assert_eq!(delivery.delivery_id.as_deref(), Some("7"));
+        assert_eq!(delivery.attempt, Some(1));
         insert_delivery(
             &t.db,
-            hook.id,
-            "check",
-            r#"{"sha":"def"}"#,
-            Some(500),
-            Some("boom"),
-            1_700_000_020,
+            &DeliveryAttempt {
+                webhook_id: hook.id,
+                delivery_id: "7",
+                attempt: 2,
+                event: "check",
+                action: None,
+                request_headers: "{}",
+                payload: r#"{"sha":"def"}"#,
+                status_code: Some(500),
+                response_headers: Some("{}"),
+                response_body: Some("boom"),
+                error: Some("boom"),
+                duration_ms: 4,
+                redelivery: false,
+                now: 1_700_000_020,
+            },
         )
         .await
         .unwrap();
@@ -1096,5 +1181,73 @@ mod tests {
             }
         }
         assert_eq!(normalized, vec!["trail", "review", "check"]);
+    }
+}
+
+#[cfg(test)]
+mod k3_delivery_log_tests {
+    use super::*;
+    use crate::repos::{self, NewRepo};
+    use crate::users::{self, NewUser};
+
+    #[tokio::test]
+    async fn prune_deletes_only_rows_older_than_30_days() {
+        let t = crate::testing::TestDb::new().await;
+        let alice = users::insert(
+            &t.db,
+            &NewUser {
+                handle: "prune-alice",
+                display_name: "",
+                email: None,
+                email_verified: false,
+                password_hash: None,
+                is_admin: false,
+            },
+        )
+        .await
+        .unwrap();
+        let repo_id = repos::insert(
+            &t.db,
+            &NewRepo {
+                owner_id: alice,
+                name: "prune-demo",
+                description: "",
+                visibility: "private",
+                default_branch: "main",
+            },
+        )
+        .await
+        .unwrap();
+        let hook = insert_webhook(
+            &t.db,
+            repo_id,
+            "https://example.com/hook",
+            "v1:x",
+            "[]",
+            1_700_000_000,
+        )
+        .await
+        .unwrap();
+        let old = 1_700_000_000 - 30 * 86_400 - 1;
+        let edge = 1_700_000_000 - 30 * 86_400 + 60;
+        for (payload, at) in [("old", old), ("fresh", edge)] {
+            sqlx::query(
+                "INSERT INTO webhook_deliveries (webhook_id, event, payload, delivered_at) \
+                 VALUES ($1, 'check', $2, $3)",
+            )
+            .bind(hook.id)
+            .bind(payload)
+            .bind(at)
+            .execute(t.db.pool())
+            .await
+            .unwrap();
+        }
+        let deleted = prune_deliveries_before(&t.db, 1_700_000_000 - 30 * 86_400)
+            .await
+            .unwrap();
+        assert_eq!(deleted, 1);
+        let kept = recent_deliveries(&t.db, hook.id, 10).await.unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].payload, "fresh");
     }
 }
