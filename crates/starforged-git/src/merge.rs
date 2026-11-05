@@ -1,6 +1,9 @@
-//! Mergeability probing (spec §8.4): `git merge-tree --write-tree` dry-runs a
-//! merge with no worktree. Argv-only (validated SHAs, never a shell string),
-//! hermetic env via [`command::git`], bounded by [`MERGE_TREE_TIMEOUT`].
+//! Merge-path probes (spec §8.4): `git merge-tree --write-tree` dry-runs a
+//! merge with no worktree, and `git merge-base --is-ancestor` answers whether
+//! a fast-forward is possible. Argv-only (validated SHAs, never a shell
+//! string), hermetic env via [`command::git`], bounded by
+//! [`MERGE_TREE_TIMEOUT`] / [`IS_ANCESTOR_TIMEOUT`]; on expiry the dropped
+//! child is killed (`kill_on_drop`).
 //!
 //! Output contract (verified against real git): stdout's first line is the
 //! resulting tree object id; with `--name-only` the conflicting paths follow,
@@ -17,6 +20,9 @@ use crate::refpolicy;
 /// How long one merge-tree probe may run; the worker treats a timeout as a
 /// failed job attempt (retried), never as a verdict.
 pub const MERGE_TREE_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long the fast-forward ancestry probe may run: the merge path's 60 s
+/// budget (the same as `write::WRITE_TIMEOUT`).
+pub const IS_ANCESTOR_TIMEOUT: Duration = Duration::from_secs(60);
 /// Cap on reported conflict paths; the serialized payload is capped separately
 /// by the caller.
 pub const MAX_CONFLICT_PATHS: usize = 100;
@@ -65,6 +71,40 @@ pub async fn merge_tree(repo: &Path, base: &str, head: &str) -> Result<MergeTree
         tree,
         paths,
     })
+}
+
+/// True when `ancestor` is reachable from `head` (`merge-base --is-ancestor`:
+/// exit `0` is true, `1` is false). Both must be full object ids. Any other
+/// outcome — bad repo, missing object, an unexpected exit, or running past
+/// [`IS_ANCESTOR_TIMEOUT`] (the child is killed) — is `Err`, never a verdict.
+pub async fn is_ancestor(repo: &Path, ancestor: &str, head: &str) -> Result<bool, GitError> {
+    if !refpolicy::is_oid(ancestor) || !refpolicy::is_oid(head) {
+        return Err(GitError::Failed {
+            command: "merge-base --is-ancestor".to_owned(),
+            stderr: "merge-base needs full object ids".to_owned(),
+        });
+    }
+    let mut cmd = git();
+    cmd.arg("-C")
+        .arg(repo)
+        .arg("merge-base")
+        .arg("--is-ancestor")
+        .arg(ancestor)
+        .arg(head);
+    let out = tokio::time::timeout(IS_ANCESTOR_TIMEOUT, cmd.output())
+        .await
+        .map_err(|_| GitError::Failed {
+            command: "merge-base --is-ancestor".to_owned(),
+            stderr: "merge-base --is-ancestor timed out".to_owned(),
+        })??;
+    match out.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(GitError::Failed {
+            command: "merge-base --is-ancestor".to_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).trim().to_owned(),
+        }),
+    }
 }
 
 /// Splits merge-tree `--name-only` stdout into its tree line and conflict

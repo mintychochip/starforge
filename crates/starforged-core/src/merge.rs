@@ -272,25 +272,14 @@ impl Core {
         .map_err(CoreError::from)
     }
 
-    /// True when `head` contains `base` (blocking `merge-base --is-ancestor`
-    /// probe). Checked before the first CAS attempt and again on retry: a
+    /// True when `head` contains `base` (`merge-base --is-ancestor`, bounded
+    /// by the merge path's 60 s budget; expiry kills the child and refuses).
+    /// Checked before the first CAS attempt and again on retry: a
     /// fast-forward that stops being one must refuse, never rewind the base.
-    /// The blocking probe runs under the same 60 s timeout as the other
-    /// merge-path git calls; expiry reports the same `Git` error shape.
     async fn is_fast_forwardable(&self, repo_id: i64, base: &str, head: &str) -> CoreResult<bool> {
         let repo = self.repo_path(repo_id);
-        let (ancestor, tip) = (base.to_owned(), head.to_owned());
-        let probe = tokio::task::spawn_blocking(move || read::is_ancestor(&repo, &ancestor, &tip));
-        let joined = tokio::time::timeout(std::time::Duration::from_secs(60), probe)
+        merge::is_ancestor(&repo, base, head)
             .await
-            .map_err(|_| {
-                CoreError::from(starforged_git::GitError::Failed {
-                    command: "merge-base --is-ancestor".to_owned(),
-                    stderr: "merge-base --is-ancestor timed out".to_owned(),
-                })
-            })?;
-        joined
-            .map_err(|e| CoreError::Internal(e.to_string()))?
             .map_err(CoreError::from)
     }
 
