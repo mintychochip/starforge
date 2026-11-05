@@ -118,12 +118,20 @@ pub struct ChangePage {
     reviewers: Vec<String>,
     reviews: Vec<ReviewItem>,
     threads: Vec<ThreadItem>,
+    gates_passed: bool,
+    gates: Vec<GateItem>,
     can_review: bool,
     can_triage: bool,
     can_close: bool,
     is_open: bool,
     merge_title: &'static str,
     error: Option<String>,
+}
+
+pub struct GateItem {
+    rule: String,
+    passed: bool,
+    reason: String,
 }
 
 /// Builds the detail view; shared by the viewer and the 422 re-renders.
@@ -222,6 +230,10 @@ async fn change_view(
                     .is_some_and(|c| Some(c.author_handle.as_str()) == viewer_handle),
         })
         .collect();
+    let gates = state
+        .core
+        .evaluate_gates(user, owner, repo, number, k)
+        .await?;
     Ok(ChangePage {
         nav_user: nav(session),
         head: RepoHead::new(&access, "trails", None),
@@ -247,6 +259,16 @@ async fn change_view(
         reviewers: reviewers.into_iter().collect(),
         reviews,
         threads,
+        gates_passed: gates.passed,
+        gates: gates
+            .results
+            .into_iter()
+            .map(|g| GateItem {
+                rule: g.rule,
+                passed: g.passed,
+                reason: g.reason,
+            })
+            .collect(),
         can_review: session.is_some(),
         can_triage: detail.can_triage,
         can_close: detail.can_close,

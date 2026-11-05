@@ -17,9 +17,12 @@
 //! `receive.hideRefs`); the consumed `refs/for/*` pseudo-ref is deleted by
 //! the scan after a successful ingest.
 
-use starforged_db::{changes as db_changes, now, repos as db_repos, trails as db_trails};
+use starforged_db::{
+    changes as db_changes, checks as db_checks, now, repos as db_repos, trails as db_trails,
+};
 use starforged_git::{merge, read, refpolicy, write};
 
+use crate::gates::pattern_matches;
 use crate::jobs::Job;
 use crate::{Core, CoreError, CoreResult};
 
@@ -575,7 +578,57 @@ impl Core {
             Err(e) => return Err(e.into()),
         };
         db_changes::set_current_revision(self.db(), change.id, revision.id, now()).await?;
+        self.dismiss_stale_reviews(repo_id, change, &revision)
+            .await?;
         Ok(revision)
+    }
+
+    /// `dismiss_on_push`: when any gate rule matching the change's base
+    /// branch has the flag set, prior `approve` reviews tied to older
+    /// revisions move to `state='dismissed'`. `request_changes` is never
+    /// touched here — a blocking review survives a push until its author
+    /// supersedes it or triage dismisses it explicitly. Rows (and their
+    /// revision ids) survive for history; each dismissal writes a
+    /// `review.dismissed` timeline row with `reason: "new revision"` next to
+    /// the revision event, so the audit trail shows why the approval
+    /// vanished. Runs in the revision-creation path, never lazily in gate
+    /// evaluation.
+    async fn dismiss_stale_reviews(
+        &self,
+        repo_id: i64,
+        change: &db_changes::ChangeRow,
+        revision: &db_changes::RevisionRow,
+    ) -> CoreResult<()> {
+        let rules = db_checks::gate_rules_for(self.db(), repo_id).await?;
+        let armed = rules.iter().any(|r| {
+            r.dismiss_on_push != 0 && pattern_matches(r.pattern.as_deref(), &change.base_branch)
+        });
+        if !armed {
+            return Ok(());
+        }
+        for review in db_changes::reviews_of_change(self.db(), change.id).await? {
+            if review.revision_id == revision.id
+                || review.state != "submitted"
+                || review.verdict != "approve"
+            {
+                continue;
+            }
+            db_changes::set_review_state(self.db(), review.id, "dismissed").await?;
+            self.change_timeline(
+                repo_id,
+                change.trail_id,
+                "review.dismissed",
+                None,
+                serde_json::json!({
+                    "change": change.number,
+                    "revision": revision.number,
+                    "review": review.id,
+                    "reason": "new revision",
+                }),
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     /// Inserts the agit change row with its `change.open` timeline row.

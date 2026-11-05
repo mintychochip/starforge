@@ -12,6 +12,10 @@
 <p>Mergeability: <span class="badge">{{ mergeability }}</span>
 {% if !conflict_paths.is_empty() %}<span class="muted">conflicting paths:</span>
 <ul>{% for p in conflict_paths %}<li><code>{{ p }}</code></li>{% endfor %}</ul>{% endif %}</p>
+<h3>Gates</h3>
+{% if gates.is_empty() %}<p class="muted" id="gates-empty">No gate rules match this change — gates pass.</p>
+{% else %}<p id="gates-banner">{% if gates_passed %}<span class="badge">All gates pass</span>{% else %}<span class="badge">Gates failing</span>{% endif %}</p>
+<ul id="gates-list">{% for g in gates %}<li id="gate-{{ loop.index }}">{% if g.passed %}<span class="badge">Pass</span>{% else %}<span class="badge">Fail</span>{% endif %} <code>{{ g.rule }}</code> — {{ g.reason }}</li>{% endfor %}</ul>{% endif %}
 <form method="get" action="/{{ head.owner }}/{{ head.name }}/trails/{{ trail_number }}/changes/{{ k }}" class="inline" id="revision-selector">
   <label>Revision <select name="rev">{% for r in revisions %}<option value="{{ r.r }}"{% if r.selected %} selected{% endif %}>r{{ r.r }} {{ r.short }} · {{ r.time }}</option>{% endfor %}</select></label>
   <button type="submit">Show</button>

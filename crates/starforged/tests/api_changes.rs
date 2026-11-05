@@ -1154,3 +1154,98 @@ async fn resolve_thread_idempotent_writes_one_event() {
     assert_eq!(reopen.status(), 200);
     assert_eq!(resolved_events().await.len(), 2);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gates_report_in_detail_and_endpoint() {
+    let c = Ctx::start().await;
+    c.push_basic().await;
+    let n = c.trail().await;
+    c.create_branch_change(n, &c.bob_rw).await;
+    let client = reqwest::Client::new();
+
+    // No rules: the detail embeds a passing, empty report.
+    let detail: Value = client
+        .get(c.change(n, 1))
+        .bearer_auth(&c.alice_rw)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(detail["gates"]["passed"].as_bool().unwrap());
+    assert_eq!(detail["gates"]["results"].as_array().unwrap().len(), 0);
+
+    // One approval rule: the gates endpoint reports the shortfall.
+    let repo_id =
+        c.s.core
+            .repo_for(Some(&c.alice), "alice", "proj")
+            .await
+            .unwrap()
+            .repo
+            .id;
+    starforged_db::checks::insert_gate_rule(
+        c.s.core.db(),
+        repo_id,
+        None,
+        1,
+        false,
+        false,
+        "[]",
+        false,
+        false,
+        false,
+        "[]",
+        starforged_db::now(),
+    )
+    .await
+    .unwrap();
+    let gates: Value = client
+        .get(format!("{}/gates", c.change(n, 1)))
+        .bearer_auth(&c.alice_rw)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(!gates["passed"].as_bool().unwrap());
+    assert_eq!(gates["results"].as_array().unwrap().len(), 1);
+    assert!(
+        gates["results"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("needs 1 more approval"),
+        "{gates}"
+    );
+
+    // An owner approval counts (write+): both shapes pass.
+    let res = client
+        .post(format!("{}/reviews", c.change(n, 1)))
+        .bearer_auth(&c.alice_rw)
+        .json(&json!({"verdict": "approve", "body": "ship it"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 201);
+    let gates: Value = client
+        .get(format!("{}/gates", c.change(n, 1)))
+        .bearer_auth(&c.alice_rw)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(gates["passed"].as_bool().unwrap(), "{gates}");
+    let detail: Value = client
+        .get(c.change(n, 1))
+        .bearer_auth(&c.alice_rw)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(detail["gates"]["passed"].as_bool().unwrap());
+}

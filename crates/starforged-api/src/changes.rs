@@ -21,6 +21,7 @@ use serde_json::{Value, json};
 use starforged_core::changes::{
     ChangeDetail, ChangeView, ReviewView, RevisionView, ThreadCommentView, ThreadView,
 };
+use starforged_core::gates::GateReport;
 use starforged_core::tokens::Scope;
 
 use crate::ApiState;
@@ -157,7 +158,7 @@ fn thread_json(view: &ThreadView) -> ThreadJson {
     }
 }
 
-fn detail_json(detail: &ChangeDetail, diff: Value) -> Value {
+fn detail_json(detail: &ChangeDetail, diff: Value, gates: &GateReport) -> Value {
     json!({
         "change": change_json(&detail.change),
         "revisions": detail.revisions.iter().map(revision_json).collect::<Vec<_>>(),
@@ -166,6 +167,7 @@ fn detail_json(detail: &ChangeDetail, diff: Value) -> Value {
         "truncated": diff["truncated"],
         "reviews": detail.reviews.iter().map(review_json).collect::<Vec<_>>(),
         "threads": detail.threads.iter().map(thread_json).collect::<Vec<_>>(),
+        "gates": gates,
         "can_review": detail.can_review,
         "can_triage": detail.can_triage,
         "can_close": detail.can_close,
@@ -250,7 +252,26 @@ pub async fn get_change(
         .core
         .change_diff_json(viewer, &owner, &repo, n, k, query.rev)
         .await?;
-    Ok(Json(detail_json(&detail, diff)))
+    let gates = state
+        .core
+        .evaluate_gates(viewer, &owner, &repo, n, k)
+        .await?;
+    Ok(Json(detail_json(&detail, diff, &gates)))
+}
+
+/// `GET /repos/{owner}/{repo}/trails/{n}/changes/{k}/gates`: the merge-gate
+/// report for the change (informational; merging re-evaluates server-side).
+pub async fn get_gates(
+    State(state): State<ApiState>,
+    auth: ApiAuth,
+    Path((owner, repo, n, k)): Path<(String, String, i64, i64)>,
+) -> Result<Json<GateReport>, ApiError> {
+    let viewer = auth.reader()?;
+    let report = state
+        .core
+        .evaluate_gates(viewer, &owner, &repo, n, k)
+        .await?;
+    Ok(Json(report))
 }
 
 #[derive(Deserialize)]

@@ -178,6 +178,10 @@ pub fn router(core: Core, base_url: String) -> Router {
             post(changes::add_comment),
         )
         .route(
+            "/repos/{owner}/{repo}/trails/{n}/changes/{k}/gates",
+            get(changes::get_gates),
+        )
+        .route(
             "/repos/{owner}/{repo}/statuses/{sha}",
             post(statuses::submit_status).get(statuses::list_statuses),
         )

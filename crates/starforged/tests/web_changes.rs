@@ -561,3 +561,61 @@ async fn dismiss_close_and_reopen_flow() {
         .unwrap();
     assert_eq!(res.status(), 303);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn change_page_renders_gate_panel() {
+    let c = Ctx::start().await;
+    let repo_id =
+        c.s.core
+            .repo_for(Some(&c.alice), "alice", "proj")
+            .await
+            .unwrap()
+            .repo
+            .id;
+    let (work, url) = setup_pushed_repo(&c.s, &c.alice).await;
+    push_revision(
+        &c,
+        repo_id,
+        &work,
+        &url,
+        "feat",
+        &[("feature.txt", b"hello feature\n")],
+        "add feature",
+    )
+    .await;
+    c.s.core.run_due_jobs().await.unwrap();
+    starforged_db::checks::insert_gate_rule(
+        c.s.core.db(),
+        repo_id,
+        None,
+        1,
+        false,
+        false,
+        "[]",
+        false,
+        false,
+        false,
+        "[]",
+        starforged_db::now(),
+    )
+    .await
+    .unwrap();
+
+    let (alice, _) = c.s.login("alice").await;
+    let page = get_text(&alice, &c.change(1, 1)).await;
+    assert!(page.contains("Gates"), "gate panel:\n{page}");
+    assert!(page.contains("Gates failing"), "failing banner:\n{page}");
+    assert!(
+        page.contains("needs 1 more approval"),
+        "gate reason:\n{page}"
+    );
+
+    c.s.core
+        .submit_review(
+            &c.alice, "alice", "proj", 1, 1, None, "approve", "lgtm", None,
+        )
+        .await
+        .unwrap();
+    let page = get_text(&alice, &c.change(1, 1)).await;
+    assert!(page.contains("All gates pass"), "passing banner:\n{page}");
+}
