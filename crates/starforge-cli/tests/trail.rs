@@ -654,15 +654,10 @@ fn j4_stub_git(
     );
 }
 
-#[tokio::test]
-async fn push_timeout_reports_sha_and_exits_zero() {
-    let (base, _app) = start(vec![(
-        "GET",
-        "/api/v1/repos/o/r/changes",
-        200,
-        serde_json::json!({"changes": []}),
-    )])
-    .await;
+/// Temp repo with one commit pushing to a seeded bare `origin`, plus a trail
+/// ctx using it and the HEAD sha. The tempdir returns first so the caller
+/// keeps it alive.
+fn j4_push_repo(base: &str) -> (tempfile::TempDir, TrailCtx, String) {
     let tmp = tempfile::tempdir().unwrap();
     let env = j4_stub_env(tmp.path());
     let repo = tmp.path().join("work");
@@ -706,16 +701,32 @@ async fn push_timeout_reports_sha_and_exits_zero() {
     .unwrap()
     .trim()
     .to_string();
-
-    let api = ApiClient::new(&base, "o/r", TOKEN).unwrap();
+    let api = ApiClient::new(base, "o/r", TOKEN).unwrap();
     let ctx = TrailCtx::new(api, &repo, Some("origin"), env);
-    let args = PushArgs {
+    (tmp, ctx, sha)
+}
+
+fn j4_push_args() -> PushArgs {
+    PushArgs {
         trail: None,
         title: None,
         base: None,
         topic: None,
         remote: None,
-    };
+    }
+}
+
+#[tokio::test]
+async fn push_timeout_reports_sha_and_exits_zero() {
+    let (base, _app) = start(vec![(
+        "GET",
+        "/api/v1/repos/o/r/changes",
+        200,
+        serde_json::json!({"changes": []}),
+    )])
+    .await;
+    let (_tmp, ctx, sha) = j4_push_repo(&base);
+    let args = j4_push_args();
     let (out, code) = push_with(
         &ctx,
         &args,
@@ -749,4 +760,65 @@ async fn push_timeout_reports_sha_and_exits_zero() {
         Some(sha.as_str())
     );
     assert!(value.get("trail").is_some_and(|v| v.is_null()));
+}
+
+#[tokio::test]
+async fn push_lookup_unauthorized_fails_fast() {
+    let (base, _app) = start(vec![(
+        "GET",
+        "/api/v1/repos/o/r/changes",
+        401,
+        serde_json::json!({"error": {"code": "unauthenticated", "message": "a valid token is required", "details": null}}),
+    )])
+    .await;
+    let (_tmp, ctx, sha) = j4_push_repo(&base);
+    let began = std::time::Instant::now();
+    let (out, code) = push_with(
+        &ctx,
+        &j4_push_args(),
+        starforge_cli::commands::trail::Format::Text,
+        &TokioSleeper,
+        std::time::Duration::from_millis(10),
+        std::time::Duration::from_secs(30),
+    )
+    .await;
+    assert_eq!(code, 1, "lookup failure exits 1: {out}");
+    assert!(
+        out.contains(&format!("pushed {sha}")),
+        "names the landed push: {out}"
+    );
+    assert!(
+        out.contains("authentication failed") && out.contains("starforge auth login"),
+        "login hint, not server lag: {out}"
+    );
+    assert!(
+        began.elapsed() < std::time::Duration::from_secs(10),
+        "fails fast instead of riding the deadline"
+    );
+}
+
+#[tokio::test]
+async fn push_lookup_not_found_fails_fast() {
+    let (base, _app) = start(vec![(
+        "GET",
+        "/api/v1/repos/o/r/changes",
+        404,
+        serde_json::json!({"error": {"code": "not_found", "message": "no such repo", "details": null}}),
+    )])
+    .await;
+    let (_tmp, ctx, sha) = j4_push_repo(&base);
+    let (out, code) = push_with(
+        &ctx,
+        &j4_push_args(),
+        starforge_cli::commands::trail::Format::Text,
+        &TokioSleeper,
+        std::time::Duration::from_millis(10),
+        std::time::Duration::from_secs(30),
+    )
+    .await;
+    assert_eq!(code, 1, "lookup failure exits 1: {out}");
+    assert!(
+        out.contains(&format!("pushed {sha}")) && out.contains("no such repo (not_found)"),
+        "names the push and the lookup error: {out}"
+    );
 }

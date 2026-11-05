@@ -293,6 +293,10 @@ async fn push_and_checkout_round_trip() {
         out.contains(&format!("on trail/1/1 at {}", &sha2[..7])),
         "checkout names the branch and short sha: {out}"
     );
+    assert!(
+        out.contains("(trail #1 change 1 revision 2)"),
+        "checkout names the revision: {out}"
+    );
     assert_eq!(
         git_ok(&clone_dir, &["symbolic-ref", "--short", "HEAD"])
             .await
@@ -322,6 +326,10 @@ async fn push_and_checkout_round_trip() {
     assert_eq!(code, 0, "third push: {out}");
     let (out, code) = checkout(&rctx, &co, Format::Text).await;
     assert_eq!(code, 0, "second checkout: {out}");
+    assert!(
+        out.contains("(trail #1 change 1 revision 3)"),
+        "second checkout names the revision: {out}"
+    );
     assert_eq!(
         git_ok(&clone_dir, &["rev-parse", "HEAD"]).await.trim(),
         sha3
@@ -331,6 +339,20 @@ async fn push_and_checkout_round_trip() {
             .await
             .trim(),
         "trail/1/1"
+    );
+    let (out, code) = checkout(&rctx, &co, Format::Json).await;
+    assert_eq!(code, 0, "json checkout: {out}");
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(value.get("trail").and_then(|v| v.as_i64()), Some(1));
+    assert_eq!(value.get("change").and_then(|v| v.as_i64()), Some(1));
+    assert_eq!(value.get("revision").and_then(|v| v.as_i64()), Some(3));
+    assert_eq!(
+        value.get("sha").and_then(|v| v.as_str()),
+        Some(sha3.as_str())
+    );
+    assert_eq!(
+        value.get("branch").and_then(|v| v.as_str()),
+        Some("trail/1/1")
     );
 
     // A diverged branch is refused with the branch and HEAD untouched.
@@ -374,9 +396,27 @@ async fn push_and_checkout_round_trip() {
         out.contains(&format!("HEAD detached at {}", &sha1[..7])),
         "detached message: {out}"
     );
+    assert!(
+        out.contains("(trail #1 change 1 revision 1)"),
+        "detached message names the revision: {out}"
+    );
     assert_eq!(
         git_ok(&clone_dir, &["rev-parse", "HEAD"]).await.trim(),
         sha1
+    );
+    let (out, code) = checkout(&rctx, &co_rev, Format::Json).await;
+    assert_eq!(code, 0, "json rev checkout: {out}");
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(value.get("trail").and_then(|v| v.as_i64()), Some(1));
+    assert_eq!(value.get("change").and_then(|v| v.as_i64()), Some(1));
+    assert_eq!(value.get("revision").and_then(|v| v.as_i64()), Some(1));
+    assert_eq!(
+        value.get("sha").and_then(|v| v.as_str()),
+        Some(sha1.as_str())
+    );
+    assert!(
+        value.get("branch").is_some_and(|v| v.is_null()),
+        "detached json has a null branch: {out}"
     );
 }
 

@@ -5,6 +5,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 
 use super::{Format, TrailCtx, agent_unsupported, pretty, select_change};
+use crate::api::ApiError;
 use crate::git;
 use crate::queue::{Sleeper, TokioSleeper};
 
@@ -178,7 +179,7 @@ pub async fn push_with<S: Sleeper>(
     )
     .await
     {
-        Some(change) => {
+        Ok(Some(change)) => {
             let n = change.get("trail").and_then(Value::as_i64).unwrap_or(0);
             let k = change.get("k").and_then(Value::as_i64).unwrap_or(0);
             let r = change
@@ -201,7 +202,7 @@ pub async fn push_with<S: Sleeper>(
                 Format::Agent => agent_unsupported(),
             }
         }
-        None => match format {
+        Ok(None) => match format {
             Format::Json => (
                 pretty(&json!({
                     "trail": Value::Null,
@@ -218,12 +219,22 @@ pub async fn push_with<S: Sleeper>(
             ),
             Format::Agent => agent_unsupported(),
         },
+        // The git push already landed, so say so; the lookup itself failed.
+        Err(err) => {
+            let (msg, _) = ctx.api.render_error(err);
+            (
+                format!("pushed {sha}, but looking up the change failed: {msg}"),
+                1,
+            )
+        }
     }
 }
 
 /// Poll `GET changes?head_sha=<sha>` for a change on `base` (pinned to
-/// `trail` when given) until `deadline`. Read failures are swallowed: the
-/// push already succeeded, so polling continues until the deadline.
+/// `trail` when given) until `deadline`. Only `Ok` with an empty or
+/// non-matching `changes` array means "not yet recorded"; a read error fails
+/// fast (the push already landed, but a persistent 401/404/transport failure
+/// is not server lag and must not exit 0).
 async fn poll_for_change<S: Sleeper>(
     ctx: &TrailCtx,
     sha: &str,
@@ -232,14 +243,18 @@ async fn poll_for_change<S: Sleeper>(
     sleeper: &S,
     poll_interval: Duration,
     poll_deadline: Duration,
-) -> Option<Value> {
+) -> Result<Option<Value>, ApiError> {
     let start = std::time::Instant::now();
     loop {
-        if let Ok(resp) = ctx
+        let resp = match ctx
             .api
             .get("changes", &[("head_sha", sha.to_string())])
             .await
-            && let Some(changes) = resp.get("changes").and_then(Value::as_array)
+        {
+            Ok(resp) => resp,
+            Err(err) => return Err(err),
+        };
+        if let Some(changes) = resp.get("changes").and_then(Value::as_array)
             && let Some(hit) = changes
                 .iter()
                 .find(|change| {
@@ -249,10 +264,10 @@ async fn poll_for_change<S: Sleeper>(
                 })
                 .cloned()
         {
-            return Some(hit);
+            return Ok(Some(hit));
         }
         if start.elapsed() >= poll_deadline {
-            return None;
+            return Ok(None);
         }
         sleeper.sleep(poll_interval).await;
     }
