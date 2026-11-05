@@ -1144,3 +1144,274 @@ async fn fetch_change_head_by_sha() {
         "anonymous fetch of a private change head must fail"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_pointer_branch_move_records_nothing() {
+    // D1: `record_branch_move` compares against the head of the change's
+    // LATEST revision row, not the current-revision pointer. A revision row
+    // inserted without moving the pointer (a stuck pointer) must not be
+    // recorded a second time, and no `revision_pushed` fans out.
+    let s = TestServer::start().await;
+    let alice = s.user("alice").await;
+    let (repo_id, url, work, server) = setup_repo(&s, &alice, "proj").await;
+
+    git_ok(&work, &["checkout", "-q", "-b", "feature"]).await;
+    commit_files(&work, &[("feat.txt", b"f\n")], "feature work").await;
+    git_ok(&work, &["push", "-q", &url, "feature"]).await;
+    git_ok(&work, &["checkout", "-q", "main"]).await;
+    let c1 = server_rev_ok(&work, &server, "refs/heads/feature").await;
+    let main_tip = server_rev_ok(&work, &server, "refs/heads/main").await;
+
+    let t = s
+        .core
+        .create_trail(&alice, "alice", "proj", "Branch work", "")
+        .await
+        .unwrap();
+    let created = s
+        .core
+        .create_branch_change(&alice, "alice", "proj", t.number, "feature", "main")
+        .await
+        .unwrap();
+    let trail = starforged_db::trails::trail_by_number(s.core.db(), repo_id, t.number)
+        .await
+        .unwrap()
+        .unwrap();
+    let change = starforged_db::changes::change_by_trail_number(s.core.db(), trail.id, created.k)
+        .await
+        .unwrap()
+        .unwrap();
+
+    // A stuck pointer: the row for the new head lands without the pointer
+    // moving. The head never reaches the server (no push), so only the
+    // no-op path can avoid touching git here.
+    git_ok(&work, &["checkout", "-q", "feature"]).await;
+    commit_files(&work, &[("more.txt", b"m\n")], "more feature").await;
+    let c2 = git_ok(&work, &["rev-parse", "HEAD"])
+        .await
+        .trim()
+        .to_owned();
+    git_ok(&work, &["checkout", "-q", "main"]).await;
+    let now = starforged_db::now();
+    starforged_db::changes::insert_revision(
+        s.core.db(),
+        change.id,
+        &c2,
+        &main_tip,
+        Some(alice.id),
+        now,
+    )
+    .await
+    .unwrap();
+    // A `trail` subscription observes any `revision_pushed` fan-out as an
+    // enqueued delivery job (nothing is delivered in this test).
+    s.core
+        .create_webhook(
+            &alice,
+            "alice",
+            "proj",
+            "http://127.0.0.1:9/hook",
+            &["trail".to_owned()],
+        )
+        .await
+        .unwrap();
+    let revisions_before = starforged_db::changes::revisions_of_change(s.core.db(), change.id)
+        .await
+        .unwrap()
+        .len();
+    let revision_events_before = starforged_db::trails::timeline_of_trail(s.core.db(), trail.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == "change.revision")
+        .count();
+    let deliveries_before = webhook_delivery_jobs(&s).await;
+
+    s.core
+        .record_branch_move(repo_id, "feature", Some(&c1), &c2, Some(alice.id))
+        .await
+        .unwrap();
+
+    let revisions_after = starforged_db::changes::revisions_of_change(s.core.db(), change.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        revisions_after.len(),
+        revisions_before,
+        "a head equal to the latest row records no revision"
+    );
+    let revision_events_after = starforged_db::trails::timeline_of_trail(s.core.db(), trail.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == "change.revision")
+        .count();
+    assert_eq!(
+        revision_events_after, revision_events_before,
+        "a duplicate head writes no revision timeline row"
+    );
+    assert_eq!(
+        webhook_delivery_jobs(&s).await,
+        deliveries_before,
+        "a duplicate head dispatches no revision_pushed"
+    );
+    let pointed = starforged_db::changes::change_by_id(s.core.db(), change.id)
+        .await
+        .unwrap()
+        .unwrap()
+        .current_revision_id
+        .expect("creation points at a revision");
+    let head = starforged_db::changes::revision_by_id(s.core.db(), pointed)
+        .await
+        .unwrap()
+        .unwrap()
+        .head_sha;
+    assert_eq!(head, c1, "the stuck pointer is left alone");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_branch_ingest_converges_on_the_live_tip() {
+    // D1: two scans race for one repo; the second push line carries a stale
+    // `new` (the older commit) while the branch tip is newer. Both ingest
+    // the CURRENT tip under the per-repo lock, so the change ends at the tip
+    // with no two consecutive revisions sharing a head.
+    let s = TestServer::start().await;
+    let alice = s.user("alice").await;
+    let (repo_id, url, work, server) = setup_repo(&s, &alice, "proj").await;
+
+    git_ok(&work, &["checkout", "-q", "-b", "feature"]).await;
+    commit_files(&work, &[("feat.txt", b"f\n")], "feature work").await;
+    git_ok(&work, &["push", "-q", &url, "feature"]).await;
+    let c1 = server_rev_ok(&work, &server, "refs/heads/feature").await;
+
+    let t = s
+        .core
+        .create_trail(&alice, "alice", "proj", "Branch work", "")
+        .await
+        .unwrap();
+    let created = s
+        .core
+        .create_branch_change(&alice, "alice", "proj", t.number, "feature", "main")
+        .await
+        .unwrap();
+    let trail = starforged_db::trails::trail_by_number(s.core.db(), repo_id, t.number)
+        .await
+        .unwrap()
+        .unwrap();
+    let change = starforged_db::changes::change_by_trail_number(s.core.db(), trail.id, created.k)
+        .await
+        .unwrap()
+        .unwrap();
+
+    // C2 reaches the server without a scan: it rides a scratch ref (whose
+    // own scan touches no tracked branch), then the feature ref is moved
+    // directly, bypassing every hook.
+    git_ok(&work, &["checkout", "-q", "feature"]).await;
+    commit_files(&work, &[("more.txt", b"m\n")], "more feature").await;
+    let c2 = git_ok(&work, &["rev-parse", "HEAD"])
+        .await
+        .trim()
+        .to_owned();
+    git_ok(&work, &["push", "-q", &url, "HEAD:refs/heads/scratch"]).await;
+    git_ok(&work, &["checkout", "-q", "main"]).await;
+    let gd = git_dir_arg(&server);
+    git_ok(&work, &[&gd, "update-ref", "refs/heads/feature", &c2]).await;
+
+    let stale: Vec<(String, Option<String>, String)> = vec![(
+        "refs/heads/feature".to_owned(),
+        Some(c1.clone()),
+        c1.clone(),
+    )];
+    let fresh: Vec<(String, Option<String>, String)> = vec![(
+        "refs/heads/feature".to_owned(),
+        Some(c1.clone()),
+        c2.clone(),
+    )];
+    let alice_id = alice.id;
+    let (core_a, core_b) = (s.core.clone(), s.core.clone());
+    tokio::join!(
+        async {
+            let guard = core_a.repo_ingest_lock(repo_id).await;
+            core_a
+                .ingest_branch_moves(&guard, repo_id, Some(alice_id), &stale)
+                .await
+        },
+        async {
+            let guard = core_b.repo_ingest_lock(repo_id).await;
+            core_b
+                .ingest_branch_moves(&guard, repo_id, Some(alice_id), &fresh)
+                .await
+        },
+    );
+    let revs = starforged_db::changes::revisions_of_change(s.core.db(), change.id)
+        .await
+        .unwrap();
+    let heads: Vec<&str> = revs.iter().map(|r| r.head_sha.as_str()).collect();
+    assert_eq!(
+        heads,
+        vec![c1.as_str(), c2.as_str()],
+        "the tip is recorded exactly once, whatever the push lines said"
+    );
+    let pointed = starforged_db::changes::change_by_id(s.core.db(), change.id)
+        .await
+        .unwrap()
+        .unwrap()
+        .current_revision_id
+        .expect("ingest points at a revision");
+    let head = starforged_db::changes::revision_by_id(s.core.db(), pointed)
+        .await
+        .unwrap()
+        .unwrap()
+        .head_sha;
+    assert_eq!(head, c2, "the current revision is the branch tip");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn branch_change_creation_is_atomic() {
+    // D1: the change, its first revision, and the current-revision pointer
+    // land in one transaction — never a change with no current revision.
+    let s = TestServer::start().await;
+    let alice = s.user("alice").await;
+    let (repo_id, url, work, _server) = setup_repo(&s, &alice, "proj").await;
+
+    git_ok(&work, &["checkout", "-q", "-b", "feature"]).await;
+    commit_files(&work, &[("feat.txt", b"f\n")], "feature work").await;
+    git_ok(&work, &["push", "-q", &url, "feature"]).await;
+    git_ok(&work, &["checkout", "-q", "main"]).await;
+
+    let t = s
+        .core
+        .create_trail(&alice, "alice", "proj", "Branch work", "")
+        .await
+        .unwrap();
+    let created = s
+        .core
+        .create_branch_change(&alice, "alice", "proj", t.number, "feature", "main")
+        .await
+        .unwrap();
+    let trail = starforged_db::trails::trail_by_number(s.core.db(), repo_id, t.number)
+        .await
+        .unwrap()
+        .unwrap();
+    let change = starforged_db::changes::change_by_trail_number(s.core.db(), trail.id, created.k)
+        .await
+        .unwrap()
+        .expect("the change exists together with its revision");
+    let revision_id = change
+        .current_revision_id
+        .expect("creation points at a revision");
+    let revision = starforged_db::changes::revision_by_id(s.core.db(), revision_id)
+        .await
+        .unwrap()
+        .expect("the pointed-to revision exists");
+    assert_eq!(revision.change_id, change.id);
+    assert_eq!(revision.number, 1);
+}
+
+async fn webhook_delivery_jobs(s: &TestServer) -> usize {
+    starforged_db::jobs::list_recent(s.core.db(), 100)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|row| row.kind == "webhook_delivery")
+        .count()
+}

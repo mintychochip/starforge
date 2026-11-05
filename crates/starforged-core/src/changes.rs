@@ -107,9 +107,9 @@ impl Core {
         let (change, revision) = match existing {
             Some(change) => {
                 debug_assert_eq!(change.trail_id, trail_id);
-                if let Some(current_id) = change.current_revision_id
-                    && let Some(current) = db_changes::revision_by_id(self.db(), current_id).await?
-                    && current.head_sha == head_sha
+                if let Some(latest) =
+                    db_changes::latest_revision_of_change(self.db(), change.id).await?
+                    && latest.head_sha == head_sha
                 {
                     // Idempotent re-push: no row, no timeline.
                     return Ok(None);
@@ -303,6 +303,48 @@ impl Core {
         }
     }
 
+    /// Serialized branch-move ingest for one push (D1). Call with the repo's
+    /// ingest lock held — the `_ingest` guard is proof of that. Every moved
+    /// branch is ingested at its CURRENT tip, re-read under the lock: the
+    /// push line's `new` may be stale when scans race, and the pointer must
+    /// never land on an older head. Branches that no longer exist are
+    /// skipped (a delete still runs when its `new` is the zero oid, so
+    /// base-branch deletions recompute mergeability). Per-branch failures
+    /// only warn: a push never fails because of the scan.
+    pub async fn ingest_branch_moves(
+        &self,
+        _ingest: &tokio::sync::OwnedMutexGuard<()>,
+        repo_id: i64,
+        pusher_id: Option<i64>,
+        moves: &[(String, Option<String>, String)],
+    ) {
+        for (name, old, new) in moves {
+            let Some(branch) = name.strip_prefix("refs/heads/") else {
+                continue;
+            };
+            let tip = match self.branch_tip(repo_id, branch).await {
+                Ok(tip) => tip,
+                Err(err) => {
+                    tracing::warn!(repo_id, branch, error = %err, "push scan: branch tip read failed");
+                    continue;
+                }
+            };
+            let new = tip.as_deref().unwrap_or(new);
+            if tip.is_none() && refpolicy::is_oid(new) {
+                // The branch vanished mid-scan while the line claims an
+                // update: recording the line's head would point at a ref
+                // that no longer exists.
+                continue;
+            }
+            if let Err(err) = self
+                .record_branch_move(repo_id, branch, old.as_deref(), new, pusher_id)
+                .await
+            {
+                tracing::warn!(repo_id, branch, error = %err, "push scan: branch move ingest failed");
+            }
+        }
+    }
+
     /// Branch push: for every open branch change whose head branch is
     /// `branch`, appends a revision when the tip moved (no revision when the
     /// head SHA is unchanged, and never on a delete). Base-branch moves append
@@ -340,13 +382,13 @@ impl Core {
             return Ok(());
         }
         for change in db_changes::open_branch_changes(self.db(), repo_id, branch).await? {
-            let current_head = match change.current_revision_id {
-                Some(id) => db_changes::revision_by_id(self.db(), id)
-                    .await?
-                    .map(|row| row.head_sha),
-                None => None,
-            };
-            if current_head.as_deref() == Some(new) {
+            // Compare against the LATEST row, never the current-revision
+            // pointer: a row that landed without moving the pointer (or a
+            // stale pointer in general) must not be recorded twice.
+            let latest_head = db_changes::latest_revision_of_change(self.db(), change.id)
+                .await?
+                .map(|row| row.head_sha);
+            if latest_head.as_deref() == Some(new) {
                 continue;
             }
             let base_tip = self.branch_tip(repo_id, &change.base_branch).await?;
@@ -625,7 +667,9 @@ impl Core {
         .map_err(|err| CoreError::Internal(err.to_string()))?
     }
 
-    /// Appends a revision and points the trail refs at it: reserves the number
+    /// Appends a revision and points the trail refs at it: returns the
+    /// latest row unchanged when it already carries `head_sha` (no row, no
+    /// dismissals, no timeline, no webhook), otherwise reserves the number
     /// first, writes `head`/`rev/<r>`, and only then inserts the row and sets
     /// it current. Readers poll rows (never refs), so a visible revision
     /// always has its refs — a row that outruns its refs breaks the
@@ -641,6 +685,16 @@ impl Core {
         base_sha: &str,
         pusher: Option<i64>,
     ) -> CoreResult<db_changes::RevisionRow> {
+        // Never append a head equal to the latest row's head: with a stale
+        // current-revision pointer (or a racing scan) this call would
+        // otherwise record the same head twice. The existing row is
+        // returned with no dismissals, no timeline, and no webhook, so
+        // every caller is covered.
+        if let Some(latest) = db_changes::latest_revision_of_change(self.db(), change.id).await?
+            && latest.head_sha == head_sha
+        {
+            return Ok(latest);
+        }
         let number = match db_changes::reserve_revision_number(self.db(), change.id).await {
             Ok(number) => number,
             Err(e) if e.is_unique_violation() => {
@@ -1356,28 +1410,15 @@ impl Core {
             )));
         }
         let (head_tip, base_tip) = self.branch_tips(access.repo.id, head, base).await?;
-        let row = match db_changes::insert_change(
+        // One transaction: the change, its first revision, and the current
+        // pointer commit together, so readers never see a change with no
+        // current revision.
+        let (row, revision) = match db_changes::insert_branch_change_with_revision(
             self.db(),
             trail.id,
-            "branch",
-            Some(head),
+            head,
             base,
             user.id,
-            now(),
-        )
-        .await
-        {
-            Ok(row) => row,
-            Err(e) if e.is_unique_violation() => {
-                return Err(CoreError::Conflict(
-                    "could not allocate a change number; please retry".into(),
-                ));
-            }
-            Err(e) => return Err(e.into()),
-        };
-        let revision = match db_changes::insert_revision(
-            self.db(),
-            row.id,
             &head_tip,
             &base_tip,
             Some(user.id),
@@ -1385,15 +1426,14 @@ impl Core {
         )
         .await
         {
-            Ok(revision) => revision,
+            Ok(t) => t,
             Err(e) if e.is_unique_violation() => {
                 return Err(CoreError::Conflict(
-                    "could not allocate a revision number; please retry".into(),
+                    "could not allocate a change number; please retry".into(),
                 ));
             }
             Err(e) => return Err(e.into()),
         };
-        db_changes::set_current_revision(self.db(), row.id, revision.id, now()).await?;
         if let Err(err) = self
             .ensure_trail_refs(
                 access.repo.id,
@@ -2273,7 +2313,7 @@ fn file_json(f: &starforged_git::diff::FileDiff) -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
-    use super::check_thread_anchor;
+    use super::*;
 
     #[test]
     fn thread_anchor_rejects_interior_control_characters() {
@@ -2299,5 +2339,89 @@ mod tests {
             assert_eq!(side, "head");
             assert_eq!(body, "nit");
         }
+    }
+
+    /// D1: `append_revision` refuses to append a head equal to the latest
+    /// row's head. It returns that row with no dismissals, no timeline, and
+    /// no webhook, so every caller is covered.
+    #[tokio::test]
+    async fn append_revision_with_latest_head_is_a_noop() {
+        use starforged_db::{now, repos, trails, users};
+
+        use crate::testing::test_core;
+
+        let (core, _fx) = test_core().await;
+        let db = core.db();
+        let alice = users::insert(
+            db,
+            &users::NewUser {
+                handle: "alice",
+                display_name: "",
+                email: None,
+                email_verified: false,
+                password_hash: None,
+                is_admin: false,
+            },
+        )
+        .await
+        .unwrap();
+        let repo_id = repos::insert(
+            db,
+            &repos::NewRepo {
+                owner_id: alice,
+                name: "proj",
+                description: "",
+                visibility: "private",
+                default_branch: "main",
+            },
+        )
+        .await
+        .unwrap();
+        let trail = trails::insert_trail(
+            db,
+            &trails::NewTrail {
+                repo_id,
+                title: "t",
+                intent: "why",
+                author_id: alice,
+            },
+            now(),
+        )
+        .await
+        .unwrap();
+        let change = db_changes::insert_change(
+            db,
+            trail.id,
+            "branch",
+            Some("feature"),
+            "main",
+            alice,
+            now(),
+        )
+        .await
+        .unwrap();
+        let head = "a".repeat(40);
+        let base = "b".repeat(40);
+        let first = db_changes::insert_revision(db, change.id, &head, &base, Some(alice), now())
+            .await
+            .unwrap();
+        db_changes::set_current_revision(db, change.id, first.id, now())
+            .await
+            .unwrap();
+
+        let got = core
+            .append_revision(repo_id, trail.number, &change, &head, &base, None)
+            .await
+            .unwrap();
+        assert_eq!(got.id, first.id, "the existing latest row is returned");
+        let revs = db_changes::revisions_of_change(db, change.id)
+            .await
+            .unwrap();
+        assert_eq!(revs.len(), 1, "no duplicate row is inserted");
+        let timeline = trails::timeline_of_trail(db, trail.id).await.unwrap();
+        assert!(
+            timeline.is_empty(),
+            "no timeline row is written: {timeline:?}"
+        );
     }
 }

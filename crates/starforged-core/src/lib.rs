@@ -122,6 +122,12 @@ struct Inner {
     /// in production. Integration tests set it to move the base ref between
     /// gate evaluation and the compare-and-swap.
     merge_cas_hook: std::sync::Mutex<Option<merge::PreCasHook>>,
+    /// Per-repository post-receive ingest locks (D1): one async mutex per
+    /// repo, held for a whole scan. Entries are weak: a mutex nobody holds
+    /// drops out of the map on the next lookup, so the map cannot grow
+    /// without bound.
+    ingest_locks:
+        std::sync::Mutex<std::collections::HashMap<i64, std::sync::Weak<tokio::sync::Mutex<()>>>>,
 }
 
 impl Core {
@@ -132,6 +138,7 @@ impl Core {
                 config,
                 job_wakeup: tokio::sync::Notify::new(),
                 merge_cas_hook: std::sync::Mutex::new(None),
+                ingest_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
             }),
         }
     }
@@ -153,6 +160,28 @@ impl Core {
             .repos_dir
             .join(format!("{:02}", repo_id.rem_euclid(100)))
             .join(format!("{repo_id}.git"))
+    }
+}
+
+impl Core {
+    /// The post-receive ingest lock for one repository (D1). The
+    /// scan holds it for its whole run — `refs/for` ingest, branch moves,
+    /// and push events — so racing pushes serialize on one process (the
+    /// deployment model; see §2 non-goals). Entries whose mutex nobody
+    /// holds are dropped from the map on lookup.
+    pub async fn repo_ingest_lock(&self, repo_id: i64) -> tokio::sync::OwnedMutexGuard<()> {
+        let mutex = {
+            let mut locks = self.inner.ingest_locks.lock().unwrap();
+            locks.retain(|_, weak| weak.upgrade().is_some());
+            if let Some(mutex) = locks.get(&repo_id).and_then(|weak| weak.upgrade()) {
+                mutex
+            } else {
+                let mutex = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+                locks.insert(repo_id, std::sync::Arc::downgrade(&mutex));
+                mutex
+            }
+        };
+        mutex.lock_owned().await
     }
 }
 

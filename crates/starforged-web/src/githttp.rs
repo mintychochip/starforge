@@ -560,6 +560,9 @@ async fn scan_push_changes(
     before: Option<BTreeMap<String, String>>,
 ) {
     let Some(before) = before else { return };
+    // D1: the whole scan holds the per-repo ingest lock — `refs/for`
+    // ingest, branch moves, and push events serialize with racing pushes.
+    let ingest = core.repo_ingest_lock(repo_id).await;
     let Some(after) = list_refs(&repo).await else {
         return;
     };
@@ -593,9 +596,23 @@ async fn scan_push_changes(
         )
         .await;
     }
-    // Push fan-out: one `push` event per heads/tags create, update, and
-    // delete. `record_push` skips `refs/for/*` and `refs/trails/*` itself;
-    // the zero oid marks creates (`old`) and deletes (`new`).
+    // Branch moves ingest each branch's CURRENT tip under the lock, never
+    // the push line's `new` (stale when scans race); a missing branch is
+    // skipped, while a delete still runs so base deletions recompute.
+    // Non-heads never reach `record_branch_move` (it strips the prefix).
+    let mut moves: Vec<(String, Option<String>, String)> = changes.clone();
+    moves.extend(
+        deletes
+            .iter()
+            .map(|(name, old)| ((*name).to_owned(), Some((*old).to_owned()), "0".repeat(40))),
+    );
+    core.ingest_branch_moves(&ingest, repo_id, pusher.as_ref().map(|u| u.id), &moves)
+        .await;
+    // Push fan-out runs AFTER branch moves and `refs/for` ingest: one
+    // `push` event per heads/tags create, update, and delete, so a
+    // delivered `push` event implies the push's revisions exist.
+    // `record_push` skips `refs/for/*` and `refs/trails/*` itself; the zero
+    // oid marks creates (`old`) and deletes (`new`).
     let mut push_updates: Vec<RefUpdate> = changes
         .iter()
         .map(|(name, old, new)| RefUpdate {
@@ -611,45 +628,6 @@ async fn scan_push_changes(
     }));
     core.record_push(repo_id, pusher.as_ref(), &push_updates)
         .await;
-    for (name, old, new) in &changes {
-        let Some(branch) = name.strip_prefix("refs/heads/") else {
-            continue;
-        };
-        if refpolicy::is_zero_oid(new) {
-            continue;
-        }
-        if let Err(err) = core
-            .record_branch_move(
-                repo_id,
-                branch,
-                old.as_deref(),
-                new,
-                pusher.as_ref().map(|u| u.id),
-            )
-            .await
-        {
-            tracing::warn!(repo_id, branch, error = %err, "push scan: branch move ingest failed");
-        }
-    }
-    // Report the deletions collected above: no revision is recorded for a
-    // delete (the zero oid marks it as one), but base deletions recompute.
-    for (name, old) in &deletes {
-        let Some(branch) = name.strip_prefix("refs/heads/") else {
-            continue;
-        };
-        if let Err(err) = core
-            .record_branch_move(
-                repo_id,
-                branch,
-                Some(*old),
-                &"0".repeat(40),
-                pusher.as_ref().map(|u| u.id),
-            )
-            .await
-        {
-            tracing::warn!(repo_id, branch, error = %err, "push scan: branch delete ingest failed");
-        }
-    }
 }
 
 /// Ingests every new `refs/for/*` tip: change + revision + trail refs via

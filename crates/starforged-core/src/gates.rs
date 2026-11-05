@@ -190,9 +190,11 @@ impl Core {
         // `request_changes` makes the author a requester, from any revision.
         let current_only = rule.dismiss_on_push != 0;
         let reviews = db_changes::reviews_of_change(self.db(), change.id).await?;
-        // Latest decisive review per author. `reviews_of_change` returns
-        // id order, so walking backwards takes the highest id first.
-        let mut latest: Vec<(&db_changes::ReviewRow, i64)> = Vec::new();
+        // Latest decisive review per author, keyed by author id.
+        // `reviews_of_change` returns id order, so walking backwards the
+        // first hit per author is the highest id — the latest decisive one.
+        let mut latest: std::collections::HashMap<i64, &db_changes::ReviewRow> =
+            std::collections::HashMap::new();
         for review in reviews.iter().rev() {
             if !matches!(review.verdict.as_str(), "approve" | "request_changes") {
                 continue;
@@ -200,14 +202,11 @@ impl Core {
             let Some(author_id) = review.author_id else {
                 continue;
             };
-            if latest.iter().any(|(_, seen)| *seen == author_id) {
-                continue;
-            }
-            latest.push((review, author_id));
+            latest.entry(author_id).or_insert(review);
         }
         let mut approvals = 0i64;
         let mut requesters: Vec<String> = Vec::new();
-        for (review, author_id) in latest {
+        for (author_id, review) in latest {
             if review.state != "submitted" {
                 continue;
             }

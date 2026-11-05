@@ -941,3 +941,60 @@ async fn web_merge_form_merges_on_post() {
     assert_eq!(res.status(), 303, "{res:?}");
     assert_eq!(server_rev(&work, &server, "refs/heads/main").await, head);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_authors_two_approvals_count_once() {
+    // D10: approval de-duplication is one voice per author — the latest
+    // decisive review. Two `approve` reviews from alice satisfy one of two
+    // required approvals, never both.
+    let c = Ctx::start().await;
+    let (_work, _url) = c.push_basic().await;
+    let n = c.trail().await;
+    c.create_branch_change(n, "feature/x", "main").await;
+    starforged_db::checks::insert_gate_rule(
+        c.s.core.db(),
+        c.repo_id().await,
+        None,
+        2,
+        false,
+        false,
+        "[]",
+        false,
+        false,
+        false,
+        "[]",
+        starforged_db::now(),
+    )
+    .await
+    .unwrap();
+
+    let client = reqwest::Client::new();
+    for body in ["first look", "second look"] {
+        let res = client
+            .post(format!("{}/reviews", c.change(n, 1)))
+            .bearer_auth(&c.alice_repo)
+            .json(&json!({"verdict": "approve", "body": body}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 201, "submit {body}");
+    }
+
+    let gates: Value = client
+        .get(format!("{}/gates", c.change(n, 1)))
+        .bearer_auth(&c.alice_rw)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(!gates["passed"].as_bool().unwrap(), "{gates}");
+    let text = serde_json::to_string(&gates).unwrap();
+    assert!(
+        text.contains("needs 1 more approval"),
+        "two approvals from one author count once: {gates}"
+    );
+    let (status, body) = c.post_merge(n, 1, &c.alice_repo, "merge").await;
+    assert_eq!(status, 422, "{body}");
+}

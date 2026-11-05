@@ -132,9 +132,25 @@ impl Core {
 
     /// Queues `job` to run at `run_at` (unix seconds). A recurring job that is already pending is left alone.
     pub async fn enqueue_at(&self, job: &Job, run_at: i64) -> CoreResult<()> {
+        self.insert_job(job, run_at).await.map(|_| ())
+    }
+
+    /// Queues `job` to run now and returns its id (jobs without a dedupe
+    /// key always land a fresh row).
+    pub async fn enqueue_returning(&self, job: &Job) -> CoreResult<i64> {
+        self.insert_job(job, now())
+            .await?
+            .ok_or_else(|| CoreError::Internal("job insert was deduplicated".into()))
+    }
+
+    /// The shared insert-and-notify behind [`Core::enqueue`],
+    /// [`Core::enqueue_at`], and [`Core::enqueue_returning`]: serializes
+    /// the job, inserts it (a colliding dedupe key inserts nothing and
+    /// yields `None`), and wakes a worker.
+    async fn insert_job(&self, job: &Job, run_at: i64) -> CoreResult<Option<i64>> {
         let payload = serde_json::to_string(job).map_err(|e| CoreError::Internal(e.to_string()))?;
         let dedupe_key = job.dedupe_key();
-        jobs::insert(
+        let id = jobs::insert(
             self.db(),
             &NewJob {
                 kind: job.kind(),
@@ -144,25 +160,6 @@ impl Core {
             },
         )
         .await?;
-        self.inner.job_wakeup.notify_one();
-        Ok(())
-    }
-    /// Queues `job` to run now and returns its id (jobs without a dedupe
-    /// key always land a fresh row).
-    pub async fn enqueue_returning(&self, job: &Job) -> CoreResult<i64> {
-        let payload = serde_json::to_string(job).map_err(|e| CoreError::Internal(e.to_string()))?;
-        let dedupe_key = job.dedupe_key();
-        let id = jobs::insert(
-            self.db(),
-            &NewJob {
-                kind: job.kind(),
-                payload: &payload,
-                dedupe_key: dedupe_key.as_deref(),
-                run_at: now(),
-            },
-        )
-        .await?
-        .ok_or_else(|| CoreError::Internal("job insert was deduplicated".into()))?;
         self.inner.job_wakeup.notify_one();
         Ok(id)
     }

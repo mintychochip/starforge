@@ -1387,16 +1387,17 @@ async fn post_hook(
 fn response_headers_json(headers: &reqwest::header::HeaderMap) -> String {
     let mut out = serde_json::Map::with_capacity(headers.keys_len().min(MAX_STORED_HEADERS));
     for name in headers.keys().take(MAX_STORED_HEADERS) {
-        let mut values = Vec::new();
+        // Join first, then truncate the JOINED value: truncating each
+        // value would store more than the cap for repeated headers.
+        let mut joined = String::new();
         for value in headers.get_all(name) {
-            let text = String::from_utf8_lossy(value.as_bytes());
-            let end = floor_char_boundary(&text, MAX_STORED_HEADER_VALUE_BYTES);
-            values.push(text[..end].to_owned());
+            if !joined.is_empty() {
+                joined.push_str(", ");
+            }
+            joined.push_str(&String::from_utf8_lossy(value.as_bytes()));
         }
-        out.insert(
-            name.as_str().to_owned(),
-            serde_json::Value::String(values.join(", ")),
-        );
+        joined.truncate(floor_char_boundary(&joined, MAX_STORED_HEADER_VALUE_BYTES));
+        out.insert(name.as_str().to_owned(), serde_json::Value::String(joined));
     }
     serde_json::Value::Object(out).to_string()
 }
@@ -1748,5 +1749,20 @@ mod tests {
         let err = deliver_once(&core, hook.id).await.unwrap_err();
         assert!(err.to_string().contains("64 KiB"), "{err}");
         assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn repeated_header_values_truncate_after_joining() {
+        // D10: the JOINED value of a repeated header is capped at 1 KiB —
+        // truncating each value first would store more than the cap.
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.append("x-trace", "y".repeat(700).parse().unwrap());
+        headers.append("x-trace", "z".repeat(700).parse().unwrap());
+        let stored: serde_json::Value =
+            serde_json::from_str(&response_headers_json(&headers)).unwrap();
+        let value = stored["x-trace"].as_str().expect("x-trace stored");
+        assert_eq!(value.len(), MAX_STORED_HEADER_VALUE_BYTES, "{value:?}");
+        let joined = format!("{}, {}", "y".repeat(700), "z".repeat(700));
+        assert_eq!(&joined[..MAX_STORED_HEADER_VALUE_BYTES], value);
     }
 }

@@ -714,6 +714,82 @@ pub async fn insert_agit_change_with_revision(
     Ok((change, revision))
 }
 
+/// Inserts a `branch` change with its first revision and current pointer in
+/// one transaction (mirrors [`insert_agit_change_with_revision`]): the
+/// change number, the change row, the revision number, the revision row, and
+/// the current-revision pointer commit atomically, so readers never observe
+/// a change with no current revision.
+#[allow(clippy::too_many_arguments)]
+pub async fn insert_branch_change_with_revision(
+    db: &Db,
+    trail_id: i64,
+    head_branch: &str,
+    base_branch: &str,
+    creator_id: i64,
+    head_sha: &str,
+    base_sha: &str,
+    pusher: Option<i64>,
+    now: i64,
+) -> DbResult<(ChangeRow, RevisionRow)> {
+    let mut tx = db.pool().begin().await?;
+    let k = alloc_change_number(&mut tx, trail_id).await?;
+    let change_id: i64 = sqlx::query_scalar(
+        "INSERT INTO changes (trail_id, number, kind, head_branch, base_branch, topic, state, \
+         creator_id, created_at, updated_at) \
+         VALUES ($1, $2, 'branch', $3, $4, '', 'open', $5, $6, $6) RETURNING id",
+    )
+    .bind(trail_id)
+    .bind(k)
+    .bind(head_branch)
+    .bind(base_branch)
+    .bind(creator_id)
+    .bind(now)
+    .fetch_one(&mut *tx)
+    .await?;
+    let r = alloc_revision_number(&mut tx, change_id).await?;
+    let rev_row = sqlx::query(
+        "INSERT INTO revisions (change_id, number, head_sha, base_sha, pusher_id, created_at) \
+         VALUES ($1, $2, $3, $4, $5, $6) \
+         RETURNING id, change_id, number, head_sha, base_sha, merge_base_sha, pusher_id, created_at, \
+         mergeability, conflict_paths",
+    )
+    .bind(change_id)
+    .bind(r)
+    .bind(head_sha)
+    .bind(base_sha)
+    .bind(pusher)
+    .bind(now)
+    .fetch_one(&mut *tx)
+    .await?;
+    let revision = revision_from_row(&rev_row)?;
+    sqlx::query("UPDATE changes SET current_revision_id = $1, updated_at = $2 WHERE id = $3")
+        .bind(revision.id)
+        .bind(now)
+        .bind(change_id)
+        .execute(&mut *tx)
+        .await?;
+    let change_row = sqlx::query(select_change!("WHERE id = $1"))
+        .bind(change_id)
+        .fetch_one(&mut *tx)
+        .await?;
+    let change = change_from_row(&change_row)?;
+    tx.commit().await?;
+    Ok((change, revision))
+}
+
+/// The change's latest revision (highest number), if any. Revision
+/// integrity compares against this row — never the current-revision
+/// pointer, which may lag a row that landed without moving it.
+pub async fn latest_revision_of_change(db: &Db, change_id: i64) -> DbResult<Option<RevisionRow>> {
+    let row = sqlx::query(select_revision!(
+        "WHERE change_id = $1 ORDER BY number DESC LIMIT 1"
+    ))
+    .bind(change_id)
+    .fetch_optional(db.pool())
+    .await?;
+    row.as_ref().map(revision_from_row).transpose()
+}
+
 /// Revisions of the change in ascending number order.
 pub async fn revisions_of_change(db: &Db, change_id: i64) -> DbResult<Vec<RevisionRow>> {
     let rows = sqlx::query(select_revision!("WHERE change_id = $1 ORDER BY number ASC"))
@@ -1556,5 +1632,38 @@ mod tests {
             found.iter().map(|r| r.trail_id).collect::<Vec<_>>(),
             vec![trail_a, trail_b]
         );
+    }
+
+    #[tokio::test]
+    async fn branch_change_with_revision_is_one_transaction() {
+        // D1: the change, its first revision, and the current-revision
+        // pointer land together — no observable change without a current
+        // revision.
+        let (t, alice, _bob, repo_id) = setup().await;
+        let trail_id = trail(&t, repo_id, alice, "a", 1_700_000_000).await;
+        let (change, revision) = insert_branch_change_with_revision(
+            &t.db,
+            trail_id,
+            "feature",
+            "main",
+            alice,
+            "head1",
+            "base1",
+            Some(alice),
+            1_700_000_001,
+        )
+        .await
+        .unwrap();
+        assert_eq!(change.kind, "branch");
+        assert_eq!(change.head_branch.as_deref(), Some("feature"));
+        assert_eq!(change.number, 1);
+        assert_eq!(revision.number, 1);
+        assert_eq!(revision.head_sha, "head1");
+        assert_eq!(change.current_revision_id, Some(revision.id));
+        let latest = latest_revision_of_change(&t.db, change.id)
+            .await
+            .unwrap()
+            .expect("the first revision exists");
+        assert_eq!(latest.id, revision.id);
     }
 }

@@ -2556,3 +2556,100 @@ async fn redeliver_form_requires_csrf() {
         .unwrap();
     assert_eq!(res.status(), 403, "redeliver without CSRF is forbidden");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn push_delivery_implies_its_revisions_exist() {
+    // D1: the scan records branch moves BEFORE fanning out `push`, so a
+    // delivered `push` event implies the push's revisions exist. Three
+    // sequential head pushes make a pre-fix ordering slip near-certain to
+    // surface: each round waits for its push delivery, then asserts the
+    // current revision with no further polling.
+    let c = Ctx::start().await;
+    let (sink_url, sink) = Sink::spawn(false).await;
+    let created = c.create_hook(&c.alice_rw, &sink_url, &["push"]).await;
+    let secret = created["secret"].as_str().unwrap().to_owned();
+
+    let token =
+        c.s.token(&c.alice, &[Scope::RepoRead, Scope::RepoWrite])
+            .await;
+    let url = c.s.git_url("alice", "proj", Some(&token));
+    let tmp = tempfile::tempdir().unwrap();
+    let work = work_repo(tmp.path(), "work", &[("a.txt", "one\n")]).await;
+    git_ok(&work, &["checkout", "-q", "-b", "feature/k"]).await;
+    commit_files(&work, &[("a.txt", b"one\ntwo\n")], "add two").await;
+    git_ok(&work, &["push", "-q", &url, "main", "feature/k"]).await;
+
+    let t =
+        c.s.core
+            .create_trail(&c.alice, "alice", "proj", "k work", "why")
+            .await
+            .unwrap();
+    c.s.core
+        .create_branch_change(&c.alice, "alice", "proj", t.number, "feature/k", "main")
+        .await
+        .unwrap();
+    let repo_id =
+        c.s.core
+            .repo_for(Some(&c.alice), "alice", "proj")
+            .await
+            .unwrap()
+            .repo
+            .id;
+    let trail = starforged_db::trails::trail_by_number(c.s.core.db(), repo_id, t.number)
+        .await
+        .unwrap()
+        .unwrap();
+    let change = starforged_db::changes::change_by_trail_number(c.s.core.db(), trail.id, 1)
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Drain setup jobs (notably the creation mergeability run) so the
+    // delivery polls below observe only this test's pushes.
+    c.s.core.run_due_jobs().await.unwrap();
+
+    let mut from = hits(&sink);
+    for i in 0..5 {
+        commit_files(
+            &work,
+            &[("round.txt", format!("round {i}\n").as_bytes())],
+            &format!("round {i}"),
+        )
+        .await;
+        // The tip SHA is known before the push, so nothing after the
+        // delivery may touch the network or the clock.
+        let new_tip = git_ok(&work, &["rev-parse", "HEAD"])
+            .await
+            .trim()
+            .to_owned();
+        git_ok(&work, &["push", "-q", &url, "feature/k"]).await;
+        let got = delivered_until(&c, &sink, &secret, from, |got| {
+            got.iter()
+                .any(|b| b["event"] == "push" && b["push"]["after"] == new_tip)
+        })
+        .await;
+        assert!(
+            got.iter()
+                .any(|b| b["event"] == "push" && b["push"]["after"] == new_tip),
+            "round {i}: the push event for {new_tip} never arrived: {got:?}"
+        );
+        from = hits(&sink);
+        // IMMEDIATELY: no polling, no sleeps. The delivery may only exist
+        // once the scan has recorded the revision.
+        let pointed = starforged_db::changes::change_by_id(c.s.core.db(), change.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .current_revision_id
+            .expect("round {i}: the change points at a revision");
+        let head = starforged_db::changes::revision_by_id(c.s.core.db(), pointed)
+            .await
+            .unwrap()
+            .unwrap()
+            .head_sha;
+        assert_eq!(
+            head, new_tip,
+            "round {i}: a delivered push implies its revision exists"
+        );
+    }
+}
