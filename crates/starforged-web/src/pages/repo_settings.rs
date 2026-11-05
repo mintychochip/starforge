@@ -190,11 +190,13 @@ fn split_list(raw: Option<&str>) -> Vec<String> {
     }
 }
 
-/// Builds the Core input for a full-replacement edit: absent checkboxes
-/// mean false, absent text inputs mean empty. (Create passes absents
-/// through as `None` instead so Core defaults apply; see
-/// [`create_gate_rule`].)
-fn edit_input(form: &GateRuleForm) -> CoreResult<GateRuleInput> {
+/// Builds the Core input from the settings form. Both the create and the
+/// edit forms are full specifications: an absent checkbox means false (the
+/// pre-checked "Block on request changes" default lives only in the
+/// template, so unchecking it stores false) and an absent text input means
+/// empty. Editing stays in place rather than delete-then-recreate so no
+/// window opens where the branch is unprotected.
+fn form_input(form: &GateRuleForm) -> CoreResult<GateRuleInput> {
     let approvals = match &form.required_approvals {
         None => None,
         Some(raw) => Some(Some(raw.trim().parse::<i64>().map_err(|_| {
@@ -214,37 +216,6 @@ fn edit_input(form: &GateRuleForm) -> CoreResult<GateRuleInput> {
         require_threads_resolved: Some(Some(form.require_threads_resolved.is_some())),
         require_session_evidence: Some(Some(form.require_session_evidence.is_some())),
         allowed_methods: Some(Some(split_list(form.allowed_methods.as_deref()))),
-    })
-}
-
-/// Builds the Core input for a create: absent fields stay absent so Core
-/// defaults apply (`block_on_request_changes` defaults to true).
-fn create_input(form: &GateRuleForm) -> CoreResult<GateRuleInput> {
-    let approvals = match &form.required_approvals {
-        None => None,
-        Some(raw) => Some(Some(raw.trim().parse::<i64>().map_err(|_| {
-            CoreError::Invalid(format!(
-                "invalid required_approvals '{}' (expected 0-20)",
-                raw.trim()
-            ))
-        })?)),
-    };
-    Ok(GateRuleInput {
-        pattern: form.pattern.clone().map(Some),
-        required_approvals: approvals,
-        dismiss_on_push: form.dismiss_on_push.as_ref().map(|_| Some(true)),
-        block_on_request_changes: form.block_on_request_changes.as_ref().map(|_| Some(true)),
-        required_contexts: form
-            .required_contexts
-            .as_deref()
-            .map(|raw| Some(split_list(Some(raw)))),
-        require_up_to_date: form.require_up_to_date.as_ref().map(|_| Some(true)),
-        require_threads_resolved: form.require_threads_resolved.as_ref().map(|_| Some(true)),
-        require_session_evidence: form.require_session_evidence.as_ref().map(|_| Some(true)),
-        allowed_methods: form
-            .allowed_methods
-            .as_deref()
-            .map(|raw| Some(split_list(Some(raw)))),
     })
 }
 
@@ -268,7 +239,7 @@ pub async fn create_gate_rule(
     Form(form): Form<GateRuleForm>,
 ) -> Result<Response, WebError> {
     verify_csrf(&session.csrf_token, &form.csrf)?;
-    let input = match create_input(&form) {
+    let input = match form_input(&form) {
         Ok(input) => input,
         Err(message @ CoreError::Invalid(_)) => {
             return gate_rule_page(&state, &session, &owner, &repo, message.to_string()).await;
@@ -298,7 +269,7 @@ pub async fn update_gate_rule(
     Form(form): Form<GateRuleForm>,
 ) -> Result<Response, WebError> {
     verify_csrf(&session.csrf_token, &form.csrf)?;
-    let input = match edit_input(&form) {
+    let input = match form_input(&form) {
         Ok(input) => input,
         Err(message @ CoreError::Invalid(_)) => {
             return gate_rule_page(&state, &session, &owner, &repo, message.to_string()).await;

@@ -445,11 +445,14 @@ pub async fn update_gate_rule(
     if let Some(m) = update.methods {
         rule.allowed_methods = m.to_owned();
     }
-    sqlx::query(
+    // The write stays repo-scoped and its result is checked: a row deleted
+    // (or moved) between the read above and this write reports `None`
+    // instead of a phantom update with timeline/audit rows.
+    let done = sqlx::query(
         "UPDATE gate_rules SET pattern = $1, required_approvals = $2, dismiss_on_push = $3, \
          block_on_request_changes = $4, required_contexts = $5, require_up_to_date = $6, \
          require_threads_resolved = $7, require_session_evidence = $8, allowed_methods = $9, \
-         updated_at = $10 WHERE id = $11",
+         updated_at = $10 WHERE id = $11 AND repo_id = $12",
     )
     .bind(rule.pattern.as_deref())
     .bind(rule.required_approvals)
@@ -462,8 +465,12 @@ pub async fn update_gate_rule(
     .bind(&rule.allowed_methods)
     .bind(now)
     .bind(rule.id)
+    .bind(repo_id)
     .execute(db.pool())
     .await?;
+    if done.rows_affected() == 0 {
+        return Ok(None);
+    }
     rule.updated_at = now;
     Ok(Some(rule))
 }
@@ -950,14 +957,12 @@ mod tests {
             .unwrap()
             .is_none()
         );
-        assert_eq!(
-            gate_rule_by_id(&t.db, rule.id, repo_id)
-                .await
-                .unwrap()
-                .unwrap()
-                .required_approvals,
-            2
-        );
+        let untouched = gate_rule_by_id(&t.db, rule.id, repo_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(untouched.required_approvals, 2);
+        assert_eq!(untouched.updated_at, updated.updated_at);
     }
 
     #[tokio::test]

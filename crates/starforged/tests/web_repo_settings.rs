@@ -453,3 +453,55 @@ async fn merge_gates_section_is_maintain_only_with_crud() {
     assert!(!settings.contains("ci/unit"), "{settings}");
     assert!(!settings.contains("release/*"), "{settings}");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gate_rule_create_checkbox_is_full_spec() {
+    let s = TestServer::start().await;
+    let alice = s.user("alice").await;
+    s.user("mia").await;
+    s.repo(&alice, "proj", Visibility::Private).await;
+    s.core
+        .set_collaborator(&alice, "alice", "proj", "mia", Permission::Maintain)
+        .await
+        .unwrap();
+    let (mia, mia_csrf) = s.login("mia").await;
+
+    // The pre-checked "Block on request changes" box left unchecked stores false.
+    let saved = mia
+        .post(s.url("/alice/proj/settings/gate-rules"))
+        .form(&[("_csrf", mia_csrf.as_str()), ("pattern", "unchecked")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(saved.status(), 303);
+
+    // … while a checked box stores true.
+    let saved = mia
+        .post(s.url("/alice/proj/settings/gate-rules"))
+        .form(&[
+            ("_csrf", mia_csrf.as_str()),
+            ("pattern", "checked"),
+            ("block_on_request_changes", "true"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(saved.status(), 303);
+
+    let rules = s
+        .core
+        .list_gate_rules(Some(&alice), "alice", "proj")
+        .await
+        .unwrap();
+    assert_eq!(rules.len(), 2);
+    let unchecked = rules
+        .iter()
+        .find(|r| r.pattern.as_deref() == Some("unchecked"))
+        .unwrap();
+    let checked = rules
+        .iter()
+        .find(|r| r.pattern.as_deref() == Some("checked"))
+        .unwrap();
+    assert!(!unchecked.block_on_request_changes);
+    assert!(checked.block_on_request_changes);
+}
