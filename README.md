@@ -287,7 +287,42 @@ hands its API token to git — so push and fetch use your usual credentials
 and prompts. Exits are `0` on success, `1` on any failure; usage errors keep
 clap's `2`.
 
-Not yet: webhook alignment and web gaps arrive in M2e.
+## Finding Trails
+
+Review requests mark the Trails that need eyes. They are per Trail: triage
+and up may request any repository member except the Trail's author (at most
+10 per Trail; adding twice is a no-op), and the request clears itself when
+that user submits any review on any change of the Trail — `review.submitted`
+records the clearing, so no extra timeline row appears. The API is
+`POST`/`DELETE /api/v1/repos/{owner}/{repo}/trails/{n}/review-requests` with
+`{"user": "<handle>"}` (`200` with the updated Trail; unknown, non-member,
+and author targets are `422`, non-reader callers `404`, below-triage readers
+`403`); the Trail page carries a Reviewers section with add/remove forms.
+Every add and remove writes exactly one `trail.review_requested` /
+`trail.review_request_removed` timeline row and fans out a `trail`
+`updated` webhook with the matching `cause`.
+
+The Trail list filters compose: `?state=open|closed|merged`, `?label=`,
+`?assignee=`, `?author=`, `?has_changes=true|false`, and
+`?review_requested=<handle>` (an unknown handle lists nothing, never `404`),
+30 per page with pager links that keep the filters. The API mirrors them as
+keyset filters — `GET .../trails?state=&label=&assignee=&author=&
+has_changes=&review_requested=&after=&limit=` with a `next_after` cursor
+(`has_changes=maybe` is `422`) — and the CLI as
+`starforge trail list [--state open|closed|merged|all] [--label=…]
+[--assignee=…] [--author=…] [--has-changes true|false]
+[--review-requested <handle>]`.
+
+The dashboard (`/`, signed in) adds three sections above the repository
+list — "Assigned to you" and "Awaiting your review" (open Trails, newest
+updated first, at most 20 each) and "Your recent sessions" (your uploads you
+may still read, newest first, at most 10). Every row is re-checked against
+your current permission, so losing access hides it immediately; anonymous
+visitors see the marketing page with no sections.
+
+Not yet (M2f): the `has-sessions` filter, a repository Sessions tab,
+sessions and checks on the timeline, a Trail-header gate panel,
+revision-to-revision diffs, viewed state, and pending reviews.
 
 ## Changes and reviews
 
@@ -325,7 +360,7 @@ branch), `GET`/`PATCH .../changes/{k}` (close/reopen; `merged` is refused), `...
 and `.../threads` (`POST .../{t}/resolve`, `.../{t}/comments`). Reads need `repo:read`,
 mutations need `trail:write`; strangers get `404` so change numbers stay undiscoverable.
 
-## Commit statuses, gates, merging, and webhooks
+## Commit statuses, gates, and merging
 
 CI pushes per-commit statuses: `POST /api/v1/repos/{owner}/{repo}/statuses/{sha}` with
 `{"state": "pending|success|failure|error", "context": "ci/unit"}` (context names are
@@ -365,17 +400,66 @@ moves the ref only when the head already contains the base; every commit carries
 trail closes once no open change remains. Conflicts and CAS races answer `409` with the
 fresh SHAs; failing gates answer `422` with the reasons.
 
-Repository webhooks (`/{owner}/{repo}/settings/hooks`, maintain access and up)
-subscribe to event types `push`, `trail`, `review`, `check`, and `session`
-(empty means all). The secret shows once at creation and rests sealed under
-the server key; every delivery is one JSON envelope — `event`, `action`,
-`cause`, `at`, `repository`, `sender`, plus the subject under its event
-key — signed as `X-Starforge-Signature-256: sha256=<hex>` over HMAC-SHA256
-of the exact bytes with that secret. Verify with e.g.
-`echo -n "$body" | openssl dgst -sha256 -hmac "$secret"`. Only `https`
-URLs are accepted (`http` for localhost); loopback and private ranges are
-refused, bodies cap at 64 KiB, and failures retry on a 1m/5m/30m/2h ladder
-before the hook is marked failed.
+## Webhooks
+
+Repository webhooks (`/{owner}/{repo}/settings/hooks`, maintain access and
+up) subscribe to event types `push`, `trail`, `review`, `check`, and
+`session` (empty means all; unknown names are `422` on create). The secret
+shows once at creation and rests sealed under the server key.
+
+Every delivery is `POST` with these headers:
+
+- `Content-Type: application/json`
+- `User-Agent: starforged/<version>`
+- `X-Starforge-Event: <event>`
+- `X-Starforge-Delivery: <delivery id>` (stable across retries of one job; new on redelivery)
+- `X-Starforge-Signature-256: sha256=<lowercase hex HMAC-SHA256 of the exact body>`
+
+The body is one envelope:
+
+```json
+{"event": "trail", "action": "updated", "cause": "review_requested",
+ "at": "2026-11-05T10:00:00Z",
+ "repository": {"owner": "alice", "name": "proj", "full_name": "alice/proj",
+                "url": "https://forge.example/alice/proj"},
+ "sender": {"handle": "alice"},
+ "trail": {"number": 12, "title": "Faster sync", "state": "open", "ready": false,
+           "author": "alice", "url": "https://forge.example/alice/proj/trails/12"}}
+```
+
+`action` and `cause` are always present (string or `null`); `sender` is
+`null` for system-originated events; exactly one subject key matches
+`event`. Verify a delivery with e.g.
+`echo -n "$body" | openssl dgst -sha256 -hmac "$secret"` and compare with
+the `X-Starforge-Signature-256` header.
+
+The five events, with their subjects:
+
+- `push` (`action`/`cause` null): one per `refs/heads/*` create, update,
+  and delete plus tag pushes, with `ref`, `before`, `after`, `created`,
+  `deleted`, and `pusher`. `refs/for/*` proposals and server-internal refs
+  never emit push.
+- `trail`: `opened` on create; `ready` when the flag flips false to true;
+  `merged` when the last open change merges (a completing merge emits only
+  `merged`); `closed` on close; otherwise `updated` with a `cause`
+  (`edited`, `ready_cleared`, `reopened`, `labeled`, `unlabeled`,
+  `assigned`, `unassigned`, `review_requested`, `review_request_removed`,
+  `change_opened`, `revision_pushed`, `change_merged`, `change_closed`,
+  `change_reopened`). The subject carries `number`, `title`, `state`,
+  `ready`, `author`, and `url`, plus `change` (`k`, `revision`) when a
+  change caused the event.
+- `review`: `submitted` on every review, `dismissed` on explicit dismissal
+  or automatically when a new revision lands (`sender` null then). The
+  subject carries `id`, `trail`, `change`, `revision`, `verdict`, `state`,
+  `author`, and `body`.
+- `check` (`action`/`cause` null): one per posted commit status, with
+  `sha`, `context`, `state`, `target_url`, `description`, and `creator`.
+- `session`: `uploaded` when the lifecycle reaches `complete`,
+  `quarantined` when a scan hits, `published` on publish. The subject
+  carries identifiers and state only (`ulid`, `uploader`, `agent`,
+  `lifecycle_state`, `quarantine_state`, `visibility`) — never titles,
+  reasons, or transcript text.
+
 Every attempt writes one row to the delivery log — success, HTTP error,
 transport error, timeout, SSRF denial, and corrupt secret alike — holding
 the delivery id (stable across retries of one job), the 1-based attempt
@@ -385,13 +469,23 @@ and body, the response status, headers (at most 50, each value cut to
 send to the end of the body. Rows older than 30 days fall out in the hourly
 cleanup. The settings page lists the last 20 attempts under each hook with
 a link to each attempt's request and response; the API mirrors it at
-`GET .../hooks/{id}/deliveries[?limit=]` and `.../deliveries/{row}`.
+`GET .../hooks/{id}/deliveries[?limit=]` (1–100, default 20) and
+`.../deliveries/{row}`. Reads and mutations need maintain access;
+below-threshold readers get `403`, non-readers `404`.
+
 `POST .../deliveries/{row}/redeliver` (maintain, active hook,
-non-archived repo; `202 {"delivery_id"}`) replays the stored body as a new
-delivery — a new id, re-signed with the current secret, through the same
-SSRF gate — and writes one `webhook.redelivered` timeline and audit row. A
-hook whose stored subscription names no known event type receives nothing
-and renders as `events: []` with an invalid-subscription flag.
+non-archived repo; `202 {"delivery_id"}`, or the redeliver form on the
+delivery page) replays the stored body as a new delivery — a new id,
+re-signed with the current secret, through the same SSRF gate and retry
+ladder — and writes one `webhook.redelivered` timeline and audit row.
+Inactive hooks and archived repos answer `422`. A hook whose stored
+subscription names no known event type receives nothing and renders as
+`events: []` with an invalid-subscription flag.
+
+Only `https` URLs are accepted (`http` for localhost); loopback and private
+ranges are refused, nothing is redirected, bodies cap at 64 KiB under a
+10 s timeout, and failures retry on a 1m/5m/30m/2h ladder before the hook
+is marked failed.
 
 Not yet: gate-rule management screens, per-context soft gates, check retries, deployments, and mirrors.
 
