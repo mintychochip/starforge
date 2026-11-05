@@ -273,10 +273,13 @@ mutations need `trail:write`; strangers get `404` so change numbers stay undisco
 CI pushes per-commit statuses: `POST /api/v1/repos/{owner}/{repo}/statuses/{sha}` with
 `{"state": "pending|success|failure|error", "context": "ci/unit"}` (plus an optional
 `description` of at most 1024 chars and an `http(s)` `target_url` of at most 2048 chars).
-Posting needs write access (`repo:write` on top of read); reads need `repo:read`.
-`GET .../commits/{sha}/combined-status` folds every latest-per-context row into one
-state (`error` beats `failure` beats `pending` beats `success`; an unknown SHA is
-`pending` with nothing behind it). A bad SHA, state, or context answers `422`.
+Posting needs write access (`repo:write` on top of read) and answers `201`, like GitHub's;
+reads need `repo:read`. `GET .../commits/{ref}/status` folds every latest-per-context row
+into one state (`error` beats `failure` beats `pending` beats `success`; an unknown SHA is
+`pending` with nothing behind it). `{ref}` is a SHA, a branch, or an annotated tag (a
+branch shadows a same-named tag; anything else is `404`); slashes arrive percent-encoded.
+A bad SHA, state, or context answers `422`. Every API error body is
+`{"error": {"code", "message", "details": null}}`.
 
 Gate rules make merging fail closed. Each rule is stored on the repository with a
 branch glob (empty matches every branch); every rule matching the change's base must

@@ -1,5 +1,5 @@
-//! Commit status routes (spec §6.5, M2c H2):
-//! `…/statuses/{sha}` and `…/commits/{sha}/combined-status`.
+//! Commit status routes (spec §6.5, M2c H2, M2d D10/D11):
+//! `…/statuses/{sha}` and `…/commits/{ref}/status`.
 //!
 //! Handlers authenticate (scope checks) and delegate; all permission,
 //! validation, and upsert logic lives on [`Core`]. Reads go through
@@ -7,7 +7,7 @@
 //! `NotFound`, never translated to `403`); submissions require
 //! `Scope::RepoWrite` first, then `Core` enforces ≥ `Write`
 //! (`Forbidden` → `403`). `CoreError::Invalid` → `422`, all in the
-//! `{error:{code,message}}` envelope.
+//! `{error:{code,message,details}}` envelope.
 //!
 //! Timestamps render as RFC 3339 (`…Z`); the service stores unix seconds
 //! internally. Status writes are timeline-free and audit-free (see
@@ -17,6 +17,7 @@ use axum::Json;
 use axum::extract::Path;
 use axum::extract::State;
 use axum::extract::rejection::JsonRejection;
+use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use starforged_core::checks::{CombinedDto, StatusDto};
@@ -69,14 +70,14 @@ pub struct SubmitStatusBody {
     pub description: Option<String>,
 }
 
-/// `POST /repos/{owner}/{repo}/statuses/{sha}` (200): upserts the caller's
+/// `POST /repos/{owner}/{repo}/statuses/{sha}` (201): upserts the caller's
 /// status for `(sha, context)` and returns the current row.
 pub async fn submit_status(
     State(state): State<ApiState>,
     auth: ApiAuth,
     Path((owner, repo, sha)): Path<(String, String, String)>,
     body: Result<Json<SubmitStatusBody>, JsonRejection>,
-) -> Result<Json<StatusJson>, ApiError> {
+) -> Result<(StatusCode, Json<StatusJson>), ApiError> {
     let auth = auth.require(Scope::RepoWrite)?;
     let Json(body) = body.map_err(|e| ApiError::Invalid(e.body_text()))?;
     let view = state
@@ -92,7 +93,7 @@ pub async fn submit_status(
             body.description.as_deref(),
         )
         .await?;
-    Ok(Json(status_json(&view)))
+    Ok((StatusCode::CREATED, Json(status_json(&view))))
 }
 
 /// `GET /repos/{owner}/{repo}/statuses/{sha}` (200): the latest status per
@@ -111,17 +112,19 @@ pub async fn list_statuses(
     })))
 }
 
-/// `GET /repos/{owner}/{repo}/commits/{sha}/combined-status` (200): the
-/// latest-per-context rows folded with error > failure > pending > success
-/// precedence; an unknown sha is `pending` with zero rows.
+/// `GET /repos/{owner}/{repo}/commits/{ref}/status` (200): the combined
+/// status for a SHA, branch, or tag (D10: SHA as-is, then `refs/heads`,
+/// then peeled `refs/tags`; a branch shadows a same-named tag; anything
+/// else is `404`). The latest-per-context rows fold with error > failure >
+/// pending > success precedence; an unknown sha is `pending` with zero rows.
 pub async fn combined_status(
     State(state): State<ApiState>,
     auth: ApiAuth,
-    Path((owner, repo, sha)): Path<(String, String, String)>,
+    Path((owner, repo, reference)): Path<(String, String, String)>,
 ) -> Result<Json<Value>, ApiError> {
     let view = state
         .core
-        .combined_status(auth.reader()?, &owner, &repo, &sha)
+        .combined_status_for_ref(auth.reader()?, &owner, &repo, &reference)
         .await?;
     Ok(Json(combined_json(&view)))
 }

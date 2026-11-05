@@ -330,13 +330,6 @@ impl Core {
         {
             return Err(CoreError::Invalid(format!("invalid state '{s}'")));
         }
-        // `merged` lists empty in M2a, never 422.
-        if f.state.as_deref() == Some("merged") {
-            return Ok(ListPage {
-                trails: Vec::new(),
-                next_after: None,
-            });
-        }
         let label = f.label.as_deref().map(normalize_label).transpose()?;
         // Unknown handles match nothing, not a 404.
         let author_id = match f.author.as_deref() {
@@ -1351,7 +1344,8 @@ mod tests {
         core.set_trail_state(&alice, "alice", "proj", 2, "closed")
             .await
             .unwrap();
-        // Bogus state filter is Invalid; merged lists empty.
+        // Bogus state filter is Invalid; `merged` filters like any other state
+        // (empty here — the merge path owns the only writer).
         assert!(matches!(
             core.list_trails(
                 Some(&alice),

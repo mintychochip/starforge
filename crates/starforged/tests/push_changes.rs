@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use common::*;
+use serde_json::Value;
 use starforged_core::accounts::User;
 use starforged_core::permission::{Permission, Visibility};
 use starforged_core::tokens::Scope;
@@ -1050,5 +1051,80 @@ async fn base_branch_delete_recomputes_mergeability() {
             .len(),
         1,
         "a delete must not record a revision"
+    );
+}
+
+/// D1: change heads stay hidden from advertisements but are fetchable by SHA
+/// over both protocol versions; anonymous fetches on a private repo fail.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fetch_change_head_by_sha() {
+    let s = TestServer::start().await;
+    let alice = s.user("alice").await;
+    let (repo_id, url, work, _server) = setup_repo(&s, &alice, "proj").await;
+
+    commit_files(&work, &[("feature.txt", b"feature\n")], "add feature").await;
+    git_ok(&work, &["push", "-q", &url, "HEAD:refs/for/main"]).await;
+    let change = wait_for_open_change(&s, repo_id, alice.id, "main", "alice").await;
+    let revs = wait_for_revisions(&s, change.id, 1).await;
+    assert_eq!(revs[0].head_sha.len(), 40);
+
+    // The head SHA as the API reports it (fresh repo: the push opens trail 1).
+    let trail = starforged_db::trails::trail_by_number(s.core.db(), repo_id, 1)
+        .await
+        .unwrap()
+        .expect("trail 1 exists");
+    assert_eq!(trail.id, change.trail_id);
+    let api_token = s.token(&alice, &[Scope::RepoRead]).await;
+    let client = reqwest::Client::new();
+    let res = client
+        .get(s.url("/api/v1/repos/alice/proj/trails/1/changes/1"))
+        .bearer_auth(&api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let body: Value = res.json().await.unwrap();
+    let head = body["selected"]["head_sha"].as_str().unwrap().to_owned();
+    assert_eq!(head, revs[0].head_sha);
+
+    // The server-only namespaces stay out of advertisements …
+    let advertised = git_ok(&work, &["ls-remote", &url]).await;
+    assert!(!advertised.contains("refs/trails"), "{advertised}");
+    assert!(!advertised.contains("refs/for"), "{advertised}");
+
+    // … but the head is fetchable by SHA over both protocol versions.
+    let tmp = tempfile::tempdir().unwrap();
+    let fresh = work_repo(tmp.path(), "fresh", &[("other.txt", "other\n")]).await;
+    for version in ["0", "2"] {
+        let out = git(
+            &fresh,
+            &[
+                "-c",
+                &format!("protocol.version={version}"),
+                "fetch",
+                "-q",
+                &url,
+                &head,
+            ],
+        )
+        .await;
+        assert!(
+            out.status.success(),
+            "protocol v{version} fetch of {head} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        git_ok(&fresh, &["cat-file", "-e", &head]).await;
+    }
+
+    // Anonymous fetches on a private repo are refused.
+    let anon_url = s.git_url("alice", "proj", None);
+    let out = git(
+        &fresh,
+        &["-c", "protocol.version=0", "fetch", &anon_url, &head],
+    )
+    .await;
+    assert!(
+        !out.status.success(),
+        "anonymous fetch of a private change head must fail"
     );
 }

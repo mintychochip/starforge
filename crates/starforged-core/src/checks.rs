@@ -13,6 +13,7 @@
 //! precedent); reads stay available.
 
 use starforged_db::{checks as db_checks, now};
+use starforged_git::{read, refpolicy};
 
 use crate::accounts::User;
 use crate::permission::Permission;
@@ -195,6 +196,56 @@ impl Core {
         if !valid_sha(sha) {
             return Err(CoreError::Invalid(format!("invalid sha '{sha}'")));
         }
+        self.combined_fold(viewer, owner, repo, sha).await
+    }
+
+    /// Combined status for `reference` (D10): lowercase 40/64-hex goes as-is;
+    /// else `refs/heads/<reference>`, else `refs/tags/<reference>` peeled to
+    /// its commit, via `starforged_git::read` helpers on the blocking pool;
+    /// unresolvable → `NotFound`. Visibility and the fold are those of
+    /// `combined_status` (a branch shadows a tag of the same name).
+    pub async fn combined_status_for_ref(
+        &self,
+        viewer: Option<&User>,
+        owner: &str,
+        repo: &str,
+        reference: &str,
+    ) -> CoreResult<CombinedDto> {
+        if refpolicy::is_oid(reference) {
+            return self.combined_fold(viewer, owner, repo, reference).await;
+        }
+        let access = self.repo_for(viewer, owner, repo).await?;
+        let repo_path = self.repo_path(access.repo.id);
+        let name = reference.to_owned();
+        let sha = tokio::task::spawn_blocking(move || -> CoreResult<Option<String>> {
+            if let Some(branch) = read::branch_list(&repo_path)?
+                .into_iter()
+                .find(|branch| branch.name == name)
+            {
+                return Ok(Some(branch.tip.id));
+            }
+            let tag = read::tag_list(&repo_path)?
+                .into_iter()
+                .find(|tag| tag.name == name);
+            Ok(tag.map(|tag| tag.commit_id))
+        })
+        .await
+        .map_err(|err| CoreError::Internal(err.to_string()))??;
+        let Some(sha) = sha else {
+            return Err(CoreError::NotFound);
+        };
+        self.combined_fold(viewer, owner, repo, &sha).await
+    }
+
+    /// Visibility plus the `combined_state` fold shared by [`Core::combined_status`]
+    /// and [`Core::combined_status_for_ref`].
+    async fn combined_fold(
+        &self,
+        viewer: Option<&User>,
+        owner: &str,
+        repo: &str,
+        sha: &str,
+    ) -> CoreResult<CombinedDto> {
         let access = self.repo_for(viewer, owner, repo).await?;
         let rows = db_checks::latest_statuses(self.db(), access.repo.id, sha).await?;
         let state = db_checks::combined_state(&rows).await;

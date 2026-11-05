@@ -15,6 +15,7 @@ struct Ctx {
     composed: String,
     triage: String,
     stranger: String,
+    full: String,
 }
 
 impl Ctx {
@@ -38,6 +39,12 @@ impl Ctx {
         let composed = s.token(&alice, &[Scope::RepoRead, Scope::TrailWrite]).await;
         let triage = s.token(&bob, &[Scope::RepoRead, Scope::TrailWrite]).await;
         let stranger = s.token(&carol, &[Scope::RepoRead, Scope::TrailWrite]).await;
+        let full = s
+            .token(
+                &alice,
+                &[Scope::RepoRead, Scope::RepoWrite, Scope::TrailWrite],
+            )
+            .await;
         Ctx {
             s,
             read,
@@ -45,6 +52,7 @@ impl Ctx {
             composed,
             triage,
             stranger,
+            full,
         }
     }
 
@@ -725,4 +733,72 @@ async fn patch_validates_before_writing() {
     let both = both.json::<Value>().await.unwrap();
     assert_eq!(both["title"], "ok");
     assert_eq!(both["state"], "closed");
+}
+
+/// The M2a `state=merged` short-circuit is gone: merging a change flips its
+/// trail to `merged`, and the filter lists it (while `open` no longer does).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn merged_state_filter_lists_merged_trails() {
+    let c = Ctx::start().await;
+    let client = reqwest::Client::new();
+    let url = c.s.git_url("alice", "proj", Some(&c.full));
+    let tmp = tempfile::tempdir().unwrap();
+    let work = work_repo(tmp.path(), "work", &[("a.txt", "one\n")]).await;
+    git_ok(&work, &["push", "-q", &url, "main"]).await;
+    git_ok(&work, &["checkout", "-q", "-b", "feature/x"]).await;
+    commit_files(&work, &[("a.txt", b"one\ntwo\n")], "add two").await;
+    git_ok(&work, &["push", "-q", &url, "feature/x"]).await;
+
+    let created = c.create("merge me").await;
+    let n = created["number"].as_i64().unwrap();
+    let res = client
+        .post(c.s.url(&format!("/api/v1/repos/alice/proj/trails/{n}/changes")))
+        .bearer_auth(&c.composed)
+        .json(&json!({
+            "kind": "branch",
+            "head_branch": "feature/x",
+            "base_branch": "main",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 201, "create branch change");
+
+    let res = client
+        .post(c.s.url(&format!(
+            "/api/v1/repos/alice/proj/trails/{n}/changes/1/merge"
+        )))
+        .bearer_auth(&c.full)
+        .json(&json!({"method": "merge"}))
+        .send()
+        .await
+        .unwrap();
+    let status = res.status();
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(status, 200, "{body}");
+
+    async fn numbers(client: &reqwest::Client, c: &Ctx, state: &str) -> Vec<i64> {
+        let res = client
+            .get(c.s.url(&format!("/api/v1/repos/alice/proj/trails?state={state}")))
+            .bearer_auth(&c.read)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let body: Value = res.json().await.unwrap();
+        body["trails"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["number"].as_i64().unwrap())
+            .collect()
+    }
+    assert!(
+        numbers(&client, &c, "merged").await.contains(&n),
+        "merged lists trail {n}"
+    );
+    assert!(
+        !numbers(&client, &c, "open").await.contains(&n),
+        "open no longer lists merged trail {n}"
+    );
 }

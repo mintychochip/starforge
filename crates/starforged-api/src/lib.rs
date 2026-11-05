@@ -192,7 +192,7 @@ pub fn router(core: Core, base_url: String) -> Router {
             post(statuses::submit_status).get(statuses::list_statuses),
         )
         .route(
-            "/repos/{owner}/{repo}/commits/{sha}/combined-status",
+            "/repos/{owner}/{repo}/commits/{reference}/status",
             get(statuses::combined_status),
         )
         .route(

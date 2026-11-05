@@ -52,9 +52,8 @@ impl Ctx {
     }
 
     fn combined(&self, sha: &str) -> String {
-        self.s.url(&format!(
-            "/api/v1/repos/alice/proj/commits/{sha}/combined-status"
-        ))
+        self.s
+            .url(&format!("/api/v1/repos/alice/proj/commits/{sha}/status"))
     }
 }
 
@@ -111,7 +110,7 @@ async fn status_matrix() {
         .send()
         .await
         .unwrap();
-    assert_eq!(res.status(), 200);
+    assert_eq!(res.status(), 201);
 
     // Non-member GET on a private repo: 404.
     let res = client
@@ -185,7 +184,7 @@ async fn upsert_same_context_replaces_latest() {
             .send()
             .await
             .unwrap();
-        assert_eq!(res.status(), 200);
+        assert_eq!(res.status(), 201);
     }
 
     let res = client
@@ -215,7 +214,7 @@ async fn two_contexts_both_returned() {
             .send()
             .await
             .unwrap();
-        assert_eq!(res.status(), 200);
+        assert_eq!(res.status(), 201);
     }
 
     let res = client
@@ -260,7 +259,7 @@ async fn combined_precedence_across_contexts() {
             .send()
             .await
             .unwrap();
-        assert_eq!(res.status(), 200);
+        assert_eq!(res.status(), 201);
     }
 
     post(&client, &c, sha, "pending", "ci/a").await;
@@ -316,7 +315,7 @@ async fn response_timestamps_parse() {
         .send()
         .await
         .unwrap();
-    assert_eq!(res.status(), 200);
+    assert_eq!(res.status(), 201);
     let created: Value = res.json().await.unwrap();
     rfc3339(&created["created_at"]);
     rfc3339(&created["updated_at"]);
@@ -367,7 +366,7 @@ async fn status_field_length_bounds() {
         .send()
         .await
         .unwrap();
-    assert_eq!(res.status(), 200, "context of 255 chars is accepted");
+    assert_eq!(res.status(), 201, "context of 255 chars is accepted");
     for context in ["c".repeat(256)] {
         let res = client
             .post(c.statuses(SHA_FRESH))
@@ -402,7 +401,7 @@ async fn status_field_length_bounds() {
         .send()
         .await
         .unwrap();
-    assert_eq!(res.status(), 200, "target_url of 2048 chars is accepted");
+    assert_eq!(res.status(), 201, "target_url of 2048 chars is accepted");
     let long_url = format!("{base}{}", "y".repeat(2049 - base.len()));
     let res = client
         .post(c.statuses(SHA_A))
@@ -435,7 +434,7 @@ async fn status_field_length_bounds() {
         .send()
         .await
         .unwrap();
-    assert_eq!(res.status(), 200, "description of 1024 chars is accepted");
+    assert_eq!(res.status(), 201, "description of 1024 chars is accepted");
     let res = client
         .post(c.statuses(SHA_B))
         .bearer_auth(&c.alice_repo)
@@ -458,4 +457,147 @@ async fn status_field_length_bounds() {
         rows.iter().all(|r| r["context"] != "ci/desc-long"),
         "rejected description wrote no row: {body}"
     );
+}
+
+/// D10: `GET …/commits/{ref}/status` resolves SHAs, branches (including names
+/// with slashes, percent-encoded), and annotated tags; a branch shadows a tag
+/// of the same name; unknown refs are 404 and the old route is gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn status_by_ref() {
+    let c = Ctx::start().await;
+    let client = reqwest::Client::new();
+    let url = c.s.git_url("alice", "proj", Some(&c.alice_repo));
+    let tmp = tempfile::tempdir().unwrap();
+    let work = work_repo(tmp.path(), "work", &[("a.txt", "one\n")]).await;
+    git_ok(&work, &["push", "-q", &url, "main"]).await;
+    git_ok(&work, &["checkout", "-q", "-b", "feature/x"]).await;
+    commit_files(&work, &[("b.txt", b"two\n")], "add two").await;
+    git_ok(&work, &["push", "-q", &url, "feature/x"]).await;
+    let feature_tip = git_ok(&work, &["rev-parse", "HEAD"]).await;
+    let feature_tip = feature_tip.trim();
+    let main_tip = git_ok(&work, &["rev-parse", "main"]).await;
+    let main_tip = main_tip.trim();
+    // Annotated tag on main, plus a branch and a tag sharing one name.
+    git_ok(&work, &["tag", "-a", "v1", "-m", "release", "main"]).await;
+    git_ok(&work, &["push", "-q", &url, "tag", "v1"]).await;
+    git_ok(&work, &["checkout", "-q", "-b", "dupe"]).await;
+    git_ok(&work, &["push", "-q", &url, "dupe"]).await;
+    git_ok(&work, &["tag", "dupe", "main"]).await;
+    git_ok(&work, &["push", "-q", &url, "tag", "dupe"]).await;
+
+    async fn post(client: &reqwest::Client, c: &Ctx, sha: &str, state: &str, context: &str) {
+        let res = client
+            .post(c.statuses(sha))
+            .bearer_auth(&c.alice_repo)
+            .json(&post_body(state, context))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 201);
+    }
+    post(&client, &c, main_tip, "success", "ci/main").await;
+    post(&client, &c, feature_tip, "failure", "ci/feature").await;
+
+    async fn get(client: &reqwest::Client, c: &Ctx, reference: &str) -> (u16, Value) {
+        let res = client
+            .get(c.s.url(&format!(
+                "/api/v1/repos/alice/proj/commits/{reference}/status"
+            )))
+            .bearer_auth(&c.alice_repo)
+            .send()
+            .await
+            .unwrap();
+        let status = res.status().as_u16();
+        let body: Value = res.json().await.unwrap_or(Value::Null);
+        (status, body)
+    }
+
+    // By SHA: the peeled commit's statuses.
+    let (status, body) = get(&client, &c, main_tip).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["sha"], main_tip);
+    assert_eq!(body["state"], "success", "{body}");
+    assert_eq!(body["total_count"], 1, "{body}");
+
+    // By branch; a slash arrives percent-encoded.
+    let (status, body) = get(&client, &c, "main").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["sha"], main_tip, "{body}");
+    let (status, body) = get(&client, &c, "feature%2Fx").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["sha"], feature_tip, "{body}");
+    assert_eq!(body["state"], "failure", "{body}");
+
+    // By annotated tag: the peeled commit.
+    let (status, body) = get(&client, &c, "v1").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["sha"], main_tip, "{body}");
+
+    // A branch shadows a tag of the same name.
+    let (status, body) = get(&client, &c, "dupe").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["sha"], feature_tip, "{body}");
+
+    // Unknown branch and unknown SHA behave: 404, and pending with zero rows.
+    let (status, _) = get(&client, &c, "nope").await;
+    assert_eq!(status, 404);
+    let (status, body) = get(&client, &c, SHA_FRESH).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["state"], "pending", "{body}");
+    assert_eq!(body["total_count"], 0, "{body}");
+
+    // The old combined-status route is gone.
+    let res = client
+        .get(c.s.url(&format!(
+            "/api/v1/repos/alice/proj/commits/{main_tip}/combined-status"
+        )))
+        .bearer_auth(&c.alice_repo)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 404);
+}
+
+/// D11: every API error body carries `"details": null`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn error_envelope_carries_details() {
+    let c = Ctx::start().await;
+    let client = reqwest::Client::new();
+
+    // 401: anonymous status POST.
+    let res = client
+        .post(c.statuses(SHA_A))
+        .json(&post_body("pending", "ci/x"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 401);
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "unauthenticated", "{body}");
+    assert_eq!(body["error"].get("details"), Some(&Value::Null), "{body}");
+
+    // 422: bad SHA.
+    let res = client
+        .post(c.s.url("/api/v1/repos/alice/proj/statuses/not-a-sha"))
+        .bearer_auth(&c.alice_repo)
+        .json(&post_body("pending", "ci/x"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 422);
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "invalid", "{body}");
+    assert_eq!(body["error"].get("details"), Some(&Value::Null), "{body}");
+
+    // 404: non-member read on a private repo.
+    let res = client
+        .get(c.statuses(SHA_A))
+        .bearer_auth(&c.dave_read)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 404);
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "not_found", "{body}");
+    assert_eq!(body["error"].get("details"), Some(&Value::Null), "{body}");
 }

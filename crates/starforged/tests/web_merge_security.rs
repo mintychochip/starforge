@@ -127,9 +127,8 @@ impl Ctx {
     }
 
     fn combined(&self, repo: &str, sha: &str) -> String {
-        self.s.url(&format!(
-            "/api/v1/repos/alice/{repo}/commits/{sha}/combined-status"
-        ))
+        self.s
+            .url(&format!("/api/v1/repos/alice/{repo}/commits/{sha}/status"))
     }
 
     fn gates(&self, repo: &str, n: i64, k: i64) -> String {
@@ -435,7 +434,7 @@ async fn matrix_status_gates() {
             .send()
             .await
             .unwrap();
-        assert_eq!(res.status(), 200, "{} POSTs status", user.handle);
+        assert_eq!(res.status(), 201, "{} POSTs status", user.handle);
     }
     for user in [&c.bob, &c.carol] {
         let t = c.tok(user, &[Scope::RepoRead, Scope::RepoWrite]).await;
@@ -992,7 +991,7 @@ async fn matrix_internal() {
         .send()
         .await
         .unwrap();
-    assert_eq!(res.status(), 200, "seed status");
+    assert_eq!(res.status(), 201, "seed status");
 
     // Anonymous: mutations 401, reads 404 (no implicit read).
     let res = client
@@ -1197,7 +1196,7 @@ async fn matrix_internal() {
             .send()
             .await
             .unwrap();
-        assert_eq!(res.status(), 200, "{} POSTs status", user.handle);
+        assert_eq!(res.status(), 201, "{} POSTs status", user.handle);
     }
     for user in [&c.bob, &c.carol] {
         let t = c.tok(user, &[Scope::RepoRead, Scope::RepoWrite]).await;
@@ -1454,7 +1453,7 @@ async fn xss_corpus() {
             .send()
             .await
             .unwrap();
-        assert_eq!(res.status(), 200, "status POST {payload:?}");
+        assert_eq!(res.status(), 201, "status POST {payload:?}");
     }
     let ctx_json = serde_json::to_string(PAYLOADS).unwrap();
     c.gate_rule(None, 0, &ctx_json, "[]").await;
@@ -1569,7 +1568,7 @@ async fn xss_corpus() {
         .send()
         .await
         .unwrap();
-    assert_eq!(res.status(), 200, "attacker http target_url stored");
+    assert_eq!(res.status(), 201, "attacker http target_url stored");
     let page = get_text(&browser, &c.web_change("proj", n, 1)).await;
     // The change page renders no status links at all: the attacker host is
     // absent entirely (target_url/description are API-only data).
@@ -1794,7 +1793,7 @@ async fn e2e_methods() {
             .send()
             .await
             .unwrap();
-        assert_eq!(res.status(), 200);
+        assert_eq!(res.status(), 201);
         let gates: Value = client
             .get(c.gates("proj", n, k))
             .bearer_auth(&alice_rw)

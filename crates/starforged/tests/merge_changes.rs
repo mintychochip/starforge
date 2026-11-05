@@ -536,7 +536,7 @@ async fn approval_plus_status_satisfies_gate_then_merge() {
         .send()
         .await
         .unwrap();
-    assert_eq!(res.status(), 200);
+    assert_eq!(res.status(), 201);
     let res = client
         .post(format!("{}/reviews", c.change(n, 1)))
         .bearer_auth(&c.alice_repo)

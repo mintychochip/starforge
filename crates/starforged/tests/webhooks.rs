@@ -326,7 +326,7 @@ async fn event_filter_and_signed_delivery() {
         .send()
         .await
         .unwrap();
-    assert_eq!(res.status(), 200);
+    assert_eq!(res.status(), 201);
 
     c.s.core.run_due_jobs().await.unwrap();
     let hits = sink.hits.lock().unwrap().clone();
@@ -560,7 +560,7 @@ async fn end_to_end_push_review_merge_fan_out() {
         .send()
         .await
         .unwrap();
-    assert_eq!(res.status(), 200);
+    assert_eq!(res.status(), 201);
 
     let res = client
         .post(c.s.url(&format!(

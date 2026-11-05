@@ -1,9 +1,9 @@
-//! The JSON error envelope: `{"error": {"code": "...", "message": "..."}}`.
+//! The JSON error envelope: `{"error": {"code": "...", "message": "...", "details": null}}`.
 
 use axum::Json;
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use serde_json::json;
+use serde_json::{Value, json};
 use starforged_core::CoreError;
 
 #[derive(Debug)]
@@ -59,7 +59,7 @@ impl IntoResponse for ApiError {
         };
         let mut response = (
             status,
-            Json(json!({ "error": { "code": code, "message": message } })),
+            Json(json!({ "error": { "code": code, "message": message, "details": Value::Null } })),
         )
             .into_response();
         if status == StatusCode::UNAUTHORIZED {

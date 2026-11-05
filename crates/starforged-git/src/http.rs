@@ -135,6 +135,11 @@ pub fn spawn_rpc(
 /// must stay visible to stay pushable. Upload-pack hides the server-only
 /// namespaces (`refs/for`, `refs/trails`) from fetches via
 /// `uploadpack.hideRefs`, so default clones and `ls-remote` never see them.
+/// It also sets `uploadpack.allowTipSHA1InWant` (D1): the hidden tips stay
+/// hidden from advertisements, but clients that learn a change head from the
+/// API can fetch it by SHA. Protocol v2 accepts wants for any object already,
+/// so the flag only brings v0/v1 clients to parity; `ls-remote` and default
+/// clones still never see the trail refs.
 /// Passed through the existing `spawn_rpc` / `advertisement` `env` seam.
 pub fn rpc_env(service: Service) -> Vec<(&'static str, String)> {
     match service {
@@ -147,11 +152,16 @@ pub fn rpc_env(service: Service) -> Vec<(&'static str, String)> {
             ("GIT_CONFIG_VALUE_0", "true".to_owned()),
         ],
         Service::UploadPack => vec![
-            ("GIT_CONFIG_COUNT", "2".to_owned()),
+            ("GIT_CONFIG_COUNT", "3".to_owned()),
             ("GIT_CONFIG_KEY_0", "uploadpack.hideRefs".to_owned()),
             ("GIT_CONFIG_VALUE_0", "refs/for".to_owned()),
             ("GIT_CONFIG_KEY_1", "uploadpack.hideRefs".to_owned()),
             ("GIT_CONFIG_VALUE_1", "refs/trails".to_owned()),
+            (
+                "GIT_CONFIG_KEY_2",
+                "uploadpack.allowTipSHA1InWant".to_owned(),
+            ),
+            ("GIT_CONFIG_VALUE_2", "true".to_owned()),
         ],
     }
 }
@@ -221,6 +231,17 @@ mod tests {
         let fetch = pairs_of(&rpc_env(Service::UploadPack));
         assert!(fetch.contains(&("uploadpack.hideRefs".to_owned(), "refs/for".to_owned())));
         assert!(fetch.contains(&("uploadpack.hideRefs".to_owned(), "refs/trails".to_owned())));
+    }
+    #[test]
+    fn upload_pack_allows_tip_sha_wants() {
+        // D1: change heads stay hidden from advertisements but fetchable by
+        // SHA, so protocol v0/v1 clients reach parity with v2 (which accepts
+        // any want already).
+        let fetch = pairs_of(&rpc_env(Service::UploadPack));
+        assert!(fetch.contains(&(
+            "uploadpack.allowTipSHA1InWant".to_owned(),
+            "true".to_owned()
+        )));
     }
 
     #[tokio::test]
