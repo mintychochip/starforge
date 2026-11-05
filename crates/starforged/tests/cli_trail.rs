@@ -1145,3 +1145,51 @@ async fn list_has_sessions_flag_maps_to_param() {
         "sessionless trail misses true: {out}"
     );
 }
+
+/// M2f F6 (RED): `trail show` renders no foreign pending drafts (the API
+/// thread listing hides them), while the author still sees their own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn show_hides_foreign_pending_drafts() {
+    let (s, alice, _work, _server, _repo, writer, n) = j5_setup().await;
+    let bob = s.user("bob").await;
+    s.core
+        .set_collaborator(
+            &alice,
+            "alice",
+            "proj",
+            "bob",
+            starforged_core::permission::Permission::Read,
+        )
+        .await
+        .unwrap();
+    let bob_token = s.token(&bob, &[Scope::RepoRead, Scope::TrailWrite]).await;
+
+    // The author's pending draft, posted through the API like the CLI reads.
+    let client = reqwest::Client::new();
+    let res = client
+        .post(s.url(&format!("/api/v1/repos/alice/proj/trails/{n}/changes/1/threads")))
+        .bearer_auth(&writer)
+        .json(&j5_json!({"path": "a.txt", "side": "head", "start_line": 1, "end_line": 2, "body": "secret draft nit", "pending": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 201, "pending draft");
+
+    // A foreign reader's `show` renders no trace of the draft.
+    let bctx = j5_ctx(&s, &bob_token);
+    let (out, code) = show(&bctx, n, Format::Text).await;
+    assert_eq!(code, 0, "show: {out}");
+    assert!(
+        !out.contains("secret draft nit"),
+        "foreign draft hidden: {out}"
+    );
+
+    // The author's own `show` still lists their draft thread.
+    let actx = j5_ctx(&s, &writer);
+    let (out, code) = show(&actx, n, Format::Text).await;
+    assert_eq!(code, 0, "show: {out}");
+    assert!(
+        out.contains("secret draft nit"),
+        "author sees the draft: {out}"
+    );
+}

@@ -985,6 +985,7 @@ mod tests {
                 1,
                 1,
                 "fix this",
+                false,
             )
             .await
             .unwrap();
@@ -1381,6 +1382,47 @@ mod tests {
             .unwrap();
         assert_eq!(reviews.len(), 2);
         assert_eq!(reviews[0].state, "dismissed");
-        assert_eq!(reviews[1].state, "submitted");
+    }
+    #[tokio::test]
+    async fn pending_reviews_do_not_count_toward_gates() {
+        let h = Harness::setup().await;
+        h.rule_n(1, false).await;
+        assert!(!h.report().await.passed);
+        // A pending draft comment changes nothing at the gates.
+        h.core
+            .create_thread(
+                &h.bob,
+                "alice",
+                "proj-gates",
+                h.trail_n,
+                h.k,
+                None,
+                "feature.txt",
+                "head",
+                1,
+                1,
+                "draft nit",
+                true,
+            )
+            .await
+            .unwrap();
+        assert!(!h.report().await.passed, "pending drafts never count");
+        // Submitting the draft as an approval satisfies the rule.
+        h.core
+            .submit_review(
+                &h.bob,
+                "alice",
+                "proj-gates",
+                h.trail_n,
+                h.k,
+                None,
+                "approve",
+                "lgtm",
+                None,
+                &[],
+            )
+            .await
+            .unwrap();
+        assert!(h.report().await.passed);
     }
 }

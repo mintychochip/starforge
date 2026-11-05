@@ -20,8 +20,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use starforged_core::accounts::User;
 use starforged_core::changes::{
-    ChangeDetail, ChangeView, NewInlineComment, ReviewView, RevisionView, ThreadCommentView,
-    ThreadView,
+    ChangeDetail, ChangeView, NewInlineComment, PendingReviewView, ReviewView, RevisionView,
+    ThreadCommentView, ThreadView,
 };
 use starforged_core::gates::GateReport;
 use starforged_core::merge::MergeRequest;
@@ -594,10 +594,15 @@ pub struct CreateThreadBody {
     pub start_line: i64,
     pub end_line: i64,
     pub body: String,
+    /// D9: attaches the first comment to the actor's draft review instead
+    /// of opening a public thread.
+    #[serde(default)]
+    pub pending: bool,
 }
 
 /// `POST …/changes/{k}/threads` (201): any reader may open a thread; the
-/// body becomes its first comment.
+/// body becomes its first comment. With `"pending": true` the comment
+/// attaches to the actor's draft review and stays invisible to others.
 pub async fn create_thread(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -620,6 +625,7 @@ pub async fn create_thread(
             body.start_line,
             body.end_line,
             &body.body,
+            body.pending,
         )
         .await?;
     Ok((StatusCode::CREATED, Json(thread_json(&view))))
@@ -668,10 +674,16 @@ pub async fn resolve_thread(
 pub struct CommentBody {
     pub body: String,
     pub review_id: Option<i64>,
+    /// D9: attaches the comment to the actor's draft review instead of
+    /// auditing a `thread.comment` row. Cannot combine with `review_id`.
+    #[serde(default)]
+    pub pending: bool,
 }
 
 /// `POST …/threads/{t}/comments` (201): any reader may comment; `review_id`,
-/// when given, must name a review on the same change.
+/// when given, must name a review on the same change. With `"pending": true`
+/// the comment attaches to the actor's draft review and stays invisible to
+/// others.
 pub async fn add_comment(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -691,7 +703,75 @@ pub async fn add_comment(
             t,
             &body.body,
             body.review_id,
+            body.pending,
         )
         .await?;
     Ok((StatusCode::CREATED, Json(thread_comment_json(&view))))
+}
+
+#[derive(Serialize)]
+pub struct PendingCommentJson {
+    pub id: i64,
+    pub thread_id: i64,
+    pub body: String,
+    pub created_at: String,
+}
+
+#[derive(Serialize)]
+pub struct PendingReviewJson {
+    pub id: i64,
+    pub revision: i64,
+    pub comments: Vec<PendingCommentJson>,
+    pub created_at: String,
+}
+
+fn pending_review_json(view: &PendingReviewView) -> PendingReviewJson {
+    PendingReviewJson {
+        id: view.id,
+        revision: view.revision,
+        comments: view
+            .comments
+            .iter()
+            .map(|c| PendingCommentJson {
+                id: c.id,
+                thread_id: c.thread_id,
+                body: c.body.clone(),
+                created_at: rfc3339(c.created_at),
+            })
+            .collect(),
+        created_at: rfc3339(view.created_at),
+    }
+}
+
+/// `GET …/changes/{k}/reviews/pending`: the caller's draft review, or 404
+/// when they hold none.
+pub async fn get_pending_review(
+    State(state): State<ApiState>,
+    auth: ApiAuth,
+    Path((owner, repo, n, k)): Path<(String, String, i64, i64)>,
+) -> Result<Json<PendingReviewJson>, ApiError> {
+    let draft = state
+        .core
+        .pending_review(auth.reader()?, &owner, &repo, n, k)
+        .await?;
+    match draft {
+        Some(view) => Ok(Json(pending_review_json(&view))),
+        None => Err(ApiError::NotFound),
+    }
+}
+
+/// `DELETE …/changes/{k}/reviews/pending`: discards the caller's draft —
+/// its comments plus the threads left without comments. No draft is 404;
+/// nothing is audited or dispatched.
+pub async fn discard_pending_review(
+    State(state): State<ApiState>,
+    auth: ApiAuth,
+    Path((owner, repo, n, k)): Path<(String, String, i64, i64)>,
+) -> Result<Json<Value>, ApiError> {
+    let auth = auth.require(Scope::TrailWrite)?;
+    state
+        .core
+        .discard_pending_review(&auth.user, &owner, &repo, n, k)
+        .await?;
+    Ok(Json(json!({ "discarded": true })))
 }

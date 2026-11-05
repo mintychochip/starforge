@@ -331,6 +331,10 @@ fn page_routes() -> Router<AppState> {
             post(pages::changes::submit_review),
         )
         .route(
+            "/{owner}/{repo}/trails/{number}/changes/{k}/reviews/pending",
+            post(pages::changes::discard_pending_review),
+        )
+        .route(
             "/{owner}/{repo}/trails/{number}/changes/{k}/reviews/{id}/dismiss",
             post(pages::changes::dismiss_review),
         )

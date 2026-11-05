@@ -180,6 +180,10 @@ pub fn router(core: Core, base_url: String) -> Router {
             get(changes::list_reviews).post(changes::submit_review),
         )
         .route(
+            "/repos/{owner}/{repo}/trails/{n}/changes/{k}/reviews/pending",
+            get(changes::get_pending_review).delete(changes::discard_pending_review),
+        )
+        .route(
             "/repos/{owner}/{repo}/trails/{n}/changes/{k}/reviews/{id}/dismiss",
             post(changes::dismiss_review),
         )

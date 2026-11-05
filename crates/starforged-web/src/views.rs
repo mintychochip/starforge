@@ -484,6 +484,10 @@ pub struct InlineCommentView {
 pub struct FileView {
     pub status: &'static str,
     pub path: String,
+    /// The path the viewed toggle posts: the file's display path (the new
+    /// path for renames), which — unlike the `"old → new"` label — the
+    /// server can resolve.
+    pub form_path: String,
     pub binary: bool,
     pub hunks: Vec<HunkView>,
     /// The viewer marked this blob viewed (D8); the page renders it collapsed.
@@ -606,6 +610,7 @@ pub fn file_views_with(
             FileView {
                 status,
                 path,
+                form_path: shown.clone(),
                 binary: file.binary,
                 hunks,
                 viewed: viewed.get(&shown).copied().unwrap_or(false),

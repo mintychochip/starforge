@@ -128,6 +128,9 @@ pub struct ChangePage {
     request_changes: usize,
     reviewers: Vec<String>,
     reviews: Vec<ReviewItem>,
+    /// The viewer's draft review (D9): the "Finish your review" panel shows
+    /// while they hold pending comments.
+    pending: Option<PendingPanel>,
     /// Threads that did not attach inline (or every thread in the
     /// inter-revision view), in creation order.
     threads: Vec<ThreadItem>,
@@ -140,9 +143,17 @@ pub struct ChangePage {
     error: Option<String>,
 }
 
-/// Counting votes for a change: live (non-dismissed) `approve`s and
-/// `request_changes` from authors holding Write+ (the same rule the change
-/// page has always used). Shared with the Trail header gate panels.
+/// The "Finish your review" panel (D9): how many draft comments the viewer
+/// holds on the change. Submitting the review form above attaches them;
+/// the Discard form removes them.
+pub struct PendingPanel {
+    pub count: usize,
+}
+
+/// Counting votes for a change: live `submitted` `approve`s and
+/// `request_changes` from authors holding Write+ (drafts never count; the
+/// same rule the change page has always used). Shared with the Trail header
+/// gate panels.
 pub(crate) async fn count_votes(
     state: &AppState,
     access: &RepoAccess,
@@ -157,7 +168,7 @@ pub(crate) async fn count_votes(
             .permission_on(&access.repo, author.as_ref())
             .await?
             .is_some_and(|p| p >= Permission::Write);
-        if r.state != "dismissed" && counting {
+        if r.state == "submitted" && counting {
             match r.verdict.as_str() {
                 "approve" => approvals += 1,
                 "request_changes" => request_changes += 1,
@@ -301,7 +312,7 @@ async fn change_view(
             .permission_on(&access.repo, author.as_ref())
             .await?
             .is_some_and(|p| p >= Permission::Write);
-        let live = r.state != "dismissed";
+        let live = r.state == "submitted";
         if live && counting {
             match r.verdict.as_str() {
                 "approve" => approvals += 1,
@@ -444,6 +455,18 @@ async fn change_view(
         changes_count: changes.len(),
         sessions_count: seen.len(),
     };
+    // D9: the "Finish your review" panel shows while the signed-in viewer
+    // holds draft comments on the change.
+    let pending = match session {
+        Some(s) => state
+            .core
+            .pending_review(Some(&s.user), owner, repo, number, k)
+            .await?
+            .map(|draft| PendingPanel {
+                count: draft.comments.len(),
+            }),
+        None => None,
+    };
     Ok(ChangePage {
         nav_user: nav(session),
         head: RepoHead::new(&access, "trails", None),
@@ -470,6 +493,7 @@ async fn change_view(
         request_changes,
         reviewers: reviewers.into_iter().collect(),
         reviews,
+        pending,
         threads: below,
         panel,
         tabs,
@@ -663,7 +687,8 @@ pub struct DismissForm {
     csrf: String,
 }
 
-/// `POST …/reviews/{id}/dismiss`: triage-only.
+/// `POST …/reviews/{id}/dismiss`: triage-only. Dismissing a pending review
+/// is 422 (`Invalid` re-renders like every other review form error).
 pub async fn dismiss_review(
     State(state): State<AppState>,
     RequireUser(session): RequireUser,
@@ -677,15 +702,78 @@ pub async fn dismiss_review(
         .repo_for(Some(&session.user), &owner, &repo)
         .await?;
     verify_csrf(&session.csrf_token, &form.csrf)?;
-    state
+    match state
         .core
         .dismiss_review(&session.user, &owner, &repo, number, k, id)
+        .await
+    {
+        Ok(_review) => Ok(Redirect::to(&format!(
+            "/{}/{}/trails/{number}/changes/{k}#review-{id}",
+            access.repo.owner, access.repo.name
+        ))
+        .into_response()),
+        Err(starforged_core::CoreError::Invalid(message)) => {
+            let page = change_view(
+                &state,
+                Some(&session),
+                &owner,
+                &repo,
+                number,
+                k,
+                None,
+                None,
+                Some(message),
+            )
+            .await?;
+            Ok((StatusCode::UNPROCESSABLE_ENTITY, detail_headers(), page).into_response())
+        }
+        Err(other) => Err(other.into()),
+    }
+}
+
+/// `POST …/reviews/pending`: discards the signed-in reader's draft review
+/// (D9). Readers only: non-readers 404 before the CSRF check. No draft is
+/// 404; `Invalid` (archived repos) re-renders with 422.
+pub async fn discard_pending_review(
+    State(state): State<AppState>,
+    RequireUser(session): RequireUser,
+    Path((owner, repo, number, k)): Path<(String, String, i64, i64)>,
+    Form(form): Form<DismissForm>,
+) -> Result<Response, WebError> {
+    // Non-readers 404 before the CSRF check, matching the trail pages: a
+    // forged POST must not distinguish "exists" from "missing".
+    let access = state
+        .core
+        .repo_for(Some(&session.user), &owner, &repo)
         .await?;
-    Ok(Redirect::to(&format!(
-        "/{}/{}/trails/{number}/changes/{k}#review-{id}",
-        access.repo.owner, access.repo.name
-    ))
-    .into_response())
+    verify_csrf(&session.csrf_token, &form.csrf)?;
+    match state
+        .core
+        .discard_pending_review(&session.user, &owner, &repo, number, k)
+        .await
+    {
+        Ok(()) => Ok(Redirect::to(&format!(
+            "/{}/{}/trails/{number}/changes/{k}",
+            access.repo.owner, access.repo.name
+        ))
+        .into_response()),
+        Err(starforged_core::CoreError::Invalid(message)) => {
+            let page = change_view(
+                &state,
+                Some(&session),
+                &owner,
+                &repo,
+                number,
+                k,
+                None,
+                None,
+                Some(message),
+            )
+            .await?;
+            Ok((StatusCode::UNPROCESSABLE_ENTITY, detail_headers(), page).into_response())
+        }
+        Err(other) => Err(other.into()),
+    }
 }
 
 #[derive(Deserialize)]
@@ -704,6 +792,9 @@ pub struct ThreadForm {
     body: String,
     #[serde(default)]
     r: Option<i64>,
+    /// D9: "Add to review" attaches the first comment to the actor's draft.
+    #[serde(default)]
+    pending: bool,
 }
 
 /// `POST …/threads`: any signed-in reader opens a thread with `body` as
@@ -736,6 +827,7 @@ pub async fn create_thread(
             start,
             end,
             &form.body,
+            form.pending,
         )
         .await
     {
@@ -811,10 +903,14 @@ pub struct ThreadCommentForm {
     csrf: String,
     #[serde(default)]
     body: String,
+    /// D9: "Add to review" attaches the comment to the actor's draft.
+    #[serde(default)]
+    pending: bool,
 }
 
-/// `POST …/threads/{id}/comments`: any signed-in reader appends a comment.
-/// `Invalid` re-renders with 422.
+/// `POST …/threads/{id}/comments`: any signed-in reader appends a comment —
+/// or, with `pending`, attaches it to their draft review. `Invalid`
+/// re-renders with 422.
 pub async fn add_thread_comment(
     State(state): State<AppState>,
     RequireUser(session): RequireUser,
@@ -839,6 +935,7 @@ pub async fn add_thread_comment(
             id,
             &form.body,
             None,
+            form.pending,
         )
         .await
     {

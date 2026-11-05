@@ -2653,3 +2653,132 @@ async fn push_delivery_implies_its_revisions_exist() {
         );
     }
 }
+
+/// M2f F6 (RED): pending drafts dispatch nothing; submitting the draft
+/// emits exactly one `review`/`submitted` event and one timeline row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pending_review_emits_single_submit_event() {
+    let c = Ctx::start().await;
+    let (sink_url, sink) = Sink::spawn(false).await;
+    let created = c.create_hook(&c.alice_rw, &sink_url, &[]).await;
+    let secret = created["secret"].as_str().unwrap().to_owned();
+    let repo_url = format!("{}/alice/proj", c.s.base);
+    let core = &c.s.core;
+    let carol = core
+        .user_by_handle("carol")
+        .await
+        .unwrap()
+        .expect("carol exists");
+    let carol_rw =
+        c.s.token(&carol, &[Scope::RepoRead, Scope::TrailWrite])
+            .await;
+
+    let url = c.s.git_url(
+        "alice",
+        "proj",
+        Some(&c.s.token(&c.alice, &[Scope::RepoWrite]).await),
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    let work = work_repo(tmp.path(), "work", &[("a.txt", "one\n")]).await;
+    git_ok(&work, &["checkout", "-q", "-b", "feature/p"]).await;
+    commit_files(&work, &[("a.txt", b"one\ntwo\n")], "add two").await;
+    git_ok(&work, &["push", "-q", &url, "main", "feature/p"]).await;
+    let mut from = hits(&sink);
+    delivered_until(&c, &sink, &secret, from, |got| {
+        got.iter().filter(|b| b["event"] == "push").count() == 2
+    })
+    .await;
+
+    let t = core
+        .create_trail(&c.alice, "alice", "proj", "pending", "why")
+        .await
+        .unwrap();
+    core.create_branch_change(&c.alice, "alice", "proj", t.number, "feature/p", "main")
+        .await
+        .unwrap();
+    delivered_from(&c, &sink, &secret, from).await;
+    from = hits(&sink);
+
+    // Two pending comments dispatch nothing.
+    let client = reqwest::Client::new();
+    let threads = c.s.url(&format!(
+        "/api/v1/repos/alice/proj/trails/{}/changes/1/threads",
+        t.number
+    ));
+    for body in ["draft one", "draft two"] {
+        let res = client
+            .post(&threads)
+            .bearer_auth(&carol_rw)
+            .json(&json!({"path": "a.txt", "side": "head", "start_line": 1, "end_line": 1, "body": body, "pending": true}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 201, "pending {body}");
+    }
+    core.run_due_jobs().await.unwrap();
+    assert_eq!(hits(&sink), from, "pending drafts dispatch nothing");
+
+    // Submitting converts the draft with exactly one event.
+    let res = client
+        .post(c.s.url(&format!(
+            "/api/v1/repos/alice/proj/trails/{}/changes/1/reviews",
+            t.number
+        )))
+        .bearer_auth(&carol_rw)
+        .json(&json!({"verdict": "approve", "body": "lgtm"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 201, "submit");
+    let submitted: Value = res.json().await.unwrap();
+    let review_id = submitted["id"].as_i64().unwrap();
+    assert_eq!(
+        submitted["threads"].as_array().unwrap().len(),
+        2,
+        "the draft threads attach to the submitted review: {submitted}"
+    );
+    let got = delivered_from(&c, &sink, &secret, from).await;
+    assert_eq!(got.len(), 1, "submit emits one event: {got:?}");
+    let subject = check_envelope(
+        &got[0],
+        "review",
+        Some("submitted"),
+        None,
+        "carol",
+        &repo_url,
+    );
+    assert_eq!(subject["id"], review_id);
+    assert_eq!(subject["trail"], t.number);
+    assert_eq!(subject["change"], 1);
+    assert_eq!(subject["revision"], 1);
+    assert_eq!(subject["verdict"], "approve");
+    assert_eq!(subject["state"], "submitted");
+    assert_eq!(subject["author"], "carol");
+    assert_eq!(subject["body"], "lgtm");
+
+    let trail = starforged_db::trails::trail_by_number(
+        core.db(),
+        c.s.core
+            .repo_for(Some(&c.alice), "alice", "proj")
+            .await
+            .unwrap()
+            .repo
+            .id,
+        t.number,
+    )
+    .await
+    .unwrap()
+    .expect("trail");
+    let timeline = starforged_db::trails::timeline_of_trail(core.db(), trail.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        timeline
+            .iter()
+            .filter(|e| e.kind == "review.submitted")
+            .count(),
+        1,
+        "one submitted row: {:?}",
+        timeline.iter().map(|e| e.kind.as_str()).collect::<Vec<_>>()
+    );
+}

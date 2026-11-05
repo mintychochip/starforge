@@ -1022,3 +1022,198 @@ async fn hostile_file_path_escapes_in_viewed_form() {
     assert!(!page.contains("<script>"), "no raw script element:\n{page}");
     assert!(page.contains("&#60;script"), "escaped path:\n{page}");
 }
+
+/// M2f F6 (RED): "Add to review" drafts are visible only to their author,
+/// the "Finish your review" panel submits and discards them, and dismissing
+/// a pending review is 422.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pending_review_web_flow() {
+    let c = Ctx::start().await;
+    let repo_id =
+        c.s.core
+            .repo_for(Some(&c.alice), "alice", "proj")
+            .await
+            .unwrap()
+            .repo
+            .id;
+    let (work, url) = setup_pushed_repo(&c.s, &c.alice).await;
+    push_revision(
+        &c,
+        repo_id,
+        &work,
+        &url,
+        "feat",
+        &[("a.txt", b"one\ntwo\n")],
+        "first",
+    )
+    .await;
+
+    // "Add to review" posts pending=true: the author sees the draft.
+    let (carol, _) = c.s.login("carol").await;
+    let token = csrf(&carol, &c.change(1, 1)).await;
+    let res = carol
+        .post(c.change(1, 1) + "/threads")
+        .form(&[
+            ("_csrf", token.as_str()),
+            ("path", "a.txt"),
+            ("side", "head"),
+            ("start", "1"),
+            ("end", "2"),
+            ("body", "draft nit"),
+            ("pending", "true"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 303);
+    let page = get_text(&carol, &c.change(1, 1)).await;
+    assert!(page.contains("draft nit"), "author sees the draft:\n{page}");
+    assert!(page.contains("Finish your review"), "finish panel:\n{page}");
+
+    // Another reader sees neither the thread nor the panel.
+    let (bob, _) = c.s.login("bob").await;
+    let page = get_text(&bob, &c.change(1, 1)).await;
+    assert!(!page.contains("draft nit"), "foreign draft hidden:\n{page}");
+    assert!(
+        !page.contains("Finish your review"),
+        "no panel for others:\n{page}"
+    );
+
+    // Dismissing the pending review is 422 and keeps the draft (triage
+    // reaches the pending check; the author alone would 403 first).
+    let draft_id =
+        c.s.core
+            .pending_review(Some(&c.carol), "alice", "proj", 1, 1)
+            .await
+            .unwrap()
+            .expect("draft")
+            .id;
+    let bob_token = csrf(&bob, &c.change(1, 1)).await;
+    let res = bob
+        .post(format!("{}/reviews/{draft_id}/dismiss", c.change(1, 1)))
+        .form(&[("_csrf", bob_token.as_str())])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 422, "pending dismiss rejected");
+
+    // Submit converts the draft: the review and its comment render publicly.
+    let res = carol
+        .post(c.change(1, 1) + "/reviews")
+        .form(&[
+            ("_csrf", token.as_str()),
+            ("verdict", "approve"),
+            ("body", "ship it"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 303);
+    let page = get_text(&bob, &c.change(1, 1)).await;
+    assert!(
+        page.contains("draft nit"),
+        "submitted draft is public:\n{page}"
+    );
+    assert!(page.contains("ship it"), "review body:\n{page}");
+
+    // A new draft discards cleanly; a forged CSRF is refused first.
+    let token = csrf(&carol, &c.change(1, 1)).await;
+    let res = carol
+        .post(c.change(1, 1) + "/threads")
+        .form(&[
+            ("_csrf", token.as_str()),
+            ("path", "a.txt"),
+            ("side", "head"),
+            ("start", "1"),
+            ("end", "1"),
+            ("body", "second draft"),
+            ("pending", "true"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 303);
+    let bad = carol
+        .post(c.change(1, 1) + "/reviews/pending")
+        .form(&[("_csrf", "bogus")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 403, "forged CSRF refused");
+    let page = get_text(&carol, &c.change(1, 1)).await;
+    assert!(
+        page.contains("second draft"),
+        "draft intact after forged post:\n{page}"
+    );
+    let res = carol
+        .post(c.change(1, 1) + "/reviews/pending")
+        .form(&[("_csrf", token.as_str())])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 303);
+    let page = get_text(&carol, &c.change(1, 1)).await;
+    assert!(!page.contains("second draft"), "draft discarded:\n{page}");
+}
+
+/// M2f F6 folded F5 finding: the viewed toggle posts the file's display
+/// path (the new path for renames), and in-tree paths outside the diff are
+/// rejected instead of stored.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn viewed_toggle_uses_new_path_and_rejects_orphans() {
+    let c = Ctx::start().await;
+    let repo_id =
+        c.s.core
+            .repo_for(Some(&c.alice), "alice", "proj")
+            .await
+            .unwrap()
+            .repo
+            .id;
+    let (work, url) = setup_pushed_repo(&c.s, &c.alice).await;
+    // a.txt starts life on main, so the branch rename reads as a rename in
+    // the merge-base..head diff (a rename inside the branch alone would
+    // read as an add).
+    commit_files(&work, &[("a.txt", b"one\ntwo\n")], "add a").await;
+    git_ok(&work, &["push", "-q", &url, "main"]).await;
+    // The topic revision renames it.
+    std::fs::rename(work.join("a.txt"), work.join("b.txt")).unwrap();
+    push_revision(&c, repo_id, &work, &url, "feat", &[], "rename a to b").await;
+
+    let (carol, _) = c.s.login("carol").await;
+    let page = get_text(&carol, &c.change(1, 1)).await;
+    assert!(page.contains("a.txt → b.txt"), "rename label:\n{page}");
+    assert!(
+        page.contains("value=\"b.txt\""),
+        "toggle posts the new path:\n{page}"
+    );
+
+    // Marking the renamed file viewed collapses it.
+    let token = csrf(&carol, &c.change(1, 1)).await;
+    let res = carol
+        .post(c.change(1, 1) + "/viewed")
+        .form(&[
+            ("_csrf", token.as_str()),
+            ("path", "b.txt"),
+            ("viewed", "1"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 303);
+    let page = get_text(&carol, &c.change(1, 1)).await;
+    assert!(page.contains("Viewed"), "renamed file viewed:\n{page}");
+
+    // An in-tree path outside the displayed diff is rejected, not stored.
+    let token = csrf(&carol, &c.change(1, 1)).await;
+    let res = carol
+        .post(c.change(1, 1) + "/viewed")
+        .form(&[
+            ("_csrf", token.as_str()),
+            ("path", "README.md"),
+            ("viewed", "1"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 422, "orphan path rejected");
+}

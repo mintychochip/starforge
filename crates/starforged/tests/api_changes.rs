@@ -1780,3 +1780,366 @@ async fn api_inter_revision_diff() {
         .unwrap();
     assert_eq!(res.status(), 422);
 }
+
+/// M2f F6 (RED): pending drafts are visible only to their author, write no
+/// timeline rows, reuse one draft per author, and discard cleanly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pending_review_draft_visibility_reuse_and_discard() {
+    let c = Ctx::start().await;
+    c.push_basic().await;
+    let n = c.trail().await;
+    c.create_branch_change(n, &c.bob_rw).await;
+    let client = reqwest::Client::new();
+    let threads = format!("{}/threads", c.change(n, 1));
+    let reviews = format!("{}/reviews", c.change(n, 1));
+    let pending = format!("{}/reviews/pending", c.change(n, 1));
+
+    // Two "Add to review" comments from carol.
+    for (path, body) in [("a.txt", "draft nit one"), ("b.txt", "draft nit two")] {
+        let res = client
+            .post(&threads)
+            .bearer_auth(&c.carol_rw)
+            .json(&json!({"path": path, "side": "head", "start_line": 1, "end_line": 1, "body": body, "pending": true}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 201, "pending thread for {path}");
+    }
+
+    // The author sees both threads with the draft review attached.
+    let draft: Value = client
+        .get(&pending)
+        .bearer_auth(&c.carol_rw)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(draft["comments"].as_array().unwrap().len(), 2, "{draft}");
+    let draft_id = draft["id"].as_i64().unwrap();
+    let listed: Value = client
+        .get(&threads)
+        .bearer_auth(&c.carol_rw)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let mine = listed["threads"].as_array().unwrap();
+    assert_eq!(mine.len(), 2, "{listed}");
+    for t in mine {
+        assert_eq!(t["comments"].as_array().unwrap().len(), 1, "{t}");
+        assert_eq!(t["comments"][0]["review_id"], draft_id, "{t}");
+    }
+
+    // Another reader sees no threads, no reviews, no count; anonymous 404s.
+    let foreign: Value = client
+        .get(&threads)
+        .bearer_auth(&c.erin_rw)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(foreign["threads"].as_array().unwrap().len(), 0, "{foreign}");
+    let detail: Value = client
+        .get(c.change(n, 1))
+        .bearer_auth(&c.erin_rw)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(detail["threads"].as_array().unwrap().len(), 0, "{detail}");
+    assert_eq!(detail["reviews"].as_array().unwrap().len(), 0, "{detail}");
+    let res = client
+        .get(&pending)
+        .bearer_auth(&c.erin_rw)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 404, "no foreign draft");
+    let res = client.get(&threads).send().await.unwrap();
+    assert_eq!(res.status(), 404, "anonymous sees nothing");
+
+    // Drafts write no timeline rows.
+    let repo_id =
+        c.s.core
+            .repo_for(Some(&c.alice), "alice", "proj")
+            .await
+            .unwrap()
+            .repo
+            .id;
+    let trail = db_trails::trail_by_number(c.s.core.db(), repo_id, n)
+        .await
+        .unwrap()
+        .expect("trail");
+    let kinds = || async {
+        starforged_db::trails::timeline_of_trail(c.s.core.db(), trail.id)
+            .await
+            .unwrap()
+            .iter()
+            .map(|e| e.kind.clone())
+            .collect::<Vec<_>>()
+    };
+    let before = kinds().await;
+    assert!(
+        !before.iter().any(|k| k == "review.submitted"),
+        "{before:?}"
+    );
+    assert!(!before.iter().any(|k| k == "thread.open"), "{before:?}");
+
+    // A second draft reuses the first; the unique index holds one row.
+    let res = client
+        .post(&threads)
+        .bearer_auth(&c.carol_rw)
+        .json(&json!({"path": "a.txt", "side": "head", "start_line": 1, "end_line": 1, "body": "third", "pending": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 201);
+    let again: Value = client
+        .get(&pending)
+        .bearer_auth(&c.carol_rw)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(again["id"], draft_id, "same draft reused: {again}");
+    let change = db_changes::change_by_trail_number(c.s.core.db(), trail.id, 1)
+        .await
+        .unwrap()
+        .expect("change");
+    let pendings = db_changes::reviews_of_change(c.s.core.db(), change.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.state == "pending")
+        .collect::<Vec<_>>();
+    assert_eq!(pendings.len(), 1, "one pending row");
+
+    // Dismissing a pending review is 422, never a state change.
+    let res = client
+        .post(format!("{reviews}/{draft_id}/dismiss"))
+        .bearer_auth(&c.bob_rw)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 422, "pending cannot be dismissed");
+
+    // Discard removes the draft comments and the threads left empty.
+    let res = client
+        .delete(&pending)
+        .bearer_auth(&c.carol_rw)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200, "discard");
+    let listed: Value = client
+        .get(&threads)
+        .bearer_auth(&c.carol_rw)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(listed["threads"].as_array().unwrap().len(), 0, "{listed}");
+    let res = client
+        .get(&pending)
+        .bearer_auth(&c.carol_rw)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 404, "draft gone");
+    assert_eq!(kinds().await, before, "discard writes no timeline row");
+}
+
+/// M2f F6 (RED): submitting converts the draft with exactly one
+/// `review.submitted` row, clears the review request, and counts gates.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pending_review_submit_converts_draft_once() {
+    let c = Ctx::start().await;
+    c.push_basic().await;
+    let n = c.trail().await;
+    c.create_branch_change(n, &c.bob_rw).await;
+    let client = reqwest::Client::new();
+    let threads = format!("{}/threads", c.change(n, 1));
+    let reviews = format!("{}/reviews", c.change(n, 1));
+
+    // frank_repo lacks the TrailWrite scope the mutations need; mint one.
+    let frank =
+        c.s.core
+            .user_by_handle("frank")
+            .await
+            .unwrap()
+            .expect("frank exists");
+    let frank_rw =
+        c.s.token(&frank, &[Scope::RepoRead, Scope::TrailWrite])
+            .await;
+    let res = client
+        .post(c.s.url(&format!(
+            "/api/v1/repos/alice/proj/trails/{n}/review-requests"
+        )))
+        .bearer_auth(&c.bob_rw)
+        .json(&json!({"user": "frank"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200, "request review");
+    let repo_id =
+        c.s.core
+            .repo_for(Some(&c.alice), "alice", "proj")
+            .await
+            .unwrap()
+            .repo
+            .id;
+    starforged_db::checks::insert_gate_rule(
+        c.s.core.db(),
+        repo_id,
+        None,
+        1,
+        false,
+        false,
+        "[]",
+        false,
+        false,
+        false,
+        "[]",
+        starforged_db::now(),
+    )
+    .await
+    .unwrap();
+    let gates: Value = client
+        .get(format!("{}/gates", c.change(n, 1)))
+        .bearer_auth(&frank_rw)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(gates["passed"], false, "no approvals yet: {gates}");
+
+    // Two pending comments: still no gate effect, no webhook-side rows.
+    for (path, body) in [("a.txt", "pending one"), ("b.txt", "pending two")] {
+        let res = client
+            .post(&threads)
+            .bearer_auth(&frank_rw)
+            .json(&json!({"path": path, "side": "head", "start_line": 1, "end_line": 1, "body": body, "pending": true}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 201, "pending thread for {path}");
+    }
+    let gates: Value = client
+        .get(format!("{}/gates", c.change(n, 1)))
+        .bearer_auth(&frank_rw)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        gates["passed"], false,
+        "pending drafts never count: {gates}"
+    );
+
+    // Submit with an approval converts the draft.
+    let res = client
+        .post(&reviews)
+        .bearer_auth(&frank_rw)
+        .json(&json!({"verdict": "approve", "body": "ship it"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 201, "submit");
+    let submitted: Value = res.json().await.unwrap();
+    assert_eq!(submitted["state"], "submitted", "{submitted}");
+    assert_eq!(submitted["verdict"], "approve", "{submitted}");
+    let attached = submitted["threads"].as_array().unwrap();
+    assert_eq!(attached.len(), 2, "{submitted}");
+    let review_id = submitted["id"].as_i64().unwrap();
+    for t in attached {
+        assert_eq!(t["comments"].as_array().unwrap().len(), 1, "{t}");
+        assert_eq!(t["comments"][0]["review_id"], review_id, "{t}");
+    }
+
+    // Exactly one review, now public to other readers.
+    let listed: Value = client
+        .get(&reviews)
+        .bearer_auth(&c.erin_rw)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(listed["reviews"].as_array().unwrap().len(), 1, "{listed}");
+    assert_eq!(listed["reviews"][0]["state"], "submitted", "{listed}");
+    let foreign: Value = client
+        .get(&threads)
+        .bearer_auth(&c.erin_rw)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(foreign["threads"].as_array().unwrap().len(), 2, "{foreign}");
+
+    // Exactly one review.submitted row; the request is cleared; gates pass.
+    let trail = db_trails::trail_by_number(c.s.core.db(), repo_id, n)
+        .await
+        .unwrap()
+        .expect("trail");
+    let timeline = starforged_db::trails::timeline_of_trail(c.s.core.db(), trail.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        timeline
+            .iter()
+            .filter(|e| e.kind == "review.submitted")
+            .count(),
+        1,
+        "{:?}",
+        timeline.iter().map(|e| e.kind.as_str()).collect::<Vec<_>>()
+    );
+    let detail: Value = client
+        .get(c.s.url(&format!("/api/v1/repos/alice/proj/trails/{n}")))
+        .bearer_auth(&frank_rw)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        !detail["review_requests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|u| u == "frank"),
+        "submit clears the request: {detail}"
+    );
+    let gates: Value = client
+        .get(format!("{}/gates", c.change(n, 1)))
+        .bearer_auth(&frank_rw)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        gates["passed"], true,
+        "approval counts after submit: {gates}"
+    );
+}

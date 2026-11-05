@@ -1044,6 +1044,91 @@ pub async fn reviews_of_change_revision(
     .await?;
     rows.iter().map(review_from_row).collect()
 }
+/// The author's `pending` review on the change, if any (D9: at most one per
+/// author per change, enforced by `reviews_one_pending_per_author`).
+pub async fn pending_review_of_author(
+    db: &Db,
+    change_id: i64,
+    author_id: i64,
+) -> DbResult<Option<ReviewRow>> {
+    let row = sqlx::query(select_review!(
+        "WHERE change_id = $1 AND author_id = $2 AND state = 'pending' ORDER BY id ASC LIMIT 1"
+    ))
+    .bind(change_id)
+    .bind(author_id)
+    .fetch_optional(db.pool())
+    .await?;
+    row.as_ref().map(review_from_row).transpose()
+}
+
+/// Creates the author's `pending` review on the change's revision. A
+/// concurrent create for the same author fails on the partial unique index;
+/// callers re-read via [`pending_review_of_author`] in that case.
+pub async fn insert_pending_review(
+    db: &Db,
+    change_id: i64,
+    revision_id: i64,
+    author_id: i64,
+    now: i64,
+) -> DbResult<ReviewRow> {
+    let row = sqlx::query(
+        "INSERT INTO reviews (change_id, revision_id, author_id, verdict, body, session_ulid, state, created_at) \
+         VALUES ($1, $2, $3, 'comment', '', NULL, 'pending', $4) \
+         RETURNING id, change_id, revision_id, author_id, verdict, body, session_ulid, state, created_at",
+    )
+    .bind(change_id)
+    .bind(revision_id)
+    .bind(author_id)
+    .bind(now)
+    .fetch_one(db.pool())
+    .await?;
+    review_from_row(&row)
+}
+
+/// Converts a `pending` review into a submitted one on the given revision:
+/// sets the verdict, body, session link, and submitted state in one row
+/// write. The caller audits the single `review.submitted` row.
+#[allow(clippy::too_many_arguments)]
+pub async fn submit_pending_review(
+    db: &Db,
+    review_id: i64,
+    revision_id: i64,
+    verdict: &str,
+    body: &str,
+    session_ulid: Option<&str>,
+) -> DbResult<()> {
+    sqlx::query(
+        "UPDATE reviews SET revision_id = $1, verdict = $2, body = $3, session_ulid = $4, state = 'submitted' \
+         WHERE id = $5",
+    )
+    .bind(revision_id)
+    .bind(verdict)
+    .bind(body)
+    .bind(session_ulid)
+    .bind(review_id)
+    .execute(db.pool())
+    .await?;
+    Ok(())
+}
+
+/// Deletes a review row (D9 discard). Its comments are removed first by the
+/// caller; threads emptied by that pass are removed too.
+pub async fn delete_review(db: &Db, review_id: i64) -> DbResult<()> {
+    sqlx::query("DELETE FROM reviews WHERE id = $1")
+        .bind(review_id)
+        .execute(db.pool())
+        .await?;
+    Ok(())
+}
+
+/// Deletes a thread row; its comments go through `ON DELETE CASCADE`.
+pub async fn delete_thread(db: &Db, thread_id: i64) -> DbResult<()> {
+    sqlx::query("DELETE FROM review_threads WHERE id = $1")
+        .bind(thread_id)
+        .execute(db.pool())
+        .await?;
+    Ok(())
+}
 
 pub async fn set_review_state(db: &Db, review_id: i64, state: &str) -> DbResult<()> {
     sqlx::query("UPDATE reviews SET state = $1 WHERE id = $2")
@@ -1131,6 +1216,34 @@ pub async fn comments_of_thread(db: &Db, thread_id: i64) -> DbResult<Vec<ReviewC
         .fetch_all(db.pool())
         .await?;
     rows.iter().map(comment_from_row).collect()
+}
+/// Attaches an existing comment to a review (D9: pending comments link to
+/// the author's draft when they are written).
+pub async fn set_comment_review(db: &Db, comment_id: i64, review_id: i64) -> DbResult<()> {
+    sqlx::query("UPDATE review_comments SET review_id = $1 WHERE id = $2")
+        .bind(review_id)
+        .bind(comment_id)
+        .execute(db.pool())
+        .await?;
+    Ok(())
+}
+
+/// Comments linked to one review, in insert order (D9: the draft's comments).
+pub async fn comments_of_review(db: &Db, review_id: i64) -> DbResult<Vec<ReviewCommentRow>> {
+    let rows = sqlx::query(select_comment!("WHERE review_id = $1 ORDER BY id ASC"))
+        .bind(review_id)
+        .fetch_all(db.pool())
+        .await?;
+    rows.iter().map(comment_from_row).collect()
+}
+
+/// Deletes one comment (D9 discard).
+pub async fn delete_thread_comment(db: &Db, comment_id: i64) -> DbResult<()> {
+    sqlx::query("DELETE FROM review_comments WHERE id = $1")
+        .bind(comment_id)
+        .execute(db.pool())
+        .await?;
+    Ok(())
 }
 
 /// One reader's viewed mark on a change file: the blob the reader saw.

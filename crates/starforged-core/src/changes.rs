@@ -1211,6 +1211,23 @@ pub struct ThreadCommentView {
     pub body: String,
     pub created_at: i64,
 }
+/// Flat read shape for one draft comment: the thread it will open on submit.
+#[derive(Debug, Clone)]
+pub struct PendingCommentView {
+    pub id: i64,
+    pub thread_id: i64,
+    pub body: String,
+    pub created_at: i64,
+}
+
+/// Flat read shape for the viewer's draft review on a change (D9).
+#[derive(Debug, Clone)]
+pub struct PendingReviewView {
+    pub id: i64,
+    pub revision: i64,
+    pub comments: Vec<PendingCommentView>,
+    pub created_at: i64,
+}
 
 /// Full read shape: the change, its revisions, the selected revision, whether
 /// the selected diff is truncated, its discussion, and viewer capabilities.
@@ -1682,9 +1699,14 @@ impl Core {
             .await?;
         let mut reviews = Vec::new();
         for row in db_changes::reviews_of_change(self.db(), change.id).await? {
+            // D9: drafts never appear in the detail — not even to their
+            // author, who reads them through `pending_review`.
+            if row.state == "pending" {
+                continue;
+            }
             reviews.push(self.review_view(&row).await?);
         }
-        let threads = self.thread_views(&access, &change).await?;
+        let threads = self.thread_views(viewer, &access, &change).await?;
         let triage = access.permission >= Permission::Triage;
         let can_close = match viewer {
             None => false,
@@ -1848,6 +1870,15 @@ impl Core {
         if path.chars().count() > MAX_THREAD_PATH_CHARS {
             return Err(CoreError::Invalid("unknown file".into()));
         }
+        // Folded F5 finding: only paths in the displayed (current-revision)
+        // diff may be marked — any other in-tree path is `Invalid`, so no
+        // orphan row is ever stored.
+        let current = self
+            .change_diff_files(Some(user), owner, repo, trail_n, k, None, None)
+            .await?;
+        if !current.files.iter().any(|f| f.file.display_path() == path) {
+            return Err(CoreError::Invalid("unknown file".into()));
+        }
         let revision = self.resolve_revision(&change, None).await?;
         let repo_path = self.repo_path(access.repo.id);
         let (head, candidate) = (revision.head_sha.clone(), path.to_owned());
@@ -1878,6 +1909,11 @@ impl Core {
     /// comment carries `review_id` = the new review. Audits one
     /// `review.submitted` row plus one `thread.open` row per comment (the
     /// same rows the separate calls write today, written in this method).
+    /// D9: when the actor holds a pending review, it converts in place
+    /// instead — same verdict/body/session, the pending comments plus any
+    /// comments sent in the call — still exactly one `review.submitted`
+    /// row and one webhook. The `thread.open` rows the draft creation
+    /// deferred fire now, once per newly public thread.
     ///
     /// The db layer has no transaction seam for these helpers, so "nothing is
     /// written" is guaranteed by validating everything first. A mid-sequence
@@ -1930,17 +1966,43 @@ impl Core {
                 Err(other) => return Err(other),
             }
         }
-        let row = db_changes::insert_review(
-            self.db(),
-            change.id,
-            revision.id,
-            user.id,
-            verdict,
-            &body,
-            session.as_deref(),
-            now(),
-        )
-        .await?;
+        // D9: the actor's pending review, if any, converts in place — one
+        // row write, so submit still audits exactly one `review.submitted`
+        // row and dispatches one webhook however many drafts fed it. Without
+        // a draft the call behaves exactly as before.
+        let draft = db_changes::pending_review_of_author(self.db(), change.id, user.id).await?;
+        let draft_id = draft.as_ref().map(|row| row.id);
+        let row = match draft {
+            Some(pending) => {
+                db_changes::submit_pending_review(
+                    self.db(),
+                    pending.id,
+                    revision.id,
+                    verdict,
+                    &body,
+                    session.as_deref(),
+                )
+                .await?;
+                db_changes::reviews_of_change(self.db(), change.id)
+                    .await?
+                    .into_iter()
+                    .find(|r| r.id == pending.id)
+                    .ok_or_else(|| CoreError::Internal("review vanished after submit".into()))?
+            }
+            None => {
+                db_changes::insert_review(
+                    self.db(),
+                    change.id,
+                    revision.id,
+                    user.id,
+                    verdict,
+                    &body,
+                    session.as_deref(),
+                    now(),
+                )
+                .await?
+            }
+        };
         // D7: the reviewer's pending request on this Trail is fulfilled. No
         // timeline row and no dispatch; `review.submitted` records it.
         db_trails::remove_review_request(self.db(), trail.id, user.id).await?;
@@ -1978,7 +2040,53 @@ impl Core {
         )
         .await;
         let review = self.review_view(&row).await?;
-        let mut threads = Vec::with_capacity(checked.len());
+        let viewer = Some(user);
+        // The converted draft now reads `submitted`, so its comments are
+        // visible to the response builder below.
+        let reviews = self.reviews_by_id(change.id).await?;
+        // Threads the draft already opened go public with this submit: the
+        // `thread.open` rows their pending creation deferred fire now, once
+        // each (a thread that already has one — e.g. a pending reply on a
+        // public thread — is left alone).
+        let mut threads = Vec::new();
+        if let Some(id) = draft_id {
+            let opened: std::collections::HashSet<i64> =
+                db_trails::timeline_of_trail(self.db(), trail.id)
+                    .await?
+                    .iter()
+                    .filter(|e| e.kind == "thread.open")
+                    .filter_map(|e| serde_json::from_str::<serde_json::Value>(&e.payload).ok())
+                    .filter_map(|p| p.get("thread").and_then(serde_json::Value::as_i64))
+                    .collect();
+            for thread in self.review_threads(change.id, id).await? {
+                if !opened.contains(&thread.id) {
+                    let anchor = db_changes::revision_by_id(self.db(), thread.anchor_revision_id)
+                        .await?
+                        .ok_or_else(|| CoreError::Internal("thread has no revision".into()))?;
+                    self.change_timeline(
+                        access.repo.id,
+                        trail.id,
+                        "thread.open",
+                        Some(user.id),
+                        serde_json::json!({
+                            "change": change.number,
+                            "thread": thread.id,
+                            "revision": anchor.number,
+                            "path": thread.path,
+                            "side": thread.side,
+                            "start_line": thread.start_line,
+                            "end_line": thread.end_line,
+                        }),
+                    )
+                    .await?;
+                }
+                threads.push(
+                    self.thread_view(viewer, &access, &change, &thread, &reviews)
+                        .await?
+                        .ok_or_else(|| CoreError::Internal("own thread hidden".into()))?,
+                );
+            }
+        }
         for (path, side, start_line, end_line, comment_body) in checked {
             let thread = db_changes::insert_thread(
                 self.db(),
@@ -2016,9 +2124,136 @@ impl Core {
                 }),
             )
             .await?;
-            threads.push(self.thread_view(&access, &change, &thread).await?);
+            threads.push(
+                self.thread_view(viewer, &access, &change, &thread, &reviews)
+                    .await?
+                    .ok_or_else(|| CoreError::Internal("own thread hidden".into()))?,
+            );
         }
         Ok((review, threads))
+    }
+
+    /// The viewer's draft review on the change (D9), or `None` when they
+    /// hold none. Anonymous viewers never hold one. Readers only;
+    /// non-readers get `NotFound`, exactly like every other change read.
+    pub async fn pending_review(
+        &self,
+        viewer: Option<&User>,
+        owner: &str,
+        repo: &str,
+        trail_n: i64,
+        k: i64,
+    ) -> CoreResult<Option<PendingReviewView>> {
+        let (_, _, change) = self.resolve_change(viewer, owner, repo, trail_n, k).await?;
+        let Some(user) = viewer else {
+            return Ok(None);
+        };
+        let Some(draft) =
+            db_changes::pending_review_of_author(self.db(), change.id, user.id).await?
+        else {
+            return Ok(None);
+        };
+        let revision = db_changes::revision_by_id(self.db(), draft.revision_id)
+            .await?
+            .ok_or_else(|| CoreError::Internal("review has no revision".into()))?;
+        let mut comments = Vec::new();
+        for row in db_changes::comments_of_review(self.db(), draft.id).await? {
+            comments.push(PendingCommentView {
+                id: row.id,
+                thread_id: row.thread_id,
+                body: row.body.clone(),
+                created_at: row.created_at,
+            });
+        }
+        Ok(Some(PendingReviewView {
+            id: draft.id,
+            revision: revision.number,
+            comments,
+            created_at: draft.created_at,
+        }))
+    }
+
+    /// Discards the actor's draft review (D9): its comments, plus the threads
+    /// left without comments. Writes no timeline row and dispatches nothing.
+    /// No draft is `NotFound`.
+    pub async fn discard_pending_review(
+        &self,
+        user: &User,
+        owner: &str,
+        repo: &str,
+        trail_n: i64,
+        k: i64,
+    ) -> CoreResult<()> {
+        let (access, _, change) = self
+            .resolve_change(Some(user), owner, repo, trail_n, k)
+            .await?;
+        Self::ensure_writable_g4(&access)?;
+        let Some(draft) =
+            db_changes::pending_review_of_author(self.db(), change.id, user.id).await?
+        else {
+            return Err(CoreError::NotFound);
+        };
+        for comment in db_changes::comments_of_review(self.db(), draft.id).await? {
+            db_changes::delete_thread_comment(self.db(), comment.id).await?;
+            if db_changes::comments_of_thread(self.db(), comment.thread_id)
+                .await?
+                .is_empty()
+            {
+                db_changes::delete_thread(self.db(), comment.thread_id).await?;
+            }
+        }
+        db_changes::delete_review(self.db(), draft.id).await?;
+        Ok(())
+    }
+
+    /// The actor's draft review, creating it on the current revision when
+    /// missing. A concurrent create loses the insert race on the partial
+    /// unique index and re-reads the winner, so one author still ends up
+    /// with exactly one draft.
+    async fn ensure_pending_review(
+        &self,
+        user: &User,
+        change: &db_changes::ChangeRow,
+    ) -> CoreResult<db_changes::ReviewRow> {
+        if let Some(row) =
+            db_changes::pending_review_of_author(self.db(), change.id, user.id).await?
+        {
+            return Ok(row);
+        }
+        let revision = self.resolve_revision(change, None).await?;
+        match db_changes::insert_pending_review(self.db(), change.id, revision.id, user.id, now())
+            .await
+        {
+            Ok(row) => Ok(row),
+            Err(e) if e.is_unique_violation() => {
+                db_changes::pending_review_of_author(self.db(), change.id, user.id)
+                    .await?
+                    .ok_or_else(|| {
+                        CoreError::Internal("pending review vanished after conflict".into())
+                    })
+            }
+            Err(other) => Err(other.into()),
+        }
+    }
+
+    /// Threads holding at least one comment linked to the review, in
+    /// creation order.
+    async fn review_threads(
+        &self,
+        change_id: i64,
+        review_id: i64,
+    ) -> CoreResult<Vec<db_changes::ThreadRow>> {
+        let mut out = Vec::new();
+        for thread in db_changes::threads_of_change(self.db(), change_id).await? {
+            let linked = db_changes::comments_of_thread(self.db(), thread.id)
+                .await?
+                .iter()
+                .any(|c| c.review_id == Some(review_id));
+            if linked {
+                out.push(thread);
+            }
+        }
+        Ok(out)
     }
 
     /// Reviews of the change in submission order.
@@ -2035,6 +2270,11 @@ impl Core {
         let take = check_limit(limit)?;
         let mut out = Vec::new();
         for row in db_changes::reviews_of_change(self.db(), change.id).await? {
+            // D9: pending drafts never appear in review listings — not even to
+            // their author, who reads them through `pending_review`.
+            if row.state == "pending" {
+                continue;
+            }
             if take.is_some_and(|n| out.len() >= n) {
                 break;
             }
@@ -2066,6 +2306,12 @@ impl Core {
             .into_iter()
             .find(|r| r.id == review_id)
             .ok_or(CoreError::NotFound)?;
+        // D9: drafts are submitted or discarded, never dismissed.
+        if row.state == "pending" {
+            return Err(CoreError::Invalid(
+                "pending reviews cannot be dismissed; submit or discard them".into(),
+            ));
+        }
         if row.state != "dismissed" {
             db_changes::set_review_state(self.db(), row.id, "dismissed").await?;
             self.change_timeline(
@@ -2106,6 +2352,9 @@ impl Core {
 
     /// Opens a thread anchored at `r` (default: current) with `body` as its
     /// first comment. Any ≥ `Read` viewer. Audits one `thread.open` row.
+    /// With `pending`, the first comment attaches to the actor's draft
+    /// review (created on demand) instead of auditing a `thread.open` row:
+    /// the thread stays visible only to its author until submit.
     #[allow(clippy::too_many_arguments)]
     pub async fn create_thread(
         &self,
@@ -2120,6 +2369,7 @@ impl Core {
         start: i64,
         end: i64,
         body: &str,
+        pending: bool,
     ) -> CoreResult<ThreadView> {
         let (access, trail, change) = self
             .resolve_change(Some(user), owner, repo, trail_n, k)
@@ -2138,25 +2388,34 @@ impl Core {
             now(),
         )
         .await?;
-        db_changes::insert_thread_comment(self.db(), thread.id, None, user.id, &body, now())
+        let comment =
+            db_changes::insert_thread_comment(self.db(), thread.id, None, user.id, &body, now())
+                .await?;
+        if pending {
+            let draft = self.ensure_pending_review(user, &change).await?;
+            db_changes::set_comment_review(self.db(), comment.id, draft.id).await?;
+        } else {
+            self.change_timeline(
+                access.repo.id,
+                trail.id,
+                "thread.open",
+                Some(user.id),
+                serde_json::json!({
+                    "change": change.number,
+                    "thread": thread.id,
+                    "revision": revision.number,
+                    "path": path,
+                    "side": side,
+                    "start_line": start,
+                    "end_line": end,
+                }),
+            )
             .await?;
-        self.change_timeline(
-            access.repo.id,
-            trail.id,
-            "thread.open",
-            Some(user.id),
-            serde_json::json!({
-                "change": change.number,
-                "thread": thread.id,
-                "revision": revision.number,
-                "path": path,
-                "side": side,
-                "start_line": start,
-                "end_line": end,
-            }),
-        )
-        .await?;
-        self.thread_view(&access, &change, &thread).await
+        }
+        let reviews = self.reviews_by_id(change.id).await?;
+        self.thread_view(Some(user), &access, &change, &thread, &reviews)
+            .await?
+            .ok_or_else(|| CoreError::Internal("own thread hidden".into()))
     }
 
     /// Threads of the change in creation order, with outdated flags.
@@ -2171,45 +2430,80 @@ impl Core {
     ) -> CoreResult<Vec<ThreadView>> {
         let (access, _, change) = self.resolve_change(viewer, owner, repo, trail_n, k).await?;
         let take = check_limit(limit)?;
+        let reviews = self.reviews_by_id(change.id).await?;
         let mut out = Vec::new();
         for row in db_changes::threads_of_change(self.db(), change.id).await? {
             if take.is_some_and(|n| out.len() >= n) {
                 break;
             }
-            out.push(self.thread_view(&access, &change, &row).await?);
+            if let Some(view) = self
+                .thread_view(viewer, &access, &change, &row, &reviews)
+                .await?
+            {
+                out.push(view);
+            }
         }
         Ok(out)
+    }
+
+    /// Reviews of one change keyed by id, for draft-visibility checks.
+    async fn reviews_by_id(
+        &self,
+        change_id: i64,
+    ) -> CoreResult<std::collections::HashMap<i64, db_changes::ReviewRow>> {
+        let mut map = std::collections::HashMap::new();
+        for row in db_changes::reviews_of_change(self.db(), change_id).await? {
+            map.insert(row.id, row);
+        }
+        Ok(map)
     }
 
     async fn thread_views(
         &self,
+        viewer: Option<&User>,
         access: &RepoAccess,
         change: &db_changes::ChangeRow,
     ) -> CoreResult<Vec<ThreadView>> {
+        let reviews = self.reviews_by_id(change.id).await?;
         let mut out = Vec::new();
         for row in db_changes::threads_of_change(self.db(), change.id).await? {
-            out.push(self.thread_view(access, change, &row).await?);
+            if let Some(view) = self
+                .thread_view(viewer, access, change, &row, &reviews)
+                .await?
+            {
+                out.push(view);
+            }
         }
         Ok(out)
     }
 
+    /// One thread with its visible comments, or `None` when the viewer may
+    /// see none of them. D9: pending comments — and threads whose only
+    /// comments are pending — are visible only to their author.
     async fn thread_view(
         &self,
+        viewer: Option<&User>,
         access: &RepoAccess,
         change: &db_changes::ChangeRow,
         thread: &db_changes::ThreadRow,
-    ) -> CoreResult<ThreadView> {
+        reviews: &std::collections::HashMap<i64, db_changes::ReviewRow>,
+    ) -> CoreResult<Option<ThreadView>> {
         let anchor = db_changes::revision_by_id(self.db(), thread.anchor_revision_id)
             .await?
             .ok_or_else(|| CoreError::Internal("thread has no revision".into()))?;
         let mut comments = Vec::new();
         for row in db_changes::comments_of_thread(self.db(), thread.id).await? {
-            comments.push(self.thread_comment_view(&row).await?);
+            if Self::comment_visible(viewer, reviews, &row) {
+                comments.push(self.thread_comment_view(&row).await?);
+            }
+        }
+        if comments.is_empty() {
+            return Ok(None);
         }
         let outdated = self
             .thread_outdated(access, change, thread, &anchor)
             .await?;
-        Ok(ThreadView {
+        Ok(Some(ThreadView {
             id: thread.id,
             revision: anchor.number,
             path: thread.path.clone(),
@@ -2219,7 +2513,32 @@ impl Core {
             resolved: thread.resolved != 0,
             outdated,
             comments,
-        })
+        }))
+    }
+
+    /// A comment is visible when it is not attached to a draft, or when the
+    /// viewer authored that draft. Unlinked comments and comments on
+    /// submitted or dismissed reviews are always visible.
+    fn comment_visible(
+        viewer: Option<&User>,
+        reviews: &std::collections::HashMap<i64, db_changes::ReviewRow>,
+        comment: &db_changes::ReviewCommentRow,
+    ) -> bool {
+        let Some(review_id) = comment.review_id else {
+            return true;
+        };
+        match reviews.get(&review_id) {
+            None => true,
+            Some(review) => {
+                if review.state != "pending" {
+                    return true;
+                }
+                match (viewer, review.author_id) {
+                    (Some(user), Some(author)) => user.id == author,
+                    _ => false,
+                }
+            }
+        }
     }
 
     /// A thread is outdated iff its anchor is not the current revision AND
@@ -2320,11 +2639,19 @@ impl Core {
             .into_iter()
             .find(|t| t.id == thread_id)
             .ok_or(CoreError::NotFound)?;
-        self.thread_view(&access, &change, &thread).await
+        // D9: resolving a thread the caller cannot see is `NotFound`, never
+        // a leak-shaped error.
+        let reviews = self.reviews_by_id(change.id).await?;
+        self.thread_view(Some(user), &access, &change, &thread, &reviews)
+            .await?
+            .ok_or(CoreError::NotFound)
     }
 
     /// Appends a comment to a thread. Any ≥ `Read` viewer. `review_id`, when
     /// given, must name a review on the same change. Audits `thread.comment`.
+    /// With `pending`, the comment attaches to the actor's draft review
+    /// (created on demand) and audits nothing. `pending` and `review_id`
+    /// cannot be combined.
     #[allow(clippy::too_many_arguments)]
     pub async fn add_thread_comment(
         &self,
@@ -2336,6 +2663,7 @@ impl Core {
         thread_id: i64,
         body: &str,
         review_id: Option<i64>,
+        pending: bool,
     ) -> CoreResult<ThreadCommentView> {
         let (access, trail, change) = self
             .resolve_change(Some(user), owner, repo, trail_n, k)
@@ -2346,6 +2674,11 @@ impl Core {
             .into_iter()
             .find(|t| t.id == thread_id)
             .ok_or(CoreError::NotFound)?;
+        if pending && review_id.is_some() {
+            return Err(CoreError::Invalid(
+                "pending and review_id cannot be combined".into(),
+            ));
+        }
         if let Some(id) = review_id {
             let known = db_changes::reviews_of_change(self.db(), change.id)
                 .await?
@@ -2356,15 +2689,31 @@ impl Core {
             }
         }
         let body = check_markdown(body, "comment body")?;
-        let row = db_changes::insert_thread_comment(
-            self.db(),
-            thread.id,
-            review_id,
-            user.id,
-            &body,
-            now(),
-        )
-        .await?;
+        let row = if pending {
+            let draft = self.ensure_pending_review(user, &change).await?;
+            db_changes::insert_thread_comment(
+                self.db(),
+                thread.id,
+                Some(draft.id),
+                user.id,
+                &body,
+                now(),
+            )
+            .await?
+        } else {
+            db_changes::insert_thread_comment(
+                self.db(),
+                thread.id,
+                review_id,
+                user.id,
+                &body,
+                now(),
+            )
+            .await?
+        };
+        if pending {
+            return self.thread_comment_view(&row).await;
+        }
         self.change_timeline(
             access.repo.id,
             trail.id,

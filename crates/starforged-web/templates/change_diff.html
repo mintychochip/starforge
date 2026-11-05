@@ -5,7 +5,7 @@
 {% if show_toggles %}
 <form method="post" action="/{{ head.owner }}/{{ head.name }}/trails/{{ trail_number }}/changes/{{ k }}/viewed" class="inline">
   <input type="hidden" name="_csrf" value="{{ csrf }}">
-  <input type="hidden" name="path" value="{{ f.path }}">
+  <input type="hidden" name="path" value="{{ f.form_path }}">
   {% if f.viewed %}<input type="hidden" name="viewed" value="0"><button type="submit">Mark as unviewed</button>
   {% else %}<input type="hidden" name="viewed" value="1"><button type="submit">Mark as viewed</button>{% endif %}
 </form>
