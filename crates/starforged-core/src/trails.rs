@@ -57,9 +57,31 @@ pub struct TrailFilterInput {
     pub label: Option<String>,
     pub assignee: Option<String>,
     pub author: Option<String>,
+    /// `Some(true)` keeps Trails with at least one change; `Some(false)`
+    /// keeps Trails with none.
+    pub has_changes: Option<bool>,
+    /// Keeps Trails with a pending review request for this handle.
+    pub review_requested: Option<String>,
     pub after: Option<i64>,
     pub limit: Option<i64>,
 }
+
+/// One dashboard Trail row: its repository coordinates plus the fields the
+/// dashboard renders and links.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrailSummary {
+    pub owner: String,
+    pub repo: String,
+    pub number: i64,
+    pub title: String,
+    pub updated_at: i64,
+}
+
+/// Dashboard candidate cap per section (D8): Core filters these by the
+/// viewer's current effective read permission, then truncates.
+const DASHBOARD_CANDIDATES: i64 = 100;
+/// Dashboard display cap per Trail section (D8).
+const DASHBOARD_TRAILS: usize = 20;
 
 /// One keyset page; `next_after` is the last number iff the page was full.
 #[derive(Debug, Clone)]
@@ -369,6 +391,18 @@ impl Core {
                 }
             },
         };
+        let review_requested_id = match f.review_requested.as_deref() {
+            None => None,
+            Some(h) => match self.user_by_handle(h).await? {
+                Some(u) => Some(u.id),
+                None => {
+                    return Ok(ListPage {
+                        trails: Vec::new(),
+                        next_after: None,
+                    });
+                }
+            },
+        };
         let limit = f.limit.unwrap_or(30).clamp(1, 100);
         let rows = db_trails::trails_of_repo(
             self.db(),
@@ -378,6 +412,8 @@ impl Core {
                 label,
                 assignee_id,
                 author_id,
+                has_changes: f.has_changes,
+                review_requested_id,
                 after: f.after,
                 limit,
             },
@@ -393,6 +429,60 @@ impl Core {
             None
         };
         Ok(ListPage { trails, next_after })
+    }
+
+    /// The dashboard sections, filtered by the viewer's current effective
+    /// read permission: open Trails assigned to them, and open Trails with a
+    /// pending review request for them, newest `updated_at` first, at most
+    /// 20 each. Losing read on a repository hides its Trails immediately.
+    /// Suspended users are anonymous and see nothing.
+    pub async fn dashboard_trails(
+        &self,
+        user: &User,
+    ) -> CoreResult<(Vec<TrailSummary>, Vec<TrailSummary>)> {
+        let viewer = user.active.then_some(user);
+        let assigned =
+            db_trails::trails_assigned_to(self.db(), user.id, DASHBOARD_CANDIDATES).await?;
+        let awaiting =
+            db_trails::trails_awaiting_review(self.db(), user.id, DASHBOARD_CANDIDATES).await?;
+        Ok((
+            self.visible_dashboard_trails(viewer, assigned).await?,
+            self.visible_dashboard_trails(viewer, awaiting).await?,
+        ))
+    }
+
+    /// Keeps the candidate rows the viewer can read now, truncating to the
+    /// display cap (newest-first order preserved).
+    async fn visible_dashboard_trails(
+        &self,
+        viewer: Option<&User>,
+        rows: Vec<db_trails::DashboardTrailRow>,
+    ) -> CoreResult<Vec<TrailSummary>> {
+        let mut out = Vec::new();
+        for row in rows {
+            let Some(repo_row) = starforged_db::repos::by_id(self.db(), row.trail.repo_id).await?
+            else {
+                continue;
+            };
+            if repo_row.deleted_at.is_some() {
+                continue;
+            }
+            let repo = crate::repos::to_repo(repo_row)?;
+            if self.permission_on(&repo, viewer).await?.is_none() {
+                continue;
+            }
+            out.push(TrailSummary {
+                owner: row.owner,
+                repo: row.repo,
+                number: row.trail.number,
+                title: row.trail.title,
+                updated_at: row.trail.updated_at,
+            });
+            if out.len() >= DASHBOARD_TRAILS {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     /// The seven-parameter shape is the M2a interface; the options bundle into one call.

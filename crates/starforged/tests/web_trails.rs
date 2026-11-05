@@ -594,3 +594,83 @@ async fn reviewers_section_round_trip() {
         "read user must not see the request form"
     );
 }
+
+/// M2e K5: the list form gains the `merged` state, a has-changes select, and
+/// a review-requested field; all three filter the list and persist across
+/// pager links.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn list_filters_has_changes_and_review_requested() {
+    use starforged_core::tokens::Scope;
+    let c = Ctx::start().await;
+    for i in 1..=35 {
+        c.create(&format!("trail-{i:02}"), "intent").await;
+    }
+    // One open change on trail 1: push the branches, then open via Core.
+    let push_token = c.s.token(&c.alice, &[Scope::RepoWrite]).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let work = work_repo(tmp.path(), "work", &[("a.txt", "one\n")]).await;
+    let url = c.s.git_url("alice", "proj", Some(&push_token));
+    git_ok(&work, &["push", "-q", &url, "main"]).await;
+    git_ok(&work, &["checkout", "-q", "-b", "feature/x"]).await;
+    commit_files(&work, &[("a.txt", b"one\ntwo\n")], "add two").await;
+    git_ok(&work, &["push", "-q", &url, "feature/x"]).await;
+    c.s.core
+        .create_branch_change(&c.alice, "alice", "proj", 1, "feature/x", "main")
+        .await
+        .unwrap();
+    // Pending review requests for carol on trails 1..=31 (a full pager page).
+    for n in 1..=31 {
+        c.s.core
+            .request_review(&c.bob, "alice", "proj", n, "carol")
+            .await
+            .unwrap();
+    }
+
+    let (carol, _) = c.s.login("carol").await;
+    let list = get_text(&carol, &c.trails()).await;
+    assert!(list.contains(r#"value="merged""#), "state gains merged");
+    assert!(list.contains(r#"name="has_changes""#), "has-changes select");
+    assert!(
+        list.contains(r#"name="review_requested""#),
+        "review-requested field"
+    );
+
+    let with_changes = get_text(&carol, &c.s.url("/alice/proj/trails?has_changes=true")).await;
+    assert!(with_changes.contains("trail-01"));
+    assert!(!with_changes.contains("trail-02"));
+    let without_changes = get_text(&carol, &c.s.url("/alice/proj/trails?has_changes=false")).await;
+    assert!(!without_changes.contains("trail-01"));
+    assert!(without_changes.contains("trail-02"));
+    let for_carol = get_text(
+        &carol,
+        &c.s.url("/alice/proj/trails?review_requested=carol"),
+    )
+    .await;
+    assert!(for_carol.contains("trail-01"));
+    assert!(!for_carol.contains("trail-32"), "page 1 stops at 30");
+    // (Askama escapes the `&` in pager hrefs, so check the params apart.)
+    assert!(
+        for_carol.contains("review_requested=carol"),
+        "pager links persist the filter"
+    );
+    assert!(for_carol.contains("page=2"), "pager links carry the page");
+    let page2 = get_text(
+        &carol,
+        &c.s.url("/alice/proj/trails?review_requested=carol&page=2"),
+    )
+    .await;
+    assert!(page2.contains("trail-31"));
+    assert!(!page2.contains("trail-01"));
+    assert!(
+        page2.contains("review_requested=carol"),
+        "prev link persists the filter"
+    );
+    assert!(page2.contains("page=1"), "prev link carries the page");
+    // Unknown handles list empty, never 404.
+    let unknown = get_text(
+        &carol,
+        &c.s.url("/alice/proj/trails?review_requested=nosuchuser"),
+    )
+    .await;
+    assert!(unknown.contains("No trails yet."));
+}

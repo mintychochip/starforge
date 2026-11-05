@@ -1195,3 +1195,100 @@ async fn review_requests_dispatch_webhooks() {
     assert_eq!(bodies[1]["action"], "updated");
     assert_eq!(bodies[1]["cause"], "review_request_removed");
 }
+
+/// M2e K5: `has_changes` and `review_requested` list filters compose with the
+/// existing filters and keyset pagination; `has_changes=maybe` is a 422 and
+/// `state=merged` stays reachable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn list_filters_has_changes_and_review_requested() {
+    let c = Ctx::start().await;
+    let client = reqwest::Client::new();
+    for title in ["with change", "for bob", "plain"] {
+        c.create(title).await;
+    }
+
+    // One open change on trail 1 (same branch-push shape as the merge test).
+    let url = c.s.git_url("alice", "proj", Some(&c.full));
+    let tmp = tempfile::tempdir().unwrap();
+    let work = work_repo(tmp.path(), "work", &[("a.txt", "one\n")]).await;
+    git_ok(&work, &["push", "-q", &url, "main"]).await;
+    git_ok(&work, &["checkout", "-q", "-b", "feature/x"]).await;
+    commit_files(&work, &[("a.txt", b"one\ntwo\n")], "add two").await;
+    git_ok(&work, &["push", "-q", &url, "feature/x"]).await;
+    let res = client
+        .post(c.s.url("/api/v1/repos/alice/proj/trails/1/changes"))
+        .bearer_auth(&c.composed)
+        .json(&json!({
+            "kind": "branch",
+            "head_branch": "feature/x",
+            "base_branch": "main",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 201, "create change on trail 1");
+
+    // A pending review request for bob on trail 2.
+    let res = client
+        .post(c.s.url("/api/v1/repos/alice/proj/trails/2/review-requests"))
+        .bearer_auth(&c.composed)
+        .json(&json!({"user": "bob"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200, "request review from bob");
+
+    async fn numbers(client: &reqwest::Client, c: &Ctx, query: &str) -> Vec<i64> {
+        let res = client
+            .get(c.s.url(&format!("/api/v1/repos/alice/proj/trails{query}")))
+            .bearer_auth(&c.read)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200, "GET {query}");
+        let body: Value = res.json().await.unwrap();
+        body["trails"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["number"].as_i64().unwrap())
+            .collect()
+    }
+
+    assert_eq!(numbers(&client, &c, "?has_changes=true").await, vec![1]);
+    assert_eq!(numbers(&client, &c, "?has_changes=false").await, vec![2, 3]);
+    assert_eq!(numbers(&client, &c, "?review_requested=bob").await, vec![2]);
+    assert_eq!(
+        numbers(&client, &c, "?review_requested=nosuchuser").await,
+        Vec::<i64>::new(),
+        "unknown handles list empty, never 404"
+    );
+    // The filters compose as extra AND conjuncts.
+    assert_eq!(
+        numbers(&client, &c, "?has_changes=false&review_requested=bob").await,
+        vec![2]
+    );
+    assert_eq!(
+        numbers(&client, &c, "?has_changes=true&review_requested=bob").await,
+        Vec::<i64>::new()
+    );
+
+    // Anything but true/false is a 422.
+    let bad = client
+        .get(c.s.url("/api/v1/repos/alice/proj/trails?has_changes=maybe"))
+        .bearer_auth(&c.read)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 422);
+
+    // `state=merged` (the web filter value) stays reachable.
+    let merged = client
+        .get(c.s.url("/api/v1/repos/alice/proj/trails?state=merged"))
+        .bearer_auth(&c.read)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(merged.status(), 200);
+    assert_eq!(merged.json::<Value>().await.unwrap()["trails"], json!([]));
+}

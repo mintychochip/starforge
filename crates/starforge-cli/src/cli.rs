@@ -144,6 +144,12 @@ pub enum TrailCmd {
         /// Filter by author handle.
         #[arg(long)]
         author: Option<String>,
+        /// Only Trails with (true) or without (false) any change.
+        #[arg(long, value_name = "BOOL")]
+        has_changes: Option<bool>,
+        /// Only Trails with a pending review request for this handle.
+        #[arg(long, value_name = "HANDLE")]
+        review_requested: Option<String>,
         /// Page size (1–100).
         #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u32).range(1..=100))]
         limit: u32,
@@ -603,6 +609,8 @@ async fn run_trail(cmd: TrailCmd, paths: CliPaths, dry_run: bool) -> std::proces
             label,
             assignee,
             author,
+            has_changes,
+            review_requested,
             limit,
             after,
             format,
@@ -612,6 +620,8 @@ async fn run_trail(cmd: TrailCmd, paths: CliPaths, dry_run: bool) -> std::proces
                 label,
                 assignee,
                 author,
+                has_changes,
+                review_requested,
                 limit,
                 after,
             };

@@ -71,6 +71,11 @@ pub struct TrailFilter {
     pub label: Option<String>,
     pub assignee_id: Option<i64>,
     pub author_id: Option<i64>,
+    /// `Some(true)` matches Trails with at least one change in any state;
+    /// `Some(false)` matches Trails with none.
+    pub has_changes: Option<bool>,
+    /// Matches Trails with a pending review request for this user.
+    pub review_requested_id: Option<i64>,
     pub after: Option<i64>,
     pub limit: i64,
 }
@@ -82,6 +87,8 @@ impl Default for TrailFilter {
             label: None,
             assignee_id: None,
             author_id: None,
+            has_changes: None,
+            review_requested_id: None,
             after: None,
             limit: 30,
         }
@@ -214,14 +221,22 @@ pub async fn trail_by_id(db: &Db, id: i64) -> DbResult<Option<TrailRow>> {
 
 /// Trails of the repository in ascending number order, at most `f.limit` rows.
 /// Every filter is optional: `after` is the keyset cursor (rows above it only),
-/// label/assignee match through `EXISTS` subqueries, state/author directly.
+/// label/assignee/review-request match through `EXISTS` subqueries, state/author
+/// directly, and `has_changes` through an existence check on `changes`.
 pub async fn trails_of_repo(db: &Db, repo_id: i64, f: &TrailFilter) -> DbResult<Vec<TrailRow>> {
+    // `has_changes` binds 0/1 (never a boolean literal): 1 keeps Trails with
+    // at least one change, 0 keeps Trails with none. The three-way shape
+    // keeps the `NULL` (no filter) arm valid on both engines.
+    let has_changes: Option<i64> = f.has_changes.map(i64::from);
     let rows = sqlx::query(select_trail!(
         "WHERE repo_id = $1 AND ($2 IS NULL OR number > $2) AND ($3 IS NULL OR state = $3) \
          AND ($4 IS NULL OR author_id = $4) \
          AND ($5 IS NULL OR EXISTS (SELECT 1 FROM trail_labels WHERE trail_id = trails.id AND name = $5)) \
          AND ($6 IS NULL OR EXISTS (SELECT 1 FROM trail_assignees WHERE trail_id = trails.id AND user_id = $6)) \
-         ORDER BY number ASC LIMIT $7"
+         AND ($7 IS NULL OR ($7 = 1 AND EXISTS (SELECT 1 FROM changes WHERE trail_id = trails.id)) \
+         OR ($7 = 0 AND NOT EXISTS (SELECT 1 FROM changes WHERE trail_id = trails.id))) \
+         AND ($8 IS NULL OR EXISTS (SELECT 1 FROM trail_review_requests WHERE trail_id = trails.id AND user_id = $8)) \
+         ORDER BY number ASC LIMIT $9"
     ))
     .bind(repo_id)
     .bind(f.after)
@@ -229,10 +244,83 @@ pub async fn trails_of_repo(db: &Db, repo_id: i64, f: &TrailFilter) -> DbResult<
     .bind(f.author_id)
     .bind(f.label.as_deref())
     .bind(f.assignee_id)
+    .bind(has_changes)
+    .bind(f.review_requested_id)
     .bind(f.limit)
     .fetch_all(db.pool())
     .await?;
     rows.iter().map(trail_from_row).collect()
+}
+
+/// One open Trail plus its repository coordinates, for the cross-repo
+/// dashboard sections. The repository identity travels with the row so Core
+/// can re-check the viewer's current effective read permission per row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DashboardTrailRow {
+    pub trail: TrailRow,
+    pub owner: String,
+    pub repo: String,
+}
+
+/// Open Trails assigned to `user_id` across live repositories, newest
+/// `updated_at` first, at most `limit` rows. Callers filter by the viewer's
+/// current effective read permission and truncate to the display cap.
+pub async fn trails_assigned_to(
+    db: &Db,
+    user_id: i64,
+    limit: i64,
+) -> DbResult<Vec<DashboardTrailRow>> {
+    dashboard_trails(db, user_id, limit, "trail_assignees").await
+}
+
+/// Open Trails with a pending review request for `user_id` across live
+/// repositories, newest `updated_at` first, at most `limit` rows. Same
+/// caller-side filtering contract as [`trails_assigned_to`].
+pub async fn trails_awaiting_review(
+    db: &Db,
+    user_id: i64,
+    limit: i64,
+) -> DbResult<Vec<DashboardTrailRow>> {
+    dashboard_trails(db, user_id, limit, "trail_review_requests").await
+}
+
+/// Shared body for the two dashboard sections: `link_table` is either
+/// `trail_assignees` or `trail_review_requests` (both keyed by
+/// `(trail_id, user_id)`), interpolated as an identifier, never a bind.
+async fn dashboard_trails(
+    db: &Db,
+    user_id: i64,
+    limit: i64,
+    link_table: &str,
+) -> DbResult<Vec<DashboardTrailRow>> {
+    assert!(
+        matches!(link_table, "trail_assignees" | "trail_review_requests"),
+        "dashboard link table must be a known constant"
+    );
+    // Safe: only `$N` placeholders are interpolated alongside the asserted
+    // constant table name; every value is a bound parameter.
+    let sql = format!(
+        "SELECT t.id, t.repo_id, t.number, t.title, t.intent, t.state, t.ready, t.author_id, \
+         t.created_at, t.updated_at, t.closed_at, t.merged_at, o.handle AS owner, r.name AS repo \
+         FROM trails t JOIN repos r ON r.id = t.repo_id JOIN owners o ON o.id = r.owner_id \
+         WHERE t.state = 'open' AND r.deleted_at IS NULL \
+         AND EXISTS (SELECT 1 FROM {link_table} l WHERE l.trail_id = t.id AND l.user_id = $1) \
+         ORDER BY t.updated_at DESC, t.id DESC LIMIT $2"
+    );
+    let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+        .bind(user_id)
+        .bind(limit)
+        .fetch_all(db.pool())
+        .await?;
+    rows.iter().map(dashboard_trail_from_row).collect()
+}
+
+fn dashboard_trail_from_row(row: &AnyRow) -> DbResult<DashboardTrailRow> {
+    Ok(DashboardTrailRow {
+        trail: trail_from_row(row)?,
+        owner: row.try_get("owner")?,
+        repo: row.try_get("repo")?,
+    })
 }
 
 pub async fn set_title_intent(
@@ -766,6 +854,8 @@ mod tests {
             label: Some("bug".to_owned()),
             assignee_id: None,
             author_id: None,
+            has_changes: None,
+            review_requested_id: None,
             after: None,
             limit: 30,
         };
@@ -778,6 +868,8 @@ mod tests {
             label: None,
             assignee_id: Some(alice),
             author_id: Some(alice),
+            has_changes: None,
+            review_requested_id: None,
             after: Some(1),
             limit: 30,
         };

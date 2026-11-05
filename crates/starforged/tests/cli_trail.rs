@@ -26,6 +26,8 @@ fn open_list_args() -> ListArgs {
         label: None,
         assignee: None,
         author: None,
+        has_changes: None,
+        review_requested: None,
         limit: 30,
         after: None,
     }
@@ -1085,6 +1087,8 @@ async fn agent_workflow_sweep() {
             label: None,
             assignee: None,
             author: None,
+            has_changes: None,
+            review_requested: None,
             limit: 30,
             after: None,
         },

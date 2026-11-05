@@ -118,6 +118,70 @@ impl Core {
         Ok((access, session))
     }
 }
+/// One dashboard session row: its repository coordinates plus the fields
+/// the dashboard renders and links.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSummary {
+    pub owner: String,
+    pub repo: String,
+    pub ulid: String,
+    pub agent: String,
+    pub title: String,
+    pub started_at: i64,
+}
+
+/// Dashboard candidate cap (D8): Core filters these through the §6.4 read
+/// check for the viewer, then truncates.
+const DASHBOARD_SESSION_CANDIDATES: i64 = 100;
+/// Dashboard display cap for the sessions section (D8).
+const DASHBOARD_SESSIONS: usize = 10;
+
+impl Core {
+    /// The viewer's own uploads that pass the §6.4 read check for them now,
+    /// newest first, at most 10. Losing read on a repository hides its
+    /// sessions immediately; unpublished uploads to public repositories they
+    /// are not a member of (rule 2) never appear. Suspended users are
+    /// anonymous and see nothing.
+    pub async fn recent_sessions_for(&self, user: &User) -> CoreResult<Vec<SessionSummary>> {
+        let viewer = user.active.then_some(Viewer {
+            user_id: user.id,
+            is_admin: user.is_admin,
+        });
+        let mut out = Vec::new();
+        for session in
+            db_sessions::sessions_uploaded_by(self.db(), user.id, DASHBOARD_SESSION_CANDIDATES)
+                .await?
+        {
+            let Some(repo_row) = db_repos::by_id(self.db(), session.repo_id).await? else {
+                continue;
+            };
+            if repo_row.deleted_at.is_some() {
+                continue;
+            }
+            let repo = crate::repos::to_repo(repo_row)?;
+            if self
+                .authorize_session_read(viewer, &repo, &session)
+                .await
+                .is_err()
+            {
+                continue;
+            }
+            out.push(SessionSummary {
+                owner: repo.owner.clone(),
+                repo: repo.name.clone(),
+                ulid: session.ulid.clone(),
+                agent: session.agent_name.clone(),
+                title: session.title.clone(),
+                started_at: session.started_at,
+            });
+            if out.len() >= DASHBOARD_SESSIONS {
+                break;
+            }
+        }
+        Ok(out)
+    }
+}
+
 impl Core {
     /// The full redacted item stream for `session_id`: segments in stored
     /// order, each decompressed under the configured cap, parsed line by

@@ -59,6 +59,8 @@ pub struct ListQuery {
     label: Option<String>,
     assignee: Option<String>,
     author: Option<String>,
+    has_changes: Option<String>,
+    review_requested: Option<String>,
     page: Option<i64>,
 }
 
@@ -82,12 +84,13 @@ pub struct TrailsPage {
     label: String,
     assignee: String,
     author: String,
+    has_changes: String,
+    review_requested: String,
     page: i64,
     prev_href: Option<String>,
     next_href: Option<String>,
 }
-
-/// `GET /{owner}/{repo}/trails[?state=&label=&assignee=&author=&page=]`.
+/// `GET /{owner}/{repo}/trails[?state=&label=&assignee=&author=&has_changes=&review_requested=&page=]`.
 /// Non-readers 404, exactly like every other trail read.
 pub async fn list(
     State(state): State<AppState>,
@@ -103,6 +106,8 @@ pub async fn list(
     let filter_label = query.label.clone().filter(|s| !s.is_empty());
     let filter_assignee = query.assignee.clone().filter(|s| !s.is_empty());
     let filter_author = query.author.clone().filter(|s| !s.is_empty());
+    let filter_has_changes = query.has_changes.clone().filter(|s| !s.is_empty());
+    let filter_review_requested = query.review_requested.clone().filter(|s| !s.is_empty());
     let page_no = query.page.unwrap_or(1).max(1);
     if page_no > MAX_PAGE {
         return Err(WebError::NotFound);
@@ -118,6 +123,8 @@ pub async fn list(
         &filter_label,
         &filter_assignee,
         &filter_author,
+        &filter_has_changes,
+        &filter_review_requested,
         None,
     )
     .await?;
@@ -137,6 +144,8 @@ pub async fn list(
             &filter_label,
             &filter_assignee,
             &filter_author,
+            &filter_has_changes,
+            &filter_review_requested,
             Some(cursor),
         )
         .await?;
@@ -167,6 +176,8 @@ pub async fn list(
             filter_label.as_deref().unwrap_or_default(),
             filter_assignee.as_deref().unwrap_or_default(),
             filter_author.as_deref().unwrap_or_default(),
+            filter_has_changes.as_deref().unwrap_or_default(),
+            filter_review_requested.as_deref().unwrap_or_default(),
             page_no - 1,
         )
     });
@@ -178,6 +189,8 @@ pub async fn list(
             filter_label.as_deref().unwrap_or_default(),
             filter_assignee.as_deref().unwrap_or_default(),
             filter_author.as_deref().unwrap_or_default(),
+            filter_has_changes.as_deref().unwrap_or_default(),
+            filter_review_requested.as_deref().unwrap_or_default(),
             page_no + 1,
         )
     });
@@ -191,6 +204,8 @@ pub async fn list(
             label: filter_label.unwrap_or_default(),
             assignee: filter_assignee.unwrap_or_default(),
             author: filter_author.unwrap_or_default(),
+            has_changes: filter_has_changes.unwrap_or_default(),
+            review_requested: filter_review_requested.unwrap_or_default(),
             page: page_no,
             prev_href,
             next_href,
@@ -200,6 +215,7 @@ pub async fn list(
 
 /// Filter-preserving pager links; values come from constrained charsets
 /// (states, lowercased labels, handles), and askama escapes them in `href`.
+#[allow(clippy::too_many_arguments)]
 fn list_href(
     owner: &str,
     repo: &str,
@@ -207,6 +223,8 @@ fn list_href(
     label: &str,
     assignee: &str,
     author: &str,
+    has_changes: &str,
+    review_requested: &str,
     page: i64,
 ) -> String {
     let mut query = String::new();
@@ -215,6 +233,8 @@ fn list_href(
         ("label", label),
         ("assignee", assignee),
         ("author", author),
+        ("has_changes", has_changes),
+        ("review_requested", review_requested),
     ] {
         if !value.is_empty() {
             if !query.is_empty() {
@@ -242,8 +262,16 @@ async fn fetch_page(
     filter_label: &Option<String>,
     filter_assignee: &Option<String>,
     filter_author: &Option<String>,
+    filter_has_changes: &Option<String>,
+    filter_review_requested: &Option<String>,
     after: Option<i64>,
 ) -> Result<starforged_core::trails::ListPage, WebError> {
+    // The select posts "true"/"false"; anything else means no change filter.
+    let has_changes = match filter_has_changes.as_deref() {
+        Some("true") => Some(true),
+        Some("false") => Some(false),
+        _ => None,
+    };
     Ok(state
         .core
         .list_trails(
@@ -255,6 +283,8 @@ async fn fetch_page(
                 label: filter_label.clone(),
                 assignee: filter_assignee.clone(),
                 author: filter_author.clone(),
+                has_changes,
+                review_requested: filter_review_requested.clone(),
                 after,
                 limit: Some(PAGE_SIZE),
             },

@@ -137,17 +137,31 @@ pub struct ListQuery {
     pub label: Option<String>,
     pub assignee: Option<String>,
     pub author: Option<String>,
+    /// `true` keeps Trails with at least one change, `false` those with
+    /// none; anything else is a 422.
+    pub has_changes: Option<String>,
+    pub review_requested: Option<String>,
     pub after: Option<i64>,
     pub limit: Option<i64>,
 }
 
-/// `GET /repos/{owner}/{repo}/trails[?state=&label=&assignee=&author=&after=&limit=]`.
+/// `GET /repos/{owner}/{repo}/trails[?state=&label=&assignee=&author=&has_changes=&review_requested=&after=&limit=]`.
 pub async fn list_trails(
     State(state): State<ApiState>,
     auth: ApiAuth,
     Path((owner, repo)): Path<(String, String)>,
     Query(query): Query<ListQuery>,
 ) -> Result<Json<Value>, ApiError> {
+    let has_changes = match query.has_changes.as_deref() {
+        None => None,
+        Some("true") => Some(true),
+        Some("false") => Some(false),
+        Some(other) => {
+            return Err(ApiError::Invalid(format!(
+                "invalid has_changes '{other}': expected true or false"
+            )));
+        }
+    };
     let page = state
         .core
         .list_trails(
@@ -159,6 +173,8 @@ pub async fn list_trails(
                 label: query.label,
                 assignee: query.assignee,
                 author: query.author,
+                has_changes,
+                review_requested: query.review_requested,
                 after: query.after,
                 limit: query.limit,
             },

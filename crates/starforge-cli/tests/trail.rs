@@ -193,9 +193,32 @@ fn default_list_args() -> ListArgs {
         label: None,
         assignee: None,
         author: None,
+        has_changes: None,
+        review_requested: None,
         limit: 30,
         after: None,
     }
+}
+
+#[tokio::test]
+async fn list_sends_dashboard_filters() {
+    let (base, app) = start(vec![(
+        "GET",
+        "/api/v1/repos/o/r/trails",
+        200,
+        json!({"trails": [], "next_after": null}),
+    )])
+    .await;
+    let ctx = ctx_for(&base);
+    let mut args = default_list_args();
+    args.has_changes = Some(true);
+    args.review_requested = Some("bob".to_string());
+    let (_, code) = list(&ctx, &args, Format::Text).await;
+    assert_eq!(code, 0);
+    let reqs = app.recorded.lock().unwrap();
+    let q = query_pairs(&reqs[0].query);
+    assert_eq!(q.get("has_changes").map(String::as_str), Some("true"));
+    assert_eq!(q.get("review_requested").map(String::as_str), Some("bob"));
 }
 
 #[tokio::test]

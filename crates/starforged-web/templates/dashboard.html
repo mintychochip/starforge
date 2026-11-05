@@ -1,6 +1,30 @@
 {% extends "base.html" %}
 {% block content %}
 {% if nav_user.is_some() %}
+{% if !assigned.is_empty() %}
+<h2>Assigned to you</h2>
+<ul class="trail-list">
+{% for t in assigned %}
+<li><a href="/{{ t.owner }}/{{ t.repo }}/trails/{{ t.number }}">#{{ t.number }} {{ t.title }}</a> <span class="muted">{{ t.owner }}/{{ t.repo }}</span></li>
+{% endfor %}
+</ul>
+{% endif %}
+{% if !awaiting.is_empty() %}
+<h2>Awaiting your review</h2>
+<ul class="trail-list">
+{% for t in awaiting %}
+<li><a href="/{{ t.owner }}/{{ t.repo }}/trails/{{ t.number }}">#{{ t.number }} {{ t.title }}</a> <span class="muted">{{ t.owner }}/{{ t.repo }}</span></li>
+{% endfor %}
+</ul>
+{% endif %}
+{% if !sessions.is_empty() %}
+<h2>Your recent sessions</h2>
+<ul class="session-list">
+{% for s in sessions %}
+<li><a href="/{{ s.owner }}/{{ s.repo }}/sessions/{{ s.ulid }}">{{ s.title }}</a> <span class="muted">{{ s.agent }}</span> <span class="muted">{{ s.owner }}/{{ s.repo }}</span></li>
+{% endfor %}
+</ul>
+{% endif %}
 <h1>Your repositories</h1>
 {% if repos.is_empty() %}
 <p>No repositories yet. <a href="/new">Create one</a>.</p>

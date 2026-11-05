@@ -59,7 +59,7 @@ pub struct Collaborator {
     pub permission: Permission,
 }
 
-fn to_repo(row: RepoRow) -> CoreResult<Repo> {
+pub(crate) fn to_repo(row: RepoRow) -> CoreResult<Repo> {
     let visibility = Visibility::parse(&row.visibility)
         .ok_or_else(|| CoreError::Internal(format!("unknown visibility '{}'", row.visibility)))?;
     Ok(Repo {

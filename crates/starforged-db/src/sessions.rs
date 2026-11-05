@@ -838,6 +838,24 @@ pub async fn links_for_shas(
     rows.iter().map(link_from_row).collect()
 }
 
+/// Sessions uploaded by `uploader_id` across all repositories, newest
+/// first, at most `limit` rows. Callers pass every row through the §6.4
+/// read check for the viewer and truncate to the display cap.
+pub async fn sessions_uploaded_by(
+    db: &Db,
+    uploader_id: i64,
+    limit: i64,
+) -> DbResult<Vec<SessionRow>> {
+    let rows = sqlx::query(select_session!(
+        "WHERE uploader_id = $1 ORDER BY id DESC LIMIT $2"
+    ))
+    .bind(uploader_id)
+    .bind(limit)
+    .fetch_all(db.pool())
+    .await?;
+    rows.iter().map(session_from_row).collect()
+}
+
 /// Sessions of the repository, oldest first, at most `limit` rows.
 pub async fn sessions_of_repo(db: &Db, repo_id: i64, limit: i64) -> DbResult<Vec<SessionRow>> {
     let rows = sqlx::query(select_session!(

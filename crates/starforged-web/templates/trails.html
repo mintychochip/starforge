@@ -8,12 +8,21 @@
     <select name="state">
       <option value=""{% if state.is_empty() %} selected{% endif %}>all</option>
       <option value="open"{% if state == "open" %} selected{% endif %}>open</option>
+      <option value="merged"{% if state == "merged" %} selected{% endif %}>merged</option>
       <option value="closed"{% if state == "closed" %} selected{% endif %}>closed</option>
+    </select>
+  </label>
+  <label>Changes
+    <select name="has_changes">
+      <option value=""{% if has_changes.is_empty() %} selected{% endif %}>any</option>
+      <option value="true"{% if has_changes == "true" %} selected{% endif %}>yes</option>
+      <option value="false"{% if has_changes == "false" %} selected{% endif %}>no</option>
     </select>
   </label>
   <label>Label <input type="text" name="label" value="{{ label }}"></label>
   <label>Assignee <input type="text" name="assignee" value="{{ assignee }}"></label>
   <label>Author <input type="text" name="author" value="{{ author }}"></label>
+  <label>Review requested <input type="text" name="review_requested" value="{{ review_requested }}"></label>
   <button type="submit">Filter</button>
 </form>
 <p><a href="/{{ head.owner }}/{{ head.name }}/trails/new">New trail</a></p>
