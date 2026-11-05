@@ -359,3 +359,62 @@ fn trail_list_outside_repo_exits_1() {
         "discovery names the missing server: {err}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn trail_list_without_token_hints_login() {
+    // Minimal stub: only the well-known document. Discovery resolves the
+    // server from `git config starforge.server`; then the missing token
+    // fails with the login hint. Empty home, no `STARFORGE_TOKEN`.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}");
+    let body = serde_json::json!({
+        "starforge": "test",
+        "api_url": base_url,
+        "ssh_url": "ssh://git@example.com:2222",
+    });
+    let app = Router::new().route(
+        "/.well-known/starforge.json",
+        get({
+            let body = body.clone();
+            move || {
+                let body = body.clone();
+                async move { axum::Json(body) }
+            }
+        }),
+    );
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let home = TempDir::new().unwrap();
+    let path = bin_path();
+    let (_dir, repo) = init_repo(home.path(), &path);
+    git_ok(
+        &repo,
+        &["config", "starforge.server", &base_url],
+        home.path(),
+        &path,
+    );
+
+    let out = Command::new("starforge")
+        .current_dir(&repo)
+        .args(["trail", "list"])
+        .env("STARFORGE_HOME", home.path())
+        .env("PATH", &path)
+        .env_remove("STARFORGE_TOKEN")
+        .output()
+        .expect("starforge runs");
+    assert_eq!(out.status.code(), Some(1), "trail list exits 1");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.contains("starforge auth login"),
+        "login hint: {combined}"
+    );
+    assert!(
+        !combined.contains(TOKEN),
+        "no token-shaped text: {combined}"
+    );
+}

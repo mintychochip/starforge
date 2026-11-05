@@ -1098,7 +1098,9 @@ async fn agent_workflow_sweep() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn missing_credentials_name_the_login_hint() {
     // No `STARFORGE_TOKEN` and no stored credentials: resolution fails with
-    // the `starforge auth login` hint.
+    // the `starforge auth login` hint. The end-to-end proof (empty home, no
+    // token, real binary, exit 1) lives in e2e_binary.rs
+    // `trail_list_without_token_hints_login`.
     let home = tempfile::tempdir().unwrap();
     let paths = starforge_cli::config::CliPaths::from_home(home.path().to_path_buf());
     let err = starforge_cli::auth::resolve_token(&paths, "forge.example", |_| None).unwrap_err();
@@ -1107,17 +1109,4 @@ async fn missing_credentials_name_the_login_hint() {
             .contains("run `starforge auth login forge.example`"),
         "login hint: {err}"
     );
-
-    // And a real trail command with refused credentials exits 1 naming it.
-    let s = TestServer::start().await;
-    let alice = s.user("alice").await;
-    s.repo(&alice, "proj", Visibility::Private).await;
-    let ctx = ctx_for(&s, "alice/proj", "no-such-token");
-    let (out, code) = list(&ctx, &open_list_args(), Format::Text).await;
-    assert_eq!(code, 1, "refused list exits 1: {out}");
-    assert!(
-        out.contains("run `starforge auth login "),
-        "login hint: {out}"
-    );
-    assert!(!out.contains("no-such-token"), "token never appears");
 }
