@@ -456,6 +456,33 @@ pub async fn open_branch_changes(db: &Db, repo_id: i64, branch: &str) -> DbResul
     rows.iter().map(change_from_row).collect()
 }
 
+/// Changes in the repo (any state) whose CURRENT revision's head is `sha`,
+/// ascending by (trail number, change number). Joining the current revision
+/// (not all revisions) ignores non-current revisions carrying the same head;
+/// joining trails keeps the rows inside the repo.
+pub async fn changes_with_current_head(
+    db: &Db,
+    repo_id: i64,
+    sha: &str,
+) -> DbResult<Vec<ChangeRow>> {
+    // Column-qualified: the joins would make the shared SELECT list ambiguous.
+    let rows = sqlx::query(
+        "SELECT changes.id, changes.trail_id, changes.number, changes.kind, changes.head_branch, \
+         changes.base_branch, changes.topic, changes.current_revision_id, changes.state, \
+         changes.merge_method, changes.merge_commit, changes.creator_id, changes.created_at, \
+         changes.updated_at, changes.mergeability, changes.conflict_paths \
+         FROM changes JOIN trails t ON t.id = changes.trail_id \
+         JOIN revisions r ON r.id = changes.current_revision_id \
+         WHERE t.repo_id = $1 AND r.head_sha = $2 \
+         ORDER BY t.number ASC, changes.number ASC",
+    )
+    .bind(repo_id)
+    .bind(sha)
+    .fetch_all(db.pool())
+    .await?;
+    rows.iter().map(change_from_row).collect()
+}
+
 /// Ids of every open change in the repo whose base branch is `base` (any kind):
 /// a base-branch move recomputes mergeability for all of them but revises none.
 pub async fn open_change_ids_with_base(db: &Db, repo_id: i64, base: &str) -> DbResult<Vec<i64>> {
@@ -1463,6 +1490,71 @@ mod tests {
             repos::refs_for_access(&t.db, repo_id).await.unwrap(),
             "members",
             "failed update changes nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn changes_with_current_head_matches_current_only() {
+        let (t, alice, _bob, repo_id) = setup().await;
+        let trail_a = trail(&t, repo_id, alice, "a", 1_700_000_000).await;
+        let trail_b = trail(&t, repo_id, alice, "b", 1_700_000_001).await;
+        let other_repo = repos::insert(&t.db, &repo(alice, "other")).await.unwrap();
+        let other_trail = trail(&t, other_repo, alice, "c", 1_700_000_002).await;
+        let sha_old = "a".repeat(40);
+        let sha_new = "b".repeat(40);
+
+        let ca = agit(&t, trail_a, alice, "main", "one", 1_700_000_003).await;
+        let r1 = revision(&t, ca.id, &sha_old, alice, 1_700_000_004).await;
+        set_current_revision(&t.db, ca.id, r1.id, 1_700_000_005)
+            .await
+            .unwrap();
+        let found = changes_with_current_head(&t.db, repo_id, &sha_old)
+            .await
+            .unwrap();
+        assert_eq!(found.iter().map(|r| r.id).collect::<Vec<_>>(), vec![ca.id]);
+
+        // A newer revision on the same change hides the old head.
+        let r2 = revision(&t, ca.id, &sha_new, alice, 1_700_000_006).await;
+        set_current_revision(&t.db, ca.id, r2.id, 1_700_000_007)
+            .await
+            .unwrap();
+        assert!(
+            changes_with_current_head(&t.db, repo_id, &sha_old)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let found = changes_with_current_head(&t.db, repo_id, &sha_new)
+            .await
+            .unwrap();
+        assert_eq!(found.iter().map(|r| r.id).collect::<Vec<_>>(), vec![ca.id]);
+
+        // A second change on the same head sorts after the first trail.
+        let cb = agit(&t, trail_b, alice, "main", "two", 1_700_000_008).await;
+        let rb = revision(&t, cb.id, &sha_new, alice, 1_700_000_009).await;
+        set_current_revision(&t.db, cb.id, rb.id, 1_700_000_010)
+            .await
+            .unwrap();
+        let found = changes_with_current_head(&t.db, repo_id, &sha_new)
+            .await
+            .unwrap();
+        assert_eq!(
+            found.iter().map(|r| r.trail_id).collect::<Vec<_>>(),
+            vec![trail_a, trail_b]
+        );
+
+        // The same head in another repo stays out.
+        let co = agit(&t, other_trail, alice, "main", "one", 1_700_000_011).await;
+        let ro = revision(&t, co.id, &sha_new, alice, 1_700_000_012).await;
+        set_current_revision(&t.db, co.id, ro.id, 1_700_000_013)
+            .await
+            .unwrap();
+        let found = changes_with_current_head(&t.db, repo_id, &sha_new)
+            .await
+            .unwrap();
+        assert_eq!(
+            found.iter().map(|r| r.trail_id).collect::<Vec<_>>(),
+            vec![trail_a, trail_b]
         );
     }
 }

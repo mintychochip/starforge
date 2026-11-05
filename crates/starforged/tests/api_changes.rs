@@ -3,6 +3,7 @@
 mod common;
 
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use common::*;
 use serde_json::{Value, json};
@@ -10,6 +11,7 @@ use starforged_core::permission::{Permission, Visibility};
 use starforged_core::tokens::Scope;
 use starforged_db::sessions as db_sessions;
 use starforged_db::{changes as db_changes, trails as db_trails};
+use tokio::time::sleep;
 
 const BOGUS: &str = "sfp_0000000000000000000000000000000000000000000000000000000000000000";
 const ULID_A: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
@@ -342,7 +344,7 @@ async fn reviews_verdicts_session_validation_and_dismiss() {
         assert_eq!(body["revision"], 1);
         assert_eq!(body["author"], "carol");
         assert_eq!(body["state"], "submitted");
-        assert!(body["id"].is_number());
+        assert_eq!(body["threads"].as_array().unwrap().len(), 0, "{verdict}");
     }
 
     // Bad verdicts, empty bodies, and oversized bodies are 422.
@@ -1248,4 +1250,366 @@ async fn gates_report_in_detail_and_endpoint() {
         .await
         .unwrap();
     assert!(detail["gates"]["passed"].as_bool().unwrap());
+}
+
+// ── J2: one-request reviews with inline comments ────────────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_with_inline_comments_opens_linked_threads() {
+    let c = Ctx::start().await;
+    c.push_basic().await;
+    let n = c.trail().await;
+    c.create_branch_change(n, &c.bob_rw).await;
+    let client = reqwest::Client::new();
+    let reviews = format!("{}/reviews", c.change(n, 1));
+
+    let res = client
+        .post(&reviews)
+        .bearer_auth(&c.carol_rw)
+        .json(&json!({
+            "verdict": "comment",
+            "body": "two nits",
+            "comments": [
+                {"path": "a.txt", "side": "head", "start_line": 1, "end_line": 2, "body": "nit one"},
+                {"path": "b.txt", "side": "head", "start_line": 1, "end_line": 1, "body": "nit two"},
+            ],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 201);
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["verdict"], "comment");
+    let review_id = body["id"].as_i64().unwrap();
+    let threads = body["threads"].as_array().unwrap();
+    assert_eq!(threads.len(), 2, "{body}");
+    assert_eq!(threads[0]["path"], "a.txt");
+    assert_eq!(threads[1]["path"], "b.txt");
+    for t in threads {
+        assert_eq!(t["revision"], 1, "{t}");
+        let comments = t["comments"].as_array().unwrap();
+        assert_eq!(comments.len(), 1, "{t}");
+        assert_eq!(comments[0]["review_id"], review_id, "{t}");
+        assert_eq!(comments[0]["author"], "carol", "{t}");
+    }
+
+    // Timeline: exactly one review.submitted plus two thread.open rows.
+    let repo_id =
+        c.s.core
+            .repo_for(Some(&c.alice), "alice", "proj")
+            .await
+            .unwrap()
+            .repo
+            .id;
+    let trail = db_trails::trail_by_number(c.s.core.db(), repo_id, n)
+        .await
+        .unwrap()
+        .expect("trail");
+    let timeline = starforged_db::trails::timeline_of_trail(c.s.core.db(), trail.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        timeline
+            .iter()
+            .filter(|e| e.kind == "review.submitted")
+            .count(),
+        1,
+        "{:?}",
+        timeline.iter().map(|e| e.kind.as_str()).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        timeline.iter().filter(|e| e.kind == "thread.open").count(),
+        2,
+        "{:?}",
+        timeline.iter().map(|e| e.kind.as_str()).collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_with_invalid_inline_comment_writes_nothing() {
+    let c = Ctx::start().await;
+    c.push_basic().await;
+    let n = c.trail().await;
+    c.create_branch_change(n, &c.bob_rw).await;
+    let client = reqwest::Client::new();
+    let reviews = format!("{}/reviews", c.change(n, 1));
+
+    let repo_id =
+        c.s.core
+            .repo_for(Some(&c.alice), "alice", "proj")
+            .await
+            .unwrap()
+            .repo
+            .id;
+    let trail = db_trails::trail_by_number(c.s.core.db(), repo_id, n)
+        .await
+        .unwrap()
+        .expect("trail");
+    let timeline_before = starforged_db::trails::timeline_of_trail(c.s.core.db(), trail.id)
+        .await
+        .unwrap()
+        .len();
+
+    // The second comment is invalid: end_line < start_line.
+    let res = client
+        .post(&reviews)
+        .bearer_auth(&c.carol_rw)
+        .json(&json!({
+            "verdict": "comment",
+            "body": "half-baked",
+            "comments": [
+                {"path": "a.txt", "side": "head", "start_line": 1, "end_line": 1, "body": "fine"},
+                {"path": "b.txt", "side": "head", "start_line": 2, "end_line": 1, "body": "bad span"},
+            ],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 422);
+    let err: Value = res.json().await.unwrap();
+    assert!(
+        err["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("comments[1]"),
+        "{err}"
+    );
+
+    // Nothing was written: no review, no thread, no new timeline row.
+    let change = db_changes::change_by_trail_number(c.s.core.db(), trail.id, 1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        db_changes::reviews_of_change(c.s.core.db(), change.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        db_changes::threads_of_change(c.s.core.db(), change.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let timeline_after = starforged_db::trails::timeline_of_trail(c.s.core.db(), trail.id)
+        .await
+        .unwrap();
+    assert_eq!(timeline_after.len(), timeline_before);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_comment_count_and_unknown_fields_rejected() {
+    let c = Ctx::start().await;
+    c.push_basic().await;
+    let n = c.trail().await;
+    c.create_branch_change(n, &c.bob_rw).await;
+    let client = reqwest::Client::new();
+    let reviews = format!("{}/reviews", c.change(n, 1));
+
+    // 101 comments exceed the 100-comment cap.
+    let many: Vec<Value> = (0..101)
+        .map(|i| json!({"path": "a.txt", "side": "head", "start_line": 1, "end_line": 1, "body": format!("c{i}")}))
+        .collect();
+    let res = client
+        .post(&reviews)
+        .bearer_auth(&c.carol_rw)
+        .json(&json!({"verdict": "comment", "body": "too many", "comments": many}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 422, "101 comments must be refused");
+
+    // Unknown top-level field.
+    let res = client
+        .post(&reviews)
+        .bearer_auth(&c.carol_rw)
+        .json(&json!({"verdict": "comment", "body": "x", "coment": "typo"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 422, "unknown top-level field must be refused");
+
+    // Unknown field inside a comment.
+    let res = client
+        .post(&reviews)
+        .bearer_auth(&c.carol_rw)
+        .json(&json!({
+            "verdict": "comment",
+            "body": "x",
+            "comments": [
+                {"path": "a.txt", "side": "head", "start_line": 1, "end_line": 1, "body": "y", "coment": 1},
+            ],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 422, "unknown comment field must be refused");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn change_json_carries_allowed_methods() {
+    let c = Ctx::start().await;
+    c.push_basic().await;
+    let n = c.trail().await;
+    c.create_branch_change(n, &c.bob_rw).await;
+    let client = reqwest::Client::new();
+
+    // No rule: all three merge methods are allowed.
+    let detail: Value = client
+        .get(c.change(n, 1))
+        .bearer_auth(&c.carol_rw)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        detail["change"]["allowed_methods"],
+        json!(["merge", "squash", "fast_forward"])
+    );
+
+    // A rule restricting to squash narrows the list to exactly that.
+    let repo_id =
+        c.s.core
+            .repo_for(Some(&c.alice), "alice", "proj")
+            .await
+            .unwrap()
+            .repo
+            .id;
+    starforged_db::checks::insert_gate_rule(
+        c.s.core.db(),
+        repo_id,
+        None,
+        0,
+        false,
+        false,
+        "[]",
+        false,
+        false,
+        false,
+        r#"["squash"]"#,
+        starforged_db::now(),
+    )
+    .await
+    .unwrap();
+    let detail: Value = client
+        .get(c.change(n, 1))
+        .bearer_auth(&c.carol_rw)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        detail["change"]["allowed_methods"],
+        json!(["squash"]),
+        "{detail}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn changes_lookup_by_head_sha() {
+    let c = Ctx::start().await;
+    let url = c.s.git_url(
+        "alice",
+        "proj",
+        Some(&c.s.token(&c.alice, &[Scope::RepoWrite]).await),
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    let tmp_path = tmp.path().to_path_buf();
+    std::mem::forget(tmp);
+    let work = work_repo(&tmp_path, "work", &[("README.md", "# proj\n")]).await;
+    git_ok(&work, &["push", "-q", &url, "main"]).await;
+    commit_files(&work, &[("feature.txt", b"feature\n")], "add feature").await;
+    git_ok(&work, &["push", "-q", &url, "HEAD:refs/for/main"]).await;
+    let sha = git_ok(&work, &["rev-parse", "HEAD"])
+        .await
+        .trim()
+        .to_owned();
+
+    // Wait for the post-push scan to ingest the agit change.
+    let repo_id =
+        c.s.core
+            .repo_for(Some(&c.alice), "alice", "proj")
+            .await
+            .unwrap()
+            .repo
+            .id;
+    let start = Instant::now();
+    let change = loop {
+        let found =
+            db_changes::open_agit_change(c.s.core.db(), repo_id, c.alice.id, "main", "alice", None)
+                .await
+                .unwrap();
+        if let Some(change) = found {
+            break change;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "timed out waiting for agit change"
+        );
+        sleep(Duration::from_millis(50)).await;
+    };
+    let trail = starforged_db::trails::trail_by_id(c.s.core.db(), change.trail_id)
+        .await
+        .unwrap()
+        .expect("trail");
+
+    let client = reqwest::Client::new();
+    let lookup = c.s.url("/api/v1/repos/alice/proj/changes");
+
+    // The pushed SHA finds the change with its trail number and k.
+    let res = client
+        .get(format!("{lookup}?head_sha={sha}"))
+        .bearer_auth(&c.carol_rw)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let body: Value = res.json().await.unwrap();
+    let found = body["changes"].as_array().unwrap();
+    assert_eq!(found.len(), 1, "{body}");
+    assert_eq!(found[0]["trail"], trail.number, "{body}");
+    assert_eq!(found[0]["k"], 1, "{body}");
+
+    // An unknown SHA gives an empty list.
+    let res = client
+        .get(format!("{lookup}?head_sha={}", "a".repeat(40)))
+        .bearer_auth(&c.carol_rw)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["changes"].as_array().unwrap().len(), 0, "{body}");
+
+    // A malformed SHA is 422.
+    let res = client
+        .get(format!("{lookup}?head_sha=xyz"))
+        .bearer_auth(&c.carol_rw)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 422);
+
+    // Missing head_sha is 422.
+    let res = client
+        .get(&lookup)
+        .bearer_auth(&c.carol_rw)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 422);
+
+    // An outsider on a private repo gets 404.
+    let res = client
+        .get(format!("{lookup}?head_sha={sha}"))
+        .bearer_auth(&c.dave_rw)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 404);
 }

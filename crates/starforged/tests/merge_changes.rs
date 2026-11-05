@@ -913,7 +913,16 @@ async fn web_merge_form_merges_on_post() {
     // An approval re-enables the merge; posting merges the base.
     c.s.core
         .submit_review(
-            &c.alice, "alice", "proj", n, 1, None, "approve", "lgtm", None,
+            &c.alice,
+            "alice",
+            "proj",
+            n,
+            1,
+            None,
+            "approve",
+            "lgtm",
+            None,
+            &[],
         )
         .await
         .unwrap();

@@ -582,6 +582,7 @@ mod tests {
                     "approve",
                     "lgtm",
                     None,
+                    &[],
                 )
                 .await
                 .unwrap();
@@ -768,7 +769,7 @@ mod tests {
         let h = Harness::setup().await;
         h.rule(None, 0, true, "[]", false, false, false, "[]").await;
         assert!(h.report().await.passed);
-        let review = h
+        let (review, _) = h
             .core
             .submit_review(
                 &h.bob,
@@ -780,6 +781,7 @@ mod tests {
                 "request_changes",
                 "nope",
                 None,
+                &[],
             )
             .await
             .unwrap();
@@ -1086,7 +1088,7 @@ mod tests {
     async fn request_changes_survives_push_until_explicit_dismiss() {
         let h = Harness::setup().await;
         h.rule_flags(true, true).await;
-        let review = h
+        let (review, _) = h
             .core
             .submit_review(
                 &h.bob,
@@ -1098,6 +1100,7 @@ mod tests {
                 "request_changes",
                 "nope",
                 None,
+                &[],
             )
             .await
             .unwrap();

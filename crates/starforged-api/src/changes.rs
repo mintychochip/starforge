@@ -18,8 +18,10 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use starforged_core::accounts::User;
 use starforged_core::changes::{
-    ChangeDetail, ChangeView, ReviewView, RevisionView, ThreadCommentView, ThreadView,
+    ChangeDetail, ChangeView, NewInlineComment, ReviewView, RevisionView, ThreadCommentView,
+    ThreadView,
 };
 use starforged_core::gates::GateReport;
 use starforged_core::merge::MergeRequest;
@@ -42,12 +44,25 @@ pub struct ChangeJson {
     pub creator: String,
     pub mergeability: String,
     pub conflict_paths: Vec<String>,
+    pub allowed_methods: Vec<String>,
     pub created_at: String,
     pub updated_at: String,
 }
 
-fn change_json(view: &ChangeView) -> ChangeJson {
-    ChangeJson {
+/// The change JSON with the merge methods the merge POST enforces for its base
+/// branch (no rule matches → all three), via `Core::allowed_merge_methods`.
+async fn change_json_full(
+    state: &ApiState,
+    viewer: Option<&User>,
+    owner: &str,
+    repo: &str,
+    view: &ChangeView,
+) -> Result<ChangeJson, ApiError> {
+    let allowed_methods = state
+        .core
+        .allowed_merge_methods(viewer, owner, repo, view.trail_number, view.k)
+        .await?;
+    Ok(ChangeJson {
         trail: view.trail_number,
         k: view.k,
         kind: view.kind.clone(),
@@ -58,9 +73,10 @@ fn change_json(view: &ChangeView) -> ChangeJson {
         creator: view.creator_handle.clone(),
         mergeability: view.mergeability.clone(),
         conflict_paths: view.conflict_paths.clone(),
+        allowed_methods,
         created_at: rfc3339(view.created_at),
         updated_at: rfc3339(view.updated_at),
-    }
+    })
 }
 
 #[derive(Serialize)]
@@ -159,9 +175,14 @@ fn thread_json(view: &ThreadView) -> ThreadJson {
     }
 }
 
-fn detail_json(detail: &ChangeDetail, diff: Value, gates: &GateReport) -> Value {
+fn detail_json(
+    change: ChangeJson,
+    detail: &ChangeDetail,
+    diff: Value,
+    gates: &GateReport,
+) -> Value {
     json!({
-        "change": change_json(&detail.change),
+        "change": change,
         "revisions": detail.revisions.iter().map(revision_json).collect::<Vec<_>>(),
         "selected": revision_json(&detail.selected),
         "files": diff["files"],
@@ -192,13 +213,16 @@ pub async fn list_changes(
     Path((owner, repo, n)): Path<(String, String, i64)>,
     Query(query): Query<LimitQuery>,
 ) -> Result<Json<Value>, ApiError> {
+    let viewer = auth.reader()?;
     let views = state
         .core
-        .list_changes(auth.reader()?, &owner, &repo, n, query.limit)
+        .list_changes(viewer, &owner, &repo, n, query.limit)
         .await?;
-    Ok(Json(json!({
-        "changes": views.iter().map(change_json).collect::<Vec<_>>(),
-    })))
+    let mut out = Vec::with_capacity(views.len());
+    for view in &views {
+        out.push(change_json_full(&state, viewer, &owner, &repo, view).await?);
+    }
+    Ok(Json(json!({ "changes": out })))
 }
 
 #[derive(Deserialize)]
@@ -233,7 +257,8 @@ pub async fn create_change(
         .core
         .create_branch_change(&auth.user, &owner, &repo, n, &head, &base)
         .await?;
-    Ok((StatusCode::CREATED, Json(change_json(&view))))
+    let out = change_json_full(&state, Some(&auth.user), &owner, &repo, &view).await?;
+    Ok((StatusCode::CREATED, Json(out)))
 }
 
 /// `GET /repos/{owner}/{repo}/trails/{n}/changes/{k}[?rev=]`: the change with
@@ -249,6 +274,7 @@ pub async fn get_change(
         .core
         .get_change(viewer, &owner, &repo, n, k, query.rev)
         .await?;
+    let change = change_json_full(&state, viewer, &owner, &repo, &detail.change).await?;
     let diff = state
         .core
         .change_diff_json(viewer, &owner, &repo, n, k, query.rev)
@@ -257,7 +283,7 @@ pub async fn get_change(
         .core
         .evaluate_gates(viewer, &owner, &repo, n, k)
         .await?;
-    Ok(Json(detail_json(&detail, diff, &gates)))
+    Ok(Json(detail_json(change, &detail, diff, &gates)))
 }
 
 /// `GET /repos/{owner}/{repo}/trails/{n}/changes/{k}/gates`: the merge-gate
@@ -310,12 +336,11 @@ async fn set_state(
     next: &str,
 ) -> Result<ChangeJson, ApiError> {
     let auth = auth.require(Scope::TrailWrite)?;
-    Ok(change_json(
-        &state
-            .core
-            .set_change_state(&auth.user, owner, repo, n, k, next)
-            .await?,
-    ))
+    let view = state
+        .core
+        .set_change_state(&auth.user, owner, repo, n, k, next)
+        .await?;
+    change_json_full(state, Some(&auth.user), owner, repo, &view).await
 }
 
 /// `PATCH /repos/{owner}/{repo}/trails/{n}/changes/{k}` (`{"state": …}`):
@@ -405,25 +430,53 @@ pub async fn get_diff(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SubmitReviewBody {
     pub revision: Option<i64>,
     pub verdict: String,
     pub body: String,
     pub session: Option<String>,
+    #[serde(default)]
+    pub comments: Vec<InlineCommentBody>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InlineCommentBody {
+    pub path: String,
+    pub side: String,
+    pub start_line: i64,
+    pub end_line: i64,
+    pub body: String,
 }
 
 /// `POST …/changes/{k}/reviews` (201): any reader may submit any verdict;
 /// gate counting is M2c's problem. `session`, when given, must name a live
-/// (non-quarantined) session in this repo.
+/// (non-quarantined) session in this repo. `comments`, when given, holds at
+/// most 100 inline comments; each opens a thread on the reviewed revision
+/// with its first comment linked to the new review. Unknown fields at either
+/// level are 422. The response is the review JSON plus a `threads` array
+/// (empty when no comments were sent).
 pub async fn submit_review(
     State(state): State<ApiState>,
     auth: ApiAuth,
     Path((owner, repo, n, k)): Path<(String, String, i64, i64)>,
     body: Result<Json<SubmitReviewBody>, JsonRejection>,
-) -> Result<(StatusCode, Json<ReviewJson>), ApiError> {
+) -> Result<(StatusCode, Json<Value>), ApiError> {
     let auth = auth.require(Scope::TrailWrite)?;
     let Json(body) = body.map_err(|e| ApiError::Invalid(e.body_text()))?;
-    let view = state
+    let comments: Vec<NewInlineComment> = body
+        .comments
+        .into_iter()
+        .map(|c| NewInlineComment {
+            path: c.path,
+            side: c.side,
+            start_line: c.start_line,
+            end_line: c.end_line,
+            body: c.body,
+        })
+        .collect();
+    let (review, threads) = state
         .core
         .submit_review(
             &auth.user,
@@ -435,9 +488,43 @@ pub async fn submit_review(
             &body.verdict,
             &body.body,
             body.session.as_deref(),
+            &comments,
         )
         .await?;
-    Ok((StatusCode::CREATED, Json(review_json(&view))))
+    let mut out = serde_json::to_value(review_json(&review))
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    out["threads"] = json!(threads.iter().map(thread_json).collect::<Vec<_>>());
+    Ok((StatusCode::CREATED, Json(out)))
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct HeadShaQuery {
+    pub head_sha: Option<String>,
+}
+
+/// `GET /repos/{owner}/{repo}/changes?head_sha=<sha>`: the repo's changes
+/// (any state) whose current revision's head is `sha`, ascending by (trail
+/// number, k). Reader auth like the other change GETs; a missing or invalid
+/// `head_sha` is 422.
+pub async fn list_changes_by_head(
+    State(state): State<ApiState>,
+    auth: ApiAuth,
+    Path((owner, repo)): Path<(String, String)>,
+    Query(query): Query<HeadShaQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let viewer = auth.reader()?;
+    let Some(sha) = query.head_sha else {
+        return Err(ApiError::Invalid("missing head_sha".into()));
+    };
+    let views = state
+        .core
+        .changes_with_head(viewer, &owner, &repo, sha.trim())
+        .await?;
+    let mut out = Vec::with_capacity(views.len());
+    for view in &views {
+        out.push(change_json_full(&state, viewer, &owner, &repo, view).await?);
+    }
+    Ok(Json(json!({ "changes": out })))
 }
 
 /// `GET …/changes/{k}/reviews[?limit=]`.

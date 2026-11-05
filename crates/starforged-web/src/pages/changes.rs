@@ -417,10 +417,11 @@ pub async fn submit_review(
             &form.verdict,
             &form.body,
             session_ulid.as_deref(),
+            &[],
         )
         .await
     {
-        Ok(saved) => Ok(Redirect::to(&format!(
+        Ok((saved, _)) => Ok(Redirect::to(&format!(
             "/{}/{}/trails/{number}/changes/{k}#review-{}",
             access.repo.owner, access.repo.name, saved.id
         ))

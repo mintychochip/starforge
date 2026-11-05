@@ -862,6 +862,18 @@ pub const MAX_THREAD_SPAN: i64 = 1000;
 /// How long one revision diff may run; the caller sees `Internal` on expiry.
 const DIFF_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// One inline comment on a batched review: an anchor plus its body.
+#[derive(Debug, Clone)]
+pub struct NewInlineComment {
+    pub path: String,
+    pub side: String,
+    pub start_line: i64,
+    pub end_line: i64,
+    pub body: String,
+}
+/// Most inline comments one review may carry.
+pub const MAX_REVIEW_COMMENTS: usize = 100;
+
 /// Flat read shape for a change.
 #[derive(Debug, Clone)]
 pub struct ChangeView {
@@ -947,6 +959,31 @@ pub struct ChangeDetail {
 /// Stored `conflict_paths` payloads are JSON arrays; corrupt rows read empty.
 fn parse_paths(raw: &str) -> Vec<String> {
     serde_json::from_str(raw).unwrap_or_default()
+}
+
+/// Validates one thread anchor (path, side, line span) plus its body: the
+/// checks `create_thread` enforces, shared with batched-review inline
+/// comments so both paths accept exactly the same anchors. Returns the
+/// trimmed path, the side, and the body.
+fn check_thread_anchor(
+    path: &str,
+    side: &str,
+    start: i64,
+    end: i64,
+    body: &str,
+) -> CoreResult<(String, String, String)> {
+    let path = path.trim();
+    if path.is_empty() || path.chars().count() > MAX_THREAD_PATH_CHARS {
+        return Err(CoreError::Invalid("thread path is invalid".into()));
+    }
+    if !matches!(side, "base" | "head") {
+        return Err(CoreError::Invalid(format!("invalid thread side '{side}'")));
+    }
+    if start < 1 || end < start || end - start > MAX_THREAD_SPAN {
+        return Err(CoreError::Invalid("thread lines are invalid".into()));
+    }
+    let body = check_markdown(body, "thread body")?;
+    Ok((path.to_owned(), side.to_owned(), body))
 }
 
 fn check_markdown(body: &str, what: &str) -> CoreResult<String> {
@@ -1304,6 +1341,29 @@ impl Core {
         .await
     }
 
+    /// Changes in the repo (any state) whose CURRENT revision's head is
+    /// `sha`, visible to the viewer, ascending by (trail number, k). `sha`
+    /// must be lowercase 40/64-hex → else `Invalid` (so non-oids never reach
+    /// git or the query). Invisible repos and below-`Read` viewers answer
+    /// `NotFound`, like the other change reads.
+    pub async fn changes_with_head(
+        &self,
+        viewer: Option<&User>,
+        owner: &str,
+        repo: &str,
+        sha: &str,
+    ) -> CoreResult<Vec<ChangeView>> {
+        if !refpolicy::is_oid(sha) {
+            return Err(CoreError::Invalid(format!("invalid head sha '{sha}'")));
+        }
+        let access = self.repo_for(viewer, owner, repo).await?;
+        let mut out = Vec::new();
+        for row in db_changes::changes_with_current_head(self.db(), access.repo.id, sha).await? {
+            out.push(self.change_view(&row).await?);
+        }
+        Ok(out)
+    }
+
     /// Changes of the trail in ascending `k` order.
     pub async fn list_changes(
         &self,
@@ -1418,9 +1478,22 @@ impl Core {
         .map_err(CoreError::from)
     }
 
-    /// Submits a review on `r` (default: current). Any ≥ `Read` viewer may
-    /// submit any verdict — gate counting (write+ only) is M2c's problem.
-    /// Audits `review.submitted`.
+    /// Submits a review on `r` (default: current) with `comments` inline
+    /// comments. Any ≥ `Read` viewer may submit any verdict — gate counting
+    /// (write+ only) is M2c's problem. Every input is validated before the
+    /// first write — verdict, body, session, comment count
+    /// (≤ [`MAX_REVIEW_COMMENTS`]), and each comment's anchor and body via
+    /// the SAME validator `create_thread` uses — so an
+    /// invalid comment (`Invalid("comments[<i>]: <reason>")`) writes nothing.
+    /// Each comment opens a thread on the reviewed revision; its first
+    /// comment carries `review_id` = the new review. Audits one
+    /// `review.submitted` row plus one `thread.open` row per comment (the
+    /// same rows the separate calls write today, written in this method).
+    ///
+    /// The db layer has no transaction seam for these helpers, so "nothing is
+    /// written" is guaranteed by validating everything first. A mid-sequence
+    /// database failure can leave partial rows, exactly as every existing
+    /// multi-row `Core` mutation can; no transactions are added here.
     #[allow(clippy::too_many_arguments)]
     pub async fn submit_review(
         &self,
@@ -1433,7 +1506,8 @@ impl Core {
         verdict: &str,
         body: &str,
         session: Option<&str>,
-    ) -> CoreResult<ReviewView> {
+        comments: &[NewInlineComment],
+    ) -> CoreResult<(ReviewView, Vec<ThreadView>)> {
         let (access, trail, change) = self
             .resolve_change(Some(user), owner, repo, trail_n, k)
             .await?;
@@ -1444,6 +1518,29 @@ impl Core {
         }
         let body = check_markdown(body, "review body")?;
         let session = self.check_session(access.repo.id, session).await?;
+        if comments.len() > MAX_REVIEW_COMMENTS {
+            return Err(CoreError::Invalid(format!(
+                "too many comments (max {MAX_REVIEW_COMMENTS})"
+            )));
+        }
+        let mut checked = Vec::with_capacity(comments.len());
+        for (i, comment) in comments.iter().enumerate() {
+            match check_thread_anchor(
+                &comment.path,
+                &comment.side,
+                comment.start_line,
+                comment.end_line,
+                &comment.body,
+            ) {
+                Ok((path, side, body)) => {
+                    checked.push((path, side, comment.start_line, comment.end_line, body));
+                }
+                Err(CoreError::Invalid(reason)) => {
+                    return Err(CoreError::Invalid(format!("comments[{i}]: {reason}")));
+                }
+                Err(other) => return Err(other),
+            }
+        }
         let row = db_changes::insert_review(
             self.db(),
             change.id,
@@ -1479,7 +1576,48 @@ impl Core {
             }),
         )
         .await;
-        self.review_view(&row).await
+        let review = self.review_view(&row).await?;
+        let mut threads = Vec::with_capacity(checked.len());
+        for (path, side, start_line, end_line, comment_body) in checked {
+            let thread = db_changes::insert_thread(
+                self.db(),
+                change.id,
+                revision.id,
+                &path,
+                &side,
+                start_line,
+                end_line,
+                now(),
+            )
+            .await?;
+            db_changes::insert_thread_comment(
+                self.db(),
+                thread.id,
+                Some(row.id),
+                user.id,
+                &comment_body,
+                now(),
+            )
+            .await?;
+            self.change_timeline(
+                access.repo.id,
+                trail.id,
+                "thread.open",
+                Some(user.id),
+                serde_json::json!({
+                    "change": change.number,
+                    "thread": thread.id,
+                    "revision": revision.number,
+                    "path": path,
+                    "side": side,
+                    "start_line": start_line,
+                    "end_line": end_line,
+                }),
+            )
+            .await?;
+            threads.push(self.thread_view(&access, &change, &thread).await?);
+        }
+        Ok((review, threads))
     }
 
     /// Reviews of the change in submission order.
@@ -1568,23 +1706,13 @@ impl Core {
             .await?;
         Self::ensure_writable_g4(&access)?;
         let revision = self.resolve_revision(&change, r).await?;
-        let path = path.trim();
-        if path.is_empty() || path.chars().count() > MAX_THREAD_PATH_CHARS {
-            return Err(CoreError::Invalid("thread path is invalid".into()));
-        }
-        if !matches!(side, "base" | "head") {
-            return Err(CoreError::Invalid(format!("invalid thread side '{side}'")));
-        }
-        if start < 1 || end < start || end - start > MAX_THREAD_SPAN {
-            return Err(CoreError::Invalid("thread lines are invalid".into()));
-        }
-        let body = check_markdown(body, "thread body")?;
+        let (path, side, body) = check_thread_anchor(path, side, start, end, body)?;
         let thread = db_changes::insert_thread(
             self.db(),
             change.id,
             revision.id,
-            path,
-            side,
+            &path,
+            &side,
             start,
             end,
             now(),

@@ -615,7 +615,16 @@ async fn change_page_renders_gate_panel() {
 
     c.s.core
         .submit_review(
-            &c.alice, "alice", "proj", 1, 1, None, "approve", "lgtm", None,
+            &c.alice,
+            "alice",
+            "proj",
+            1,
+            1,
+            None,
+            "approve",
+            "lgtm",
+            None,
+            &[],
         )
         .await
         .unwrap();
