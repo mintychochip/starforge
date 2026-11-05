@@ -583,7 +583,7 @@ impl Core {
         Ok(revision)
     }
 
-    /// `dismiss_on_push`: when any gate rule matching the change's base
+    /// `dismiss_on_push`: when every gate rule matching the change's base
     /// branch has the flag set, prior `approve` reviews tied to older
     /// revisions move to `state='dismissed'`. `request_changes` is never
     /// touched here — a blocking review survives a push until its author
@@ -600,10 +600,16 @@ impl Core {
         revision: &db_changes::RevisionRow,
     ) -> CoreResult<()> {
         let rules = db_checks::gate_rules_for(self.db(), repo_id).await?;
-        let armed = rules.iter().any(|r| {
-            r.dismiss_on_push != 0 && pattern_matches(r.pattern.as_deref(), &change.base_branch)
-        });
-        if !armed {
+        // Unanimous arming: dismiss only when EVERY matching rule carries the
+        // flag. A mixed set is safe without dismissal — flag-ON rules count
+        // current-revision approvals at evaluation time while flag-OFF rules
+        // keep counting older ones — but dismissing on ANY would physically
+        // erase the older approvals a flag-OFF rule still needs.
+        let matching: Vec<_> = rules
+            .iter()
+            .filter(|r| pattern_matches(r.pattern.as_deref(), &change.base_branch))
+            .collect();
+        if matching.is_empty() || matching.iter().any(|r| r.dismiss_on_push == 0) {
             return Ok(());
         }
         for review in db_changes::reviews_of_change(self.db(), change.id).await? {
@@ -732,7 +738,7 @@ impl Core {
     }
 
     /// One timeline row on the change's trail.
-    async fn change_timeline(
+    pub(crate) async fn change_timeline(
         &self,
         repo_id: i64,
         trail_id: i64,
@@ -770,7 +776,7 @@ fn truncate_title(title: &str) -> String {
 /// Serializes conflict paths as a JSON array, capped at
 /// [`MAX_CONFLICT_PAYLOAD_BYTES`]; over-long lists shed trailing paths (the
 /// merge-tree probe already caps the count).
-fn conflict_payload(paths: &[String]) -> String {
+pub(crate) fn conflict_payload(paths: &[String]) -> String {
     let mut kept: Vec<&str> = paths.iter().map(String::as_str).collect();
     loop {
         let payload = serde_json::to_string(&kept).unwrap_or_else(|_| "[]".to_owned());

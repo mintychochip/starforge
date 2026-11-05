@@ -98,7 +98,7 @@ const MAX_EVIDENCE_COMMITS: usize = 1024;
 const MAX_EVIDENCE_TRAILERS_PER_COMMIT: usize = 64;
 
 /// `Starforge-Session` trailer ULIDs carried by one commit message.
-fn session_trailers(message: &str) -> Vec<String> {
+pub(crate) fn session_trailers(message: &str) -> Vec<String> {
     message
         .lines()
         .filter_map(|line| line.strip_prefix("Starforge-Session:"))
@@ -539,7 +539,24 @@ mod tests {
             .await
             .unwrap();
         }
-
+        async fn rule_n(&self, approvals: i64, dismiss: bool) {
+            db_checks::insert_gate_rule(
+                self.core.db(),
+                self.repo_id,
+                None,
+                approvals,
+                dismiss,
+                false,
+                "[]",
+                false,
+                false,
+                false,
+                "[]",
+                1_700_000_000,
+            )
+            .await
+            .unwrap();
+        }
         async fn report(&self) -> GateReport {
             self.core
                 .evaluate_gates(
@@ -1182,5 +1199,73 @@ mod tests {
             .unwrap();
         assert_eq!(failures.len(), 1);
         assert!(failures[0].contains("unable to verify"), "{}", failures[0]);
+    }
+
+    #[tokio::test]
+    async fn mixed_flags_keep_old_approvals() {
+        let h = Harness::setup().await;
+        h.rule_n(1, true).await;
+        h.rule_n(2, false).await;
+        h.approve(&h.bob.clone()).await;
+        let tip = push_commit(&h.bare(), "feature", "next.txt", b"next\n", "second rev");
+        h.core
+            .record_branch_move(h.repo_id, "feature", None, &tip)
+            .await
+            .unwrap();
+        h.approve(&h.alice.clone()).await;
+        // The flag-ON rule counts alice's current-revision approval; the
+        // flag-OFF rule still counts bob's older one. No dismissal fired.
+        let report = h.report().await;
+        assert!(report.passed, "{report:?}");
+        assert_eq!(report.results.len(), 2);
+        let trail = db_trails::trail_by_number(h.core.db(), h.repo_id, h.trail_n)
+            .await
+            .unwrap()
+            .unwrap();
+        let change = db_changes::change_by_trail_number(h.core.db(), trail.id, h.k)
+            .await
+            .unwrap()
+            .unwrap();
+        let reviews = db_changes::reviews_of_change(h.core.db(), change.id)
+            .await
+            .unwrap();
+        assert_eq!(reviews.len(), 2);
+        assert!(reviews.iter().all(|r| r.state == "submitted"));
+    }
+
+    #[tokio::test]
+    async fn both_flags_on_dismiss_and_fail() {
+        let h = Harness::setup().await;
+        h.rule_n(1, true).await;
+        h.rule_n(2, true).await;
+        h.approve(&h.bob.clone()).await;
+        let tip = push_commit(&h.bare(), "feature", "next.txt", b"next\n", "second rev");
+        h.core
+            .record_branch_move(h.repo_id, "feature", None, &tip)
+            .await
+            .unwrap();
+        h.approve(&h.alice.clone()).await;
+        // Unanimous flags dismiss bob's older approval: the 1-approval rule
+        // passes on alice's vote, the 2-approval rule fails on it.
+        let report = h.report().await;
+        assert!(!report.passed);
+        assert_eq!(report.results.len(), 2);
+        assert!(report.results[0].passed);
+        assert!(!report.results[1].passed);
+        assert!(report.results[1].reason.contains("needs 1 more approval"));
+        let trail = db_trails::trail_by_number(h.core.db(), h.repo_id, h.trail_n)
+            .await
+            .unwrap()
+            .unwrap();
+        let change = db_changes::change_by_trail_number(h.core.db(), trail.id, h.k)
+            .await
+            .unwrap()
+            .unwrap();
+        let reviews = db_changes::reviews_of_change(h.core.db(), change.id)
+            .await
+            .unwrap();
+        assert_eq!(reviews.len(), 2);
+        assert_eq!(reviews[0].state, "dismissed");
+        assert_eq!(reviews[1].state, "submitted");
     }
 }
