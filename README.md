@@ -260,7 +260,7 @@ are marked outdated. The change page (`/{owner}/{repo}/trails/{n}/changes/{k}`, 
 selects the revision) shows all of this with role-gated controls. The merge form
 offers the methods the matching gate rules allow and stays disabled until every gate
 passes; the server re-checks gates, permission, and method at merge time, so a stale
-page authorizes nothing. Gate and conflict failures re-render the change with `422`.
+page authorizes nothing. Gate and conflict failures re-render the change page with `422`.
 
 The JSON API mirrors the page: `GET`/`POST .../trails/{n}/changes` (triage to track a
 branch), `GET`/`PATCH .../changes/{k}` (close/reopen; `merged` is refused), `.../state`,
@@ -272,8 +272,8 @@ mutations need `trail:write`; strangers get `404` so change numbers stay undisco
 
 CI pushes per-commit statuses: `POST /api/v1/repos/{owner}/{repo}/statuses/{sha}` with
 `{"state": "pending|success|failure|error", "context": "ci/unit"}` (plus an optional
-`description` of at most 140 chars and an `http(s)` `target_url`). Posting needs write
-access (`repo:write` on top of read); reads need `repo:read`.
+`description` of at most 1024 chars and an `http(s)` `target_url` of at most 2048 chars).
+Posting needs write access (`repo:write` on top of read); reads need `repo:read`.
 `GET .../commits/{sha}/combined-status` folds every latest-per-context row into one
 state (`error` beats `failure` beats `pending` beats `success`; an unknown SHA is
 `pending` with nothing behind it). A bad SHA, state, or context answers `422`.
@@ -300,8 +300,8 @@ Merging needs write access on a non-archived repo: `POST .../changes/{k}/merge` 
 `Starforge-Session:` trailer per session in order of appearance), and `fast_forward`
 moves the ref only when the head already contains the base; every commit carries a
 `Starforge-Trail: <owner>/<repo>#<n>` trailer. The change flips to `merged`, and its
-trail closes once no open change remains. Conflicts answer `409` with the fresh SHAs;
-failing gates answer `422` with the reasons.
+trail closes once no open change remains. Conflicts and CAS races answer `409` with the
+fresh SHAs; failing gates answer `422` with the reasons.
 
 Repository webhooks (`/{owner}/{repo}/settings/hooks`, maintain access and up)
 subscribe to events such as `change.merged` or `status.updated` (empty means all).

@@ -5,6 +5,9 @@ mod common;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
+
+use starforged_db::checks::GateRuleUpdate;
 
 use common::*;
 use serde_json::{Value, json};
@@ -603,6 +606,131 @@ async fn single_base_move_retries_to_success() {
     assert_eq!(parents[1], head);
     let hook_subject = server_message(&work, &server, &parents[0]).await;
     assert!(hook_subject.starts_with("hook advance"), "{hook_subject}");
+}
+
+/// The CAS retry re-checks the allowed methods: a rule edit landing between
+/// the two CAS attempts that disallows the in-flight method refuses with
+/// 422, leaving the base at the racer's tip and the change open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cas_retry_rechecks_allowed_methods() {
+    let c = Ctx::start().await;
+    let (work, _url) = c.push_basic().await;
+    let server = c.server().await;
+    let n = c.trail().await;
+    c.create_branch_change(n, "feature/x", "main").await;
+    let repo_id = c.repo_id().await;
+    let rule = starforged_db::checks::insert_gate_rule(
+        c.s.core.db(),
+        repo_id,
+        None,
+        0,
+        false,
+        false,
+        "[]",
+        false,
+        false,
+        false,
+        "[\"merge\"]",
+        starforged_db::now(),
+    )
+    .await
+    .unwrap();
+    // Rendezvous: the hook moves the base once (forcing the retry), signals
+    // the test, and waits until the test has edited the rule, so the edit
+    // deterministically lands between the two CAS attempts.
+    let (fired_tx, fired_rx) = std::sync::mpsc::channel::<()>();
+    let (proceed_tx, proceed_rx) = std::sync::mpsc::channel::<()>();
+    let proceed_rx = Arc::new(std::sync::Mutex::new(proceed_rx));
+    let hook_server = server.clone();
+    let moved = Arc::new(AtomicBool::new(false));
+    let hook = PreCasHook::new(move || {
+        if moved.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .env("GIT_AUTHOR_NAME", "hook")
+                .env("GIT_AUTHOR_EMAIL", "hook@test")
+                .env("GIT_COMMITTER_NAME", "hook")
+                .env("GIT_COMMITTER_EMAIL", "hook@test")
+                .arg(format!("--git-dir={}", hook_server.display()))
+                .args(args)
+                .output()
+                .expect("hook git runs");
+            assert!(out.status.success(), "hook git failed: {args:?}");
+            String::from_utf8(out.stdout).unwrap().trim().to_owned()
+        };
+        let tip = run(&["rev-parse", "--verify", "refs/heads/main"]);
+        let tree = run(&["rev-parse", &format!("{tip}^{{tree}}")]);
+        let new = run(&["commit-tree", &tree, "-p", &tip, "-m", "hook advance"]);
+        run(&["update-ref", "refs/heads/main", &new, &tip]);
+        fired_tx.send(()).expect("test waits for the hook");
+        proceed_rx
+            .lock()
+            .expect("proceed channel")
+            .recv_timeout(Duration::from_secs(30))
+            .expect("test edits the rule, then releases the hook");
+    });
+    c.s.core.set_merge_cas_hook(Some(hook));
+    let merge_url = c.merge(n, 1);
+    let token = c.alice_repo.clone();
+    let merge_task = tokio::spawn(async move {
+        let client = reqwest::Client::new();
+        let res = client
+            .post(merge_url)
+            .bearer_auth(token)
+            .json(&json!({"method": "merge"}))
+            .send()
+            .await
+            .unwrap();
+        let status = res.status().as_u16();
+        let body: Value = res.json().await.unwrap_or(Value::Null);
+        (status, body)
+    });
+    tokio::task::spawn_blocking(move || {
+        fired_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("hook fires before the first CAS")
+    })
+    .await
+    .unwrap();
+    starforged_db::checks::update_gate_rule(
+        c.s.core.db(),
+        rule.id,
+        repo_id,
+        &GateRuleUpdate {
+            methods: Some("[\"squash\"]"),
+            ..Default::default()
+        },
+        starforged_db::now(),
+    )
+    .await
+    .unwrap();
+    proceed_tx.send(()).unwrap();
+    let (status, body) = merge_task.await.unwrap();
+    c.s.core.set_merge_cas_hook(None);
+    assert_eq!(status, 422, "{body}");
+    let message = body["error"]["message"].as_str().unwrap_or("");
+    assert!(message.contains("merge"), "{body}");
+    // The base stays at the racer's tip: the merge moved nothing.
+    let tip = server_rev(&work, &server, "refs/heads/main").await;
+    let subject = server_message(&work, &server, &tip).await;
+    assert!(subject.starts_with("hook advance"), "{subject}");
+    // Nothing merged: the change is still open.
+    let client = reqwest::Client::new();
+    let detail: Value = client
+        .get(c.change(n, 1))
+        .bearer_auth(&c.alice_repo)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(detail["change"]["state"], "open");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

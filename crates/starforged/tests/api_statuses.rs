@@ -159,8 +159,8 @@ async fn status_matrix() {
         .unwrap();
     assert_eq!(res.status(), 422);
 
-    // Bad context (empty and over 100 chars): 422.
-    for context in ["", &"c".repeat(101)] {
+    // Bad context (empty and over 255 chars): 422.
+    for context in ["", &"c".repeat(256)] {
         let res = client
             .post(c.statuses(SHA_A))
             .bearer_auth(&c.alice_repo)
@@ -350,4 +350,112 @@ async fn invalid_target_url_rejected() {
         .await
         .unwrap();
     assert_eq!(res.status(), 422);
+}
+
+/// H2 bounds: context 1–255 chars, `target_url` ≤ 2048, description ≤ 1024.
+/// Rejections are 422 and write no row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn status_field_length_bounds() {
+    let c = Ctx::start().await;
+    let client = reqwest::Client::new();
+
+    // Context: 255 accepted, 256 rejected.
+    let res = client
+        .post(c.statuses(SHA_FRESH))
+        .bearer_auth(&c.alice_repo)
+        .json(&post_body("pending", &"c".repeat(255)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200, "context of 255 chars is accepted");
+    for context in ["c".repeat(256)] {
+        let res = client
+            .post(c.statuses(SHA_FRESH))
+            .bearer_auth(&c.alice_repo)
+            .json(&post_body("pending", &context))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 422, "context of 256 chars is rejected");
+    }
+    let body: Value = client
+        .get(c.statuses(SHA_FRESH))
+        .bearer_auth(&c.alice_repo)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let rows = body["statuses"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "rejected context wrote no row: {body}");
+    assert_eq!(rows[0]["context"], "c".repeat(255));
+
+    // `target_url`: 2048 accepted, 2049 rejected, no row written.
+    let base = "http://x.test/";
+    let ok_url = format!("{base}{}", "y".repeat(2048 - base.len()));
+    assert_eq!(ok_url.chars().count(), 2048);
+    let res = client
+        .post(c.statuses(SHA_A))
+        .bearer_auth(&c.alice_repo)
+        .json(&json!({"state": "pending", "context": "ci/url", "target_url": ok_url}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200, "target_url of 2048 chars is accepted");
+    let long_url = format!("{base}{}", "y".repeat(2049 - base.len()));
+    let res = client
+        .post(c.statuses(SHA_A))
+        .bearer_auth(&c.alice_repo)
+        .json(&json!({"state": "pending", "context": "ci/url-long", "target_url": long_url}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 422, "target_url of 2049 chars is rejected");
+    let body: Value = client
+        .get(c.statuses(SHA_A))
+        .bearer_auth(&c.alice_repo)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let rows = body["statuses"].as_array().unwrap();
+    assert!(
+        rows.iter().all(|r| r["context"] != "ci/url-long"),
+        "rejected target_url wrote no row: {body}"
+    );
+
+    // Description: 1024 accepted, 1025 rejected, no row written.
+    let res = client
+        .post(c.statuses(SHA_B))
+        .bearer_auth(&c.alice_repo)
+        .json(&json!({"state": "pending", "context": "ci/desc", "description": "d".repeat(1024)}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200, "description of 1024 chars is accepted");
+    let res = client
+        .post(c.statuses(SHA_B))
+        .bearer_auth(&c.alice_repo)
+        .json(&json!({"state": "pending", "context": "ci/desc-long", "description": "d".repeat(1025)}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 422, "description of 1025 chars is rejected");
+    let body: Value = client
+        .get(c.statuses(SHA_B))
+        .bearer_auth(&c.alice_repo)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let rows = body["statuses"].as_array().unwrap();
+    assert!(
+        rows.iter().all(|r| r["context"] != "ci/desc-long"),
+        "rejected description wrote no row: {body}"
+    );
 }

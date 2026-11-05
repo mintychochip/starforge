@@ -528,14 +528,13 @@ async fn matrix_merge_webhooks() {
 
     // Web merge form: writers/admins see the live button; triage/read see a
     // disabled control; strangers get 404.
-    for (handle, live) in [("alice", true), ("wendy", true), ("adam", true)] {
+    for handle in ["alice", "wendy", "adam"] {
         let browser = c.login(handle).await;
         let page = get_text(&browser, &c.web_change("proj", n, 1)).await;
         assert!(
             page.contains(r#"<button type="submit">Merge</button>"#),
             "{handle} sees live merge button"
         );
-        assert!(live);
     }
     for handle in ["bob", "carol"] {
         let browser = c.login(handle).await;
@@ -1644,12 +1643,9 @@ async fn csrf_matrix() {
     let n = c.trail(&alice_full).await;
     let alice_rw = c.tok(&c.alice, REPO_WRITE).await;
     c.branch_change(&alice_rw, n, "feature/x").await;
-    let server = c.s.core.repo_path(c.repo_id("proj").await);
     let base_before = git_ok(&work, &["ls-remote", &url, "refs/heads/main"]).await;
 
     let (alice_browser, _) = c.s.login("alice").await;
-    let page = get_text(&alice_browser, &c.web_change("proj", n, 1)).await;
-    let good = extract_input(&page, "_csrf");
     let (carol_browser, _) = c.s.login("carol").await;
     let carol_page = get_text(&carol_browser, &c.web_change("proj", n, 1)).await;
     let foreign = extract_input(&carol_page, "_csrf");
@@ -1669,7 +1665,6 @@ async fn csrf_matrix() {
         base_before,
         "failed CSRF merge moved nothing"
     );
-    let _ = server;
 
     // Hooks create/toggle/delete without/with foreign token: 403, no rows change.
     let hooks_page = get_text(&alice_browser, &c.web_hooks("proj")).await;
@@ -1740,7 +1735,6 @@ async fn csrf_matrix() {
             .unwrap();
     assert_eq!(hooks.len(), count_before + 1, "CSRF wrote no hook rows");
     assert!(hooks.iter().any(|h| h.id == hook_id && h.active));
-    let _ = good;
 }
 
 /// End-to-end per method: push → approve → status → gate passes → merge.

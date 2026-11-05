@@ -275,11 +275,21 @@ impl Core {
     /// True when `head` contains `base` (blocking `merge-base --is-ancestor`
     /// probe). Checked before the first CAS attempt and again on retry: a
     /// fast-forward that stops being one must refuse, never rewind the base.
+    /// The blocking probe runs under the same 60 s timeout as the other
+    /// merge-path git calls; expiry reports the same `Git` error shape.
     async fn is_fast_forwardable(&self, repo_id: i64, base: &str, head: &str) -> CoreResult<bool> {
         let repo = self.repo_path(repo_id);
         let (ancestor, tip) = (base.to_owned(), head.to_owned());
-        tokio::task::spawn_blocking(move || read::is_ancestor(&repo, &ancestor, &tip))
+        let probe = tokio::task::spawn_blocking(move || read::is_ancestor(&repo, &ancestor, &tip));
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(60), probe)
             .await
+            .map_err(|_| {
+                CoreError::from(starforged_git::GitError::Failed {
+                    command: "merge-base --is-ancestor".to_owned(),
+                    stderr: "merge-base --is-ancestor timed out".to_owned(),
+                })
+            })?;
+        joined
             .map_err(|e| CoreError::Internal(e.to_string()))?
             .map_err(CoreError::from)
     }
@@ -547,6 +557,23 @@ impl Core {
                     "base branch '{base_branch}' is missing"
                 )));
             };
+            // A rule edit landing between the two CAS attempts that disallows
+            // the in-flight method refuses here, before the second CAS moves
+            // the ref. Same `Invalid` shape as the first allowed-methods
+            // check above.
+            let allowed = self
+                .compute_allowed_methods(access.repo.id, &base_branch)
+                .await?;
+            if !allowed.iter().any(|m| m == method) {
+                let list = if allowed.is_empty() {
+                    "none".to_owned()
+                } else {
+                    allowed.join(", ")
+                };
+                return Err(CoreError::Invalid(format!(
+                    "merge method '{method}' is not allowed by the matching gate rules (allowed: {list})"
+                )));
+            }
             // A fast-forward that stopped being one must refuse, never rewind
             // the base: pointing the ref at the head now would discard the
             // racer's commits. Checked before the rebuild, so nothing writes.

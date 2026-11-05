@@ -1,15 +1,16 @@
 //! Commit statuses on any SHA (spec §6.5, M2c H2): validation and
 //! permission live here; storage is `starforged-db::checks` (H1).
 //!
-//! Limits (H2 assignment): sha is 40 lowercase hex; context is 1–100 chars;
+//! Limits (H2 assignment): sha is 40 lowercase hex; context is 1–255 chars;
 //! state is one of `pending`/`success`/`failure`/`error`; `target_url` is
-//! empty or `http(s)://…`; description is at most 140 chars. A status is a CI
-//! push, not a Trail edit, so writes need ≥ `Write` repo permission (reads
-//! need read visibility). Status writes are timeline-free and audit-free —
-//! they fire at CI cadence and §6.5's audit list covers permission/security
-//! events, not per-status churn; submissions log at `info` via `tracing`
-//! instead. Reads write nothing. An archived repository refuses submissions
-//! (`Invalid`, like the trail/change precedent); reads stay available.
+//! empty or `http(s)://…` of at most 2048 chars; description is at most 1024
+//! chars. A status is a CI push, not a Trail edit, so writes need ≥ `Write`
+//! repo permission (reads need read visibility). Status writes are
+//! timeline-free and audit-free — they fire at CI cadence and §6.5's audit
+//! list covers permission/security events, not per-status churn; submissions
+//! log at `info` via `tracing` instead. Reads write nothing. An archived
+//! repository refuses submissions (`Invalid`, like the trail/change
+//! precedent); reads stay available.
 
 use starforged_db::{checks as db_checks, now};
 
@@ -45,12 +46,12 @@ fn valid_sha(sha: &str) -> bool {
             .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
-/// H2's status-context rule (1–100 chars), reused by gate-rule contexts.
+/// H2's status-context rule (1–255 chars), reused by gate-rule contexts.
 pub(crate) fn validate_context(context: &str) -> CoreResult<()> {
     let context_len = context.chars().count();
-    if context_len == 0 || context_len > 100 {
+    if context_len == 0 || context_len > 255 {
         return Err(CoreError::Invalid(
-            "context must be 1-100 characters".into(),
+            "context must be 1-255 characters".into(),
         ));
     }
     Ok(())
@@ -78,9 +79,14 @@ fn validate_status(
             "target_url must be an http(s) URL".into(),
         ));
     }
-    if description.is_some_and(|d| d.chars().count() > 140) {
+    if target_url.is_some_and(|u| u.chars().count() > 2048) {
         return Err(CoreError::Invalid(
-            "description must be at most 140 characters".into(),
+            "target_url must be at most 2048 characters".into(),
+        ));
+    }
+    if description.is_some_and(|d| d.chars().count() > 1024) {
+        return Err(CoreError::Invalid(
+            "description must be at most 1024 characters".into(),
         ));
     }
     Ok(())
@@ -176,10 +182,9 @@ impl Core {
         Ok(out)
     }
 
-    /// The combined status for `sha`: the latest-per-context rows folded with
-    /// error > failure > pending > success precedence (the same fold as
-    /// `starforged-db::checks::combined_state`, over the DTO states); an
-    /// unknown sha (no rows) is `pending` with an empty list.
+    /// The combined status for `sha`: the latest-per-context rows folded by
+    /// `starforged-db::checks::combined_state` (error > failure > pending >
+    /// success); an unknown sha (no rows) is `pending` with an empty list.
     pub async fn combined_status(
         &self,
         viewer: Option<&User>,
@@ -187,16 +192,16 @@ impl Core {
         repo: &str,
         sha: &str,
     ) -> CoreResult<CombinedDto> {
-        let statuses = self.list_statuses(viewer, owner, repo, sha).await?;
-        let state = if statuses.iter().any(|s| s.state == "error") {
-            "error"
-        } else if statuses.iter().any(|s| s.state == "failure") {
-            "failure"
-        } else if statuses.iter().any(|s| s.state == "pending") || statuses.is_empty() {
-            "pending"
-        } else {
-            "success"
-        };
+        if !valid_sha(sha) {
+            return Err(CoreError::Invalid(format!("invalid sha '{sha}'")));
+        }
+        let access = self.repo_for(viewer, owner, repo).await?;
+        let rows = db_checks::latest_statuses(self.db(), access.repo.id, sha).await?;
+        let state = db_checks::combined_state(&rows).await;
+        let mut statuses = Vec::new();
+        for row in rows {
+            statuses.push(status_dto(self, row).await?);
+        }
         Ok(CombinedDto {
             sha: sha.to_owned(),
             state: state.to_owned(),

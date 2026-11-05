@@ -170,7 +170,7 @@ fn normalize(base: &GateRuleDto, input: &GateRuleInput) -> CoreResult<Normalized
     for ctx in &contexts {
         validate_context(ctx).map_err(|_| {
             CoreError::Invalid(format!(
-                "invalid required_contexts entry '{ctx}' (each must be 1-100 characters)"
+                "invalid required_contexts entry '{ctx}' (each must be 1-255 characters)"
             ))
         })?;
     }

@@ -421,9 +421,15 @@ async fn validation_rejections() {
         "{rejected}"
     );
     let mut body = valid_body();
-    body["required_contexts"] = json!(["x".repeat(101)]);
+    body["required_contexts"] = json!(["x".repeat(256)]);
     let (status, rejected) = c.create(&c.bob_trail, &body).await;
     assert_eq!(status, 422, "{rejected}");
+    // The 255-char boundary is accepted.
+    let mut body = valid_body();
+    body["pattern"] = json!("ctx-boundary");
+    body["required_contexts"] = json!(["x".repeat(255)]);
+    let (status, created) = c.create(&c.bob_trail, &body).await;
+    assert_eq!(status, 201, "{created}");
 
     // PATCH validates too.
     let (status, created) = c.create(&c.bob_trail, &valid_body()).await;
