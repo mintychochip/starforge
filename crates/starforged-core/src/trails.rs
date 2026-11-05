@@ -28,6 +28,8 @@ const MAX_LABEL_LEN: usize = 50;
 /// Max labels / assignees per trail.
 const MAX_LABELS: usize = 10;
 const MAX_ASSIGNEES: usize = 10;
+/// Max review requests per trail (D7; mirrors assignees).
+const MAX_REVIEW_REQUESTS: usize = 10;
 
 /// Flat read shape shared by API and web.
 #[derive(Debug, Clone)]
@@ -41,6 +43,7 @@ pub struct TrailView {
     pub author_handle: String,
     pub labels: Vec<String>,
     pub assignees: Vec<String>,
+    pub review_requests: Vec<String>,
     pub created_at: i64,
     pub updated_at: i64,
     pub closed_at: Option<i64>,
@@ -164,6 +167,12 @@ impl Core {
                 assignees.push(u.handle);
             }
         }
+        let mut review_requests = Vec::new();
+        for id in db_trails::review_requests_of(self.db(), row.id).await? {
+            if let Some(u) = self.user_by_id(id).await? {
+                review_requests.push(u.handle);
+            }
+        }
         Ok(TrailView {
             number: row.number,
             title: row.title.clone(),
@@ -174,6 +183,7 @@ impl Core {
             author_handle,
             labels,
             assignees,
+            review_requests,
             created_at: row.created_at,
             updated_at: row.updated_at,
             closed_at: row.closed_at,
@@ -829,6 +839,112 @@ impl Core {
             Some(user.handle.clone()),
             Some("updated"),
             Some("unassigned"),
+            number,
+            None,
+        )
+        .await;
+        self.trail_view(&self.trail_row(access.repo.id, number).await?)
+            .await
+    }
+
+    /// D7. Triage+; the requested user must be a member and not the Trail author; ≤ 10; idempotent.
+    /// Writes `trail.review_requested`; dispatches trail/updated cause review_requested.
+    pub async fn request_review(
+        &self,
+        user: &User,
+        owner: &str,
+        repo: &str,
+        number: i64,
+        handle: &str,
+    ) -> CoreResult<TrailView> {
+        let access = self.repo_for(Some(user), owner, repo).await?;
+        Self::ensure_writable(&access.repo)?;
+        if access.permission < Permission::Triage {
+            return Err(CoreError::Forbidden);
+        }
+        let target = self
+            .user_by_handle(handle)
+            .await?
+            .ok_or_else(|| CoreError::Invalid(format!("no user named '{handle}'")))?;
+        if !self.is_repo_member(access.repo.id, target.id).await? {
+            return Err(CoreError::Invalid(format!(
+                "'{}' is not a member of this repository",
+                target.handle
+            )));
+        }
+        let row = self.trail_row(access.repo.id, number).await?;
+        if row.author_id == Some(target.id) {
+            return Err(CoreError::Invalid(
+                "cannot request a review from the Trail's author".into(),
+            ));
+        }
+        let current = db_trails::review_requests_of(self.db(), row.id).await?;
+        if !current.contains(&target.id) && current.len() >= MAX_REVIEW_REQUESTS {
+            return Err(CoreError::Invalid(
+                "too many review requests on this trail".into(),
+            ));
+        }
+        if !db_trails::add_review_request(self.db(), row.id, target.id, user.id, now()).await? {
+            return self.trail_view(&row).await;
+        }
+        db_trails::touch(self.db(), row.id, now()).await?;
+        self.record_timeline(
+            access.repo.id,
+            row.id,
+            "trail.review_requested",
+            Some(user.id),
+            serde_json::json!({"user": target.handle, "user_id": target.id}),
+        )
+        .await?;
+        self.dispatch_trail_event(
+            access.repo.id,
+            Some(user.handle.clone()),
+            Some("updated"),
+            Some("review_requested"),
+            number,
+            None,
+        )
+        .await;
+        self.trail_view(&self.trail_row(access.repo.id, number).await?)
+            .await
+    }
+
+    /// Triage+; idempotent. Writes `trail.review_request_removed`; dispatches trail/updated cause review_request_removed.
+    pub async fn remove_review_request(
+        &self,
+        user: &User,
+        owner: &str,
+        repo: &str,
+        number: i64,
+        handle: &str,
+    ) -> CoreResult<TrailView> {
+        let access = self.repo_for(Some(user), owner, repo).await?;
+        Self::ensure_writable(&access.repo)?;
+        if access.permission < Permission::Triage {
+            return Err(CoreError::Forbidden);
+        }
+        let target = self
+            .user_by_handle(handle)
+            .await?
+            .ok_or_else(|| CoreError::Invalid(format!("no user named '{handle}'")))?;
+        let row = self.trail_row(access.repo.id, number).await?;
+        if !db_trails::remove_review_request(self.db(), row.id, target.id).await? {
+            return self.trail_view(&row).await;
+        }
+        db_trails::touch(self.db(), row.id, now()).await?;
+        self.record_timeline(
+            access.repo.id,
+            row.id,
+            "trail.review_request_removed",
+            Some(user.id),
+            serde_json::json!({"user": target.handle, "user_id": target.id}),
+        )
+        .await?;
+        self.dispatch_trail_event(
+            access.repo.id,
+            Some(user.handle.clone()),
+            Some("updated"),
+            Some("review_request_removed"),
             number,
             None,
         )

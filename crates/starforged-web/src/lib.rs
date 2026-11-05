@@ -299,6 +299,10 @@ fn page_routes() -> Router<AppState> {
             post(pages::trails::set_assignee),
         )
         .route(
+            "/{owner}/{repo}/trails/{number}/review-requests",
+            post(pages::trails::set_review_request),
+        )
+        .route(
             "/{owner}/{repo}/trails/{number}/comments/{id}/edit",
             post(pages::trails::edit_comment),
         )

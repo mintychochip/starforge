@@ -103,6 +103,7 @@ impl Core {
             sc.trail.map(|_| trail_id),
         )
         .await?;
+        let is_new = existing.is_none();
         let (change, revision) = match existing {
             Some(change) => {
                 debug_assert_eq!(change.trail_id, trail_id);
@@ -243,15 +244,19 @@ impl Core {
             change_id: change.id,
         })
         .await?;
-        self.dispatch_trail_event(
-            repo_id,
-            self.sender_of(user_id).await,
-            Some("updated"),
-            Some("revision_pushed"),
-            trail_number,
-            Some(serde_json::json!({"k": change.number, "revision": revision.number})),
-        )
-        .await;
+        // A new change already fanned out `change_opened` above: only a
+        // revision appended to an existing change fans out `revision_pushed`.
+        if !is_new {
+            self.dispatch_trail_event(
+                repo_id,
+                self.sender_of(user_id).await,
+                Some("updated"),
+                Some("revision_pushed"),
+                trail_number,
+                Some(serde_json::json!({"k": change.number, "revision": revision.number})),
+            )
+            .await;
+        }
         Ok(Some((change.number, revision.number)))
     }
     /// Push fan-out (spec §10.4 D2): emits one `push` event per heads/tags
@@ -1425,15 +1430,6 @@ impl Core {
             Some(serde_json::json!({"k": row.number, "revision": revision.number})),
         )
         .await;
-        self.dispatch_trail_event(
-            access.repo.id,
-            Some(user.handle.clone()),
-            Some("updated"),
-            Some("revision_pushed"),
-            trail.number,
-            Some(serde_json::json!({"k": row.number, "revision": revision.number})),
-        )
-        .await;
         self.change_view(
             &db_changes::change_by_id(self.db(), row.id)
                 .await?
@@ -1653,6 +1649,9 @@ impl Core {
             now(),
         )
         .await?;
+        // D7: the reviewer's pending request on this Trail is fulfilled. No
+        // timeline row and no dispatch; `review.submitted` records it.
+        db_trails::remove_review_request(self.db(), trail.id, user.id).await?;
         self.change_timeline(
             access.repo.id,
             trail.id,

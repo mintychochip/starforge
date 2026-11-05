@@ -802,3 +802,396 @@ async fn merged_state_filter_lists_merged_trails() {
         "open no longer lists merged trail {n}"
     );
 }
+
+/// M2e K4: a triage user requests a review; the trail JSON lists it; a
+/// repeat add and a repeat remove are idempotent and write no timeline rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_requests_add_idempotent_remove() {
+    let c = Ctx::start().await;
+    let client = reqwest::Client::new();
+    c.create("review me").await;
+    let url = c.s.url("/api/v1/repos/alice/proj/trails/1/review-requests");
+
+    let added = client
+        .post(&url)
+        .bearer_auth(&c.composed)
+        .json(&json!({"user": "bob"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(added.status(), 200);
+    assert_eq!(
+        added.json::<Value>().await.unwrap()["review_requests"],
+        json!(["bob"])
+    );
+
+    // Idempotent re-add: same view, and no new timeline row.
+    let again = client
+        .post(&url)
+        .bearer_auth(&c.composed)
+        .json(&json!({"user": "bob"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(again.status(), 200);
+    assert_eq!(
+        again.json::<Value>().await.unwrap()["review_requests"],
+        json!(["bob"])
+    );
+
+    let detail = client
+        .get(c.trail(1))
+        .bearer_auth(&c.read)
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    let kinds: Vec<&str> = detail["timeline"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, vec!["trail.open", "trail.review_requested"]);
+    let requested = &detail["timeline"][1];
+    assert_eq!(requested["payload"]["user"], "bob");
+
+    // Remove works, and removing again is a silent no-op.
+    let removed = client
+        .delete(&url)
+        .bearer_auth(&c.composed)
+        .json(&json!({"user": "bob"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(removed.status(), 200);
+    assert_eq!(
+        removed.json::<Value>().await.unwrap()["review_requests"],
+        json!([])
+    );
+    let removed_again = client
+        .delete(&url)
+        .bearer_auth(&c.composed)
+        .json(&json!({"user": "bob"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(removed_again.status(), 200);
+
+    let detail = client
+        .get(c.trail(1))
+        .bearer_auth(&c.read)
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    let kinds: Vec<&str> = detail["timeline"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![
+            "trail.open",
+            "trail.review_requested",
+            "trail.review_request_removed"
+        ]
+    );
+}
+
+/// M2e K4: strangers, unknown handles, and the author are 422; the 11th
+/// request is 422; a read user is 403 and a non-reader is 404.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_requests_rejections_and_cap() {
+    let c = Ctx::start().await;
+    let client = reqwest::Client::new();
+    c.create("review me").await;
+    let url = c.s.url("/api/v1/repos/alice/proj/trails/1/review-requests");
+
+    // Carol exists but is not a member of this repo: 422.
+    let stranger = client
+        .post(&url)
+        .bearer_auth(&c.composed)
+        .json(&json!({"user": "carol"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stranger.status(), 422);
+    let (code, message) = error(stranger.json().await.unwrap());
+    assert_eq!(code, "invalid");
+    assert!(message.contains("not a member"), "{message}");
+
+    // Unknown handles resolve to a 422, not a 404.
+    let unknown = client
+        .post(&url)
+        .bearer_auth(&c.composed)
+        .json(&json!({"user": "nosuchuser"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unknown.status(), 422);
+
+    // The Trail's author cannot be requested.
+    let author = client
+        .post(&url)
+        .bearer_auth(&c.composed)
+        .json(&json!({"user": "alice"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(author.status(), 422);
+    let (code, message) = error(author.json().await.unwrap());
+    assert_eq!(code, "invalid");
+    assert_eq!(message, "cannot request a review from the Trail's author");
+
+    // A read user with a write token gets 403; a non-reader gets 404.
+    let alice = c.s.core.user_by_handle("alice").await.unwrap().unwrap();
+    let dave = c.s.user("dave").await;
+    c.s.core
+        .set_collaborator(&alice, "alice", "proj", "dave", Permission::Read)
+        .await
+        .unwrap();
+    let dave_token =
+        c.s.token(&dave, &[Scope::RepoRead, Scope::TrailWrite])
+            .await;
+    let denied = client
+        .post(&url)
+        .bearer_auth(&dave_token)
+        .json(&json!({"user": "bob"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), 403);
+    let missing = client
+        .post(&url)
+        .bearer_auth(&c.stranger)
+        .json(&json!({"user": "bob"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), 404);
+
+    // Ten requests fit; the eleventh is rejected.
+    let mut handles = vec!["bob".to_owned()];
+    for i in 1..=10 {
+        let handle = format!("reviewer{i}");
+        c.s.user(&handle).await;
+        c.s.core
+            .set_collaborator(&alice, "alice", "proj", &handle, Permission::Triage)
+            .await
+            .unwrap();
+        handles.push(handle);
+    }
+    for handle in &handles[..10] {
+        let res = client
+            .post(&url)
+            .bearer_auth(&c.composed)
+            .json(&json!({"user": handle}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200, "request {handle}");
+    }
+    let capped = client
+        .post(&url)
+        .bearer_auth(&c.composed)
+        .json(&json!({"user": handles[10]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(capped.status(), 422);
+}
+
+/// M2e K4: submitting a review clears that reviewer's pending request; other
+/// requests survive, with no extra timeline row for the clearing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_request_cleared_on_submit() {
+    let c = Ctx::start().await;
+    let client = reqwest::Client::new();
+    let url = c.s.git_url("alice", "proj", Some(&c.full));
+    let tmp = tempfile::tempdir().unwrap();
+    let work = work_repo(tmp.path(), "work", &[("a.txt", "one\n")]).await;
+    git_ok(&work, &["push", "-q", &url, "main"]).await;
+    git_ok(&work, &["checkout", "-q", "-b", "feature/x"]).await;
+    commit_files(&work, &[("a.txt", b"one\ntwo\n")], "add two").await;
+    git_ok(&work, &["push", "-q", &url, "feature/x"]).await;
+
+    let created = c.create("review me").await;
+    let n = created["number"].as_i64().unwrap();
+    let res = client
+        .post(c.s.url(&format!("/api/v1/repos/alice/proj/trails/{n}/changes")))
+        .bearer_auth(&c.composed)
+        .json(&json!({
+            "kind": "branch",
+            "head_branch": "feature/x",
+            "base_branch": "main",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 201);
+
+    let alice = c.s.core.user_by_handle("alice").await.unwrap().unwrap();
+    c.s.user("erin").await;
+    c.s.core
+        .set_collaborator(&alice, "alice", "proj", "erin", Permission::Triage)
+        .await
+        .unwrap();
+    let requests = c.s.url(&format!(
+        "/api/v1/repos/alice/proj/trails/{n}/review-requests"
+    ));
+    for handle in ["bob", "erin"] {
+        let res = client
+            .post(&requests)
+            .bearer_auth(&c.composed)
+            .json(&json!({"user": handle}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200, "request {handle}");
+    }
+
+    // Bob reviews the change: his request is fulfilled, erin's remains.
+    let res = client
+        .post(c.s.url(&format!(
+            "/api/v1/repos/alice/proj/trails/{n}/changes/1/reviews"
+        )))
+        .bearer_auth(&c.triage)
+        .json(&json!({"verdict": "approve", "body": "looks good"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 201);
+
+    let detail = client
+        .get(c.trail(n))
+        .bearer_auth(&c.read)
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(detail["review_requests"], json!(["erin"]));
+    let kinds: Vec<&str> = detail["timeline"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["kind"].as_str().unwrap())
+        .collect();
+    assert!(
+        !kinds.contains(&"trail.review_request_removed"),
+        "{kinds:?}"
+    );
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|k| *k == &"trail.review_requested")
+            .count(),
+        2
+    );
+}
+
+/// M2e K4: a real add and remove each deliver `trail`/`updated` with the
+/// matching cause to a `trail`-subscribed hook.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_requests_dispatch_webhooks() {
+    use std::sync::{Arc, Mutex};
+    let s = TestServer::start_with(|c| c.webhooks.allow_loopback = true).await;
+    let alice = s.user("alice").await;
+    let bob = s.user("bob").await;
+    s.repo(
+        &alice,
+        "proj",
+        starforged_core::permission::Visibility::Private,
+    )
+    .await;
+    s.core
+        .set_collaborator(
+            &alice,
+            "alice",
+            "proj",
+            "bob",
+            starforged_core::permission::Permission::Triage,
+        )
+        .await
+        .unwrap();
+    let rw = &[Scope::RepoRead, Scope::RepoWrite, Scope::TrailWrite];
+    let token = s.token(&alice, rw).await;
+    let client = reqwest::Client::new();
+
+    let hits: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen = hits.clone();
+    let app = axum::Router::new().route(
+        "/hook",
+        axum::routing::post(move |body: axum::body::Bytes| {
+            let seen = seen.clone();
+            async move {
+                seen.lock()
+                    .unwrap()
+                    .push(serde_json::from_slice::<Value>(&body).expect("hook body is JSON"));
+                (axum::http::StatusCode::OK, "ok".to_string())
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(axum::serve(listener, app).into_future());
+
+    let res = client
+        .post(s.url("/api/v1/repos/alice/proj/hooks"))
+        .bearer_auth(&token)
+        .json(&json!({"url": format!("http://{addr}/hook"), "events": ["trail"]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 201, "create hook");
+
+    let created = client
+        .post(s.url("/api/v1/repos/alice/proj/trails"))
+        .bearer_auth(&token)
+        .json(&json!({"title": "review me", "intent": "do the thing"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201);
+    // The open event is noise for this test; drain it before asserting.
+    s.core.run_due_jobs().await.unwrap();
+    hits.lock().unwrap().clear();
+    let _ = bob;
+
+    let url = s.url("/api/v1/repos/alice/proj/trails/1/review-requests");
+    let res = client
+        .post(&url)
+        .bearer_auth(&token)
+        .json(&json!({"user": "bob"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let res = client
+        .delete(&url)
+        .bearer_auth(&token)
+        .json(&json!({"user": "bob"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    s.core.run_due_jobs().await.unwrap();
+
+    let bodies = hits.lock().unwrap().clone();
+    assert_eq!(bodies.len(), 2, "{bodies:?}");
+    assert_eq!(bodies[0]["event"], "trail");
+    assert_eq!(bodies[0]["action"], "updated");
+    assert_eq!(bodies[0]["cause"], "review_requested");
+    assert_eq!(bodies[0]["sender"], json!({"handle": "alice"}));
+    assert_eq!(bodies[1]["event"], "trail");
+    assert_eq!(bodies[1]["action"], "updated");
+    assert_eq!(bodies[1]["cause"], "review_request_removed");
+}

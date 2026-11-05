@@ -501,6 +501,19 @@ async fn emitters_deliver_the_spec_envelope() {
         ],
     )
     .await;
+    // The push scan runs asynchronously after `git push` returns; its
+    // branch-move pass must finish before any change exists, or it would
+    // append a second revision. Push events are emitted in the same pass,
+    // so four delivered push events mean the scan is done.
+    let pushed = delivered_until(&c, &sink, &secret, 0, |got| {
+        got.iter().filter(|b| b["event"] == "push").count() == 4
+    })
+    .await;
+    assert_eq!(
+        pushed.iter().filter(|b| b["event"] == "push").count(),
+        4,
+        "one push event per pushed ref: {pushed:?}"
+    );
     let tip_a = git_ok(&work, &["rev-parse", "feature/a"])
         .await
         .trim()
@@ -535,7 +548,14 @@ async fn emitters_deliver_the_spec_envelope() {
         .send()
         .await
         .unwrap();
-    assert_eq!(res.status(), 201, "{}", res.text().await.unwrap());
+    assert_eq!(res.status(), 201);
+    let opened = res.json::<Value>().await.unwrap();
+    // Proves the current revision before the default review below: with the
+    // initial scan drained above, the new change opens at revision 1.
+    assert_eq!(
+        opened["current_revision"], 1,
+        "new change opens at revision 1: {opened:?}"
+    );
     let res = client
         .post(c.s.url(&format!(
             "/api/v1/repos/alice/proj/trails/{a}/changes/1/reviews"
@@ -554,6 +574,32 @@ async fn emitters_deliver_the_spec_envelope() {
         .await
         .unwrap();
     assert_eq!(res.status(), 201);
+    // A new commit on the tracked branch appends revision 2. It is empty
+    // on purpose: a content change would move main's tree on merge and
+    // poison trail C's later merge (both sides would differ from base A1).
+    // The pointer-based wait proves the scan landed before asserting.
+    git_ok(&work, &["checkout", "-q", "feature/a"]).await;
+    git_ok(&work, &["commit", "-q", "--allow-empty", "-m", "a v2"]).await;
+    git_ok(&work, &["push", "-q", &url, "feature/a"]).await;
+    let repo_id =
+        c.s.core
+            .repo_for(Some(&c.alice), "alice", "proj")
+            .await
+            .unwrap()
+            .repo
+            .id;
+    let trail_row = starforged_db::trails::trail_by_number(c.s.core.db(), repo_id, a)
+        .await
+        .unwrap()
+        .expect("trail A exists");
+    let change_id = starforged_db::changes::changes_of_trail(c.s.core.db(), trail_row.id)
+        .await
+        .unwrap()
+        .iter()
+        .find(|row| row.number == 1)
+        .expect("change 1 exists")
+        .id;
+    wait_for_current_revision(&c.s, change_id, 2).await;
     let res = client
         .post(c.s.url(&format!(
             "/api/v1/repos/alice/proj/trails/{a}/changes/1/merge"
@@ -655,8 +701,23 @@ async fn emitters_deliver_the_spec_envelope() {
     assert_eq!(subject["url"], format!("{repo_url}/trails/{a}"));
     assert!(subject.get("change").is_none());
 
+    // Opening a branch change emits exactly one trail event.
+    let opened_change: Vec<&Value> = bodies
+        .iter()
+        .filter(|b| {
+            b["event"] == "trail"
+                && b["action"] == "updated"
+                && b["cause"] == "change_opened"
+                && b["trail"]["number"] == a
+        })
+        .collect();
+    assert_eq!(
+        opened_change.len(),
+        1,
+        "opening a change emits exactly one event: {bodies:?}"
+    );
     let subject = check_envelope(
-        &find("trail", Some("updated"), Some("change_opened")),
+        opened_change[0],
         "trail",
         Some("updated"),
         Some("change_opened"),
@@ -667,8 +728,20 @@ async fn emitters_deliver_the_spec_envelope() {
     assert_eq!(subject["change"]["k"], 1);
     assert_eq!(subject["change"]["revision"], 1);
 
+    // revision_pushed fires only for the deliberate second push: exactly
+    // one, with revision 2.
+    let pushed: Vec<&Value> = bodies
+        .iter()
+        .filter(|b| {
+            b["event"] == "trail"
+                && b["action"] == "updated"
+                && b["cause"] == "revision_pushed"
+                && b["trail"]["number"] == a
+        })
+        .collect();
+    assert_eq!(pushed.len(), 1, "exactly one revision_pushed: {bodies:?}");
     let subject = check_envelope(
-        &find("trail", Some("updated"), Some("revision_pushed")),
+        pushed[0],
         "trail",
         Some("updated"),
         Some("revision_pushed"),
@@ -677,6 +750,7 @@ async fn emitters_deliver_the_spec_envelope() {
     );
     assert_eq!(subject["number"], a);
     assert_eq!(subject["change"]["k"], 1);
+    assert_eq!(subject["change"]["revision"], 2);
 
     let subject = check_envelope(
         &find("review", Some("submitted"), None),
@@ -1143,6 +1217,34 @@ async fn settings_page_shows_secret_once() {
     );
 }
 
+/// Pointer-based wait for a change's current revision: the revision row
+/// lands before the change's current-revision pointer moves, so a bare row
+/// count can read stale. Same approach as web_changes.rs.
+async fn wait_for_current_revision(s: &TestServer, change_id: i64, expected: i64) {
+    let start = std::time::Instant::now();
+    loop {
+        let pointed = starforged_db::changes::change_by_id(s.core.db(), change_id)
+            .await
+            .unwrap()
+            .and_then(|row| row.current_revision_id);
+        let number = match pointed {
+            Some(id) => starforged_db::changes::revision_by_id(s.core.db(), id)
+                .await
+                .unwrap()
+                .map(|row| row.number),
+            None => None,
+        };
+        if number == Some(expected) {
+            return;
+        }
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(10),
+            "timed out waiting for current revision {expected}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
 /// Drains due webhook jobs and returns the verified envelopes delivered
 /// since `from` (index into `sink.hits`).
 async fn delivered_from(c: &Ctx, sink: &Sink, secret: &str, from: usize) -> Vec<Value> {
@@ -1452,14 +1554,19 @@ async fn trail_label_assignee_change_state_events() {
     git_ok(&work, &["checkout", "-q", "-b", "feature/k"]).await;
     commit_files(&work, &[("a.txt", b"one\ntwo\n")], "add two").await;
     git_ok(&work, &["push", "-q", &url, "main", "feature/k"]).await;
-    core.create_branch_change(&c.alice, "alice", "proj", t.number, "feature/k", "main")
-        .await
-        .unwrap();
-    // Branch pushes also emit push events; wait for both, then skip past them.
+    // The push scan runs asynchronously; wait for both push events before
+    // the change exists, so no late scan revision can pollute the exact
+    // counts below.
     delivered_until(&c, &sink, &secret, from, |got| {
         got.iter().filter(|b| b["event"] == "push").count() == 2
     })
     .await;
+    core.create_branch_change(&c.alice, "alice", "proj", t.number, "feature/k", "main")
+        .await
+        .unwrap();
+    // Drain the creation events (trail opened, change opened): `from`
+    // counts delivered hits, and these jobs are still pending.
+    delivered_from(&c, &sink, &secret, from).await;
     from = hits(&sink);
 
     core.set_change_state(&c.alice, "alice", "proj", t.number, 1, "closed")
@@ -1519,6 +1626,14 @@ async fn review_dismissal_events() {
     git_ok(&work, &["checkout", "-q", "-b", "feature/d"]).await;
     commit_files(&work, &[("a.txt", b"one\ntwo\n")], "add two").await;
     git_ok(&work, &["push", "-q", &url, "main", "feature/d"]).await;
+    let mut from = hits(&sink);
+    // The push scan runs asynchronously; wait for both push events before
+    // the change exists, so no late scan revision can move the review off
+    // revision 1 or pollute the exact counts below.
+    delivered_until(&c, &sink, &secret, from, |got| {
+        got.iter().filter(|b| b["event"] == "push").count() == 2
+    })
+    .await;
 
     let t = core
         .create_trail(&c.alice, "alice", "proj", "dismiss", "why")
@@ -1542,13 +1657,9 @@ async fn review_dismissal_events() {
         )
         .await
         .unwrap();
-    let mut from = hits(&sink);
-    // The branch push's events arrive asynchronously; wait for both before
-    // the dismissal steps below assert exact counts.
-    delivered_until(&c, &sink, &secret, from, |got| {
-        got.iter().filter(|b| b["event"] == "push").count() == 2
-    })
-    .await;
+    // Drain the creation events (trail opened, change opened): `from`
+    // counts delivered hits, and these jobs are still pending.
+    delivered_from(&c, &sink, &secret, from).await;
     from = hits(&sink);
 
     // Explicit dismissal names the dismisser as sender.
@@ -1744,26 +1855,67 @@ async fn push_events_cover_create_update_delete_tag_and_skip_non_branch_refs() {
     assert_eq!(subject["deleted"], true);
     from = hits(&sink);
 
-    // A refs/for push ingests a trail change and never emits push.
+    // A refs/for push ingests a trail change and never emits push. Opening
+    // the agit change emits exactly one trail event.
     git_ok(&work, &["push", "-q", &url, "HEAD:refs/for/main"]).await;
-    let got = delivered_until(&c, &sink, &secret, from, |got| {
+    delivered_until(&c, &sink, &secret, from, |got| {
         got.iter().any(|b| {
-            b["event"] == "trail"
-                && (b["action"] == "opened"
-                    || (b["action"] == "updated" && b["cause"] == "change_opened"))
+            b["event"] == "trail" && b["action"] == "updated" && b["cause"] == "change_opened"
         })
     })
     .await;
+    // One more drain: the open and its (removed) double would arrive
+    // together, so count only after everything due has landed.
+    c.s.core.run_due_jobs().await.unwrap();
+    let got = delivered_from(&c, &sink, &secret, from).await;
+    assert_eq!(
+        got.len(),
+        1,
+        "opening an agit change emits exactly one event: {got:?}"
+    );
     assert!(
         got.iter().all(|b| b["event"] != "push"),
         "refs/for pushes never emit push: {got:?}"
     );
-    assert!(
-        got.iter().any(|b| b["event"] == "trail"
-            && (b["action"] == "opened"
-                || (b["action"] == "updated" && b["cause"] == "change_opened"))),
-        "refs/for pushes still emit trail: {got:?}"
+    let subject = check_envelope(
+        &got[0],
+        "trail",
+        Some("updated"),
+        Some("change_opened"),
+        "alice",
+        &repo_url,
     );
+    assert_eq!(subject["change"]["k"], 1);
+    assert_eq!(subject["change"]["revision"], 1);
+    from = hits(&sink);
+
+    // A second refs/for push with new content appends revision 2 to the
+    // same change: exactly one revision_pushed.
+    commit_files(&work, &[("a.txt", b"one\ntwo\nthree\nfour\n")], "add four").await;
+    git_ok(&work, &["push", "-q", &url, "HEAD:refs/for/main"]).await;
+    delivered_until(&c, &sink, &secret, from, |got| {
+        got.iter().any(|b| {
+            b["event"] == "trail" && b["action"] == "updated" && b["cause"] == "revision_pushed"
+        })
+    })
+    .await;
+    c.s.core.run_due_jobs().await.unwrap();
+    let got = delivered_from(&c, &sink, &secret, from).await;
+    assert_eq!(
+        got.len(),
+        1,
+        "a second agit push emits exactly one event: {got:?}"
+    );
+    let subject = check_envelope(
+        &got[0],
+        "trail",
+        Some("updated"),
+        Some("revision_pushed"),
+        "alice",
+        &repo_url,
+    );
+    assert_eq!(subject["change"]["k"], 1);
+    assert_eq!(subject["change"]["revision"], 2);
     from = hits(&sink);
 
     // Server-side trail refs and refs/for names never emit push, even direct.

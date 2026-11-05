@@ -367,6 +367,49 @@ pub async fn assignees_of(db: &Db, trail_id: i64) -> DbResult<Vec<i64>> {
     Ok(ids)
 }
 
+/// Records a review request; `false` when one already exists for the pair.
+pub async fn add_review_request(
+    db: &Db,
+    trail_id: i64,
+    user_id: i64,
+    requested_by: i64,
+    now: i64,
+) -> DbResult<bool> {
+    match sqlx::query(
+        "INSERT INTO trail_review_requests (trail_id, user_id, requested_by, created_at) VALUES ($1, $2, $3, $4)",
+    )
+    .bind(trail_id)
+    .bind(user_id)
+    .bind(requested_by)
+    .bind(now)
+    .execute(db.pool())
+    .await
+    {
+        Ok(_) => Ok(true),
+        Err(sqlx::Error::Database(d)) if d.is_unique_violation() => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
+pub async fn remove_review_request(db: &Db, trail_id: i64, user_id: i64) -> DbResult<bool> {
+    let r = sqlx::query("DELETE FROM trail_review_requests WHERE trail_id = $1 AND user_id = $2")
+        .bind(trail_id)
+        .bind(user_id)
+        .execute(db.pool())
+        .await?;
+    Ok(r.rows_affected() > 0)
+}
+
+pub async fn review_requests_of(db: &Db, trail_id: i64) -> DbResult<Vec<i64>> {
+    let ids: Vec<i64> = sqlx::query_scalar(
+        "SELECT user_id FROM trail_review_requests WHERE trail_id = $1 ORDER BY user_id ASC",
+    )
+    .bind(trail_id)
+    .fetch_all(db.pool())
+    .await?;
+    Ok(ids)
+}
+
 pub async fn insert_comment(
     db: &Db,
     trail_id: i64,
@@ -780,6 +823,36 @@ mod tests {
         assert!(remove_assignee(&t.db, trail.id, bob).await.unwrap());
         assert!(!remove_assignee(&t.db, trail.id, bob).await.unwrap());
         assert!(assignees_of(&t.db, trail.id).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn review_requests_add_remove() {
+        let (t, alice, bob, repo_id) = setup().await;
+        let trail = insert_trail(&t.db, &new_trail(repo_id, alice, "one"), 1_700_000_000)
+            .await
+            .unwrap();
+        assert!(
+            add_review_request(&t.db, trail.id, bob, alice, 1_700_000_001)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !add_review_request(&t.db, trail.id, bob, alice, 1_700_000_002)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            review_requests_of(&t.db, trail.id).await.unwrap(),
+            vec![bob]
+        );
+        assert!(remove_review_request(&t.db, trail.id, bob).await.unwrap());
+        assert!(!remove_review_request(&t.db, trail.id, bob).await.unwrap());
+        assert!(
+            review_requests_of(&t.db, trail.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

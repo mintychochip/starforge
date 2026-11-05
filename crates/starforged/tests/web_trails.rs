@@ -534,3 +534,63 @@ async fn state_control_and_ready_toggle() {
             .contains("ready")
     );
 }
+
+/// M2e K4: the Reviewers section round-trips through the form (303), forged
+/// CSRF is 403, and a read user sees no reviewer forms.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reviewers_section_round_trip() {
+    let c = Ctx::start().await;
+    let n = c.create("review me", "intent").await;
+    let (bob, _) = c.s.login("bob").await;
+    let page = get_text(&bob, &c.trail(n)).await;
+    assert!(
+        page.contains("add-reviewer"),
+        "triage sees the request form"
+    );
+    let csrf = extract_input(&page, "_csrf");
+
+    let added = bob
+        .post(c.trail(n) + "/review-requests")
+        .form(&[
+            ("_csrf", csrf.as_str()),
+            ("action", "add"),
+            ("handle", "carol"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(added.status(), 303);
+    let detail = get_text(&bob, &c.trail(n)).await;
+    assert!(detail.contains("Reviewers"), "Reviewers section renders");
+    assert!(detail.contains("requested a review from carol"));
+
+    // A forged CSRF token is 403 and writes nothing.
+    let forged = bob
+        .post(c.trail(n) + "/review-requests")
+        .form(&[("_csrf", "wrong"), ("action", "add"), ("handle", "bob")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(forged.status(), 403);
+
+    // Removing round-trips too.
+    let removed = bob
+        .post(c.trail(n) + "/review-requests")
+        .form(&[
+            ("_csrf", csrf.as_str()),
+            ("action", "remove"),
+            ("handle", "carol"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(removed.status(), 303);
+
+    // A read user sees no reviewer forms.
+    let (carol, _) = c.s.login("carol").await;
+    let read_detail = get_text(&carol, &c.trail(n)).await;
+    assert!(
+        !read_detail.contains("add-reviewer"),
+        "read user must not see the request form"
+    );
+}

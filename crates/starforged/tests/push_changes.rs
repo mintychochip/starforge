@@ -120,7 +120,12 @@ async fn wait_for_revisions(
         let revs = starforged_db::changes::revisions_of_change(s.core.db(), change_id)
             .await
             .unwrap();
-        if revs.len() == expected {
+        // The revision row lands before the change's current-revision pointer
+        // moves, so a bare count can render the stale revision. Wait for the
+        // pointer too.
+        if revs.len() == expected
+            && current_revision_number(s, change_id).await == Some(expected as i64)
+        {
             return revs;
         }
         assert!(
@@ -130,6 +135,17 @@ async fn wait_for_revisions(
         );
         sleep(Duration::from_millis(50)).await;
     }
+}
+
+async fn current_revision_number(s: &TestServer, change_id: i64) -> Option<i64> {
+    let change = starforged_db::changes::change_by_id(s.core.db(), change_id)
+        .await
+        .unwrap()?;
+    let current = change.current_revision_id?;
+    starforged_db::changes::revision_by_id(s.core.db(), current)
+        .await
+        .unwrap()
+        .map(|r| r.number)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

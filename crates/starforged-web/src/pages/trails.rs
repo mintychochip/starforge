@@ -386,6 +386,7 @@ pub struct TrailPage {
     author_handle: String,
     labels: Vec<String>,
     assignees: Vec<String>,
+    review_requests: Vec<String>,
     created: String,
     updated: String,
     closed: Option<String>,
@@ -472,6 +473,7 @@ pub(crate) async fn detail_view(
         author_handle: trail.author_handle.clone(),
         labels: trail.labels.clone(),
         assignees: trail.assignees.clone(),
+        review_requests: trail.review_requests.clone(),
         created: format_time(trail.created_at),
         updated: format_time(trail.updated_at),
         closed: trail.closed_at.map(format_time),
@@ -529,6 +531,14 @@ fn timeline_text(kind: &str, payload: &str, actor: &str) -> String {
                 Some("remove") => format!("{actor} unassigned {who}"),
                 _ => format!("{actor} assigned {who}"),
             }
+        }
+        "trail.review_requested" => {
+            let who = field("user").unwrap_or("someone");
+            format!("{actor} requested a review from {who}")
+        }
+        "trail.review_request_removed" => {
+            let who = field("user").unwrap_or("someone");
+            format!("{actor} removed the review request for {who}")
         }
         "trail.edit" => {
             let fields = value
@@ -807,6 +817,51 @@ pub async fn set_assignee(
             state
                 .core
                 .remove_assignee(&session.user, &owner, &repo, number, &form.handle)
+                .await?;
+        }
+        _ => return Err(WebError::BadRequest("unknown action".into())),
+    }
+    let access = state
+        .core
+        .repo_for(Some(&session.user), &owner, &repo)
+        .await?;
+    Ok(Redirect::to(&format!(
+        "/{}/{}/trails/{number}",
+        access.repo.owner, access.repo.name
+    ))
+    .into_response())
+}
+
+#[derive(Deserialize)]
+pub struct ReviewerForm {
+    #[serde(rename = "_csrf", default)]
+    csrf: String,
+    #[serde(default)]
+    action: String,
+    #[serde(default)]
+    handle: String,
+}
+
+/// `POST /{owner}/{repo}/trails/{number}/review-requests`: triage-only
+/// add/remove via the `action` field. Unknown users are 400.
+pub async fn set_review_request(
+    State(state): State<AppState>,
+    RequireUser(session): RequireUser,
+    Path((owner, repo, number)): Path<(String, String, i64)>,
+    Form(form): Form<ReviewerForm>,
+) -> Result<Response, WebError> {
+    verify_csrf(&session.csrf_token, &form.csrf)?;
+    match form.action.as_str() {
+        "add" => {
+            state
+                .core
+                .request_review(&session.user, &owner, &repo, number, &form.handle)
+                .await?;
+        }
+        "remove" => {
+            state
+                .core
+                .remove_review_request(&session.user, &owner, &repo, number, &form.handle)
                 .await?;
         }
         _ => return Err(WebError::BadRequest("unknown action".into())),

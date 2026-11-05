@@ -40,6 +40,23 @@ opened by {% if author_handle == "deleted user" %}deleted user{% else %}<a href=
   </form>
 {% endif %}
 </div>
+<div class="reviewers">
+  Reviewers:{% for r in review_requests %} <a href="/{{ r }}">{{ r }}</a>{% if can_triage %}
+  <form method="post" action="/{{ head.owner }}/{{ head.name }}/trails/{{ number }}/review-requests" class="inline">
+    <input type="hidden" name="_csrf" value="{{ csrf }}">
+    <input type="hidden" name="action" value="remove">
+    <input type="hidden" name="handle" value="{{ r }}">
+    <button type="submit" aria-label="Remove review request {{ r }}">×</button>
+  </form>{% endif %}{% endfor %}
+{% if can_triage %}
+  <form method="post" action="/{{ head.owner }}/{{ head.name }}/trails/{{ number }}/review-requests" class="inline" id="add-reviewer">
+    <input type="hidden" name="_csrf" value="{{ csrf }}">
+    <input type="hidden" name="action" value="add">
+    <input type="text" name="handle" placeholder="reviewer handle">
+    <button type="submit">Request review</button>
+  </form>
+{% endif %}
+</div>
 {% if can_edit %}
 <details id="edit-trail">
   <summary>Edit trail</summary>

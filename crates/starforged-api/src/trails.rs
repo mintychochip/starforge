@@ -40,6 +40,7 @@ pub struct TrailJson {
     pub author_id: Option<i64>,
     pub labels: Vec<String>,
     pub assignees: Vec<String>,
+    pub review_requests: Vec<String>,
     pub created_at: String,
     pub updated_at: String,
     pub closed_at: Option<String>,
@@ -57,6 +58,7 @@ fn trail_json(view: &TrailView) -> TrailJson {
         author_id: view.author_id,
         labels: view.labels.clone(),
         assignees: view.assignees.clone(),
+        review_requests: view.review_requests.clone(),
         created_at: rfc3339(view.created_at),
         updated_at: rfc3339(view.updated_at),
         closed_at: opt_ts(view.closed_at),
@@ -397,6 +399,45 @@ pub async fn remove_assignee(
     let view = state
         .core
         .remove_assignee(&auth.user, &owner, &repo, number, &body.user)
+        .await?;
+    Ok(Json(trail_json(&view)))
+}
+
+#[derive(Deserialize)]
+pub struct ReviewRequestBody {
+    pub user: String,
+}
+
+/// `POST /repos/{owner}/{repo}/trails/{n}/review-requests`: idempotent add.
+/// The handle must belong to a repository member and not be the Trail author;
+/// unknown handles, strangers, and the author answer `422`, never `404`.
+pub async fn add_review_request(
+    State(state): State<ApiState>,
+    auth: ApiAuth,
+    Path((owner, repo, number)): Path<(String, String, i64)>,
+    body: Result<Json<ReviewRequestBody>, JsonRejection>,
+) -> Result<Json<TrailJson>, ApiError> {
+    let auth = auth.require(Scope::TrailWrite)?;
+    let Json(body) = body.map_err(|e| ApiError::Invalid(e.body_text()))?;
+    let view = state
+        .core
+        .request_review(&auth.user, &owner, &repo, number, &body.user)
+        .await?;
+    Ok(Json(trail_json(&view)))
+}
+
+/// `DELETE /repos/{owner}/{repo}/trails/{n}/review-requests`: symmetric with POST.
+pub async fn remove_review_request(
+    State(state): State<ApiState>,
+    auth: ApiAuth,
+    Path((owner, repo, number)): Path<(String, String, i64)>,
+    body: Result<Json<ReviewRequestBody>, JsonRejection>,
+) -> Result<Json<TrailJson>, ApiError> {
+    let auth = auth.require(Scope::TrailWrite)?;
+    let Json(body) = body.map_err(|e| ApiError::Invalid(e.body_text()))?;
+    let view = state
+        .core
+        .remove_review_request(&auth.user, &owner, &repo, number, &body.user)
         .await?;
     Ok(Json(trail_json(&view)))
 }

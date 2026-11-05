@@ -136,6 +136,10 @@ pub fn router(core: Core, base_url: String) -> Router {
             post(trails::add_assignee).delete(trails::remove_assignee),
         )
         .route(
+            "/repos/{owner}/{repo}/trails/{n}/review-requests",
+            post(trails::add_review_request).delete(trails::remove_review_request),
+        )
+        .route(
             "/repos/{owner}/{repo}/changes",
             get(changes::list_changes_by_head),
         )
