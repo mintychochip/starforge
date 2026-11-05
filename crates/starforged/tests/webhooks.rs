@@ -1115,3 +1115,771 @@ async fn settings_page_shows_secret_once() {
             .is_empty()
     );
 }
+
+/// Drains due webhook jobs and returns the verified envelopes delivered
+/// since `from` (index into `sink.hits`).
+async fn delivered_from(c: &Ctx, sink: &Sink, secret: &str, from: usize) -> Vec<Value> {
+    c.s.core.run_due_jobs().await.unwrap();
+    sink.hits
+        .lock()
+        .unwrap()
+        .iter()
+        .skip(from)
+        .map(|hit| check_delivery(hit, secret))
+        .collect()
+}
+
+fn hits(sink: &Sink) -> usize {
+    sink.hits.lock().unwrap().len()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn trail_edit_ready_reopen_events() {
+    let c = Ctx::start().await;
+    let (sink_url, sink) = Sink::spawn(false).await;
+    let created = c.create_hook(&c.alice_rw, &sink_url, &[]).await;
+    let secret = created["secret"].as_str().unwrap().to_owned();
+    let repo_url = format!("{}/alice/proj", c.s.base);
+    let core = &c.s.core;
+
+    let t = core
+        .create_trail(&c.alice, "alice", "proj", "orig", "why")
+        .await
+        .unwrap();
+    let mut from = hits(&sink);
+    let got = delivered_from(&c, &sink, &secret, from).await;
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0]["event"], json!("trail"));
+    assert_eq!(got[0]["action"], json!("opened"));
+    from = hits(&sink);
+
+    // Title edit -> updated/edited.
+    core.update_trail(
+        &c.alice,
+        "alice",
+        "proj",
+        t.number,
+        Some("renamed"),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let got = delivered_from(&c, &sink, &secret, from).await;
+    assert_eq!(got.len(), 1, "one event per edit: {got:?}");
+    let subject = check_envelope(
+        &got[0],
+        "trail",
+        Some("updated"),
+        Some("edited"),
+        "alice",
+        &repo_url,
+    );
+    assert_eq!(subject["title"], "renamed");
+    from = hits(&sink);
+
+    // Idempotent repeat -> nothing.
+    core.update_trail(
+        &c.alice,
+        "alice",
+        "proj",
+        t.number,
+        Some("renamed"),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let got = delivered_from(&c, &sink, &secret, from).await;
+    assert!(got.is_empty(), "idempotent edit emits nothing: {got:?}");
+
+    // Intent edit -> updated/edited.
+    core.update_trail(
+        &c.alice,
+        "alice",
+        "proj",
+        t.number,
+        None,
+        Some("new why"),
+        None,
+    )
+    .await
+    .unwrap();
+    let got = delivered_from(&c, &sink, &secret, from).await;
+    assert_eq!(got.len(), 1);
+    check_envelope(
+        &got[0],
+        "trail",
+        Some("updated"),
+        Some("edited"),
+        "alice",
+        &repo_url,
+    );
+    from = hits(&sink);
+
+    // Title + ready in one call -> exactly one event, and ready wins.
+    core.update_trail(
+        &c.alice,
+        "alice",
+        "proj",
+        t.number,
+        Some("v2"),
+        Some("w2"),
+        Some(true),
+    )
+    .await
+    .unwrap();
+    let got = delivered_from(&c, &sink, &secret, from).await;
+    assert_eq!(got.len(), 1, "one event for a multi-field update: {got:?}");
+    check_envelope(&got[0], "trail", Some("ready"), None, "alice", &repo_url);
+    from = hits(&sink);
+
+    // Ready cleared -> updated/ready_cleared.
+    core.update_trail(&c.alice, "alice", "proj", t.number, None, None, Some(false))
+        .await
+        .unwrap();
+    let got = delivered_from(&c, &sink, &secret, from).await;
+    assert_eq!(got.len(), 1);
+    check_envelope(
+        &got[0],
+        "trail",
+        Some("updated"),
+        Some("ready_cleared"),
+        "alice",
+        &repo_url,
+    );
+    from = hits(&sink);
+
+    // Close (K1) then reopen -> updated/reopened. Reopening again -> nothing.
+    core.set_trail_state(&c.alice, "alice", "proj", t.number, "closed")
+        .await
+        .unwrap();
+    let got = delivered_from(&c, &sink, &secret, from).await;
+    assert_eq!(got.len(), 1);
+    check_envelope(&got[0], "trail", Some("closed"), None, "alice", &repo_url);
+    from = hits(&sink);
+    core.set_trail_state(&c.alice, "alice", "proj", t.number, "open")
+        .await
+        .unwrap();
+    let got = delivered_from(&c, &sink, &secret, from).await;
+    assert_eq!(got.len(), 1, "reopen emits one event: {got:?}");
+    let subject = check_envelope(
+        &got[0],
+        "trail",
+        Some("updated"),
+        Some("reopened"),
+        "alice",
+        &repo_url,
+    );
+    assert_eq!(subject["state"], "open");
+    from = hits(&sink);
+    core.set_trail_state(&c.alice, "alice", "proj", t.number, "open")
+        .await
+        .unwrap();
+    let got = delivered_from(&c, &sink, &secret, from).await;
+    assert!(
+        got.is_empty(),
+        "reopening an open trail emits nothing: {got:?}"
+    );
+    let _ = from;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn trail_label_assignee_change_state_events() {
+    let c = Ctx::start().await;
+    let (sink_url, sink) = Sink::spawn(false).await;
+    let created = c.create_hook(&c.alice_rw, &sink_url, &[]).await;
+    let secret = created["secret"].as_str().unwrap().to_owned();
+    let repo_url = format!("{}/alice/proj", c.s.base);
+    let core = &c.s.core;
+    let bob = core
+        .user_by_handle("bob")
+        .await
+        .unwrap()
+        .expect("bob exists");
+
+    let t = core
+        .create_trail(&c.alice, "alice", "proj", "labeled", "why")
+        .await
+        .unwrap();
+    let mut from = hits(&sink);
+    delivered_from(&c, &sink, &secret, from).await;
+    from = hits(&sink);
+
+    core.add_label(&c.alice, "alice", "proj", t.number, "Bug")
+        .await
+        .unwrap();
+    let got = delivered_from(&c, &sink, &secret, from).await;
+    assert_eq!(got.len(), 1);
+    check_envelope(
+        &got[0],
+        "trail",
+        Some("updated"),
+        Some("labeled"),
+        "alice",
+        &repo_url,
+    );
+    from = hits(&sink);
+    // Duplicate add is a no-op row-wise, so it dispatches nothing.
+    core.add_label(&c.alice, "alice", "proj", t.number, "bug")
+        .await
+        .unwrap();
+    let got = delivered_from(&c, &sink, &secret, from).await;
+    assert!(got.is_empty(), "duplicate label emits nothing: {got:?}");
+    core.remove_label(&c.alice, "alice", "proj", t.number, "BUG")
+        .await
+        .unwrap();
+    let got = delivered_from(&c, &sink, &secret, from).await;
+    assert_eq!(got.len(), 1);
+    check_envelope(
+        &got[0],
+        "trail",
+        Some("updated"),
+        Some("unlabeled"),
+        "alice",
+        &repo_url,
+    );
+    from = hits(&sink);
+    core.remove_label(&c.alice, "alice", "proj", t.number, "bug")
+        .await
+        .unwrap();
+    let got = delivered_from(&c, &sink, &secret, from).await;
+    assert!(
+        got.is_empty(),
+        "removing a missing label emits nothing: {got:?}"
+    );
+
+    core.add_assignee(&c.alice, "alice", "proj", t.number, "bob")
+        .await
+        .unwrap();
+    let got = delivered_from(&c, &sink, &secret, from).await;
+    assert_eq!(got.len(), 1);
+    check_envelope(
+        &got[0],
+        "trail",
+        Some("updated"),
+        Some("assigned"),
+        "alice",
+        &repo_url,
+    );
+    from = hits(&sink);
+    core.add_assignee(&c.alice, "alice", "proj", t.number, "BOB")
+        .await
+        .unwrap();
+    let got = delivered_from(&c, &sink, &secret, from).await;
+    assert!(got.is_empty(), "duplicate assignee emits nothing: {got:?}");
+    core.remove_assignee(&c.alice, "alice", "proj", t.number, "bob")
+        .await
+        .unwrap();
+    let got = delivered_from(&c, &sink, &secret, from).await;
+    assert_eq!(got.len(), 1);
+    check_envelope(
+        &got[0],
+        "trail",
+        Some("updated"),
+        Some("unassigned"),
+        "alice",
+        &repo_url,
+    );
+    from = hits(&sink);
+
+    // A branch change gives close/reopen something to point at.
+    let url = c.s.git_url(
+        "alice",
+        "proj",
+        Some(&c.s.token(&c.alice, &[Scope::RepoWrite]).await),
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    let work = work_repo(tmp.path(), "work", &[("a.txt", "one\n")]).await;
+    git_ok(&work, &["checkout", "-q", "-b", "feature/k"]).await;
+    commit_files(&work, &[("a.txt", b"one\ntwo\n")], "add two").await;
+    git_ok(&work, &["push", "-q", &url, "main", "feature/k"]).await;
+    core.create_branch_change(&c.alice, "alice", "proj", t.number, "feature/k", "main")
+        .await
+        .unwrap();
+    delivered_from(&c, &sink, &secret, from).await;
+    // Branch pushes also emit push events; skip past them.
+    from = hits(&sink);
+
+    core.set_change_state(&c.alice, "alice", "proj", t.number, 1, "closed")
+        .await
+        .unwrap();
+    let got = delivered_from(&c, &sink, &secret, from).await;
+    assert_eq!(got.len(), 1, "change close emits one event: {got:?}");
+    let subject = check_envelope(
+        &got[0],
+        "trail",
+        Some("updated"),
+        Some("change_closed"),
+        "alice",
+        &repo_url,
+    );
+    assert_eq!(subject["change"]["k"], 1);
+    assert_eq!(subject["change"]["revision"], 1);
+    from = hits(&sink);
+    core.set_change_state(&c.alice, "alice", "proj", t.number, 1, "open")
+        .await
+        .unwrap();
+    let got = delivered_from(&c, &sink, &secret, from).await;
+    assert_eq!(got.len(), 1, "change reopen emits one event: {got:?}");
+    let subject = check_envelope(
+        &got[0],
+        "trail",
+        Some("updated"),
+        Some("change_reopened"),
+        "alice",
+        &repo_url,
+    );
+    assert_eq!(subject["change"]["k"], 1);
+    let _ = (bob, from);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_dismissal_events() {
+    let c = Ctx::start().await;
+    let (sink_url, sink) = Sink::spawn(false).await;
+    let created = c.create_hook(&c.alice_rw, &sink_url, &[]).await;
+    let secret = created["secret"].as_str().unwrap().to_owned();
+    let repo_url = format!("{}/alice/proj", c.s.base);
+    let core = &c.s.core;
+    let bob = core
+        .user_by_handle("bob")
+        .await
+        .unwrap()
+        .expect("bob exists");
+
+    let url = c.s.git_url(
+        "alice",
+        "proj",
+        Some(&c.s.token(&c.alice, &[Scope::RepoWrite]).await),
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    let work = work_repo(tmp.path(), "work", &[("a.txt", "one\n")]).await;
+    git_ok(&work, &["checkout", "-q", "-b", "feature/d"]).await;
+    commit_files(&work, &[("a.txt", b"one\ntwo\n")], "add two").await;
+    git_ok(&work, &["push", "-q", &url, "main", "feature/d"]).await;
+
+    let t = core
+        .create_trail(&c.alice, "alice", "proj", "dismiss", "why")
+        .await
+        .unwrap();
+    core.create_branch_change(&c.alice, "alice", "proj", t.number, "feature/d", "main")
+        .await
+        .unwrap();
+    let (review, _) = core
+        .submit_review(
+            &c.alice,
+            "alice",
+            "proj",
+            t.number,
+            1,
+            None,
+            "approve",
+            "lgtm",
+            None,
+            &[],
+        )
+        .await
+        .unwrap();
+    let mut from = hits(&sink);
+    delivered_from(&c, &sink, &secret, from).await;
+    from = hits(&sink);
+
+    // Explicit dismissal names the dismisser as sender.
+    core.dismiss_review(&bob, "alice", "proj", t.number, 1, review.id)
+        .await
+        .unwrap();
+    let got = delivered_from(&c, &sink, &secret, from).await;
+    assert_eq!(got.len(), 1, "explicit dismissal emits one event: {got:?}");
+    assert!(
+        got[0]["sender"] == json!({"handle": "bob"}),
+        "sender is the dismisser: {got:?}"
+    );
+    let subject = check_envelope(&got[0], "review", Some("dismissed"), None, "bob", &repo_url);
+    assert_eq!(subject["id"], review.id);
+    assert_eq!(subject["trail"], t.number);
+    assert_eq!(subject["change"], 1);
+    assert_eq!(subject["revision"], 1);
+    assert_eq!(subject["verdict"], "approve");
+    assert_eq!(subject["state"], "dismissed");
+    assert_eq!(subject["author"], "alice");
+    assert_eq!(subject["body"], "lgtm");
+    from = hits(&sink);
+    // Dismissing again is a no-op row-wise, so it dispatches nothing.
+    core.dismiss_review(&bob, "alice", "proj", t.number, 1, review.id)
+        .await
+        .unwrap();
+    let got = delivered_from(&c, &sink, &secret, from).await;
+    assert!(got.is_empty(), "repeat dismissal emits nothing: {got:?}");
+
+    // Automatic dismiss-on-push: sender is null, one event per dismissed review.
+    let repo_id = core
+        .repo_for(Some(&c.alice), "alice", "proj")
+        .await
+        .unwrap()
+        .repo
+        .id;
+    starforged_db::checks::insert_gate_rule(
+        core.db(),
+        repo_id,
+        None,
+        1,
+        true,
+        false,
+        "[]",
+        false,
+        false,
+        false,
+        "[]",
+        starforged_db::now(),
+    )
+    .await
+    .unwrap();
+    let (review2, _) = core
+        .submit_review(
+            &c.alice,
+            "alice",
+            "proj",
+            t.number,
+            1,
+            None,
+            "approve",
+            "still lgtm",
+            None,
+            &[],
+        )
+        .await
+        .unwrap();
+    delivered_from(&c, &sink, &secret, from).await;
+    from = hits(&sink);
+    let (zero, one) = ("0".repeat(40), "1".repeat(40));
+    core.record_branch_move(
+        repo_id,
+        "feature/d",
+        Some(zero.as_str()),
+        &one,
+        Some(bob.id),
+    )
+    .await
+    .unwrap();
+    let got = delivered_from(&c, &sink, &secret, from).await;
+    let dismissed: Vec<&Value> = got
+        .iter()
+        .filter(|b| b["event"] == "review" && b["action"] == "dismissed")
+        .collect();
+    assert_eq!(dismissed.len(), 1, "one auto-dismissal event: {got:?}");
+    assert!(
+        dismissed[0]["sender"].is_null(),
+        "auto-dismissal sender is null: {got:?}"
+    );
+    assert_eq!(dismissed[0]["review"]["id"], review2.id);
+    assert_eq!(dismissed[0]["review"]["revision"], 1);
+    assert_eq!(dismissed[0]["review"]["author"], "alice");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn push_events_cover_create_update_delete_tag_and_skip_non_branch_refs() {
+    let c = Ctx::start().await;
+    let (sink_url, sink) = Sink::spawn(false).await;
+    let created = c.create_hook(&c.alice_rw, &sink_url, &[]).await;
+    let secret = created["secret"].as_str().unwrap().to_owned();
+    let repo_url = format!("{}/alice/proj", c.s.base);
+    let core = &c.s.core;
+
+    let url = c.s.git_url(
+        "alice",
+        "proj",
+        Some(&c.s.token(&c.alice, &[Scope::RepoWrite]).await),
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    let work = work_repo(tmp.path(), "work", &[("a.txt", "one\n")]).await;
+    git_ok(&work, &["checkout", "-q", "-b", "feature/p"]).await;
+    commit_files(&work, &[("a.txt", b"one\ntwo\n")], "add two").await;
+    git_ok(&work, &["push", "-q", &url, "main", "feature/p"]).await;
+    let tip1 = git_ok(&work, &["rev-parse", "feature/p"])
+        .await
+        .trim()
+        .to_owned();
+    let got = delivered_from(&c, &sink, &secret, 0).await;
+    let pushes: Vec<&Value> = got.iter().filter(|b| b["event"] == "push").collect();
+    assert_eq!(
+        pushes.len(),
+        2,
+        "one push event per created branch: {got:?}"
+    );
+    for body in &pushes {
+        assert!(body["action"].is_null(), "push action is null: {body}");
+        assert!(body["cause"].is_null(), "push cause is null: {body}");
+        let subject = check_envelope(body, "push", None, None, "alice", &repo_url);
+        assert_eq!(subject["created"], true);
+        assert_eq!(subject["deleted"], false);
+        assert_eq!(subject["before"], "0".repeat(40));
+        assert_eq!(subject["pusher"], "alice");
+    }
+    let mut from = hits(&sink);
+
+    // Branch update.
+    commit_files(&work, &[("a.txt", b"one\ntwo\nthree\n")], "add three").await;
+    git_ok(&work, &["push", "-q", &url, "feature/p"]).await;
+    let tip2 = git_ok(&work, &["rev-parse", "feature/p"])
+        .await
+        .trim()
+        .to_owned();
+    let got = delivered_from(&c, &sink, &secret, from).await;
+    let pushes: Vec<&Value> = got.iter().filter(|b| b["event"] == "push").collect();
+    assert_eq!(pushes.len(), 1, "one push event for the update: {got:?}");
+    let subject = check_envelope(pushes[0], "push", None, None, "alice", &repo_url);
+    assert_eq!(subject["ref"], "refs/heads/feature/p");
+    assert_eq!(subject["before"], tip1);
+    assert_eq!(subject["after"], tip2);
+    assert_eq!(subject["created"], false);
+    assert_eq!(subject["deleted"], false);
+    from = hits(&sink);
+
+    // Tag push.
+    git_ok(&work, &["tag", "v1"]).await;
+    git_ok(&work, &["push", "-q", &url, "tag", "v1"]).await;
+    let tag_sha = git_ok(&work, &["rev-list", "-n", "1", "v1"])
+        .await
+        .trim()
+        .to_owned();
+    let got = delivered_from(&c, &sink, &secret, from).await;
+    let pushes: Vec<&Value> = got.iter().filter(|b| b["event"] == "push").collect();
+    assert_eq!(pushes.len(), 1, "tag pushes emit push: {got:?}");
+    let subject = check_envelope(pushes[0], "push", None, None, "alice", &repo_url);
+    assert_eq!(subject["ref"], "refs/tags/v1");
+    assert_eq!(subject["after"], tag_sha);
+    assert_eq!(subject["created"], true);
+    assert_eq!(subject["deleted"], false);
+    from = hits(&sink);
+
+    // Branch delete.
+    git_ok(&work, &["push", "-q", &url, ":refs/heads/feature/p"]).await;
+    let got = delivered_from(&c, &sink, &secret, from).await;
+    let pushes: Vec<&Value> = got.iter().filter(|b| b["event"] == "push").collect();
+    assert_eq!(pushes.len(), 1, "branch deletes emit push: {got:?}");
+    let subject = check_envelope(pushes[0], "push", None, None, "alice", &repo_url);
+    assert_eq!(subject["ref"], "refs/heads/feature/p");
+    assert_eq!(subject["before"], tip2);
+    assert_eq!(subject["after"], "0".repeat(40));
+    assert_eq!(subject["created"], false);
+    assert_eq!(subject["deleted"], true);
+    from = hits(&sink);
+
+    // A refs/for push ingests a trail change and never emits push.
+    git_ok(&work, &["push", "-q", &url, "HEAD:refs/for/main"]).await;
+    let got = delivered_from(&c, &sink, &secret, from).await;
+    assert!(
+        got.iter().all(|b| b["event"] != "push"),
+        "refs/for pushes never emit push: {got:?}"
+    );
+    assert!(
+        got.iter().any(|b| b["event"] == "trail"
+            && (b["action"] == "opened"
+                || (b["action"] == "updated" && b["cause"] == "change_opened"))),
+        "refs/for pushes still emit trail: {got:?}"
+    );
+    from = hits(&sink);
+
+    // Server-side trail refs and refs/for names never emit push, even direct.
+    let repo_id = core
+        .repo_for(Some(&c.alice), "alice", "proj")
+        .await
+        .unwrap()
+        .repo
+        .id;
+    core.record_push(
+        repo_id,
+        Some(&c.alice),
+        &[
+            starforged_core::changes::RefUpdate {
+                name: "refs/trails/1/1/head".into(),
+                old: "0".repeat(40),
+                new: tip1.clone(),
+            },
+            starforged_core::changes::RefUpdate {
+                name: "refs/for/main".into(),
+                old: "0".repeat(40),
+                new: tip1.clone(),
+            },
+        ],
+    )
+    .await;
+    let got = delivered_from(&c, &sink, &secret, from).await;
+    assert!(
+        got.iter().all(|b| b["event"] != "push"),
+        "server trail refs never emit push: {got:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_upload_quarantine_publish_events() {
+    let c = Ctx::start().await;
+    let client = reqwest::Client::new();
+    let (sink_url, sink) = Sink::spawn(false).await;
+    // Sessions publish only on public repos.
+    c.s.repo(&c.alice, "pub", Visibility::Public).await;
+    let created = {
+        let res = client
+            .post(c.s.url("/api/v1/repos/alice/pub/hooks"))
+            .bearer_auth(&c.alice_rw)
+            .json(&json!({"url": sink_url, "events": []}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 201);
+        res.json::<Value>().await.unwrap()
+    };
+    let secret = created["secret"].as_str().unwrap().to_owned();
+    let repo_url = format!("{}/alice/pub", c.s.base);
+    let upload = c.s.token(&c.alice, &[Scope::SessionUpload]).await;
+
+    let ulid = "01ARZ3NDEKTSV4RRFFQ69G5FB0";
+    let title = "Secret Project Alpha";
+    let quarantining = json!({
+        "format": "starforge.session/v1",
+        "id": ulid,
+        "agent": {"name": "claude-code", "version": "1.0"},
+        "models": ["opus"],
+        "title": title,
+        "started_at": "2026-11-04T00:00:00Z",
+        "ended_at": null,
+        "repo": {"branch": "feature/widget", "head_at_start": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+        "parent_id": null,
+        "usage": {"input": 1, "output": 2, "cache_read": 3, "cache_write": 4, "reasoning": 5},
+        "files_touched": ["src/file with ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 inside.rs"],
+        "redaction": {"fingerprint": "fp-test", "counts": {}},
+        "capture": {"mode": "discovery", "cli_version": "9.9.9", "adapter_version_verified": true},
+    });
+    let res = client
+        .put(c.s.url(&format!("/api/v1/repos/alice/pub/sessions/{ulid}")))
+        .bearer_auth(&upload)
+        .json(&quarantining)
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success(), "{}", res.text().await.unwrap());
+    let got = delivered_from(&c, &sink, &secret, 0).await;
+    let quarantined: Vec<&Value> = got
+        .iter()
+        .filter(|b| b["event"] == "session" && b["action"] == "quarantined")
+        .collect();
+    assert_eq!(
+        quarantined.len(),
+        1,
+        "quarantine at ingest emits once: {got:?}"
+    );
+    assert!(
+        quarantined[0]["sender"].is_null(),
+        "quarantine sender is null: {got:?}"
+    );
+    let subject = check_envelope_session(quarantined[0], "quarantined", &repo_url);
+    assert_eq!(subject["ulid"], ulid);
+    assert_eq!(subject["uploader"], "alice");
+    assert_eq!(subject["agent"], "claude-code");
+    assert_eq!(subject["quarantine_state"], "quarantined");
+    let mut from = hits(&sink);
+
+    // Complete -> uploaded, with the uploader as sender.
+    let res = client
+        .post(c.s.url(&format!("/api/v1/repos/alice/pub/sessions/{ulid}/complete")))
+        .bearer_auth(&upload)
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success(), "{}", res.text().await.unwrap());
+    let got = delivered_from(&c, &sink, &secret, from).await;
+    let uploaded: Vec<&Value> = got
+        .iter()
+        .filter(|b| b["event"] == "session" && b["action"] == "uploaded")
+        .collect();
+    assert_eq!(uploaded.len(), 1, "complete emits uploaded once: {got:?}");
+    let subject = check_envelope_session(uploaded[0], "uploaded", &repo_url);
+    assert_eq!(subject["ulid"], ulid);
+    assert_eq!(subject["lifecycle_state"], "complete");
+    assert_eq!(uploaded[0]["sender"], json!({"handle": "alice"}));
+    from = hits(&sink);
+    // Idempotent re-complete emits nothing.
+    let res = client
+        .post(c.s.url(&format!("/api/v1/repos/alice/pub/sessions/{ulid}/complete")))
+        .bearer_auth(&upload)
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success());
+    let got = delivered_from(&c, &sink, &secret, from).await;
+    assert!(
+        got.iter()
+            .all(|b| !(b["event"] == "session" && b["action"] == "uploaded")),
+        "re-complete emits nothing: {got:?}"
+    );
+    from = hits(&sink);
+
+    // Publish -> published, with the acting user as sender.
+    let res = client
+        .post(c.s.url(&format!("/api/v1/repos/alice/pub/sessions/{ulid}/publish")))
+        .bearer_auth(&upload)
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success(), "{}", res.text().await.unwrap());
+    let got = delivered_from(&c, &sink, &secret, from).await;
+    let published: Vec<&Value> = got
+        .iter()
+        .filter(|b| b["event"] == "session" && b["action"] == "published")
+        .collect();
+    assert_eq!(published.len(), 1, "publish emits published once: {got:?}");
+    let subject = check_envelope_session(published[0], "published", &repo_url);
+    assert_eq!(subject["visibility"], "published");
+    assert_eq!(published[0]["sender"], json!({"handle": "alice"}));
+
+    // Session payloads carry identifiers and state only: no title, no
+    // quarantine reason, no transcript text anywhere in any session body.
+    for hit in sink.hits.lock().unwrap().iter() {
+        let raw = String::from_utf8_lossy(&hit.body);
+        let body: Value = serde_json::from_slice(&hit.body).unwrap();
+        if body["event"] != "session" {
+            continue;
+        }
+        assert!(!raw.contains(title), "session body leaks the title: {raw}");
+        assert!(
+            !raw.contains("known-token"),
+            "session body leaks the quarantine reason: {raw}"
+        );
+        assert!(
+            !raw.contains("ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"),
+            "session body leaks file text: {raw}"
+        );
+        let keys: Vec<&str> = body["session"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                "agent",
+                "lifecycle_state",
+                "quarantine_state",
+                "ulid",
+                "uploader",
+                "visibility"
+            ],
+            "exact session subject: {raw}"
+        );
+    }
+}
+
+/// Session envelope check: like [`check_envelope`] but the sender varies by
+/// transition (uploader, null, actor), so only the subject is pinned here.
+fn check_envelope_session<'a>(body: &'a Value, action: &str, repo_url: &str) -> &'a Value {
+    assert_eq!(body["event"], "session");
+    assert_eq!(body["action"], action);
+    assert!(body["cause"].is_null(), "session cause is null: {body}");
+    assert_eq!(body["repository"]["full_name"], "alice/pub");
+    assert_eq!(body["repository"]["url"], repo_url);
+    &body["session"]
+}

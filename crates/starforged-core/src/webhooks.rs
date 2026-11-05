@@ -529,6 +529,61 @@ impl Core {
         Ok(subject)
     }
 
+    /// Convenience fan-out for every `session` event (D2): looks up the
+    /// session by ULID, builds the identifier-and-state subject (never
+    /// titles, reasons, prompts, or transcripts — §6.4), and dispatches.
+    /// Never fails the caller: lookup failures only warn.
+    pub async fn dispatch_session_event(
+        &self,
+        repo_id: i64,
+        sender: Option<String>,
+        action: &'static str,
+        ulid: &str,
+    ) {
+        let subject = match self.session_subject(repo_id, ulid).await {
+            Ok(subject) => subject,
+            Err(err) => {
+                tracing::warn!(repo = repo_id, ulid, error = %err, "webhook session subject failed; skipping fan-out");
+                return;
+            }
+        };
+        self.dispatch_event(
+            repo_id,
+            HookEvent {
+                event: "session",
+                action: Some(action),
+                cause: None,
+                sender,
+                subject,
+            },
+        )
+        .await;
+    }
+
+    /// The D2 `session` subject: identifiers and state only (`ulid`,
+    /// `uploader`, `agent`, `lifecycle_state`, `quarantine_state`,
+    /// `visibility`). Anything richer would leak §6.4-restricted reads
+    /// to an external URL.
+    async fn session_subject(&self, repo_id: i64, ulid: &str) -> CoreResult<serde_json::Value> {
+        let Some(session) =
+            starforged_db::sessions::session_by_ulid(self.db(), repo_id, ulid).await?
+        else {
+            return Err(CoreError::Internal("session webhook has no session".into()));
+        };
+        let uploader = match self.user_by_id(session.uploader_id).await? {
+            Some(user) => user.handle,
+            None => "deleted user".to_owned(),
+        };
+        Ok(serde_json::json!({
+            "ulid": session.ulid,
+            "uploader": uploader,
+            "agent": session.agent_name,
+            "lifecycle_state": session.lifecycle,
+            "quarantine_state": session.quarantine,
+            "visibility": session.visibility,
+        }))
+    }
+
     /// The acting user's handle, or `None` when the account is gone (or the
     /// lookup fails): those senders read as system-originated.
     pub(crate) async fn sender_of(&self, user_id: i64) -> Option<String> {

@@ -403,6 +403,8 @@ impl Core {
     }
 
     /// Marks the session `complete`. Idempotent: completing twice succeeds.
+    /// The first transition to `complete` emits `session`/`uploaded` with
+    /// the uploader as sender; repeats emit nothing.
     pub async fn complete_session(&self, auth: &IngestAuth, ulid: &str) -> CoreResult<SessionRow> {
         let session = db_sessions::session_by_ulid(self.db(), auth.access.repo.id, ulid)
             .await?
@@ -410,6 +412,9 @@ impl Core {
         Self::authorize_session_write(&session, auth)?;
         if session.lifecycle != "complete" {
             db_sessions::set_lifecycle(self.db(), session.id, "complete").await?;
+            let sender = self.sender_of(session.uploader_id).await;
+            self.dispatch_session_event(auth.access.repo.id, sender, "uploaded", ulid)
+                .await;
         }
         db_sessions::session_by_ulid(self.db(), auth.access.repo.id, ulid)
             .await?
@@ -675,9 +680,22 @@ impl Core {
         let session = db_sessions::session_by_ulid(self.db(), access.repo.id, ulid)
             .await?
             .ok_or(CoreError::NotFound)?;
-        db_sessions::set_visibility(self.db(), session.id, visibility).await?;
+        if session.visibility != visibility {
+            db_sessions::set_visibility(self.db(), session.id, visibility).await?;
+        }
         self.audit(Some(actor.id), audit_action, &format!("session:{ulid}"), "")
             .await?;
+        // Publishing is a transition: only a move *to* `published` emits,
+        // with the acting user as sender. Unpublishing emits nothing.
+        if visibility == "published" && session.visibility != "published" {
+            self.dispatch_session_event(
+                access.repo.id,
+                Some(actor.handle.clone()),
+                "published",
+                ulid,
+            )
+            .await;
+        }
         db_sessions::session_by_ulid(self.db(), access.repo.id, ulid)
             .await?
             .ok_or_else(|| CoreError::Internal("session vanished during publish".into()))

@@ -429,6 +429,11 @@ impl Core {
         if fields.is_empty() {
             return self.trail_view(&row).await;
         }
+        let ready_was = row.ready != 0;
+        let content_changed = fields.contains(&"title") || fields.contains(&"intent");
+        let sender = Some(user.handle.clone());
+        let number = row.number;
+        let repo_id = access.repo.id;
         let at = now();
         if fields.contains(&"title") || fields.contains(&"intent") {
             db_trails::set_title_intent(self.db(), row.id, &new_title, &new_intent, at).await?;
@@ -437,13 +442,27 @@ impl Core {
             db_trails::set_ready(self.db(), row.id, i64::from(new_ready), at).await?;
         }
         self.record_timeline(
-            access.repo.id,
+            repo_id,
             row.id,
             "trail.edit",
             Some(user.id),
             serde_json::json!({"fields": fields, "field": fields[0]}),
         )
         .await?;
+        // Exactly one event per state-changing update: a fresh ready flag
+        // reads as `ready`; otherwise title/intent edits read as
+        // `updated`/`edited` and clearing ready as `updated`/`ready_cleared`.
+        // The timeline row above is the audit; the idempotent early return
+        // means reaching here always changed something.
+        let (action, cause) = if !ready_was && new_ready {
+            (Some("ready"), None)
+        } else if content_changed {
+            (Some("updated"), Some("edited"))
+        } else {
+            (Some("updated"), Some("ready_cleared"))
+        };
+        self.dispatch_trail_event(repo_id, sender, action, cause, number, None)
+            .await;
         self.trail_view(&self.trail_row(access.repo.id, number).await?)
             .await
     }
@@ -557,6 +576,16 @@ impl Core {
                 None,
             )
             .await;
+        } else {
+            self.dispatch_trail_event(
+                access.repo.id,
+                Some(user.handle.clone()),
+                Some("updated"),
+                Some("reopened"),
+                number,
+                None,
+            )
+            .await;
         }
         self.trail_view(&self.trail_row(access.repo.id, number).await?)
             .await
@@ -657,6 +686,15 @@ impl Core {
             serde_json::json!({"action": "add", "name": name}),
         )
         .await?;
+        self.dispatch_trail_event(
+            access.repo.id,
+            Some(user.handle.clone()),
+            Some("updated"),
+            Some("labeled"),
+            number,
+            None,
+        )
+        .await;
         self.trail_view(&self.trail_row(access.repo.id, number).await?)
             .await
     }
@@ -688,6 +726,15 @@ impl Core {
             serde_json::json!({"action": "remove", "name": name}),
         )
         .await?;
+        self.dispatch_trail_event(
+            access.repo.id,
+            Some(user.handle.clone()),
+            Some("updated"),
+            Some("unlabeled"),
+            number,
+            None,
+        )
+        .await;
         self.trail_view(&self.trail_row(access.repo.id, number).await?)
             .await
     }
@@ -734,6 +781,15 @@ impl Core {
             serde_json::json!({"action": "add", "user": target.handle, "user_id": target.id}),
         )
         .await?;
+        self.dispatch_trail_event(
+            access.repo.id,
+            Some(user.handle.clone()),
+            Some("updated"),
+            Some("assigned"),
+            number,
+            None,
+        )
+        .await;
         self.trail_view(&self.trail_row(access.repo.id, number).await?)
             .await
     }
@@ -768,6 +824,15 @@ impl Core {
             serde_json::json!({"action": "remove", "user": target.handle, "user_id": target.id}),
         )
         .await?;
+        self.dispatch_trail_event(
+            access.repo.id,
+            Some(user.handle.clone()),
+            Some("updated"),
+            Some("unassigned"),
+            number,
+            None,
+        )
+        .await;
         self.trail_view(&self.trail_row(access.repo.id, number).await?)
             .await
     }

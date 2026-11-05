@@ -26,6 +26,16 @@ use starforged_db::{
 };
 use starforged_git::{merge, read, refpolicy, write};
 
+/// One ref motion observed by the post-receive scan: the full refname and
+/// the before/after oids. A zero oid marks a create (`old`) or a delete
+/// (`new`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefUpdate {
+    pub name: String,
+    pub old: String,
+    pub new: String,
+}
+
 /// Addressing for one accepted `refs/for` line, from the pre-receive sidecar
 /// (`base`/`topic` already validated there) or the scan's optionless fallback.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -243,6 +253,49 @@ impl Core {
         )
         .await;
         Ok(Some((change.number, revision.number)))
+    }
+    /// Push fan-out (spec §10.4 D2): emits one `push` event per heads/tags
+    /// update (create, update, delete). `refs/for/*` (reported as `trail`)
+    /// and `refs/trails/*` (server-internal) never emit. Does not replace
+    /// [`Core::record_branch_move`]'s work; githttp calls both. Never fails
+    /// the caller: unknown repos and deleted repos skip silently, and
+    /// dispatch itself never fails.
+    pub async fn record_push(&self, repo_id: i64, pusher: Option<&User>, updates: &[RefUpdate]) {
+        let live = db_repos::by_id(self.db(), repo_id)
+            .await
+            .is_ok_and(|row| row.is_some_and(|row| row.deleted_at.is_none()));
+        if !live {
+            return;
+        }
+        let sender = pusher.map(|user| user.handle.clone());
+        for update in updates {
+            if !update.name.starts_with("refs/heads/") && !update.name.starts_with("refs/tags/") {
+                continue;
+            }
+            let zero_old = refpolicy::is_zero_oid(&update.old);
+            let zero_new = refpolicy::is_zero_oid(&update.new);
+            if zero_old && zero_new {
+                continue;
+            }
+            self.dispatch_event(
+                repo_id,
+                HookEvent {
+                    event: "push",
+                    action: None,
+                    cause: None,
+                    sender: sender.clone(),
+                    subject: serde_json::json!({
+                        "ref": update.name,
+                        "before": update.old,
+                        "after": update.new,
+                        "created": zero_old && !zero_new,
+                        "deleted": !zero_old && zero_new,
+                        "pusher": sender,
+                    }),
+                },
+            )
+            .await;
+        }
     }
 
     /// Branch push: for every open branch change whose head branch is
@@ -618,9 +671,41 @@ impl Core {
             Err(e) => return Err(e.into()),
         };
         db_changes::set_current_revision(self.db(), change.id, revision.id, now()).await?;
-        self.dismiss_stale_reviews(repo_id, change, &revision)
+        self.dismiss_stale_reviews(repo_id, trail_number, change, &revision)
             .await?;
         Ok(revision)
+    }
+
+    /// The D2 `review` subject for a dismissal: the review's identity and
+    /// content plus the state it moved to. Built from the stored row so
+    /// explicit and automatic dismissals share one shape.
+    async fn review_subject(
+        &self,
+        trail_number: i64,
+        change: &db_changes::ChangeRow,
+        review: &db_changes::ReviewRow,
+    ) -> CoreResult<serde_json::Value> {
+        let revision = db_changes::revision_by_id(self.db(), review.revision_id)
+            .await?
+            .map(|row| row.number)
+            .unwrap_or(0);
+        let author = match review.author_id {
+            Some(id) => self
+                .sender_of(id)
+                .await
+                .unwrap_or_else(|| "deleted user".to_owned()),
+            None => "deleted user".to_owned(),
+        };
+        Ok(serde_json::json!({
+            "id": review.id,
+            "trail": trail_number,
+            "change": change.number,
+            "revision": revision,
+            "verdict": review.verdict,
+            "state": review.state,
+            "author": author,
+            "body": review.body,
+        }))
     }
 
     /// `dismiss_on_push`: when every gate rule matching the change's base
@@ -636,6 +721,7 @@ impl Core {
     async fn dismiss_stale_reviews(
         &self,
         repo_id: i64,
+        trail_number: i64,
         change: &db_changes::ChangeRow,
         revision: &db_changes::RevisionRow,
     ) -> CoreResult<()> {
@@ -673,6 +759,25 @@ impl Core {
                 }),
             )
             .await?;
+            let dismissed = db_changes::reviews_of_change(self.db(), change.id)
+                .await?
+                .into_iter()
+                .find(|r| r.id == review.id)
+                .ok_or(CoreError::Internal("review vanished after dismiss".into()))?;
+            let subject = self
+                .review_subject(trail_number, change, &dismissed)
+                .await?;
+            self.dispatch_event(
+                repo_id,
+                HookEvent {
+                    event: "review",
+                    action: Some("dismissed"),
+                    cause: None,
+                    sender: None,
+                    subject,
+                },
+            )
+            .await;
         }
         Ok(())
     }
@@ -1680,6 +1785,25 @@ impl Core {
                 serde_json::json!({ "change": change.number, "review": row.id }),
             )
             .await?;
+            let dismissed = db_changes::reviews_of_change(self.db(), change.id)
+                .await?
+                .into_iter()
+                .find(|r| r.id == review_id)
+                .ok_or(CoreError::Internal("review vanished after dismiss".into()))?;
+            let subject = self
+                .review_subject(trail.number, &change, &dismissed)
+                .await?;
+            self.dispatch_event(
+                access.repo.id,
+                HookEvent {
+                    event: "review",
+                    action: Some("dismissed"),
+                    cause: None,
+                    sender: Some(user.handle.clone()),
+                    subject,
+                },
+            )
+            .await;
         }
         let row = db_changes::reviews_of_change(self.db(), change.id)
             .await?
@@ -2009,6 +2133,26 @@ impl Core {
                 }),
             )
             .await?;
+            let revision = match change.current_revision_id {
+                Some(id) => db_changes::revision_by_id(self.db(), id)
+                    .await?
+                    .map(|row| row.number)
+                    .unwrap_or(0),
+                None => 0,
+            };
+            self.dispatch_trail_event(
+                access.repo.id,
+                Some(user.handle.clone()),
+                Some("updated"),
+                Some(if state == "closed" {
+                    "change_closed"
+                } else {
+                    "change_reopened"
+                }),
+                trail.number,
+                Some(serde_json::json!({"k": change.number, "revision": revision})),
+            )
+            .await;
         }
         let row = db_changes::change_by_id(self.db(), change.id)
             .await?

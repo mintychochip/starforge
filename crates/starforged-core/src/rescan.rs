@@ -453,6 +453,10 @@ impl Core {
             &format!("{} at {}", hit.reason, hit.detail),
         )
         .await?;
+        // System-originated: sender is null, and the early return above
+        // means one session quarantines exactly once.
+        self.dispatch_session_event(session.repo_id, None, "quarantined", &session.ulid)
+            .await;
         Ok(true)
     }
 }

@@ -9,7 +9,7 @@ use base64::Engine;
 use futures_util::TryStreamExt;
 use serde::Deserialize;
 use starforged_core::accounts::User;
-use starforged_core::changes::IngestSidecar;
+use starforged_core::changes::{IngestSidecar, RefUpdate};
 use starforged_core::jobs::Job;
 use starforged_core::permission::Permission;
 use starforged_core::repos::RepoAccess;
@@ -566,12 +566,15 @@ async fn scan_push_changes(
     // Orphaned sidecars (a scan that never ran) must not accumulate.
     pushsidecar::reap(&repo, pushsidecar::MAX_AGE_SECS);
     let changes = changed_refs(&before, &after);
-    // Deleted branches never appear in `changed_refs` (it only walks `after`
-    // — see its unit test); collect them separately so base deletions still
-    // recompute mergeability.
+    // Deleted branches and tags never appear in `changed_refs` (it only
+    // walks `after` — see its unit test); collect them separately so base
+    // deletions still recompute mergeability.
     let deletes: Vec<(&str, &str)> = before
         .iter()
-        .filter(|(name, _)| name.starts_with("refs/heads/") && !after.contains_key(*name))
+        .filter(|(name, _)| {
+            (name.starts_with("refs/heads/") || name.starts_with("refs/tags/"))
+                && !after.contains_key(*name)
+        })
         .map(|(name, old)| (name.as_str(), old.as_str()))
         .collect();
     if changes.is_empty() && deletes.is_empty() {
@@ -590,6 +593,24 @@ async fn scan_push_changes(
         )
         .await;
     }
+    // Push fan-out: one `push` event per heads/tags create, update, and
+    // delete. `record_push` skips `refs/for/*` and `refs/trails/*` itself;
+    // the zero oid marks creates (`old`) and deletes (`new`).
+    let mut push_updates: Vec<RefUpdate> = changes
+        .iter()
+        .map(|(name, old, new)| RefUpdate {
+            name: name.clone(),
+            old: old.clone().unwrap_or_else(|| "0".repeat(40)),
+            new: new.clone(),
+        })
+        .collect();
+    push_updates.extend(deletes.iter().map(|(name, old)| RefUpdate {
+        name: (*name).to_owned(),
+        old: (*old).to_owned(),
+        new: "0".repeat(40),
+    }));
+    core.record_push(repo_id, pusher.as_ref(), &push_updates)
+        .await;
     for (name, old, new) in &changes {
         let Some(branch) = name.strip_prefix("refs/heads/") else {
             continue;
