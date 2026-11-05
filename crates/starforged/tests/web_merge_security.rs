@@ -126,6 +126,12 @@ impl Ctx {
             .url(&format!("/api/v1/repos/alice/{repo}/statuses/{sha}"))
     }
 
+    fn combined(&self, repo: &str, sha: &str) -> String {
+        self.s.url(&format!(
+            "/api/v1/repos/alice/{repo}/commits/{sha}/combined-status"
+        ))
+    }
+
     fn gates(&self, repo: &str, n: i64, k: i64) -> String {
         self.s.url(&format!(
             "/api/v1/repos/alice/{repo}/trails/{n}/changes/{k}/gates"
@@ -177,10 +183,10 @@ impl Ctx {
         (work, url)
     }
 
-    async fn trail(&self, token: &str) -> i64 {
+    async fn trail_in(&self, repo: &str, token: &str) -> i64 {
         let client = reqwest::Client::new();
         let res = client
-            .post(self.s.url("/api/v1/repos/alice/proj/trails"))
+            .post(self.s.url(&format!("/api/v1/repos/alice/{repo}/trails")))
             .bearer_auth(token)
             .json(&json!({"title": "sweep trail", "intent": "sweep"}))
             .send()
@@ -192,12 +198,16 @@ impl Ctx {
             .unwrap()
     }
 
-    async fn branch_change(&self, token: &str, n: i64, head: &str) -> Value {
+    async fn trail(&self, token: &str) -> i64 {
+        self.trail_in("proj", token).await
+    }
+
+    async fn branch_change_in(&self, repo: &str, token: &str, n: i64, head: &str) -> Value {
         let client = reqwest::Client::new();
         let res = client
             .post(
                 self.s
-                    .url(&format!("/api/v1/repos/alice/proj/trails/{n}/changes")),
+                    .url(&format!("/api/v1/repos/alice/{repo}/trails/{n}/changes")),
             )
             .bearer_auth(token)
             .json(&json!({"kind": "branch", "head_branch": head, "base_branch": "main"}))
@@ -206,6 +216,10 @@ impl Ctx {
             .unwrap();
         assert_eq!(res.status(), 201, "create branch change");
         res.json::<Value>().await.unwrap()
+    }
+
+    async fn branch_change(&self, token: &str, n: i64, head: &str) -> Value {
+        self.branch_change_in("proj", token, n, head).await
     }
 
     async fn gate_rule(
@@ -232,6 +246,41 @@ impl Ctx {
         .await
         .unwrap();
     }
+
+    /// Creates a gate rule through the H7 management API (owner/maintainer
+    /// token with `repo:write` scope), never raw SQL.
+    async fn gate_rule_api(&self, token: &str, body: Value) -> Value {
+        let client = reqwest::Client::new();
+        let res = client
+            .post(self.s.url("/api/v1/repos/alice/proj/gate-rules"))
+            .bearer_auth(token)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        let status = res.status();
+        let body: Value = res.json().await.unwrap();
+        assert_eq!(status, 201, "create gate rule: {body}");
+        body
+    }
+}
+
+/// A gate-rule create body; `pattern` `None` means all branches.
+fn rule_body(pattern: Option<&str>, methods: &[&str]) -> Value {
+    let mut body = json!({
+        "required_approvals": 0,
+        "dismiss_on_push": false,
+        "block_on_request_changes": false,
+        "required_contexts": [],
+        "require_up_to_date": false,
+        "require_threads_resolved": false,
+        "require_session_evidence": false,
+        "allowed_methods": methods,
+    });
+    if let Some(pattern) = pattern {
+        body["pattern"] = json!(pattern);
+    }
+    body
 }
 
 /// Statuses POST/GET + gates GET matrix: web panel + API, private + public.
@@ -661,6 +710,642 @@ async fn matrix_merge_webhooks() {
         404,
         "non-member hooks settings"
     );
+}
+
+/// Archived repos refuse status POST (API) and webhook create (API + web
+/// form), writing no check or hook rows. Merge/gate-rule refusals already
+/// have suites (`merge_changes.rs`, `api_gate_rules.rs`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn archived_refusals_write_no_rows() {
+    let c = Ctx::start().await;
+    let client = reqwest::Client::new();
+    let (work, url) = c.pushed_repo("proj").await;
+    git_ok(&work, &["checkout", "-q", "-b", "feature/x"]).await;
+    commit_files(&work, &[("a.txt", b"one\n")], "add a").await;
+    git_ok(&work, &["push", "-q", &url, "feature/x"]).await;
+    let alice_full = c.tok(&c.alice, FULL).await;
+    let n = c.trail(&alice_full).await;
+    let alice_rw = c.tok(&c.alice, REPO_WRITE).await;
+    c.branch_change(&alice_rw, n, "feature/x").await;
+    let head = git_ok(&work, &["rev-parse", "feature/x"]).await;
+    let head = head.trim();
+    let repo_id = c.repo_id("proj").await;
+    assert!(
+        c.s.core
+            .list_webhooks(Some(&c.alice), "alice", "proj")
+            .await
+            .unwrap()
+            .is_empty(),
+        "no hooks before archiving"
+    );
+
+    c.s.core
+        .archive_repo(&c.alice, "alice", "proj")
+        .await
+        .unwrap();
+
+    // Status POST on an archived repo: 422, and the probe context leaves
+    // no check row behind.
+    let res = client
+        .post(c.statuses("proj", head))
+        .bearer_auth(&alice_rw)
+        .json(&json!({"state": "success", "context": "ci/archived-probe"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 422, "archived status POST");
+    let body: Value = res.json().await.unwrap();
+    assert!(
+        body.to_string().contains("archived"),
+        "refusal names the archive: {body}"
+    );
+    let rows = starforged_db::checks::latest_statuses(c.s.core.db(), repo_id, head)
+        .await
+        .unwrap();
+    assert!(
+        !rows.iter().any(|r| r.context == "ci/archived-probe"),
+        "refused POST wrote a check row: {rows:?}"
+    );
+
+    // Webhook create on an archived repo: 422 over the API, no hook row.
+    let adam_t =
+        c.s.token(&c.adam, &[Scope::RepoRead, Scope::RepoWrite])
+            .await;
+    let res = client
+        .post(c.hooks("proj"))
+        .bearer_auth(&adam_t)
+        .json(&json!({"url": "http://127.0.0.1:9/x", "events": []}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 422, "archived hook create");
+    assert!(
+        c.s.core
+            .list_webhooks(Some(&c.alice), "alice", "proj")
+            .await
+            .unwrap()
+            .is_empty(),
+        "refused API create wrote a hook row"
+    );
+
+    // Same refusal through the web form: 422, still no hook row.
+    let browser = c.login("alice").await;
+    let page = get_text(&browser, &c.web_hooks("proj")).await;
+    let csrf = extract_input(&page, "_csrf");
+    let res = browser
+        .post(c.web_hooks("proj"))
+        .form(&[("_csrf", csrf.as_str()), ("url", "http://127.0.0.1:9/x")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 422, "archived web hook create");
+    assert!(
+        c.s.core
+            .list_webhooks(Some(&c.alice), "alice", "proj")
+            .await
+            .unwrap()
+            .is_empty(),
+        "refused web create wrote a hook row"
+    );
+}
+
+/// A matching gate rule with `allowed_methods: ["squash"]` refuses a
+/// `merge` POST with 422 (message names the method, base ref unchanged);
+/// `squash` then succeeds. Rules come from the gate-rule API, not SQL.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn merge_method_refused_by_gate_rule() {
+    let c = Ctx::start().await;
+    let client = reqwest::Client::new();
+    let (work, url) = c.pushed_repo("proj").await;
+    git_ok(&work, &["checkout", "-q", "-b", "feature/m"]).await;
+    commit_files(&work, &[("m.txt", b"m\n")], "add m").await;
+    git_ok(&work, &["push", "-q", &url, "feature/m"]).await;
+    let alice_full = c.tok(&c.alice, FULL).await;
+    let n = c.trail(&alice_full).await;
+    let alice_rw = c.tok(&c.alice, REPO_WRITE).await;
+    c.branch_change(&alice_rw, n, "feature/m").await;
+
+    // Only squash may land on main (owner token carries `repo:write`).
+    c.gate_rule_api(&alice_rw, rule_body(Some("main"), &["squash"]))
+        .await;
+
+    // The change page offers only the allowed method.
+    let browser = c.login("alice").await;
+    let page = get_text(&browser, &c.web_change("proj", n, 1)).await;
+    assert!(
+        page.contains(r#"<option value="squash">"#),
+        "squash offered"
+    );
+    assert!(
+        !page.contains(r#"<option value="merge">"#),
+        "merge not offered"
+    );
+    assert!(
+        !page.contains(r#"<option value="fast_forward">"#),
+        "fast_forward not offered"
+    );
+
+    // A disallowed method is refused and moves nothing.
+    let base_before = git_ok(&work, &["ls-remote", &url, "refs/heads/main"]).await;
+    let res = client
+        .post(c.merge_api("proj", n, 1))
+        .bearer_auth(&alice_rw)
+        .json(&json!({"method": "merge"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 422, "disallowed method refused");
+    let body: Value = res.json().await.unwrap();
+    assert!(
+        body.to_string().contains("'merge'"),
+        "refusal names the method: {body}"
+    );
+    assert!(
+        body.to_string().contains("squash"),
+        "refusal names what is allowed: {body}"
+    );
+    assert_eq!(
+        git_ok(&work, &["ls-remote", &url, "refs/heads/main"]).await,
+        base_before,
+        "refused merge moved the base"
+    );
+
+    // The allowed method still merges.
+    let res = client
+        .post(c.merge_api("proj", n, 1))
+        .bearer_auth(&alice_rw)
+        .json(&json!({"method": "squash"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200, "allowed method merges");
+    assert_ne!(
+        git_ok(&work, &["ls-remote", &url, "refs/heads/main"]).await,
+        base_before,
+        "squash moved the base"
+    );
+}
+
+/// Two matching rules intersect: `["merge", "squash"]` AND
+/// `["squash", "fast_forward"]` leaves only `squash`. The branch stays
+/// linear so a `fast_forward` refusal pins method gating, not ancestry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn merge_method_intersection_leaves_squash() {
+    let c = Ctx::start().await;
+    let client = reqwest::Client::new();
+    let (work, url) = c.pushed_repo("proj").await;
+    git_ok(&work, &["checkout", "-q", "-b", "feature/i"]).await;
+    commit_files(&work, &[("i.txt", b"i\n")], "add i").await;
+    git_ok(&work, &["push", "-q", &url, "feature/i"]).await;
+    let alice_full = c.tok(&c.alice, FULL).await;
+    let n = c.trail(&alice_full).await;
+    let alice_rw = c.tok(&c.alice, REPO_WRITE).await;
+    c.branch_change(&alice_rw, n, "feature/i").await;
+
+    c.gate_rule_api(&alice_rw, rule_body(None, &["merge", "squash"]))
+        .await;
+    c.gate_rule_api(
+        &alice_rw,
+        rule_body(Some("main"), &["squash", "fast_forward"]),
+    )
+    .await;
+
+    let browser = c.login("alice").await;
+    let page = get_text(&browser, &c.web_change("proj", n, 1)).await;
+    assert!(
+        page.contains(r#"<option value="squash">"#),
+        "squash offered"
+    );
+    assert!(
+        !page.contains(r#"<option value="merge">"#),
+        "merge intersected away"
+    );
+    assert!(
+        !page.contains(r#"<option value="fast_forward">"#),
+        "fast_forward intersected away"
+    );
+
+    let base_before = git_ok(&work, &["ls-remote", &url, "refs/heads/main"]).await;
+    for method in ["merge", "fast_forward"] {
+        let res = client
+            .post(c.merge_api("proj", n, 1))
+            .bearer_auth(&alice_rw)
+            .json(&json!({"method": method}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 422, "{method} refused by intersection");
+        let body: Value = res.json().await.unwrap();
+        assert!(
+            body.to_string().contains(method),
+            "refusal names {method}: {body}"
+        );
+    }
+    assert_eq!(
+        git_ok(&work, &["ls-remote", &url, "refs/heads/main"]).await,
+        base_before,
+        "refused merges moved the base"
+    );
+    let res = client
+        .post(c.merge_api("proj", n, 1))
+        .bearer_auth(&alice_rw)
+        .json(&json!({"method": "squash"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200, "surviving method merges");
+}
+
+/// The M2c role matrix on an internal repo. `require_repo` resolves
+/// internal visibility through `effective` (signed-in viewers hold an
+/// implicit `Read`; anonymous viewers hold nothing), so strangers read
+/// but mutate like readers: 403, never a leak-shaped 404.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn matrix_internal() {
+    let c = Ctx::start().await;
+    let client = reqwest::Client::new();
+    c.s.repo(&c.alice, "team", Visibility::Internal).await;
+    for (handle, perm) in [
+        ("bob", Permission::Triage),
+        ("carol", Permission::Read),
+        ("wendy", Permission::Write),
+        ("adam", Permission::Admin),
+    ] {
+        c.s.core
+            .set_collaborator(&c.alice, "alice", "team", handle, perm)
+            .await
+            .unwrap();
+    }
+    let (work, url) = c.pushed_repo("team").await;
+    git_ok(&work, &["checkout", "-q", "-b", "feature/x"]).await;
+    commit_files(&work, &[("a.txt", b"one\n")], "add a").await;
+    git_ok(&work, &["push", "-q", &url, "feature/x"]).await;
+    let alice_full = c.tok(&c.alice, FULL).await;
+    let alice_rw = c.tok(&c.alice, REPO_WRITE).await;
+    let n = c.trail_in("team", &alice_full).await;
+    c.branch_change_in("team", &alice_rw, n, "feature/x").await;
+    let head = git_ok(&work, &["rev-parse", "feature/x"]).await;
+    let head = head.trim();
+    let res = client
+        .post(c.statuses("team", head))
+        .bearer_auth(&alice_rw)
+        .json(&json!({"state": "success", "context": "ci/unit"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200, "seed status");
+
+    // Anonymous: mutations 401, reads 404 (no implicit read).
+    let res = client
+        .post(c.statuses("team", head))
+        .json(&json!({"state": "success", "context": "ci/x"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 401, "anon status POST");
+    assert_eq!(
+        client
+            .get(c.combined("team", head))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404,
+        "anon combined status"
+    );
+    assert_eq!(
+        client
+            .get(c.gates("team", n, 1))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404,
+        "anon gates"
+    );
+    let anon = c.s.browser();
+    assert_eq!(
+        anon.get(c.web_change("team", n, 1))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404,
+        "anon web change"
+    );
+    assert_eq!(
+        client
+            .post(c.merge_api("team", n, 1))
+            .json(&json!({"method": "merge"}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401,
+        "anon merge"
+    );
+    assert_eq!(
+        client
+            .post(c.hooks("team"))
+            .json(&json!({"url": "http://127.0.0.1:9/x", "events": []}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401,
+        "anon hook create"
+    );
+
+    // Signed-in stranger: implicit read (200s) but every mutation 403.
+    let dave_t = c.tok(&c.dave, FULL).await;
+    let dave_rw = c.s.token(&c.dave, REPO_WRITE).await;
+    assert_eq!(
+        client
+            .get(c.combined("team", head))
+            .bearer_auth(&dave_t)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200,
+        "stranger reads combined status"
+    );
+    assert_eq!(
+        client
+            .get(c.gates("team", n, 1))
+            .bearer_auth(&dave_t)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200,
+        "stranger reads gates"
+    );
+    let dave = c.login("dave").await;
+    let page = get_text(&dave, &c.web_change("team", n, 1)).await;
+    assert!(page.contains("Gates"), "stranger sees gate panel");
+    assert!(
+        !page.contains(r#"<button type="submit">Merge</button>"#),
+        "stranger has no live merge button"
+    );
+    assert_eq!(
+        client
+            .post(c.statuses("team", head))
+            .bearer_auth(&dave_rw)
+            .json(&json!({"state": "success", "context": "ci/x"}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403,
+        "stranger cannot POST status"
+    );
+    assert_eq!(
+        client
+            .post(c.merge_api("team", n, 1))
+            .bearer_auth(&dave_rw)
+            .json(&json!({"method": "merge"}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403,
+        "stranger cannot merge"
+    );
+    assert_eq!(
+        client
+            .post(c.hooks("team"))
+            .bearer_auth(&dave_rw)
+            .json(&json!({"url": "http://127.0.0.1:9/x", "events": []}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403,
+        "stranger cannot create hooks"
+    );
+    assert_eq!(
+        client
+            .get(c.hooks("team"))
+            .bearer_auth(&dave_rw)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403,
+        "stranger cannot list hooks (reader, not 404)"
+    );
+    assert_eq!(
+        dave.get(c.web_hooks("team")).send().await.unwrap().status(),
+        403,
+        "stranger hooks settings"
+    );
+
+    // Member reads: every role (plus the site admin) reads combined
+    // status, gates, and the change page.
+    for user in [&c.alice, &c.bob, &c.carol, &c.wendy, &c.adam, &c.root] {
+        let t = c.tok(user, FULL).await;
+        assert_eq!(
+            client
+                .get(c.combined("team", head))
+                .bearer_auth(&t)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200,
+            "{} reads combined",
+            user.handle
+        );
+        assert_eq!(
+            client
+                .get(c.gates("team", n, 1))
+                .bearer_auth(&t)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200,
+            "{} reads gates",
+            user.handle
+        );
+        let browser = c.login(&user.handle).await;
+        let page = get_text(&browser, &c.web_change("team", n, 1)).await;
+        assert!(page.contains("Gates"), "{} sees gate panel", user.handle);
+    }
+
+    // Suspended members stay refused everywhere.
+    let sam_t = c.tok(&c.sam, FULL).await;
+    assert_eq!(
+        client
+            .get(c.gates("team", n, 1))
+            .bearer_auth(&sam_t)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401,
+        "suspended gates"
+    );
+
+    // Status POST by role: write+ succeed, below write 403.
+    for user in [&c.alice, &c.wendy, &c.adam] {
+        let t = c.tok(user, &[Scope::RepoRead, Scope::RepoWrite]).await;
+        let res = client
+            .post(c.statuses("team", head))
+            .bearer_auth(&t)
+            .json(&json!({"state": "success", "context": format!("ci/{}", user.handle)}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200, "{} POSTs status", user.handle);
+    }
+    for user in [&c.bob, &c.carol] {
+        let t = c.tok(user, &[Scope::RepoRead, Scope::RepoWrite]).await;
+        let res = client
+            .post(c.statuses("team", head))
+            .bearer_auth(&t)
+            .json(&json!({"state": "success", "context": "ci/x"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 403, "{} cannot POST status", user.handle);
+    }
+
+    // Merge form: write+ see the live button, below write do not.
+    for handle in ["alice", "wendy", "adam"] {
+        let browser = c.login(handle).await;
+        let page = get_text(&browser, &c.web_change("team", n, 1)).await;
+        assert!(
+            page.contains(r#"<button type="submit">Merge</button>"#),
+            "{handle} sees live merge button"
+        );
+    }
+    for handle in ["bob", "carol"] {
+        let browser = c.login(handle).await;
+        let page = get_text(&browser, &c.web_change("team", n, 1)).await;
+        assert!(
+            !page.contains(r#"<button type="submit">Merge</button>"#),
+            "{handle} has no live merge button"
+        );
+    }
+
+    // Merge by role: below write 403; write+ merge for real on fresh changes.
+    for user in [&c.bob, &c.carol] {
+        let t = c.tok(user, REPO_WRITE).await;
+        let res = client
+            .post(c.merge_api("team", n, 1))
+            .bearer_auth(&t)
+            .json(&json!({"method": "merge"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 403, "{} cannot merge", user.handle);
+    }
+    for user in [&c.wendy, &c.adam] {
+        let t = c.tok(user, REPO_WRITE).await;
+        let branch = format!("feature/{}", user.handle);
+        git_ok(&work, &["branch", &branch, "feature/x"]).await;
+        git_ok(&work, &["push", "-q", &url, &branch]).await;
+        let nn = c.trail_in("team", &alice_full).await;
+        let k = c.branch_change_in("team", &alice_rw, nn, &branch).await["k"]
+            .as_i64()
+            .unwrap();
+        let res = client
+            .post(c.merge_api("team", nn, k))
+            .bearer_auth(&t)
+            .json(&json!({"method": "merge"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200, "{} merges", user.handle);
+    }
+
+    // Webhook CRUD: maintain+ only; readers get 403 (never 404 here,
+    // since internal strangers already hold read).
+    let adam_t =
+        c.s.token(&c.adam, &[Scope::RepoRead, Scope::RepoWrite])
+            .await;
+    let res = client
+        .post(c.hooks("team"))
+        .bearer_auth(&adam_t)
+        .json(&json!({"url": "http://127.0.0.1:9/x", "events": []}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 201, "admin creates hook");
+    let hook_id = res.json::<Value>().await.unwrap()["id"].as_i64().unwrap();
+    for user in [&c.wendy, &c.bob, &c.carol] {
+        let t = c.s.token(user, &[Scope::RepoRead, Scope::RepoWrite]).await;
+        assert_eq!(
+            client
+                .post(c.hooks("team"))
+                .bearer_auth(&t)
+                .json(&json!({"url": "http://127.0.0.1:9/x", "events": []}))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            403,
+            "{} cannot create hooks",
+            user.handle
+        );
+        assert_eq!(
+            client
+                .get(c.hooks("team"))
+                .bearer_auth(&t)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            403,
+            "{} cannot list hooks",
+            user.handle
+        );
+    }
+    let carol_rw =
+        c.s.token(&c.carol, &[Scope::RepoRead, Scope::RepoWrite])
+            .await;
+    assert_eq!(
+        client
+            .delete(format!("{}/{}", c.hooks("team"), hook_id))
+            .bearer_auth(&carol_rw)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403,
+        "readers cannot delete hooks"
+    );
+    assert_eq!(
+        client
+            .delete(format!("{}/{}", c.hooks("team"), hook_id))
+            .bearer_auth(&adam_t)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        204,
+        "admin deletes hook"
+    );
+    for (handle, want) in [
+        ("alice", 200u16),
+        ("adam", 200),
+        ("wendy", 403),
+        ("carol", 403),
+    ] {
+        let browser = c.login(handle).await;
+        assert_eq!(
+            browser
+                .get(c.web_hooks("team"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            want,
+            "{handle} hooks settings"
+        );
+    }
 }
 
 #[derive(Debug, Clone)]
