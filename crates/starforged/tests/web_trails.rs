@@ -7,6 +7,7 @@ use common::*;
 use serde_json::json;
 use starforged_core::permission::{Permission, Visibility};
 use starforged_core::tokens::Scope;
+use starforged_db::checks as db_checks;
 use starforged_db::sessions as db_sessions;
 struct Ctx {
     s: TestServer,
@@ -83,6 +84,12 @@ async fn visibility_and_role_gated_controls() {
     let (dave, _) = c.s.login("dave").await;
     assert_eq!(status(&dave, "GET", &c.trails()).await, 404);
     assert_eq!(status(&dave, "GET", &c.trail(n)).await, 404);
+    // F4: the same strangers 404 on the tab pages.
+    for tab in ["changes", "sessions"] {
+        let url = c.s.url(&format!("/alice/proj/trails/{n}/{tab}"));
+        assert_eq!(status(&anon, "GET", &url).await, 404, "{tab} anon");
+        assert_eq!(status(&dave, "GET", &url).await, 404, "{tab} dave");
+    }
 
     // Anonymous on the public repo sees list + detail but no forms.
     let pub_list = get_text(&anon, &c.s.url("/alice/open/trails")).await;
@@ -99,6 +106,15 @@ async fn visibility_and_role_gated_controls() {
         !pub_detail.contains("name=\"_csrf\""),
         "anonymous detail must carry no forms"
     );
+    // F4: anonymous readers get the tab pages on the public repo.
+    for tab in ["changes", "sessions"] {
+        let page = get_text(
+            &anon,
+            &c.s.url(&format!("/alice/open/trails/{open_n}/{tab}")),
+        )
+        .await;
+        assert!(page.contains("public trail"), "{tab} anon reads:\n{page}");
+    }
 
     // Read member sees list, detail, and the comment form — but no
     // close/label/assignee/ready controls.
@@ -1286,4 +1302,388 @@ async fn gate_panel_ids_are_unique_with_two_open_changes() {
             assert!(seen.insert(id), "duplicate id=\"{id}\" in {path}");
         }
     }
+}
+
+const F4_ULID_A: &str = "01ARZ3NDEKTSV4RRFFQ70G5FC8";
+const F4_ULID_B: &str = "01ARZ3NDEKTSV4RRFFQ70G5FC9";
+
+/// F4: the Conversation timeline merges stored events with derived session
+/// and check rows, in time order, with readable sentences for reviews.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn timeline_merges_sessions_checks_and_reviews_in_order() {
+    let c = Ctx::start().await;
+    let n = c.create("timeline trail", "do the thing").await;
+    // Two revisions: r1 at change creation, r2 via a branch move, so the
+    // page carries both a `change.open` and a `change.revision` sentence.
+    let token = c.s.token(&c.alice, &[Scope::RepoWrite]).await;
+    let url = c.s.git_url("alice", "proj", Some(&token));
+    let tmp = tempfile::tempdir().unwrap();
+    let work = work_repo(tmp.path(), "work", &[("a.txt", "one\n")]).await;
+    git_ok(&work, &["push", "-q", &url, "main"]).await;
+    git_ok(&work, &["checkout", "-q", "-b", "feature/f4"]).await;
+    commit_files(&work, &[("a.txt", b"two\n".as_slice())], "first work").await;
+    let r1 = git_ok(&work, &["rev-parse", "HEAD"])
+        .await
+        .trim()
+        .to_owned();
+    git_ok(&work, &["push", "-q", &url, "feature/f4"]).await;
+    c.s.core
+        .create_branch_change(&c.alice, "alice", "proj", n, "feature/f4", "main")
+        .await
+        .unwrap();
+    commit_files(&work, &[("a.txt", b"three\n".as_slice())], "second work").await;
+    let r2 = git_ok(&work, &["rev-parse", "HEAD"])
+        .await
+        .trim()
+        .to_owned();
+    git_ok(&work, &["push", "-q", &url, "feature/f4"]).await;
+    let repo_id =
+        c.s.core
+            .repo_for(Some(&c.alice), "alice", "proj")
+            .await
+            .unwrap()
+            .repo
+            .id;
+    // A racing post-receive scan records the same head at most once: the
+    // latest-head guard makes the explicit move below idempotent.
+    c.s.core
+        .record_branch_move(repo_id, "feature/f4", Some(&r1), &r2, Some(c.alice.id))
+        .await
+        .unwrap();
+    let up = c.s.token(&c.alice, &[Scope::SessionUpload]).await;
+    let sid = f3_upload(
+        &c.s,
+        &up,
+        "alice",
+        "proj",
+        F3_ULID_A,
+        "timeline session",
+        100,
+        20,
+    )
+    .await;
+    f3_claim(&c.s, repo_id, sid, F3_ULID_A, &r2, Some(5)).await;
+    c.s.core
+        .submit_review(
+            &c.bob,
+            "alice",
+            "proj",
+            n,
+            1,
+            None,
+            "approve",
+            "lgtm",
+            None,
+            &[],
+        )
+        .await
+        .unwrap();
+    c.s.core
+        .submit_status(
+            &c.alice,
+            "alice",
+            "proj",
+            &r2,
+            "success",
+            "ci/build",
+            Some("https://ci.example.com/run/1"),
+            Some("All green"),
+        )
+        .await
+        .unwrap();
+    let (alice, _) = c.s.login("alice").await;
+    let page = get_text(&alice, &c.trail(n)).await;
+    for want in [
+        "opened this trail",
+        "opened change 1",
+        "pushed revision 2 to change 1",
+        "bob approved change 1 (revision 2)",
+        "timeline session",
+        "#turn-5",
+        "ci/build",
+        "All green",
+    ] {
+        assert!(page.contains(want), "timeline has {want:?}:\n{page}");
+    }
+    assert!(
+        !page.contains("review.submitted"),
+        "no raw review kind:\n{page}"
+    );
+    assert!(
+        !page.contains("change.revision\""),
+        "no raw change kind:\n{page}"
+    );
+    let pos = |s: &str| {
+        page.find(s)
+            .unwrap_or_else(|| panic!("missing {s:?}:\n{page}"))
+    };
+    let opened = pos("opened this trail");
+    let change_open = pos("opened change 1");
+    let revision = pos("pushed revision 2 to change 1");
+    let review = pos("approved change 1 (revision 2)");
+    let session = pos("timeline session");
+    let check = pos("ci/build");
+    assert!(
+        opened < change_open
+            && change_open < revision
+            && revision < session
+            && revision < review
+            && session < check
+            && review < check,
+        "time order opened={opened} change_open={change_open} revision={revision} session={session} review={review} check={check}:\n{page}"
+    );
+}
+
+/// F4 §6.4: a session row linked through commits is absent from the
+/// Conversation timeline for a non-member on a public repo while the session
+/// is unpublished.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn timeline_session_row_follows_section_64() {
+    let c = Ctx::start().await;
+    let n =
+        c.s.core
+            .create_trail(&c.alice, "alice", "open", "open trail", "do the thing")
+            .await
+            .unwrap()
+            .number;
+    let shas = f3_push_change(&c, "open", n, &["open work"]).await;
+    let up = c.s.token(&c.alice, &[Scope::SessionUpload]).await;
+    let repo_id =
+        c.s.core
+            .repo_for(Some(&c.alice), "alice", "open")
+            .await
+            .unwrap()
+            .repo
+            .id;
+    let sid = f3_upload(
+        &c.s,
+        &up,
+        "alice",
+        "open",
+        F3_ULID_A,
+        "secret session",
+        910111,
+        12131,
+    )
+    .await;
+    f3_claim(&c.s, repo_id, sid, F3_ULID_A, shas.last().unwrap(), Some(9)).await;
+    let url = c.s.url(&format!("/alice/open/trails/{n}"));
+    let anon = c.s.browser();
+    let page = get_text(&anon, &url).await;
+    assert!(!page.contains("secret session"), "title leaked:\n{page}");
+    assert!(!page.contains(F3_ULID_A), "ULID leaked:\n{page}");
+    assert!(!page.contains("910111"), "totals leaked:\n{page}");
+    let (alice, _) = c.s.login("alice").await;
+    let page = get_text(&alice, &url).await;
+    assert!(
+        page.contains("secret session"),
+        "member reads title:\n{page}"
+    );
+    assert!(page.contains(F3_ULID_A), "member reads ULID:\n{page}");
+    assert!(page.contains("#turn-9"), "member reads deep link:\n{page}");
+}
+
+/// F4: a hostile check context, description, and target URL render escaped;
+/// a `javascript:` URL never becomes a link, while an https URL does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn timeline_check_xss_escapes() {
+    let c = Ctx::start().await;
+    let n = c.create("check xss", "do the thing").await;
+    let shas = f3_push_change(&c, "proj", n, &["check work"]).await;
+    let head = shas.last().unwrap().clone();
+    c.s.core
+        .submit_status(
+            &c.alice,
+            "alice",
+            "proj",
+            &head,
+            "failure",
+            "<b>ctx</b>",
+            Some("https://ci.example.com/evil"),
+            Some("<script>alert(2)</script>"),
+        )
+        .await
+        .unwrap();
+    // A `javascript:` target URL is rejected by Core validation, so it can
+    // only arrive below it: the render layer must still neutralize it.
+    let repo_id =
+        c.s.core
+            .repo_for(Some(&c.alice), "alice", "proj")
+            .await
+            .unwrap()
+            .repo
+            .id;
+    db_checks::insert_check(
+        c.s.core.db(),
+        repo_id,
+        &head,
+        "xss-link",
+        "failure",
+        Some("javascript:alert(3)"),
+        Some("hostile"),
+        Some(c.alice.id),
+        starforged_db::now(),
+    )
+    .await
+    .unwrap();
+    let (alice, _) = c.s.login("alice").await;
+    let page = get_text(&alice, &c.trail(n)).await;
+    assert!(!page.contains("<script>alert(2)"), "live script:\n{page}");
+    assert!(
+        page.contains("&#60;script&#62;alert(2)&#60;/script&#62;"),
+        "escaped description:\n{page}"
+    );
+    assert!(!page.contains("<b>ctx</b>"), "live context:\n{page}");
+    assert!(
+        page.contains("&#60;b&#62;ctx&#60;/b&#62;"),
+        "escaped context:\n{page}"
+    );
+    assert!(
+        !page.contains("javascript:"),
+        "javascript URL leaked:\n{page}"
+    );
+    assert!(
+        page.contains("href=\"https://ci.example.com/evil\""),
+        "https target links:\n{page}"
+    );
+}
+
+/// F4 + F3-review: a stored `trail.session_linked` row shows the session ULID
+/// only when the viewer can read the session — unpublished on a public repo
+/// (anonymous), quarantined on a private repo (non-admin reader) — and the
+/// API detail redacts the same payload the same way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn timeline_linked_session_ulid_follows_section_64() {
+    let c = Ctx::start().await;
+    // Public repo, unpublished hand-linked session.
+    let n =
+        c.s.core
+            .create_trail(&c.alice, "alice", "open", "open trail", "do the thing")
+            .await
+            .unwrap()
+            .number;
+    let up = c.s.token(&c.alice, &[Scope::SessionUpload]).await;
+    f3_upload(&c.s, &up, "alice", "open", F4_ULID_A, "hand session", 7, 8).await;
+    c.s.core
+        .link_trail_session(&c.alice, "alice", "open", n, F4_ULID_A)
+        .await
+        .unwrap();
+    let url = c.s.url(&format!("/alice/open/trails/{n}"));
+    let anon = c.s.browser();
+    let page = get_text(&anon, &url).await;
+    assert!(
+        page.contains("linked a session"),
+        "redacted sentence:\n{page}"
+    );
+    assert!(!page.contains(F4_ULID_A), "ULID leaked to anon:\n{page}");
+    let (alice, _) = c.s.login("alice").await;
+    let page = get_text(&alice, &url).await;
+    assert!(page.contains(F4_ULID_A), "member reads ULID:\n{page}");
+    // The API detail redacts the same payload for a non-member reader.
+    let client = reqwest::Client::new();
+    // Carol is a stranger to the public repo: a non-member reader.
+    let carol_tok = c.s.token(&c.carol, &[Scope::RepoRead]).await;
+    let body: serde_json::Value = client
+        .get(c.s.url(&format!("/api/v1/repos/alice/open/trails/{n}")))
+        .bearer_auth(&carol_tok)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let linked = body["timeline"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "trail.session_linked")
+        .expect("linked row present");
+    assert!(
+        linked["payload"].get("session").is_none(),
+        "API payload redacted for non-member: {linked}"
+    );
+    let alice_tok = c.s.token(&c.alice, &[Scope::RepoRead]).await;
+    let body: serde_json::Value = client
+        .get(c.s.url(&format!("/api/v1/repos/alice/open/trails/{n}")))
+        .bearer_auth(&alice_tok)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let linked = body["timeline"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "trail.session_linked")
+        .expect("linked row present");
+    assert_eq!(
+        linked["payload"]["session"].as_str(),
+        Some(F4_ULID_A),
+        "API payload kept for member: {linked}"
+    );
+    // Private repo, quarantined hand-linked session: a read member sees the
+    // sentence but no ULID; the admin uploader sees both.
+    let m = c.create("quarantine trail", "do the thing").await;
+    let sid = f3_upload(
+        &c.s,
+        &up,
+        "alice",
+        "proj",
+        F4_ULID_B,
+        "quarantined session",
+        1,
+        2,
+    )
+    .await;
+    c.s.core
+        .link_trail_session(&c.alice, "alice", "proj", m, F4_ULID_B)
+        .await
+        .unwrap();
+    db_sessions::set_quarantine(c.s.core.db(), sid, "quarantined", "probe", "")
+        .await
+        .unwrap();
+    let (carol, _) = c.s.login("carol").await;
+    let page = get_text(&carol, &c.trail(m)).await;
+    assert!(
+        page.contains("linked a session"),
+        "redacted sentence:\n{page}"
+    );
+    assert!(!page.contains(F4_ULID_B), "ULID leaked to reader:\n{page}");
+    let page = get_text(&alice, &c.trail(m)).await;
+    assert!(page.contains(F4_ULID_B), "admin reads ULID:\n{page}");
+}
+
+/// F4 + F3-review: the unlink forms on the Sessions tab render only for
+/// viewers who may link, like the link form.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sessions_tab_unlink_forms_follow_can_link() {
+    let c = Ctx::start().await;
+    let n = c.create("link forms", "do the thing").await;
+    let up = c.s.token(&c.alice, &[Scope::SessionUpload]).await;
+    f3_upload(&c.s, &up, "alice", "proj", F3_ULID_A, "linked", 1, 2).await;
+    c.s.core
+        .link_trail_session(&c.alice, "alice", "proj", n, F3_ULID_A)
+        .await
+        .unwrap();
+    let sessions_url = c.s.url(&format!("/alice/proj/trails/{n}/sessions"));
+    let (carol, _) = c.s.login("carol").await;
+    let page = get_text(&carol, &sessions_url).await;
+    assert!(page.contains(F3_ULID_A), "row renders:\n{page}");
+    assert!(
+        !page.contains("unlink-"),
+        "read member sees unlink forms:\n{page}"
+    );
+    assert!(
+        !page.contains("link-session"),
+        "read member sees link form:\n{page}"
+    );
+    let (bob, _) = c.s.login("bob").await;
+    let page = get_text(&bob, &sessions_url).await;
+    assert!(page.contains("unlink-"), "triage sees unlink form:\n{page}");
+    assert!(
+        page.contains("link-session"),
+        "triage sees link form:\n{page}"
+    );
 }

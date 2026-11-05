@@ -24,7 +24,7 @@
 <h3>Timeline</h3>
 <ul class="timeline">
 {% for ev in timeline %}
-<li>{{ ev.text }} · <span class="muted">{{ ev.time }}</span></li>
+<li>{{ ev.text }}{% if let Some(link) = ev.link %} <a href="{{ link.url }}">{{ link.label }}</a>{% endif %} · <span class="muted">{{ ev.time }}</span></li>
 {% endfor %}
 </ul>
 <h3>Comments</h3>

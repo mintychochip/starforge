@@ -105,7 +105,11 @@ pub struct TrailDetailJson {
     pub timeline: Vec<TimelineJson>,
 }
 
-async fn detail_json(core: &Core, detail: &TrailDetail) -> Result<TrailDetailJson, ApiError> {
+async fn detail_json(
+    core: &Core,
+    detail: &TrailDetail,
+    readable_sessions: &std::collections::HashSet<String>,
+) -> Result<TrailDetailJson, ApiError> {
     let mut timeline = Vec::with_capacity(detail.timeline.len());
     for event in &detail.timeline {
         let actor = match event.actor_id {
@@ -115,12 +119,28 @@ async fn detail_json(core: &Core, detail: &TrailDetail) -> Result<TrailDetailJso
                 None => None,
             },
         };
+        let mut payload: Value = serde_json::from_str(&event.payload)
+            .unwrap_or_else(|_| Value::String(event.payload.clone()));
+        // §6.4: stored session-link rows expose the session ULID only to
+        // viewers who can read the session. The timeline stays stored-only
+        // (no derived rows); unreadable identifiers are stripped.
+        if matches!(
+            event.kind.as_str(),
+            "trail.session_linked" | "trail.session_unlinked"
+        ) {
+            let redacted = payload
+                .get("session")
+                .and_then(|v| v.as_str())
+                .is_some_and(|ulid| !readable_sessions.contains(ulid));
+            if redacted && let Some(object) = payload.as_object_mut() {
+                object.remove("session");
+            }
+        }
         timeline.push(TimelineJson {
             id: event.id,
             kind: event.kind.clone(),
             actor,
-            payload: serde_json::from_str(&event.payload)
-                .unwrap_or_else(|_| Value::String(event.payload.clone())),
+            payload,
             created_at: rfc3339(event.created_at),
         });
     }
@@ -228,11 +248,24 @@ pub async fn get_trail(
     auth: ApiAuth,
     Path((owner, repo, number)): Path<(String, String, i64)>,
 ) -> Result<Json<TrailDetailJson>, ApiError> {
+    let reader = auth.reader()?;
     let detail = state
         .core
-        .trail_by_number(auth.reader()?, &owner, &repo, number)
+        .trail_by_number(reader, &owner, &repo, number)
         .await?;
-    Ok(Json(detail_json(&state.core, &detail).await?))
+    // §6.4 for the timeline redaction below: every ULID here is readable
+    // by this viewer, so stored session-link rows are stripped otherwise.
+    let sessions = state
+        .core
+        .trail_sessions(reader, &owner, &repo, number)
+        .await?;
+    let readable: std::collections::HashSet<String> = sessions
+        .commits
+        .iter()
+        .flat_map(|g| g.sessions.iter().map(|s| s.ulid.clone()))
+        .chain(sessions.linked.iter().map(|s| s.ulid.clone()))
+        .collect();
+    Ok(Json(detail_json(&state.core, &detail, &readable).await?))
 }
 
 #[derive(Debug, Deserialize, Default)]

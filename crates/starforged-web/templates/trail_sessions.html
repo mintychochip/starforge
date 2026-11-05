@@ -20,12 +20,14 @@
 <ul class="session-chips">
 {% for s in linked %}{% include "session_row.html" %}{% endfor %}
 </ul>
+{% if header.can_link %}
 {% for s in linked %}
 <form method="post" action="/{{ head.owner }}/{{ head.name }}/trails/{{ header.number }}/sessions/{{ s.ulid }}/unlink" class="inline" id="unlink-{{ s.ulid }}">
   <input type="hidden" name="_csrf" value="{{ header.csrf }}">
   <button type="submit">Unlink {{ s.ulid }}</button>
 </form>
 {% endfor %}
+{% endif %}
 </section>
 {% endif %}
 {% if header.can_link %}

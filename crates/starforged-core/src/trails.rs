@@ -12,6 +12,7 @@
 //! Only open/close/reopen are audited; everything else is timeline-only.
 
 use starforged_db::changes as db_changes;
+use starforged_db::checks as db_checks;
 use starforged_db::now;
 use starforged_db::sessions as db_sessions;
 use starforged_db::sessions::SessionRow;
@@ -162,6 +163,50 @@ pub struct TrailSessions {
     pub commits: Vec<CommitSessions>,
     pub linked: Vec<SessionLinkRow>,
     pub totals: TokenTotals,
+}
+
+/// One readable session linked through a commit, as a D7 timeline row. `at`
+/// is the row's time: the later of the session's `created_at` and the first
+/// revision containing its commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimelineSession {
+    pub row: SessionLinkRow,
+    pub sha: String,
+    pub subject: String,
+    pub change: i64,
+    pub revision: i64,
+    pub at: i64,
+}
+
+/// One check status posted on a revision head SHA, as a D7 timeline row.
+/// `at` is the row's `updated_at`, so a re-posted context moves with its
+/// latest post.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimelineCheck {
+    pub row: db_checks::CheckRow,
+    pub change: i64,
+    pub revision: i64,
+    pub at: i64,
+}
+
+/// One D7 Conversation timeline entry: a stored event, a readable linked
+/// session, or a check on a revision head. Entries come out in time order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrailTimelineEntry {
+    Stored(TimelineEventRow),
+    Session(TimelineSession),
+    Check(TimelineCheck),
+}
+
+impl TrailTimelineEntry {
+    /// Sort key for the merged timeline.
+    pub fn at(&self) -> i64 {
+        match self {
+            TrailTimelineEntry::Stored(row) => row.created_at,
+            TrailTimelineEntry::Session(entry) => entry.at,
+            TrailTimelineEntry::Check(entry) => entry.at,
+        }
+    }
 }
 
 /// One dashboard Trail row: its repository coordinates plus the fields the
@@ -1479,6 +1524,77 @@ impl Core {
             });
         }
         Ok(rows)
+    }
+
+    /// D7 Conversation timeline: stored events plus derived rows, in time
+    /// order (stable: stored rows in id order, then sessions in
+    /// [`Core::trail_sessions`] order, then checks in
+    /// (change, revision, context) order).
+    ///
+    /// Derived rows are computed per request and filtered for the viewer:
+    /// one row per readable session linked through commits (timed at the
+    /// later of the session's `created_at` and the first revision
+    /// containing its commit), and one row per check status posted on a
+    /// head SHA of any revision of the Trail's changes (labeled with the
+    /// newest revision carrying that head; timed at the check's
+    /// `updated_at`). Reads 404 for non-readers, like
+    /// [`Core::trail_by_number`].
+    pub async fn trail_timeline(
+        &self,
+        viewer: Option<&User>,
+        owner: &str,
+        repo: &str,
+        n: i64,
+    ) -> CoreResult<Vec<TrailTimelineEntry>> {
+        let access = self.repo_for(viewer, owner, repo).await?;
+        let trail = self.trail_row(access.repo.id, n).await?;
+        let mut entries: Vec<TrailTimelineEntry> =
+            db_trails::timeline_of_trail(self.db(), trail.id)
+                .await?
+                .into_iter()
+                .map(TrailTimelineEntry::Stored)
+                .collect();
+        let sessions = self.trail_sessions(viewer, owner, repo, n).await?;
+        for group in &sessions.commits {
+            for row in &group.sessions {
+                entries.push(TrailTimelineEntry::Session(TimelineSession {
+                    row: row.clone(),
+                    sha: group.sha.clone(),
+                    subject: group.subject.clone(),
+                    change: group.change,
+                    revision: group.revision,
+                    at: row.created_at.max(group.first_seen_at),
+                }));
+            }
+        }
+        // Newest (change, revision) carrying each head SHA; ascending
+        // iteration means the last write wins.
+        let mut heads: std::collections::HashMap<String, (i64, i64)> =
+            std::collections::HashMap::new();
+        for change in db_changes::changes_of_trail(self.db(), trail.id).await? {
+            for revision in db_changes::revisions_of_change(self.db(), change.id).await? {
+                heads.insert(revision.head_sha.clone(), (change.number, revision.number));
+            }
+        }
+        let shas: Vec<String> = heads.keys().cloned().collect();
+        let mut labeled: Vec<(i64, i64, String, db_checks::CheckRow)> = Vec::new();
+        for row in db_checks::latest_checks_for_shas(self.db(), access.repo.id, &shas).await? {
+            if let Some(&(change, revision)) = heads.get(&row.sha) {
+                labeled.push((change, revision, row.context.clone(), row));
+            }
+        }
+        labeled.sort_by(|a, b| (a.0, a.1, &a.2).cmp(&(b.0, b.1, &b.2)));
+        for (change, revision, _, row) in labeled {
+            let at = row.updated_at;
+            entries.push(TrailTimelineEntry::Check(TimelineCheck {
+                row,
+                change,
+                revision,
+                at,
+            }));
+        }
+        entries.sort_by_key(TrailTimelineEntry::at);
+        Ok(entries)
     }
 }
 

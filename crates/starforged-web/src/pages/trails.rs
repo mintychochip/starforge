@@ -5,8 +5,16 @@
 //! [`crate::markdown::render_prose`]; everything else relies on askama escaping.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::hash_map::Entry;
 
+use crate::AppState;
+use crate::auth::{MaybeUser, RequireUser, verify_csrf};
+use crate::error::WebError;
+use crate::markdown;
+use crate::views::{
+    GatePanel, NavUser, RepoHead, STRICT_CSP, SessionChip, TrailTabs, format_age, format_time, nav,
+};
 use askama::Template;
 use askama_web::WebTemplate;
 use axum::extract::{Path, Query, State};
@@ -17,14 +25,9 @@ use serde::Deserialize;
 use starforged_core::CoreError;
 use starforged_core::permission::Permission;
 use starforged_core::sessions::WebSession;
-use starforged_core::trails::{TokenTotals, TrailFilterInput, TrailSessions};
-
-use crate::AppState;
-use crate::auth::{MaybeUser, RequireUser, verify_csrf};
-use crate::error::WebError;
-use crate::markdown;
-use crate::views::{
-    GatePanel, NavUser, RepoHead, STRICT_CSP, SessionChip, TrailTabs, format_age, format_time, nav,
+use starforged_core::trails::{
+    TimelineCheck, TimelineSession, TokenTotals, TrailFilterInput, TrailSessions,
+    TrailTimelineEntry,
 };
 
 /// Trails per web page; the API stays keyset-based.
@@ -406,9 +409,19 @@ pub struct CommentItem {
     can_edit: bool,
 }
 
+/// One Conversation timeline row: a sentence plus an optional outbound link
+/// (a check's `http(s)` target, or a readable session's viewer page). The
+/// URL is only ever an `http(s)` check target or a same-origin session
+/// path built from the repo coordinates and a ULID; askama escapes both.
+pub struct TimelineLink {
+    url: String,
+    label: String,
+}
+
 pub struct TimelineItem {
     text: String,
     time: String,
+    link: Option<TimelineLink>,
 }
 
 /// One change on a trail, as the trail page's Changes section renders it.
@@ -637,8 +650,23 @@ pub(crate) async fn detail_view(
         .core
         .trail_by_number(user, owner, repo, number)
         .await?;
+    let entries = state.core.trail_timeline(user, owner, repo, number).await?;
+    let (head, header, sessions) =
+        header_data(state, session, owner, repo, number, "conversation").await?;
+    // §6.4: stored session-link rows name the session only when the viewer
+    // can read it; everything else in `sessions` is already filtered.
+    let readable: HashSet<&str> = sessions
+        .commits
+        .iter()
+        .flat_map(|g| g.sessions.iter().map(|s| s.ulid.as_str()))
+        .chain(sessions.linked.iter().map(|s| s.ulid.as_str()))
+        .collect();
     let mut handles: HashMap<i64, String> = HashMap::new();
-    for id in detail.timeline.iter().filter_map(|event| event.actor_id) {
+    for id in entries.iter().filter_map(|entry| match entry {
+        TrailTimelineEntry::Stored(event) => event.actor_id,
+        TrailTimelineEntry::Session(_) => None,
+        TrailTimelineEntry::Check(check) => check.row.creator_id,
+    }) {
         if let Entry::Vacant(slot) = handles.entry(id) {
             let handle = state
                 .core
@@ -649,20 +677,43 @@ pub(crate) async fn detail_view(
             slot.insert(handle);
         }
     }
-    let timeline = detail
-        .timeline
-        .iter()
-        .map(|event| {
-            let actor = event
-                .actor_id
-                .and_then(|id| handles.get(&id).cloned())
-                .unwrap_or_else(|| "starforge".to_owned());
-            TimelineItem {
-                text: timeline_text(&event.kind, &event.payload, &actor),
-                time: format_time(event.created_at),
+    let owner_name = header.tabs.owner.clone();
+    let repo_name = header.tabs.repo.clone();
+    let mut timeline = Vec::with_capacity(entries.len());
+    for entry in &entries {
+        match entry {
+            TrailTimelineEntry::Stored(event) => {
+                let actor = event
+                    .actor_id
+                    .and_then(|id| handles.get(&id).cloned())
+                    .unwrap_or_else(|| "starforge".to_owned());
+                let (text, link) = stored_timeline_item(
+                    &readable,
+                    &owner_name,
+                    &repo_name,
+                    &event.kind,
+                    &event.payload,
+                    &actor,
+                );
+                timeline.push(TimelineItem {
+                    text,
+                    time: format_time(event.created_at),
+                    link,
+                });
             }
-        })
-        .collect();
+            TrailTimelineEntry::Session(entry) => {
+                timeline.push(session_timeline_item(&owner_name, &repo_name, entry));
+            }
+            TrailTimelineEntry::Check(entry) => {
+                let creator = entry
+                    .row
+                    .creator_id
+                    .and_then(|id| handles.get(&id).cloned())
+                    .unwrap_or_else(|| "someone".to_owned());
+                timeline.push(check_timeline_item(entry, &creator));
+            }
+        }
+    }
     let comments = detail
         .comments
         .iter()
@@ -680,8 +731,6 @@ pub(crate) async fn detail_view(
             }),
         })
         .collect();
-    let (head, header, _) =
-        header_data(state, session, owner, repo, number, "conversation").await?;
     Ok(TrailPage {
         nav_user: session.map(NavUser::from_session),
         head,
@@ -691,6 +740,105 @@ pub(crate) async fn detail_view(
         timeline,
         error,
     })
+}
+
+/// The `session` ULID in a `trail.session_linked/unlinked` payload, if it
+/// parses. Untrusted JSON falls back to no identifier.
+fn session_payload_ulid(payload: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(payload)
+        .ok()?
+        .get("session")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+/// A stored event's timeline row. `trail.session_linked/unlinked` rows name
+/// and link the session only when the viewer can read it (§6.4); otherwise
+/// the sentence carries no identifier.
+fn stored_timeline_item(
+    readable: &HashSet<&str>,
+    owner: &str,
+    repo: &str,
+    kind: &str,
+    payload: &str,
+    actor: &str,
+) -> (String, Option<TimelineLink>) {
+    if matches!(kind, "trail.session_linked" | "trail.session_unlinked") {
+        let linked = session_payload_ulid(payload).filter(|ulid| readable.contains(ulid.as_str()));
+        match linked {
+            Some(ulid) => {
+                let link = TimelineLink {
+                    url: format!("/{owner}/{repo}/sessions/{ulid}"),
+                    label: "view session".to_owned(),
+                };
+                (timeline_text(kind, payload, actor), Some(link))
+            }
+            None => {
+                let verb = if kind == "trail.session_linked" {
+                    "linked"
+                } else {
+                    "unlinked"
+                };
+                (format!("{actor} {verb} a session"), None)
+            }
+        }
+    } else {
+        (timeline_text(kind, payload, actor), None)
+    }
+}
+
+/// A derived session row: the readable session's preview, agent, and the
+/// commit (with change/revision) that links it, plus a viewer deep link.
+fn session_timeline_item(owner: &str, repo: &str, entry: &TimelineSession) -> TimelineItem {
+    let short: String = entry.sha.chars().take(7).collect();
+    let text = format!(
+        "Session \"{}\" ({} {}) linked through commit {short} (change {}, revision {})",
+        entry.row.title, entry.row.agent, entry.row.agent_version, entry.change, entry.revision
+    );
+    let mut url = format!("/{owner}/{repo}/sessions/{}", entry.row.ulid);
+    if let Some(seq) = entry.row.seq_start {
+        url.push_str(&format!("#turn-{seq}"));
+    }
+    TimelineItem {
+        text,
+        time: format_time(entry.at),
+        link: Some(TimelineLink {
+            url,
+            label: "view session".to_owned(),
+        }),
+    }
+}
+
+/// A derived check row: creator, state, context, and change/revision label,
+/// with the description appended and the target linked only for `http(s)`.
+fn check_timeline_item(entry: &TimelineCheck, creator: &str) -> TimelineItem {
+    let row = &entry.row;
+    let mut text = format!(
+        "{creator} reported {} for {} on change {} (revision {})",
+        row.state, row.context, entry.change, entry.revision
+    );
+    if let Some(description) = row.description.as_deref().filter(|d| !d.is_empty()) {
+        text.push_str(": ");
+        text.push_str(description);
+    }
+    let link = row
+        .target_url
+        .as_deref()
+        .filter(|url| http_link(url))
+        .map(|url| TimelineLink {
+            url: url.to_owned(),
+            label: "details".to_owned(),
+        });
+    TimelineItem {
+        text,
+        time: format_time(entry.at),
+        link,
+    }
+}
+
+/// Target URLs become links only when they are `http`/`https`.
+fn http_link(url: &str) -> bool {
+    url.starts_with("http://") || url.starts_with("https://")
 }
 
 /// Builds the D6 changes list page: every change with its gate summary.
@@ -812,6 +960,7 @@ pub(crate) async fn sessions_view(
 fn timeline_text(kind: &str, payload: &str, actor: &str) -> String {
     let value: serde_json::Value = serde_json::from_str(payload).unwrap_or(serde_json::Value::Null);
     let field = |name: &str| value.get(name).and_then(|v| v.as_str());
+    let num = |name: &str| value.get(name).and_then(|v| v.as_i64());
     match kind {
         "trail.open" => format!("{actor} opened this trail"),
         "trail.state" => match field("to") {
@@ -865,6 +1014,80 @@ fn timeline_text(kind: &str, payload: &str, actor: &str) -> String {
                 .unwrap_or_else(|| "the trail".to_owned());
             format!("{actor} edited {fields}")
         }
+        "trail.merged" => format!("{actor} merged this trail"),
+        "change.open" => match (num("change"), field("kind")) {
+            (Some(k), Some("agit")) => match (field("topic"), field("base")) {
+                (Some(topic), Some(base)) => {
+                    format!("{actor} opened change {k} ({topic} onto {base})")
+                }
+                _ => format!("{actor} opened change {k}"),
+            },
+            (Some(k), _) => match (field("head"), field("base")) {
+                (Some(head), Some(base)) => {
+                    format!("{actor} opened change {k} from branch {head} onto {base}")
+                }
+                _ => format!("{actor} opened change {k}"),
+            },
+            _ => format!("{actor} opened a change"),
+        },
+        "change.revision" => match (num("change"), num("revision")) {
+            (Some(k), Some(r)) => format!("{actor} pushed revision {r} to change {k}"),
+            _ => format!("{actor} pushed a revision"),
+        },
+        "change.mergeability" => match (num("change"), field("from"), field("to")) {
+            (Some(k), Some(from), Some(to)) => {
+                format!("{actor} change {k} merge status changed from {from} to {to}")
+            }
+            _ => format!("{actor} recomputed mergeability"),
+        },
+        "change.state" => match (num("change"), field("to")) {
+            (Some(k), Some("closed")) => format!("{actor} closed change {k}"),
+            (Some(k), Some("open")) => format!("{actor} reopened change {k}"),
+            (Some(k), _) => format!("{actor} changed the state of change {k}"),
+            _ => format!("{actor} changed a change's state"),
+        },
+        "change.merge" => match (num("change"), field("method")) {
+            (Some(k), Some(method)) => format!("{actor} merged change {k} ({method})"),
+            (Some(k), None) => format!("{actor} merged change {k}"),
+            _ => format!("{actor} merged a change"),
+        },
+        "review.submitted" => match (num("change"), num("revision"), field("verdict")) {
+            (Some(k), Some(r), Some("approve")) => {
+                format!("{actor} approved change {k} (revision {r})")
+            }
+            (Some(k), Some(r), Some("request_changes")) => {
+                format!("{actor} requested changes on change {k} (revision {r})")
+            }
+            (Some(k), Some(r), _) => format!("{actor} reviewed change {k} (revision {r})"),
+            _ => format!("{actor} submitted a review"),
+        },
+        "review.dismissed" => match (num("change"), field("reason")) {
+            (Some(k), Some(reason)) => {
+                format!("{actor} dismissed a review on change {k} ({reason})")
+            }
+            (Some(k), None) => format!("{actor} dismissed a review on change {k}"),
+            _ => format!("{actor} dismissed a review"),
+        },
+        "thread.open" => match (num("change"), field("path")) {
+            (Some(k), Some(path)) => format!("{actor} opened a thread on change {k} ({path})"),
+            (Some(k), None) => format!("{actor} opened a thread on change {k}"),
+            _ => format!("{actor} opened a thread"),
+        },
+        "thread.resolved" => {
+            let resolved = value
+                .get("resolved")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            match (num("change"), resolved) {
+                (Some(k), true) => format!("{actor} resolved a thread on change {k}"),
+                (Some(k), false) => format!("{actor} reopened a thread on change {k}"),
+                _ => format!("{actor} changed a thread"),
+            }
+        }
+        "thread.comment" => match num("change") {
+            Some(k) => format!("{actor} commented on a thread on change {k}"),
+            None => format!("{actor} commented on a thread"),
+        },
         _ => format!("{actor} {kind}"),
     }
 }
