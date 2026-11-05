@@ -6,7 +6,8 @@
 //! idempotent. The token never appears in any output, log, or error.
 
 /// JSON API client rooted at one repo: `{api_url}/api/v1/repos/{owner}/{repo}/`.
-#[derive(Debug)]
+///
+/// `Debug` is redacted by hand: the bearer token must never reach logs.
 pub struct ApiClient {
     /// Server origin as passed to [`ApiClient::new`] (trailing `/` trimmed).
     server: String,
@@ -16,6 +17,18 @@ pub struct ApiClient {
     web_base: String,
     token: String,
     client: reqwest::Client,
+}
+
+impl std::fmt::Debug for ApiClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ApiClient")
+            .field("server", &self.server)
+            .field("api_base", &self.api_base)
+            .field("web_base", &self.web_base)
+            .field("token", &"<redacted>")
+            .field("client", &self.client)
+            .finish()
+    }
 }
 
 impl ApiClient {
@@ -314,5 +327,18 @@ mod tests {
     fn web_url_joins_repo_base() {
         let api = ApiClient::new("http://host:8080/", "o/r", "t").unwrap();
         assert_eq!(api.web_url("trails/12"), "http://host:8080/o/r/trails/12");
+    }
+
+    #[test]
+    fn debug_redacts_the_token() {
+        let token = "sk-test-distinctive-token-ABCDEF123456";
+        let api = ApiClient::new("http://host:8080/", "o/r", token).unwrap();
+        let shown = format!("{api:?}");
+        assert!(!shown.contains(token), "token leaked: {shown}");
+        assert!(
+            !shown.contains(&token[token.len() - 8..]),
+            "token tail leaked: {shown}"
+        );
+        assert!(shown.contains("<redacted>"), "redaction marker: {shown}");
     }
 }

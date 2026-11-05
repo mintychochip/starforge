@@ -14,6 +14,7 @@ use crate::config::CliPaths;
 /// Injected context for trail commands: the API client, the repo the command
 /// runs in, the chosen remote name (if any), and extra env for git subprocesses
 /// (empty in production; hermetic sets in tests). J3 handlers use only `api`.
+/// `Debug` redacts the token via [`ApiClient`].
 #[derive(Debug)]
 pub struct TrailCtx {
     pub api: ApiClient,
@@ -283,5 +284,19 @@ mod tests {
         ];
         assert!(select_change(&two_closed, None, true).is_err());
         assert!(select_change(&[], None, true).is_err());
+    }
+
+    #[test]
+    fn debug_redacts_the_token() {
+        let token = "sk-test-distinctive-token-ABCDEF123456";
+        let api = ApiClient::new("http://host:8080/", "o/r", token).unwrap();
+        let ctx = TrailCtx::new(api, Path::new("/tmp/cli-trail"), Some("origin"), Vec::new());
+        let shown = format!("{ctx:?}");
+        assert!(!shown.contains(token), "token leaked: {shown}");
+        assert!(
+            !shown.contains(&token[token.len() - 8..]),
+            "token tail leaked: {shown}"
+        );
+        assert!(shown.contains("<redacted>"), "redaction marker: {shown}");
     }
 }
