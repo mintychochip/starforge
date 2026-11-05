@@ -13,6 +13,7 @@ pub struct ListArgs {
     pub assignee: Option<String>,
     pub author: Option<String>,
     pub has_changes: Option<bool>,
+    pub has_sessions: Option<bool>,
     pub review_requested: Option<String>,
     pub limit: u32,
     pub after: Option<i64>,
@@ -35,6 +36,9 @@ pub async fn list(ctx: &TrailCtx, args: &ListArgs, format: Format) -> (String, u
     }
     if let Some(has_changes) = args.has_changes {
         query.push(("has_changes", has_changes.to_string()));
+    }
+    if let Some(has_sessions) = args.has_sessions {
+        query.push(("has_sessions", has_sessions.to_string()));
     }
     if let Some(review_requested) = &args.review_requested {
         query.push(("review_requested", review_requested.clone()));

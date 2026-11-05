@@ -147,6 +147,9 @@ pub enum TrailCmd {
         /// Only Trails with (true) or without (false) any change.
         #[arg(long, value_name = "BOOL")]
         has_changes: Option<bool>,
+        /// Only Trails with (true) or without (false) any readable linked session.
+        #[arg(long, value_name = "BOOL")]
+        has_sessions: Option<bool>,
         /// Only Trails with a pending review request for this handle.
         #[arg(long, value_name = "HANDLE")]
         review_requested: Option<String>,
@@ -610,6 +613,7 @@ async fn run_trail(cmd: TrailCmd, paths: CliPaths, dry_run: bool) -> std::proces
             assignee,
             author,
             has_changes,
+            has_sessions,
             review_requested,
             limit,
             after,
@@ -621,6 +625,7 @@ async fn run_trail(cmd: TrailCmd, paths: CliPaths, dry_run: bool) -> std::proces
                 assignee,
                 author,
                 has_changes,
+                has_sessions,
                 review_requested,
                 limit,
                 after,

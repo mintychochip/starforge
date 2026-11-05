@@ -17,7 +17,7 @@ mod webhooks;
 use std::sync::Arc;
 
 use axum::Router;
-use axum::routing::{get, patch, post, put};
+use axum::routing::{delete, get, patch, post, put};
 use starforged_core::Core;
 
 use crate::error::ApiError;
@@ -138,6 +138,14 @@ pub fn router(core: Core, base_url: String) -> Router {
         .route(
             "/repos/{owner}/{repo}/trails/{n}/review-requests",
             post(trails::add_review_request).delete(trails::remove_review_request),
+        )
+        .route(
+            "/repos/{owner}/{repo}/trails/{n}/sessions",
+            get(trails::get_trail_sessions).post(trails::link_trail_session),
+        )
+        .route(
+            "/repos/{owner}/{repo}/trails/{n}/sessions/{ulid}",
+            delete(trails::unlink_trail_session),
         )
         .route(
             "/repos/{owner}/{repo}/changes",

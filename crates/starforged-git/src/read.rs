@@ -37,6 +37,64 @@ impl CommitInfo {
     }
 }
 
+/// One commit in a revision's cached range: its id plus its subject line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevCommit {
+    pub sha: String,
+    pub subject: String,
+}
+
+/// Commits reachable from `head_id` but not from `from_id`, newest first (by
+/// commit time), at most `limit` of them. The second element reports whether
+/// the range was truncated, so callers keeping only the newest `limit` can
+/// warn. The head sorts first even when its timestamp ties: position 0 is
+/// always the head when the range is non-empty.
+pub fn rev_list_capped(
+    repo: &Path,
+    from_id: &str,
+    head_id: &str,
+    limit: usize,
+) -> Result<(Vec<RevCommit>, bool), GitError> {
+    let r = open(repo)?;
+    let base = r.rev_parse_single(from_id).map_err(gix_err)?.detach();
+    let head = r.rev_parse_single(head_id).map_err(gix_err)?.detach();
+    let walk = r
+        .rev_walk([head])
+        .with_hidden([base])
+        .sorting(gix::revision::walk::Sorting::ByCommitTime(
+            Default::default(),
+        ))
+        .all()
+        .map_err(gix_err)?;
+    let mut commits = Vec::new();
+    let mut truncated = false;
+    for info in walk {
+        let info = info.map_err(gix_err)?;
+        if commits.len() > limit {
+            truncated = true;
+            break;
+        }
+        let commit = info.object().map_err(gix_err)?;
+        let id = commit.id.to_string();
+        let subject = commit.message().map_err(gix_err)?.summary().to_string();
+        commits.push(RevCommit { sha: id, subject });
+    }
+    // Newest-first usually puts the head first, but equal timestamps leave
+    // the order to the walk: rotate the head to position 0 deterministically.
+    let head_hex = head.to_string();
+    if let Some(first) = commits.first().map(|rev| rev.sha.clone())
+        && first != head_hex
+        && let Some(at) = commits.iter().position(|rev| rev.sha == head_hex)
+    {
+        let rev = commits.remove(at);
+        commits.insert(0, rev);
+    }
+    if truncated {
+        commits.truncate(limit);
+    }
+    Ok((commits, truncated))
+}
+
 /// A `<ref>/<path>` URL suffix resolved to a commit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Resolved {

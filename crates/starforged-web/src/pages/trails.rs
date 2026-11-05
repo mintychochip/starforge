@@ -60,6 +60,7 @@ pub struct ListQuery {
     assignee: Option<String>,
     author: Option<String>,
     has_changes: Option<String>,
+    has_sessions: Option<String>,
     review_requested: Option<String>,
     page: Option<i64>,
 }
@@ -85,12 +86,13 @@ pub struct TrailsPage {
     assignee: String,
     author: String,
     has_changes: String,
+    has_sessions: String,
     review_requested: String,
     page: i64,
     prev_href: Option<String>,
     next_href: Option<String>,
 }
-/// `GET /{owner}/{repo}/trails[?state=&label=&assignee=&author=&has_changes=&review_requested=&page=]`.
+/// `GET /{owner}/{repo}/trails[?state=&label=&assignee=&author=&has_changes=&has_sessions=&review_requested=&page=]`.
 /// Non-readers 404, exactly like every other trail read.
 pub async fn list(
     State(state): State<AppState>,
@@ -107,6 +109,7 @@ pub async fn list(
     let filter_assignee = query.assignee.clone().filter(|s| !s.is_empty());
     let filter_author = query.author.clone().filter(|s| !s.is_empty());
     let filter_has_changes = query.has_changes.clone().filter(|s| !s.is_empty());
+    let filter_has_sessions = query.has_sessions.clone().filter(|s| !s.is_empty());
     let filter_review_requested = query.review_requested.clone().filter(|s| !s.is_empty());
     let page_no = query.page.unwrap_or(1).max(1);
     if page_no > MAX_PAGE {
@@ -124,6 +127,7 @@ pub async fn list(
         &filter_assignee,
         &filter_author,
         &filter_has_changes,
+        &filter_has_sessions,
         &filter_review_requested,
         None,
     )
@@ -145,6 +149,7 @@ pub async fn list(
             &filter_assignee,
             &filter_author,
             &filter_has_changes,
+            &filter_has_sessions,
             &filter_review_requested,
             Some(cursor),
         )
@@ -177,6 +182,7 @@ pub async fn list(
             filter_assignee.as_deref().unwrap_or_default(),
             filter_author.as_deref().unwrap_or_default(),
             filter_has_changes.as_deref().unwrap_or_default(),
+            filter_has_sessions.as_deref().unwrap_or_default(),
             filter_review_requested.as_deref().unwrap_or_default(),
             page_no - 1,
         )
@@ -190,6 +196,7 @@ pub async fn list(
             filter_assignee.as_deref().unwrap_or_default(),
             filter_author.as_deref().unwrap_or_default(),
             filter_has_changes.as_deref().unwrap_or_default(),
+            filter_has_sessions.as_deref().unwrap_or_default(),
             filter_review_requested.as_deref().unwrap_or_default(),
             page_no + 1,
         )
@@ -205,6 +212,7 @@ pub async fn list(
             assignee: filter_assignee.unwrap_or_default(),
             author: filter_author.unwrap_or_default(),
             has_changes: filter_has_changes.unwrap_or_default(),
+            has_sessions: filter_has_sessions.unwrap_or_default(),
             review_requested: filter_review_requested.unwrap_or_default(),
             page: page_no,
             prev_href,
@@ -224,6 +232,7 @@ fn list_href(
     assignee: &str,
     author: &str,
     has_changes: &str,
+    has_sessions: &str,
     review_requested: &str,
     page: i64,
 ) -> String {
@@ -234,6 +243,7 @@ fn list_href(
         ("assignee", assignee),
         ("author", author),
         ("has_changes", has_changes),
+        ("has_sessions", has_sessions),
         ("review_requested", review_requested),
     ] {
         if !value.is_empty() {
@@ -263,11 +273,17 @@ async fn fetch_page(
     filter_assignee: &Option<String>,
     filter_author: &Option<String>,
     filter_has_changes: &Option<String>,
+    filter_has_sessions: &Option<String>,
     filter_review_requested: &Option<String>,
     after: Option<i64>,
 ) -> Result<starforged_core::trails::ListPage, WebError> {
-    // The select posts "true"/"false"; anything else means no change filter.
+    // The selects post "true"/"false"; anything else means no filter.
     let has_changes = match filter_has_changes.as_deref() {
+        Some("true") => Some(true),
+        Some("false") => Some(false),
+        _ => None,
+    };
+    let has_sessions = match filter_has_sessions.as_deref() {
         Some("true") => Some(true),
         Some("false") => Some(false),
         _ => None,
@@ -284,6 +300,7 @@ async fn fetch_page(
                 assignee: filter_assignee.clone(),
                 author: filter_author.clone(),
                 has_changes,
+                has_sessions,
                 review_requested: filter_review_requested.clone(),
                 after,
                 limit: Some(PAGE_SIZE),

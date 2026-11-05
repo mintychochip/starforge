@@ -1292,3 +1292,50 @@ async fn list_filters_has_changes_and_review_requested() {
     assert_eq!(merged.status(), 200);
     assert_eq!(merged.json::<Value>().await.unwrap()["trails"], json!([]));
 }
+
+/// M2f F2: the sessions routes need `trail:write` for mutations and honor
+/// the repo visibility for reads: anonymous callers 401 on POST and 404 on
+/// a private repo's GET, and a token without the scope is 403.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn trail_sessions_routes_scope_matrix() {
+    let c = Ctx::start().await;
+    c.create("sessions scope").await;
+    let client = reqwest::Client::new();
+    let url = c.s.url("/api/v1/repos/alice/proj/trails/1/sessions");
+
+    // Anonymous: POST is 401, GET on a private repo is 404.
+    let anon_post = client
+        .post(&url)
+        .json(&json!({"session": "01ARZ3NDEKTSV4RRFFQ69G5FB0"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(anon_post.status(), 401);
+    let anon_get = client.get(&url).send().await.unwrap();
+    assert_eq!(anon_get.status(), 404);
+
+    // A token without `trail:write` is 403 on POST but reads fine.
+    let bad_post = client
+        .post(&url)
+        .bearer_auth(&c.read)
+        .json(&json!({"session": "01ARZ3NDEKTSV4RRFFQ69G5FB0"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad_post.status(), 403);
+    let read_get = client.get(&url).bearer_auth(&c.read).send().await.unwrap();
+    assert_eq!(read_get.status(), 200);
+    let body: Value = read_get.json().await.unwrap();
+    assert_eq!(body["commits"], json!([]));
+    assert_eq!(body["linked"], json!([]));
+
+    // Unknown sessions are 422-shaped 404s even with the right scope.
+    let missing = client
+        .post(&url)
+        .bearer_auth(&c.composed)
+        .json(&json!({"session": "01ARZ3NDEKTSV4RRFFQ69G5FF9"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), 404);
+}

@@ -19,6 +19,13 @@
       <option value="false"{% if has_changes == "false" %} selected{% endif %}>no</option>
     </select>
   </label>
+  <label>Sessions
+    <select name="has_sessions">
+      <option value=""{% if has_sessions.is_empty() %} selected{% endif %}>any</option>
+      <option value="true"{% if has_sessions == "true" %} selected{% endif %}>yes</option>
+      <option value="false"{% if has_sessions == "false" %} selected{% endif %}>no</option>
+    </select>
+  </label>
   <label>Label <input type="text" name="label" value="{{ label }}"></label>
   <label>Assignee <input type="text" name="assignee" value="{{ assignee }}"></label>
   <label>Author <input type="text" name="author" value="{{ author }}"></label>

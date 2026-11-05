@@ -50,6 +50,8 @@ pub struct RevisionRow {
     pub created_at: i64,
     pub mergeability: String,
     pub conflict_paths: String,
+    /// Whether the revision's commits were cached in `revision_commits` (D2).
+    pub commits_recorded: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,7 +146,7 @@ macro_rules! select_revision {
     ($tail:literal) => {
         concat!(
             "SELECT id, change_id, number, head_sha, base_sha, merge_base_sha, pusher_id, created_at, ",
-            "mergeability, conflict_paths FROM revisions ",
+            "mergeability, conflict_paths, commits_recorded FROM revisions ",
             $tail
         )
     };
@@ -212,6 +214,7 @@ fn revision_from_row(row: &AnyRow) -> DbResult<RevisionRow> {
         created_at: row.try_get("created_at")?,
         mergeability: row.try_get("mergeability")?,
         conflict_paths: row.try_get("conflict_paths")?,
+        commits_recorded: row.try_get("commits_recorded")?,
     })
 }
 
@@ -563,7 +566,7 @@ async fn insert_revision_row(db: &Db, n: &NewRevision<'_>, now: i64) -> DbResult
         "INSERT INTO revisions (change_id, number, head_sha, base_sha, pusher_id, created_at) \
          VALUES ($1, $2, $3, $4, $5, $6) \
          RETURNING id, change_id, number, head_sha, base_sha, merge_base_sha, pusher_id, created_at, \
-         mergeability, conflict_paths",
+         mergeability, conflict_paths, commits_recorded",
     )
     .bind(n.change_id)
     .bind(number)
@@ -634,7 +637,7 @@ pub async fn insert_revision_numbered(
         "INSERT INTO revisions (change_id, number, head_sha, base_sha, pusher_id, created_at) \
          VALUES ($1, $2, $3, $4, $5, $6) \
          RETURNING id, change_id, number, head_sha, base_sha, merge_base_sha, pusher_id, created_at, \
-         mergeability, conflict_paths",
+         mergeability, conflict_paths, commits_recorded",
     )
     .bind(change_id)
     .bind(number)
@@ -649,13 +652,15 @@ pub async fn insert_revision_numbered(
 
 /// Inserts an agit change with its first revision and current pointer in one
 /// transaction: allocates the change number, inserts the change, allocates
-/// the revision number, inserts the revision, and points the change at it.
-/// Readers polling for the change (the post-push scan's `open_agit_change`)
-/// see it only once the revision and its current pointer exist — combined
-/// with refs written before this commits (the fresh-trail `k == 1`, `r == 1`
-/// pre-write), a visible first revision always has its refs and its current
-/// pointer. The change row is re-read before commit so the returned row
-/// carries the current revision id.
+/// the revision number, inserts the revision, caches the walked commits, and
+/// points the change at it. Readers polling for the change (the post-push
+/// scan's `open_agit_change`) see it only once the revision and its current
+/// pointer exist — combined with refs written before this commits (the
+/// fresh-trail `k == 1`, `r == 1` pre-write), a visible first revision always
+/// has its refs and its current pointer. A revision that is current always
+/// has its commits recorded, or flag 0 after a git failure for the backfill.
+/// The change row is re-read before commit so the returned row carries the
+/// current revision id.
 #[allow(clippy::too_many_arguments)]
 pub async fn insert_agit_change_with_revision(
     db: &Db,
@@ -667,6 +672,9 @@ pub async fn insert_agit_change_with_revision(
     base_sha: &str,
     pusher: Option<i64>,
     now: i64,
+    // The walked commit range, or `None` when git failed (the flag stays 0
+    // for the backfill). Stored before the pointer moves.
+    commits: Option<&[(String, String)]>,
 ) -> DbResult<(ChangeRow, RevisionRow)> {
     let mut tx = db.pool().begin().await?;
     let k = alloc_change_number(&mut tx, trail_id).await?;
@@ -688,7 +696,7 @@ pub async fn insert_agit_change_with_revision(
         "INSERT INTO revisions (change_id, number, head_sha, base_sha, pusher_id, created_at) \
          VALUES ($1, $2, $3, $4, $5, $6) \
          RETURNING id, change_id, number, head_sha, base_sha, merge_base_sha, pusher_id, created_at, \
-         mergeability, conflict_paths",
+         mergeability, conflict_paths, commits_recorded",
     )
     .bind(change_id)
     .bind(r)
@@ -699,6 +707,9 @@ pub async fn insert_agit_change_with_revision(
     .fetch_one(&mut *tx)
     .await?;
     let revision = revision_from_row(&rev_row)?;
+    if let Some(commits) = commits {
+        store_revision_commits_tx(&mut tx, revision.id, commits).await?;
+    }
     sqlx::query("UPDATE changes SET current_revision_id = $1, updated_at = $2 WHERE id = $3")
         .bind(revision.id)
         .bind(now)
@@ -716,9 +727,11 @@ pub async fn insert_agit_change_with_revision(
 
 /// Inserts a `branch` change with its first revision and current pointer in
 /// one transaction (mirrors [`insert_agit_change_with_revision`]): the
-/// change number, the change row, the revision number, the revision row, and
-/// the current-revision pointer commit atomically, so readers never observe
-/// a change with no current revision.
+/// change number, the change row, the revision number, the revision row, the
+/// cached commits, and the current-revision pointer commit atomically, so
+/// readers never observe a change with no current revision — and a revision
+/// that is current always has its commits recorded, or flag 0 after a git
+/// failure for the backfill.
 #[allow(clippy::too_many_arguments)]
 pub async fn insert_branch_change_with_revision(
     db: &Db,
@@ -730,6 +743,9 @@ pub async fn insert_branch_change_with_revision(
     base_sha: &str,
     pusher: Option<i64>,
     now: i64,
+    // The walked commit range, or `None` when git failed (the flag stays 0
+    // for the backfill). Stored before the pointer moves.
+    commits: Option<&[(String, String)]>,
 ) -> DbResult<(ChangeRow, RevisionRow)> {
     let mut tx = db.pool().begin().await?;
     let k = alloc_change_number(&mut tx, trail_id).await?;
@@ -751,7 +767,7 @@ pub async fn insert_branch_change_with_revision(
         "INSERT INTO revisions (change_id, number, head_sha, base_sha, pusher_id, created_at) \
          VALUES ($1, $2, $3, $4, $5, $6) \
          RETURNING id, change_id, number, head_sha, base_sha, merge_base_sha, pusher_id, created_at, \
-         mergeability, conflict_paths",
+         mergeability, conflict_paths, commits_recorded",
     )
     .bind(change_id)
     .bind(r)
@@ -762,6 +778,9 @@ pub async fn insert_branch_change_with_revision(
     .fetch_one(&mut *tx)
     .await?;
     let revision = revision_from_row(&rev_row)?;
+    if let Some(commits) = commits {
+        store_revision_commits_tx(&mut tx, revision.id, commits).await?;
+    }
     sqlx::query("UPDATE changes SET current_revision_id = $1, updated_at = $2 WHERE id = $3")
         .bind(revision.id)
         .bind(now)
@@ -797,6 +816,132 @@ pub async fn revisions_of_change(db: &Db, change_id: i64) -> DbResult<Vec<Revisi
         .fetch_all(db.pool())
         .await?;
     rows.iter().map(revision_from_row).collect()
+}
+
+/// One cached commit of a revision: `position` 0 is the head.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevisionCommitRow {
+    pub revision_id: i64,
+    pub sha: String,
+    pub subject: String,
+    pub position: i64,
+}
+
+/// Replaces the revision's cached commits with `commits` (sha, subject in
+/// position order) and marks it recorded. Delete-then-insert keeps the
+/// backfill idempotent: re-recording the same revision never duplicates.
+pub async fn store_revision_commits(
+    db: &Db,
+    revision_id: i64,
+    commits: &[(String, String)],
+) -> DbResult<()> {
+    let mut tx = db.pool().begin().await?;
+    store_revision_commits_tx(&mut tx, revision_id, commits).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// [`store_revision_commits`] inside an open transaction, so revision
+/// creation can cache commits before the current-revision pointer moves: a
+/// revision that is current always has its commits recorded, or flag 0 after
+/// a git failure for the backfill.
+pub async fn store_revision_commits_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    revision_id: i64,
+    commits: &[(String, String)],
+) -> DbResult<()> {
+    sqlx::query("DELETE FROM revision_commits WHERE revision_id = $1")
+        .bind(revision_id)
+        .execute(&mut **tx)
+        .await?;
+    for (position, (sha, subject)) in commits.iter().enumerate() {
+        let position = position as i64;
+        sqlx::query(
+            "INSERT INTO revision_commits (revision_id, sha, subject, position) \
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(revision_id)
+        .bind(sha)
+        .bind(subject)
+        .bind(position)
+        .execute(&mut **tx)
+        .await?;
+    }
+    sqlx::query("UPDATE revisions SET commits_recorded = 1 WHERE id = $1")
+        .bind(revision_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+/// The revision's cached commits in position order (0 is the head).
+pub async fn revision_commits_of(db: &Db, revision_id: i64) -> DbResult<Vec<RevisionCommitRow>> {
+    let rows = sqlx::query(
+        "SELECT revision_id, sha, subject, position FROM revision_commits \
+         WHERE revision_id = $1 ORDER BY position ASC",
+    )
+    .bind(revision_id)
+    .fetch_all(db.pool())
+    .await?;
+    rows.iter()
+        .map(|row| {
+            Ok(RevisionCommitRow {
+                revision_id: row.try_get("revision_id")?,
+                sha: row.try_get("sha")?,
+                subject: row.try_get("subject")?,
+                position: row.try_get("position")?,
+            })
+        })
+        .collect()
+}
+
+/// One cached commit anywhere on the trail, with its coordinates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrailCommitRow {
+    pub change_number: i64,
+    pub revision_number: i64,
+    pub revision_created_at: i64,
+    pub sha: String,
+    pub subject: String,
+    pub position: i64,
+}
+
+/// Every cached commit of every revision of every change on the trail.
+pub async fn revision_commits_of_trail(db: &Db, trail_id: i64) -> DbResult<Vec<TrailCommitRow>> {
+    let rows = sqlx::query(
+        "SELECT c.number AS change_number, r.number AS revision_number, \
+         r.created_at AS revision_created_at, rc.sha AS sha, rc.subject AS subject, \
+         rc.position AS position FROM revision_commits rc \
+         JOIN revisions r ON r.id = rc.revision_id \
+         JOIN changes c ON c.id = r.change_id WHERE c.trail_id = $1",
+    )
+    .bind(trail_id)
+    .fetch_all(db.pool())
+    .await?;
+    rows.iter()
+        .map(|row| {
+            Ok(TrailCommitRow {
+                change_number: row.try_get("change_number")?,
+                revision_number: row.try_get("revision_number")?,
+                revision_created_at: row.try_get("revision_created_at")?,
+                sha: row.try_get("sha")?,
+                subject: row.try_get("subject")?,
+                position: row.try_get("position")?,
+            })
+        })
+        .collect()
+}
+
+/// Ids of revisions whose commits were never recorded, oldest first, at most
+/// `limit` — the hourly maintenance pass's backfill work list.
+pub async fn unrecorded_revision_ids(db: &Db, limit: i64) -> DbResult<Vec<i64>> {
+    let ids: Vec<i64> = sqlx::query_scalar(
+        "SELECT id FROM revisions WHERE commits_recorded = 0 ORDER BY id ASC LIMIT $1",
+    )
+    .bind(limit)
+    .fetch_all(db.pool())
+    .await?;
+    Ok(ids)
 }
 
 pub async fn revision_by_number(db: &Db, change_id: i64, r: i64) -> DbResult<Option<RevisionRow>> {
@@ -1651,6 +1796,7 @@ mod tests {
             "base1",
             Some(alice),
             1_700_000_001,
+            None,
         )
         .await
         .unwrap();

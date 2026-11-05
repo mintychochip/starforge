@@ -20,6 +20,8 @@ pub const POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 const HOUR: i64 = 3_600;
 const DAY: i64 = 86_400;
+/// Unrecorded revisions enqueued per hourly pass (D2 backfill bound).
+const BACKFILL_REVISIONS_PER_HOUR: i64 = 100;
 
 /// Delay before the next attempt after `attempts` failed ones, or `None` when all [`MAX_ATTEMPTS`] are used.
 pub fn retry_delay(attempts: i64) -> Option<i64> {
@@ -63,6 +65,10 @@ pub enum Job {
     /// Deduplicated per change: rapid pushes collapse into one run over the
     /// latest revision.
     ChangeMergeability { change_id: i64 },
+    /// Caches one revision's commits for the Sessions surfaces (M2f D2).
+    /// Deduplicated per revision: the hourly pass enqueues every unrecorded
+    /// revision, and rapid passes collapse into one run over each.
+    RecordRevisionCommits { revision_id: i64 },
     /// One signed webhook delivery (H5). Never deduplicated: every event fans
     /// out to its own job so retries never collapse distinct deliveries.
     /// `redelivery` marks jobs replayed from the log (D6); it defaults so
@@ -90,6 +96,7 @@ impl Job {
             Job::UpdateSessionStats { .. } => "update_session_stats",
             Job::SessionWebhookOutbox { .. } => "session_webhook_outbox",
             Job::ChangeMergeability { .. } => "change_mergeability",
+            Job::RecordRevisionCommits { .. } => "record_revision_commits",
             Job::WebhookDelivery { .. } => "webhook_delivery",
         }
     }
@@ -107,6 +114,7 @@ impl Job {
             Job::ResolveCommitLinks { .. } => None,
             Job::UpdateSessionStats { .. } => None,
             Job::ChangeMergeability { .. } => None,
+            Job::RecordRevisionCommits { .. } => None,
             Job::WebhookDelivery { .. } => None,
             Job::SessionWebhookOutbox { .. } => None,
         }
@@ -118,6 +126,9 @@ impl Job {
             Job::GitMaintenance { repo_id } => Some(format!("git_maintenance:{repo_id}")),
             Job::ChangeMergeability { change_id } => {
                 Some(format!("change_mergeability:{change_id}"))
+            }
+            Job::RecordRevisionCommits { revision_id } => {
+                Some(format!("record_revision_commits:{revision_id}"))
             }
             _ => self.recurrence().map(|_| self.kind().to_owned()),
         }
@@ -235,6 +246,9 @@ impl Core {
                 self.update_session_stats(*session_id).await.map(|_| ())
             }
             Job::ChangeMergeability { change_id } => self.recompute_mergeability(*change_id).await,
+            Job::RecordRevisionCommits { revision_id } => {
+                self.backfill_revision_commits(*revision_id).await
+            }
             Job::WebhookDelivery {
                 webhook_id,
                 event,
@@ -304,6 +318,16 @@ impl Core {
             if let Err(err) = self.config().blob_store.delete(&key).await {
                 tracing::warn!(hash = %blob.hash, error = %err, "blob sweep: file delete failed");
             }
+        }
+        // Revisions whose commits were never cached (a git failure at record
+        // time leaves the flag at 0): bounded, idempotent — the per-revision
+        // dedupe collapses repeat passes, and the worker skips recorded rows.
+        for revision_id in
+            starforged_db::changes::unrecorded_revision_ids(self.db(), BACKFILL_REVISIONS_PER_HOUR)
+                .await?
+        {
+            self.enqueue(&Job::RecordRevisionCommits { revision_id })
+                .await?;
         }
         Ok(())
     }

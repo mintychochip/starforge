@@ -74,10 +74,33 @@ pub struct TrailFilter {
     /// `Some(true)` matches Trails with at least one change in any state;
     /// `Some(false)` matches Trails with none.
     pub has_changes: Option<bool>,
+    /// `Some(true)` keeps Trails with at least one session the viewer may
+    /// read (§6.4, through commits or explicit links); `Some(false)` keeps
+    /// the rest. The viewer facts travel alongside for the SQL predicate.
+    pub has_sessions: Option<bool>,
+    pub session_facts: SessionViewerFacts,
     /// Matches Trails with a pending review request for this user.
     pub review_requested_id: Option<i64>,
     pub after: Option<i64>,
     pub limit: i64,
+}
+
+/// Bound facts about the viewer for the `has_sessions` SQL predicate (the
+/// same three rules as `core::read::can_read_session`): zeros and `false`
+/// for anonymous viewers on non-public repos. Defaults to that anonymous
+/// shape; only used when `has_sessions` is `Some`.
+#[derive(Debug, Clone, Default)]
+pub struct SessionViewerFacts {
+    /// 0 when anonymous (user ids start at 1).
+    pub viewer_id: i64,
+    pub signed_in: bool,
+    pub site_admin: bool,
+    /// Explicit grant only (ownership or collaborator row).
+    pub member: bool,
+    /// Effective repo permission is Admin or higher (owners count).
+    pub repo_admin: bool,
+    pub repo_public: bool,
+    pub repo_internal: bool,
 }
 
 impl Default for TrailFilter {
@@ -88,6 +111,8 @@ impl Default for TrailFilter {
             assignee_id: None,
             author_id: None,
             has_changes: None,
+            has_sessions: None,
+            session_facts: SessionViewerFacts::default(),
             review_requested_id: None,
             after: None,
             limit: 30,
@@ -222,33 +247,90 @@ pub async fn trail_by_id(db: &Db, id: i64) -> DbResult<Option<TrailRow>> {
 /// Trails of the repository in ascending number order, at most `f.limit` rows.
 /// Every filter is optional: `after` is the keyset cursor (rows above it only),
 /// label/assignee/review-request match through `EXISTS` subqueries, state/author
-/// directly, and `has_changes` through an existence check on `changes`.
+/// directly, `has_changes` through an existence check on `changes`, and
+/// `has_sessions` through readable-session existence checks (commit links with
+/// a non-null `session_id` plus explicit links).
+///
+/// The readable-session predicate mirrors `starforged_core::read::can_read_session`
+/// arm for arm with bound viewer facts (`$11`-`$17`; anonymous viewers bind
+/// zero/false): site admins read everything; quarantined sessions admit only
+/// the uploader, the repo owner, or repo admins; otherwise owners read all,
+/// published sessions need repo read, and unpublished sessions need repo read
+/// on non-public repos but explicit membership on public ones. A bare session
+/// existence check would leak unreadable (unpublished or quarantined)
+/// sessions, so the two must stay in sync — the `trail_sessions` §6.4 tests
+/// pin both.
 pub async fn trails_of_repo(db: &Db, repo_id: i64, f: &TrailFilter) -> DbResult<Vec<TrailRow>> {
-    // `has_changes` binds 0/1 (never a boolean literal): 1 keeps Trails with
-    // at least one change, 0 keeps Trails with none. The three-way shape
-    // keeps the `NULL` (no filter) arm valid on both engines.
+    // `has_changes`/`has_sessions` bind 0/1 (never a boolean literal): 1 keeps
+    // Trails with at least one match, 0 keeps Trails with none. The three-way
+    // shape keeps the `NULL` (no filter) arm valid on both engines. The `$N`
+    // placeholders are numbered by first appearance.
     let has_changes: Option<i64> = f.has_changes.map(i64::from);
-    let rows = sqlx::query(select_trail!(
-        "WHERE repo_id = $1 AND ($2 IS NULL OR number > $2) AND ($3 IS NULL OR state = $3) \
+    let has_sessions: Option<i64> = f.has_sessions.map(i64::from);
+    let facts = &f.session_facts;
+    // `s` is the candidate `sessions` row in both `EXISTS` bodies below.
+    // Numbering is dense 1-17 in bind order: repo and the old filters keep
+    // `$1`-`$8`, then the session flag and viewer facts, then the limit.
+    let readable = "(($12 = 1) \
+         OR (s.quarantine = 'quarantined' AND (s.uploader_id = $10 \
+         OR (SELECT owner_id FROM repos WHERE id = $1) = $10 OR $14 = 1)) \
+         OR (s.quarantine <> 'quarantined' AND ((SELECT owner_id FROM repos WHERE id = $1) = $10 \
+         OR (s.visibility = 'published' AND ($13 = 1 OR $15 = 1 OR ($16 = 1 AND $11 = 1))) \
+         OR (s.visibility <> 'published' AND (($15 = 1 AND $13 = 1) \
+         OR ($15 = 0 AND ($13 = 1 OR ($16 = 1 AND $11 = 1))))))))";
+    let linked_through_commits = format!(
+        "EXISTS (SELECT 1 FROM changes c JOIN revisions r ON r.change_id = c.id \
+         JOIN revision_commits rc ON rc.revision_id = r.id \
+         JOIN commit_links cl ON cl.repo_id = $1 AND cl.sha = rc.sha AND cl.session_id IS NOT NULL \
+         JOIN sessions s ON s.id = cl.session_id AND s.repo_id = $1 \
+         WHERE c.trail_id = trails.id AND {readable})"
+    );
+    let linked_by_hand = format!(
+        "EXISTS (SELECT 1 FROM trail_session_links tsl \
+         JOIN sessions s ON s.id = tsl.session_id AND s.repo_id = $1 \
+         WHERE tsl.trail_id = trails.id AND {readable})"
+    );
+    let sql = format!(
+        "SELECT id, repo_id, number, title, intent, state, ready, author_id, created_at, updated_at, \
+         closed_at, merged_at FROM trails \
+         WHERE repo_id = $1 AND ($2 IS NULL OR number > $2) AND ($3 IS NULL OR state = $3) \
          AND ($4 IS NULL OR author_id = $4) \
          AND ($5 IS NULL OR EXISTS (SELECT 1 FROM trail_labels WHERE trail_id = trails.id AND name = $5)) \
          AND ($6 IS NULL OR EXISTS (SELECT 1 FROM trail_assignees WHERE trail_id = trails.id AND user_id = $6)) \
          AND ($7 IS NULL OR ($7 = 1 AND EXISTS (SELECT 1 FROM changes WHERE trail_id = trails.id)) \
          OR ($7 = 0 AND NOT EXISTS (SELECT 1 FROM changes WHERE trail_id = trails.id))) \
          AND ($8 IS NULL OR EXISTS (SELECT 1 FROM trail_review_requests WHERE trail_id = trails.id AND user_id = $8)) \
-         ORDER BY number ASC LIMIT $9"
-    ))
-    .bind(repo_id)
-    .bind(f.after)
-    .bind(f.state.as_deref())
-    .bind(f.author_id)
-    .bind(f.label.as_deref())
-    .bind(f.assignee_id)
-    .bind(has_changes)
-    .bind(f.review_requested_id)
-    .bind(f.limit)
-    .fetch_all(db.pool())
-    .await?;
+         AND ($9 IS NULL OR (($9 = 1 AND ({linked_through_commits} OR {linked_by_hand})) \
+         OR ($9 = 0 AND NOT ({linked_through_commits} OR {linked_by_hand})))) \
+         ORDER BY number ASC LIMIT $17"
+    );
+    // Binds follow the placeholder numbers in order: $1 repo, $2 after,
+    // $3 state, $4 author, $5 label, $6 assignee, $7 has_changes,
+    // $8 review-requested, $9 has_sessions, $10 viewer id, $11 signed in,
+    // $12 site admin, $13 explicit member, $14 repo admin, $15 repo public,
+    // $16 repo internal, $17 limit.
+    // Dynamic only in placeholder-free structure (the same `$N` grammar as
+    // the old literal query); every value stays bound.
+    let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+        .bind(repo_id)
+        .bind(f.after)
+        .bind(f.state.as_deref())
+        .bind(f.author_id)
+        .bind(f.label.as_deref())
+        .bind(f.assignee_id)
+        .bind(has_changes)
+        .bind(f.review_requested_id)
+        .bind(has_sessions)
+        .bind(facts.viewer_id)
+        .bind(i64::from(facts.signed_in))
+        .bind(i64::from(facts.site_admin))
+        .bind(i64::from(facts.member))
+        .bind(i64::from(facts.repo_admin))
+        .bind(i64::from(facts.repo_public))
+        .bind(i64::from(facts.repo_internal))
+        .bind(f.limit)
+        .fetch_all(db.pool())
+        .await?;
     rows.iter().map(trail_from_row).collect()
 }
 
@@ -577,6 +659,78 @@ pub async fn timeline_of_trail(db: &Db, trail_id: i64) -> DbResult<Vec<TimelineE
     rows.iter().map(timeline_from_row).collect()
 }
 
+/// One explicit hand link between a Trail and a session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrailSessionLinkRow {
+    pub trail_id: i64,
+    pub session_id: i64,
+    pub linked_by: Option<i64>,
+    pub created_at: i64,
+}
+
+fn session_link_from_row(row: &AnyRow) -> DbResult<TrailSessionLinkRow> {
+    Ok(TrailSessionLinkRow {
+        trail_id: row.try_get("trail_id")?,
+        session_id: row.try_get("session_id")?,
+        linked_by: row.try_get("linked_by")?,
+        created_at: row.try_get("created_at")?,
+    })
+}
+
+/// Records an explicit link; `false` when it already exists (idempotent).
+pub async fn add_trail_session_link(
+    db: &Db,
+    trail_id: i64,
+    session_id: i64,
+    linked_by: i64,
+    now: i64,
+) -> DbResult<bool> {
+    let result = sqlx::query(
+        "INSERT INTO trail_session_links (trail_id, session_id, linked_by, created_at) \
+         VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
+    )
+    .bind(trail_id)
+    .bind(session_id)
+    .bind(linked_by)
+    .bind(now)
+    .execute(db.pool())
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// Removes an explicit link; `false` when there was none.
+pub async fn remove_trail_session_link(db: &Db, trail_id: i64, session_id: i64) -> DbResult<bool> {
+    let result =
+        sqlx::query("DELETE FROM trail_session_links WHERE trail_id = $1 AND session_id = $2")
+            .bind(trail_id)
+            .bind(session_id)
+            .execute(db.pool())
+            .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// Explicit links of the trail, oldest first.
+pub async fn trail_session_links_of(db: &Db, trail_id: i64) -> DbResult<Vec<TrailSessionLinkRow>> {
+    let rows = sqlx::query(
+        "SELECT trail_id, session_id, linked_by, created_at FROM trail_session_links \
+         WHERE trail_id = $1 ORDER BY created_at ASC, session_id ASC",
+    )
+    .bind(trail_id)
+    .fetch_all(db.pool())
+    .await?;
+    rows.iter().map(session_link_from_row).collect()
+}
+
+/// How many explicit links the trail holds (the 50-link cap checks this).
+pub async fn trail_session_link_count(db: &Db, trail_id: i64) -> DbResult<i64> {
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM trail_session_links WHERE trail_id = $1")
+            .bind(trail_id)
+            .fetch_one(db.pool())
+            .await?;
+    Ok(count)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -855,6 +1009,8 @@ mod tests {
             assignee_id: None,
             author_id: None,
             has_changes: None,
+            has_sessions: None,
+            session_facts: SessionViewerFacts::default(),
             review_requested_id: None,
             after: None,
             limit: 30,
@@ -869,6 +1025,8 @@ mod tests {
             assignee_id: Some(alice),
             author_id: Some(alice),
             has_changes: None,
+            has_sessions: None,
+            session_facts: SessionViewerFacts::default(),
             review_requested_id: None,
             after: Some(1),
             limit: 30,

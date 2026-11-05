@@ -27,6 +27,7 @@ fn open_list_args() -> ListArgs {
         assignee: None,
         author: None,
         has_changes: None,
+        has_sessions: None,
         review_requested: None,
         limit: 30,
         after: None,
@@ -1088,6 +1089,7 @@ async fn agent_workflow_sweep() {
             assignee: None,
             author: None,
             has_changes: None,
+            has_sessions: None,
             review_requested: None,
             limit: 30,
             after: None,
@@ -1112,5 +1114,34 @@ async fn missing_credentials_name_the_login_hint() {
         err.to_string()
             .contains("run `starforge auth login forge.example`"),
         "login hint: {err}"
+    );
+}
+
+/// `trail list --has-sessions` maps to the `has_sessions` list param.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn list_has_sessions_flag_maps_to_param() {
+    let s = TestServer::start().await;
+    let alice = s.user("alice").await;
+    s.repo(&alice, "proj", Visibility::Private).await;
+    let token = s.token(&alice, &[Scope::RepoRead, Scope::TrailWrite]).await;
+    let ctx = ctx_for(&s, "alice/proj", &token);
+    s.core
+        .create_trail(&alice, "alice", "proj", "Hello", "World intent")
+        .await
+        .unwrap();
+
+    let mut args = open_list_args();
+    args.has_sessions = Some(false);
+    let (out, code) = list(&ctx, &args, Format::Text).await;
+    assert_eq!(code, 0, "list: {out}");
+    assert!(out.contains("#1"), "sessionless trail matches false: {out}");
+
+    let mut args = open_list_args();
+    args.has_sessions = Some(true);
+    let (out, code) = list(&ctx, &args, Format::Text).await;
+    assert_eq!(code, 0, "list: {out}");
+    assert!(
+        out.contains("(no trails)"),
+        "sessionless trail misses true: {out}"
     );
 }

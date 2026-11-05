@@ -139,6 +139,13 @@ impl Core {
                 {
                     tracing::warn!(repo_id, error = %err, "trail ref write failed before the rows; the mergeability job replays it");
                 }
+                // Walk the commit range before the transaction so the cached
+                // commits land atomically with the revision and its pointer:
+                // a revision that is current always has its commits recorded,
+                // or flag 0 after a git failure for the backfill.
+                let commits = self
+                    .walk_revision_commits(repo_id, base_tip, head_sha)
+                    .await;
                 let (row, revision) = match db_changes::insert_agit_change_with_revision(
                     self.db(),
                     trail_id,
@@ -149,6 +156,7 @@ impl Core {
                     base_tip,
                     Some(user_id),
                     now(),
+                    commits.as_deref(),
                 )
                 .await
                 {
@@ -207,7 +215,7 @@ impl Core {
                     .create_agit_change(repo_id, user_id, trail_id, sc)
                     .await?;
                 let revision = self
-                    .insert_revision_and_point(row.id, head_sha, base_tip, Some(user_id))
+                    .insert_revision_and_point(repo_id, row.id, head_sha, base_tip, Some(user_id))
                     .await?;
                 if let Err(err) = self
                     .ensure_trail_refs(repo_id, trail_number, row.number, revision.number, head_sha)
@@ -670,9 +678,11 @@ impl Core {
     /// Appends a revision and points the trail refs at it: returns the
     /// latest row unchanged when it already carries `head_sha` (no row, no
     /// dismissals, no timeline, no webhook), otherwise reserves the number
-    /// first, writes `head`/`rev/<r>`, and only then inserts the row and sets
-    /// it current. Readers poll rows (never refs), so a visible revision
-    /// always has its refs — a row that outruns its refs breaks the
+    /// first, writes `head`/`rev/<r>`, and only then inserts the row, records
+    /// its commits, and sets it current. A revision that is current always
+    /// has its commits recorded, or flag 0 after a git failure for the
+    /// backfill. Readers poll rows (never refs), so a visible revision always
+    /// has its refs — a row that outruns its refs breaks the
     /// push→change→revision mapping the scan promises. A ref-write failure
     /// only warns (the mergeability job replays refs); a number collision
     /// behind the sequence is a `Conflict`, never retried in a loop.
@@ -729,10 +739,104 @@ impl Core {
             }
             Err(e) => return Err(e.into()),
         };
+        // Record the commits BEFORE moving the current-revision pointer: a
+        // revision that is current always has its commits recorded, or flag 0
+        // after a git failure for the backfill. Readers (Sessions tab,
+        // timeline) polling the pointer depend on this order.
+        self.record_revision_commits(repo_id, &revision).await;
         db_changes::set_current_revision(self.db(), change.id, revision.id, now()).await?;
         self.dismiss_stale_reviews(repo_id, trail_number, change, &revision)
             .await?;
         Ok(revision)
+    }
+
+    /// Maximum cached commits per revision (D2): the newest are kept.
+    /// (The git wrapper reports truncation so over-long ranges warn.)
+    pub(crate) const MAX_REVISION_COMMITS: usize = 250;
+
+    /// Walks the revision's commit range (reachable from the head and not
+    /// from `from`), newest first with the head at position 0. `None` when
+    /// git fails (callers leave the flag at 0 for the backfill); over-long
+    /// ranges warn and truncate to the newest [`Self::MAX_REVISION_COMMITS`].
+    async fn walk_revision_commits(
+        &self,
+        repo_id: i64,
+        from: &str,
+        head: &str,
+    ) -> Option<Vec<(String, String)>> {
+        let repo = self.repo_path(repo_id);
+        let (from, head) = (from.to_owned(), head.to_owned());
+        let walked = tokio::task::spawn_blocking(move || {
+            read::rev_list_capped(&repo, &from, &head, Self::MAX_REVISION_COMMITS)
+        })
+        .await;
+        let (commits, truncated) = match walked {
+            Ok(Ok(walked)) => walked,
+            Ok(Err(err)) => {
+                tracing::warn!(repo_id, error = %err, "revision commit walk failed; the backfill will retry");
+                return None;
+            }
+            Err(err) => {
+                tracing::warn!(repo_id, error = %err, "revision commit walk panicked; the backfill will retry");
+                return None;
+            }
+        };
+        if truncated {
+            tracing::warn!(
+                repo_id,
+                kept = Self::MAX_REVISION_COMMITS,
+                "revision exceeds the commit cache cap; keeping the newest"
+            );
+        }
+        Some(
+            commits
+                .into_iter()
+                .map(|rev| (rev.sha, rev.subject))
+                .collect(),
+        )
+    }
+
+    /// Caches the revision's commits (reachable from the head and not from
+    /// the merge base — or the base SHA when no merge base is known) and
+    /// marks it recorded. Git and store failures only warn and leave the
+    /// flag at 0 for the backfill; never fails the caller.
+    async fn record_revision_commits(&self, repo_id: i64, revision: &db_changes::RevisionRow) {
+        let from = revision
+            .merge_base_sha
+            .clone()
+            .unwrap_or_else(|| revision.base_sha.clone());
+        let revision_id = revision.id;
+        let Some(commits) = self
+            .walk_revision_commits(repo_id, &from, &revision.head_sha)
+            .await
+        else {
+            return;
+        };
+        if let Err(err) = db_changes::store_revision_commits(self.db(), revision_id, &commits).await
+        {
+            tracing::warn!(repo_id, revision = revision_id, error = %err, "revision commit store failed; the backfill will retry");
+        }
+    }
+
+    /// Backfills one unrecorded revision (the hourly maintenance pass's work
+    /// item): reuses the merge base once the mergeability worker resolved it.
+    /// Missing rows and recorded revisions are successful no-ops; git and
+    /// store failures only warn (the flag stays 0 for the next pass).
+    pub(crate) async fn backfill_revision_commits(&self, revision_id: i64) -> CoreResult<()> {
+        let Some(revision) = db_changes::revision_by_id(self.db(), revision_id).await? else {
+            return Ok(());
+        };
+        if revision.commits_recorded != 0 {
+            return Ok(());
+        }
+        let Some(change) = db_changes::change_by_id(self.db(), revision.change_id).await? else {
+            return Ok(());
+        };
+        let Some(trail) = db_trails::trail_by_id(self.db(), change.trail_id).await? else {
+            return Ok(());
+        };
+        self.record_revision_commits(trail.repo_id, &revision).await;
+        Ok(())
     }
 
     /// The D2 `review` subject for a dismissal: the review's identity and
@@ -884,11 +988,15 @@ impl Core {
         Ok(row)
     }
 
-    /// Inserts a revision with the plain allocator and points the change at
-    /// it. Use when the refs are handled by the caller (fresh-trail pre-write
-    /// or pinned post-write); [`Core::append_revision`] otherwise.
+    /// Inserts a revision and points the change at it: the row lands first,
+    /// its commits are recorded, and only then does the pointer move — a
+    /// revision that is current always has its commits recorded, or flag 0
+    /// after a git failure for the backfill. Use when the refs are handled
+    /// by the caller (fresh-trail pre-write or pinned post-write);
+    /// [`Core::append_revision`] otherwise.
     async fn insert_revision_and_point(
         &self,
+        repo_id: i64,
         change_id: i64,
         head_sha: &str,
         base_sha: &str,
@@ -912,6 +1020,7 @@ impl Core {
             }
             Err(e) => return Err(e.into()),
         };
+        self.record_revision_commits(repo_id, &revision).await;
         db_changes::set_current_revision(self.db(), change_id, revision.id, now()).await?;
         Ok(revision)
     }
@@ -1410,9 +1519,15 @@ impl Core {
             )));
         }
         let (head_tip, base_tip) = self.branch_tips(access.repo.id, head, base).await?;
-        // One transaction: the change, its first revision, and the current
-        // pointer commit together, so readers never see a change with no
-        // current revision.
+        // One transaction: the change, its first revision, its cached
+        // commits, and the current pointer commit together, so readers never
+        // see a change with no current revision — and a revision that is
+        // current always has its commits recorded, or flag 0 after a git
+        // failure for the backfill. The range is walked before the
+        // transaction so no git work happens inside it.
+        let commits = self
+            .walk_revision_commits(access.repo.id, &base_tip, &head_tip)
+            .await;
         let (row, revision) = match db_changes::insert_branch_change_with_revision(
             self.db(),
             trail.id,
@@ -1423,6 +1538,7 @@ impl Core {
             &base_tip,
             Some(user.id),
             now(),
+            commits.as_deref(),
         )
         .await
         {

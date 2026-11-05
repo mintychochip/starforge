@@ -140,12 +140,15 @@ pub struct ListQuery {
     /// `true` keeps Trails with at least one change, `false` those with
     /// none; anything else is a 422.
     pub has_changes: Option<String>,
+    /// `true` keeps Trails with at least one session the viewer may read
+    /// (§6.4), `false` those without; anything else is a 422.
+    pub has_sessions: Option<String>,
     pub review_requested: Option<String>,
     pub after: Option<i64>,
     pub limit: Option<i64>,
 }
 
-/// `GET /repos/{owner}/{repo}/trails[?state=&label=&assignee=&author=&has_changes=&review_requested=&after=&limit=]`.
+/// `GET /repos/{owner}/{repo}/trails[?state=&label=&assignee=&author=&has_changes=&has_sessions=&review_requested=&after=&limit=]`.
 pub async fn list_trails(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -162,6 +165,16 @@ pub async fn list_trails(
             )));
         }
     };
+    let has_sessions = match query.has_sessions.as_deref() {
+        None => None,
+        Some("true") => Some(true),
+        Some("false") => Some(false),
+        Some(other) => {
+            return Err(ApiError::Invalid(format!(
+                "invalid has_sessions '{other}': expected true or false"
+            )));
+        }
+    };
     let page = state
         .core
         .list_trails(
@@ -174,6 +187,7 @@ pub async fn list_trails(
                 assignee: query.assignee,
                 author: query.author,
                 has_changes,
+                has_sessions,
                 review_requested: query.review_requested,
                 after: query.after,
                 limit: query.limit,
@@ -456,4 +470,106 @@ pub async fn remove_review_request(
         .remove_review_request(&auth.user, &owner, &repo, number, &body.user)
         .await?;
     Ok(Json(trail_json(&view)))
+}
+
+fn totals_json(totals: &starforged_core::trails::TokenTotals) -> Value {
+    json!({
+        "input": totals.input,
+        "output": totals.output,
+        "cache_read": totals.cache_read,
+        "cache_write": totals.cache_write,
+        "reasoning": totals.reasoning,
+        "total": totals.total,
+    })
+}
+
+fn session_link_json(row: &starforged_core::trails::SessionLinkRow) -> Value {
+    json!({
+        "ulid": row.ulid,
+        "agent": row.agent,
+        "agent_version": row.agent_version,
+        "models": serde_json::from_str::<Value>(&row.models)
+            .unwrap_or_else(|_| Value::String(row.models.clone())),
+        "title": row.title,
+        "uploader": row.uploader,
+        "started_at": row.started_at,
+        "created_at": row.created_at,
+        "confidence": row.confidence,
+        "seq_start": row.seq_start,
+        "totals": totals_json(&row.totals),
+    })
+}
+
+fn trail_sessions_json(view: &starforged_core::trails::TrailSessions) -> Value {
+    json!({
+        "commits": view.commits.iter().map(|commit| json!({
+            "sha": commit.sha,
+            "subject": commit.subject,
+            "change": commit.change,
+            "revision": commit.revision,
+            "first_seen_at": commit.first_seen_at,
+            "sessions": commit.sessions.iter().map(session_link_json).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+        "linked": view.linked.iter().map(session_link_json).collect::<Vec<_>>(),
+        "totals": totals_json(&view.totals),
+    })
+}
+
+/// `GET /repos/{owner}/{repo}/trails/{n}/sessions`: the Trail's readable
+/// linked sessions (D5 JSON), applying §6.4 for the current viewer.
+pub async fn get_trail_sessions(
+    State(state): State<ApiState>,
+    auth: ApiAuth,
+    Path((owner, repo, number)): Path<(String, String, i64)>,
+) -> Result<Json<Value>, ApiError> {
+    let view = state
+        .core
+        .trail_sessions(auth.reader()?, &owner, &repo, number)
+        .await?;
+    Ok(Json(trail_sessions_json(&view)))
+}
+
+#[derive(Deserialize)]
+pub struct TrailSessionLinkBody {
+    pub session: String,
+}
+
+/// `POST /repos/{owner}/{repo}/trails/{n}/sessions`: an explicit hand link
+/// (D3). Returns the Trail sessions JSON.
+pub async fn link_trail_session(
+    State(state): State<ApiState>,
+    auth: ApiAuth,
+    Path((owner, repo, number)): Path<(String, String, i64)>,
+    body: Result<Json<TrailSessionLinkBody>, JsonRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let auth = auth.require(Scope::TrailWrite)?;
+    let Json(body) = body.map_err(|e| ApiError::Invalid(e.body_text()))?;
+    state
+        .core
+        .link_trail_session(&auth.user, &owner, &repo, number, &body.session)
+        .await?;
+    let view = state
+        .core
+        .trail_sessions(Some(&auth.user), &owner, &repo, number)
+        .await?;
+    Ok(Json(trail_sessions_json(&view)))
+}
+
+/// `DELETE /repos/{owner}/{repo}/trails/{n}/sessions/{ulid}`: removes an
+/// explicit hand link (D3). Returns the Trail sessions JSON.
+pub async fn unlink_trail_session(
+    State(state): State<ApiState>,
+    auth: ApiAuth,
+    Path((owner, repo, number, ulid)): Path<(String, String, i64, String)>,
+) -> Result<Json<Value>, ApiError> {
+    let auth = auth.require(Scope::TrailWrite)?;
+    state
+        .core
+        .unlink_trail_session(&auth.user, &owner, &repo, number, &ulid)
+        .await?;
+    let view = state
+        .core
+        .trail_sessions(Some(&auth.user), &owner, &repo, number)
+        .await?;
+    Ok(Json(trail_sessions_json(&view)))
 }

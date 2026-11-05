@@ -674,3 +674,45 @@ async fn list_filters_has_changes_and_review_requested() {
     .await;
     assert!(unknown.contains("No trails yet."));
 }
+
+/// M2f F2: the list gains a has-sessions select that filters and persists
+/// across pager links.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn list_filters_has_sessions() {
+    let c = Ctx::start().await;
+    for i in 1..=31 {
+        c.create(&format!("trail-{i:02}"), "do the thing").await;
+    }
+
+    let (carol, _) = c.s.login("carol").await;
+    let list = get_text(&carol, &c.trails()).await;
+    assert!(
+        list.contains(r#"name="has_sessions""#),
+        "has-sessions select"
+    );
+
+    // No sessions anywhere yet: true matches nothing, false matches all 31.
+    let with_sessions = get_text(&carol, &c.s.url("/alice/proj/trails?has_sessions=true")).await;
+    assert!(!with_sessions.contains("trail-01"));
+    assert!(with_sessions.contains("No trails yet."));
+    let without_sessions =
+        get_text(&carol, &c.s.url("/alice/proj/trails?has_sessions=false")).await;
+    assert!(without_sessions.contains("trail-01"));
+    assert!(!without_sessions.contains("trail-31"), "page 1 stops at 30");
+    // (Askama escapes the `&` in pager hrefs, so check the params apart.)
+    assert!(
+        without_sessions.contains("has_sessions=false"),
+        "pager links persist the filter"
+    );
+    assert!(
+        without_sessions.contains("page=2"),
+        "pager links carry the page"
+    );
+    let page2 = get_text(
+        &carol,
+        &c.s.url("/alice/proj/trails?has_sessions=false&page=2"),
+    )
+    .await;
+    assert!(page2.contains("trail-31"));
+    assert!(!page2.contains("trail-01"));
+}

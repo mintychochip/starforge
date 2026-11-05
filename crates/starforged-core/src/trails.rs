@@ -11,12 +11,16 @@
 //! `merged` is never written here — the merge path owns it.
 //! Only open/close/reopen are audited; everything else is timeline-only.
 
+use starforged_db::changes as db_changes;
 use starforged_db::now;
+use starforged_db::sessions as db_sessions;
+use starforged_db::sessions::SessionRow;
 use starforged_db::trails as db_trails;
 use starforged_db::trails::{TimelineEventRow, TrailCommentRow, TrailFilter, TrailRow};
 
 use crate::accounts::User;
-use crate::permission::Permission;
+use crate::permission::{Permission, Viewer, Visibility};
+use crate::read::can_read_session;
 use crate::{Core, CoreError, CoreResult};
 
 /// Max title length in chars after trimming.
@@ -60,10 +64,97 @@ pub struct TrailFilterInput {
     /// `Some(true)` keeps Trails with at least one change; `Some(false)`
     /// keeps Trails with none.
     pub has_changes: Option<bool>,
+    /// `Some(true)` keeps Trails with at least one session the viewer may
+    /// read (§6.4, through commits or by hand); `Some(false)` keeps the rest.
+    pub has_sessions: Option<bool>,
     /// Keeps Trails with a pending review request for this handle.
     pub review_requested: Option<String>,
     pub after: Option<i64>,
     pub limit: Option<i64>,
+}
+
+/// Max explicit Trail↔session links per Trail (D3).
+const MAX_TRAIL_SESSION_LINKS: usize = 50;
+/// Session titles render truncated to this many chars (D5 prompt preview).
+const MAX_SESSION_TITLE_CHARS: usize = 120;
+
+/// Token totals over sessions (input, output, cache read, cache write,
+/// reasoning, and their sum). Shared by per-session rows, commit groups, and
+/// the Trail-wide rollup.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TokenTotals {
+    pub input: i64,
+    pub output: i64,
+    pub cache_read: i64,
+    pub cache_write: i64,
+    pub reasoning: i64,
+    pub total: i64,
+}
+
+impl TokenTotals {
+    fn of(session: &SessionRow) -> TokenTotals {
+        let totals = TokenTotals {
+            input: session.usage_input,
+            output: session.usage_output,
+            cache_read: session.usage_cache_read,
+            cache_write: session.usage_cache_write,
+            reasoning: session.usage_reasoning,
+            total: 0,
+        };
+        let total = totals.input
+            + totals.output
+            + totals.cache_read
+            + totals.cache_write
+            + totals.reasoning;
+        TokenTotals { total, ..totals }
+    }
+
+    fn add(&mut self, other: &TokenTotals) {
+        self.input += other.input;
+        self.output += other.output;
+        self.cache_read += other.cache_read;
+        self.cache_write += other.cache_write;
+        self.reasoning += other.reasoning;
+        self.total += other.total;
+    }
+}
+
+/// One readable session linked to a Trail: through a commit (`exact` or
+/// `heuristic` confidence, with the claim's start sequence) or by hand
+/// (`explicit`, no sequence).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionLinkRow {
+    pub ulid: String,
+    pub agent: String,
+    pub agent_version: String,
+    pub models: String,
+    pub title: String,
+    pub uploader: String,
+    pub started_at: i64,
+    pub created_at: i64,
+    pub confidence: String,
+    pub seq_start: Option<i64>,
+    pub totals: TokenTotals,
+}
+
+/// One Trail commit with its readable sessions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitSessions {
+    pub sha: String,
+    pub subject: String,
+    pub change: i64,
+    pub revision: i64,
+    pub first_seen_at: i64,
+    pub sessions: Vec<SessionLinkRow>,
+}
+
+/// D5 data: the Trail's readable linked sessions, grouped. `linked` holds
+/// the explicit hand links; `totals` roll up distinct sessions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrailSessions {
+    pub commits: Vec<CommitSessions>,
+    pub linked: Vec<SessionLinkRow>,
+    pub totals: TokenTotals,
 }
 
 /// One dashboard Trail row: its repository coordinates plus the fields the
@@ -404,6 +495,23 @@ impl Core {
             },
         };
         let limit = f.limit.unwrap_or(30).clamp(1, 100);
+        // §6.4 viewer facts for the `has_sessions` SQL predicate (same three
+        // rules as `can_read_session`): suspended users are anonymous.
+        let viewer = user.filter(|u| u.active);
+        let session_facts = db_trails::SessionViewerFacts {
+            viewer_id: viewer.map(|u| u.id).unwrap_or(0),
+            signed_in: viewer.is_some(),
+            site_admin: viewer.map(|u| u.is_admin).unwrap_or(false),
+            member: match viewer {
+                Some(u) if f.has_sessions.is_some() => {
+                    self.is_repo_member(access.repo.id, u.id).await?
+                }
+                _ => false,
+            },
+            repo_admin: access.permission >= Permission::Admin,
+            repo_public: access.repo.visibility == Visibility::Public,
+            repo_internal: access.repo.visibility == Visibility::Internal,
+        };
         let rows = db_trails::trails_of_repo(
             self.db(),
             access.repo.id,
@@ -413,6 +521,8 @@ impl Core {
                 assignee_id,
                 author_id,
                 has_changes: f.has_changes,
+                has_sessions: f.has_sessions,
+                session_facts,
                 review_requested_id,
                 after: f.after,
                 limit,
@@ -1041,6 +1151,304 @@ impl Core {
         .await;
         self.trail_view(&self.trail_row(access.repo.id, number).await?)
             .await
+    }
+
+    /// D3 explicit link. Triage+ on the repo, or the Trail author for a
+    /// session they uploaded; the session must be in the same repo and
+    /// readable by the actor (§6.4), else 404. At most 50 explicit links per
+    /// Trail (422 beyond). Idempotent: repeats write nothing and still
+    /// succeed. A real link writes `trail.session_linked` and dispatches
+    /// `trail`/`updated` with cause `session_linked`. Archived repos refuse.
+    pub async fn link_trail_session(
+        &self,
+        user: &User,
+        owner: &str,
+        repo: &str,
+        n: i64,
+        ulid: &str,
+    ) -> CoreResult<()> {
+        let access = self.repo_for(Some(user), owner, repo).await?;
+        Self::ensure_writable(&access.repo)?;
+        let row = self.trail_row(access.repo.id, n).await?;
+        let session = db_sessions::session_by_ulid(self.db(), access.repo.id, ulid)
+            .await?
+            .ok_or(CoreError::NotFound)?;
+        // Suspended users are anonymous, mirroring `authorize_session_read`.
+        let viewer = user.active.then_some(Viewer {
+            user_id: user.id,
+            is_admin: user.is_admin,
+        });
+        self.authorize_session_read(viewer, &access.repo, &session)
+            .await?;
+        let triage = access.permission >= Permission::Triage;
+        let own_upload = row.author_id == Some(user.id) && session.uploader_id == user.id;
+        if !triage && !own_upload {
+            return Err(CoreError::Forbidden);
+        }
+        if !db_trails::add_trail_session_link(self.db(), row.id, session.id, user.id, now()).await?
+        {
+            return Ok(());
+        }
+        if db_trails::trail_session_link_count(self.db(), row.id).await?
+            > MAX_TRAIL_SESSION_LINKS as i64
+        {
+            db_trails::remove_trail_session_link(self.db(), row.id, session.id).await?;
+            return Err(CoreError::Invalid(
+                "this trail already has 50 explicitly linked sessions".into(),
+            ));
+        }
+        db_trails::touch(self.db(), row.id, now()).await?;
+        self.record_timeline(
+            access.repo.id,
+            row.id,
+            "trail.session_linked",
+            Some(user.id),
+            serde_json::json!({"session": ulid}),
+        )
+        .await?;
+        self.dispatch_trail_event(
+            access.repo.id,
+            Some(user.handle.clone()),
+            Some("updated"),
+            Some("session_linked"),
+            n,
+            None,
+        )
+        .await;
+        Ok(())
+    }
+
+    /// D3 explicit unlink. Same authorization as [`Core::link_trail_session`].
+    /// Removing a missing link is a silent no-op; a real unlink writes
+    /// `trail.session_unlinked` and dispatches `trail`/`updated` with cause
+    /// `session_unlinked`.
+    pub async fn unlink_trail_session(
+        &self,
+        user: &User,
+        owner: &str,
+        repo: &str,
+        n: i64,
+        ulid: &str,
+    ) -> CoreResult<()> {
+        let access = self.repo_for(Some(user), owner, repo).await?;
+        Self::ensure_writable(&access.repo)?;
+        let row = self.trail_row(access.repo.id, n).await?;
+        let session = db_sessions::session_by_ulid(self.db(), access.repo.id, ulid)
+            .await?
+            .ok_or(CoreError::NotFound)?;
+        let viewer = user.active.then_some(Viewer {
+            user_id: user.id,
+            is_admin: user.is_admin,
+        });
+        self.authorize_session_read(viewer, &access.repo, &session)
+            .await?;
+        let triage = access.permission >= Permission::Triage;
+        let own_upload = row.author_id == Some(user.id) && session.uploader_id == user.id;
+        if !triage && !own_upload {
+            return Err(CoreError::Forbidden);
+        }
+        if !db_trails::remove_trail_session_link(self.db(), row.id, session.id).await? {
+            return Ok(());
+        }
+        db_trails::touch(self.db(), row.id, now()).await?;
+        self.record_timeline(
+            access.repo.id,
+            row.id,
+            "trail.session_unlinked",
+            Some(user.id),
+            serde_json::json!({"session": ulid}),
+        )
+        .await?;
+        self.dispatch_trail_event(
+            access.repo.id,
+            Some(user.handle.clone()),
+            Some("updated"),
+            Some("session_unlinked"),
+            n,
+            None,
+        )
+        .await;
+        Ok(())
+    }
+
+    /// D5 data: the viewer's readable linked sessions, grouped. Used by F3
+    /// (Sessions tab) and F4 (timeline rows). Commit groups hold every
+    /// commit of the Trail with at least one readable session, ordered by
+    /// first appearance (change number ascending, then revision number
+    /// descending, then position); each commit appears once. The group's
+    /// `change`/`revision` is that first appearance's occurrence, and
+    /// `first_seen_at` is its revision's creation time.
+    pub async fn trail_sessions(
+        &self,
+        viewer: Option<&User>,
+        owner: &str,
+        repo: &str,
+        n: i64,
+    ) -> CoreResult<TrailSessions> {
+        let access = self.repo_for(viewer, owner, repo).await?;
+        let trail = self.trail_row(access.repo.id, n).await?;
+        // Suspended users are anonymous.
+        let viewer = viewer.filter(|u| u.active);
+        let viewer_fact = viewer.map(|u| Viewer {
+            user_id: u.id,
+            is_admin: u.is_admin,
+        });
+        let is_member = match viewer {
+            Some(u) => self.is_repo_member(access.repo.id, u.id).await?,
+            None => false,
+        };
+        let is_admin = access.permission >= Permission::Admin;
+
+        // All cached commits on the trail, first-appearance walk order.
+        let mut occurrences = db_changes::revision_commits_of_trail(self.db(), trail.id).await?;
+        occurrences.sort_by(|a, b| {
+            (
+                a.change_number,
+                std::cmp::Reverse(a.revision_number),
+                a.position,
+            )
+                .cmp(&(
+                    b.change_number,
+                    std::cmp::Reverse(b.revision_number),
+                    b.position,
+                ))
+        });
+        let mut order: Vec<String> = Vec::new();
+        let mut representative: std::collections::HashMap<String, (i64, i64, i64, String)> =
+            std::collections::HashMap::new();
+        for occurrence in &occurrences {
+            if representative.contains_key(&occurrence.sha) {
+                continue;
+            }
+            representative.insert(
+                occurrence.sha.clone(),
+                (
+                    occurrence.change_number,
+                    occurrence.revision_number,
+                    occurrence.revision_created_at,
+                    occurrence.subject.clone(),
+                ),
+            );
+            order.push(occurrence.sha.clone());
+        }
+        // One commit-link query for every cached sha, then the per-row
+        // `can_read_session` filter (mirrors `filter_readable_links`).
+        let shas: Vec<String> = order.clone();
+        let mut commit_sessions: std::collections::HashMap<String, Vec<SessionLinkRow>> =
+            std::collections::HashMap::new();
+        let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        for link in db_sessions::links_for_shas(self.db(), access.repo.id, &shas).await? {
+            let session = match link.session_id {
+                Some(id) => db_sessions::session_by_id(self.db(), id).await?,
+                None => {
+                    db_sessions::session_by_ulid(self.db(), access.repo.id, &link.session_ulid)
+                        .await?
+                }
+            };
+            let Some(session) = session else { continue };
+            if session.repo_id != access.repo.id {
+                continue;
+            }
+            if !can_read_session(viewer_fact, &access.repo, &session, is_member, is_admin) {
+                continue;
+            }
+            seen.insert(session.id);
+            commit_sessions.entry(link.sha.clone()).or_default().push(
+                self.session_link_row(&link.confidence, link.seq_start, &session)
+                    .await?,
+            );
+        }
+        // Explicit links, oldest first, same read filter.
+        let mut linked = Vec::new();
+        for explicit in db_trails::trail_session_links_of(self.db(), trail.id).await? {
+            let Some(session) = db_sessions::session_by_id(self.db(), explicit.session_id).await?
+            else {
+                continue;
+            };
+            if session.repo_id != access.repo.id {
+                continue;
+            }
+            if !can_read_session(viewer_fact, &access.repo, &session, is_member, is_admin) {
+                continue;
+            }
+            seen.insert(session.id);
+            linked.push(self.session_link_row("explicit", None, &session).await?);
+        }
+        // Commit groups in walk order, keeping only commits with a readable
+        // session; Trail totals over distinct sessions.
+        let mut commits = Vec::new();
+        for sha in &order {
+            let Some(sessions) = commit_sessions.remove(sha) else {
+                continue;
+            };
+            if sessions.is_empty() {
+                continue;
+            }
+            let (change, revision, first_seen_at, subject) = representative
+                .remove(sha)
+                .expect("walk sha has a representative");
+            commits.push(CommitSessions {
+                sha: sha.clone(),
+                subject,
+                change,
+                revision,
+                first_seen_at,
+                sessions,
+            });
+        }
+        let totals = self.trail_session_totals(seen).await?;
+        Ok(TrailSessions {
+            commits,
+            linked,
+            totals,
+        })
+    }
+
+    /// One [`SessionLinkRow`] for a readable session: title truncated to 120
+    /// chars (D5 prompt preview), token totals from its usage columns.
+    async fn session_link_row(
+        &self,
+        confidence: &str,
+        seq_start: Option<i64>,
+        session: &SessionRow,
+    ) -> CoreResult<SessionLinkRow> {
+        let uploader = self
+            .user_by_id(session.uploader_id)
+            .await?
+            .map(|user| user.handle)
+            .unwrap_or_else(|| "deleted user".to_owned());
+        Ok(SessionLinkRow {
+            ulid: session.ulid.clone(),
+            agent: session.agent_name.clone(),
+            agent_version: session.agent_version.clone(),
+            models: session.models.clone(),
+            title: session
+                .title
+                .chars()
+                .take(MAX_SESSION_TITLE_CHARS)
+                .collect(),
+            uploader,
+            started_at: session.started_at,
+            created_at: session.created_at,
+            confidence: confidence.to_owned(),
+            seq_start,
+            totals: TokenTotals::of(session),
+        })
+    }
+
+    /// Trail-wide totals over distinct session ids (a session linked through
+    /// two commits counts once).
+    async fn trail_session_totals(
+        &self,
+        session_ids: std::collections::HashSet<i64>,
+    ) -> CoreResult<TokenTotals> {
+        let mut totals = TokenTotals::default();
+        for id in session_ids {
+            if let Some(session) = db_sessions::session_by_id(self.db(), id).await? {
+                totals.add(&TokenTotals::of(&session));
+            }
+        }
+        Ok(totals)
     }
 }
 
