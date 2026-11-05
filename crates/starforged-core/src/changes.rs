@@ -178,6 +178,16 @@ impl Core {
                     }),
                 )
                 .await?;
+                self.dispatch(
+                    repo_id,
+                    "change.opened",
+                    serde_json::json!({
+                        "trail": trail_number,
+                        "change": row.number,
+                        "kind": "agit",
+                    }),
+                )
+                .await;
                 (row, revision)
             }
             None => {
@@ -195,6 +205,16 @@ impl Core {
                 {
                     tracing::warn!(repo_id, change = row.number, error = %err, "trail ref write failed; the mergeability job replays it");
                 }
+                self.dispatch(
+                    repo_id,
+                    "change.opened",
+                    serde_json::json!({
+                        "trail": trail_number,
+                        "change": row.number,
+                        "kind": "agit",
+                    }),
+                )
+                .await;
                 (row, revision)
             }
         };
@@ -215,6 +235,17 @@ impl Core {
             change_id: change.id,
         })
         .await?;
+        self.dispatch(
+            repo_id,
+            "revision.pushed",
+            serde_json::json!({
+                "trail": trail_number,
+                "change": change.number,
+                "revision": revision.number,
+                "sha": head_sha,
+            }),
+        )
+        .await;
         Ok(Some((change.number, revision.number)))
     }
 
@@ -288,6 +319,17 @@ impl Core {
                 change_id: change.id,
             })
             .await?;
+            self.dispatch(
+                repo_id,
+                "revision.pushed",
+                serde_json::json!({
+                    "trail": trail.number,
+                    "change": change.number,
+                    "revision": revision.number,
+                    "sha": new,
+                }),
+            )
+            .await;
         }
         Ok(())
     }
@@ -1231,6 +1273,29 @@ impl Core {
         .await?;
         self.enqueue(&Job::ChangeMergeability { change_id: row.id })
             .await?;
+        self.dispatch(
+            access.repo.id,
+            "change.opened",
+            serde_json::json!({
+                "trail": trail.number,
+                "change": row.number,
+                "kind": "branch",
+                "head": head,
+                "base": base,
+            }),
+        )
+        .await;
+        self.dispatch(
+            access.repo.id,
+            "revision.pushed",
+            serde_json::json!({
+                "trail": trail.number,
+                "change": row.number,
+                "revision": revision.number,
+                "sha": head_tip,
+            }),
+        )
+        .await;
         self.change_view(
             &db_changes::change_by_id(self.db(), row.id)
                 .await?
@@ -1403,6 +1468,17 @@ impl Core {
             }),
         )
         .await?;
+        self.dispatch(
+            access.repo.id,
+            "review.submitted",
+            serde_json::json!({
+                "trail": trail.number,
+                "change": change.number,
+                "revision": revision.number,
+                "verdict": verdict,
+            }),
+        )
+        .await;
         self.review_view(&row).await
     }
 

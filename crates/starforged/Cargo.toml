@@ -31,6 +31,7 @@ tracing-subscriber.workspace = true
 reqwest.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
+sha2.workspace = true
 starforge-capture = { path = "../starforge-capture" }
 starforge-cli = { path = "../starforge-cli" }
 starforge-format = { path = "../starforge-format" }

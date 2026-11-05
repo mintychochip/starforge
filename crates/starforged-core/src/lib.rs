@@ -31,6 +31,7 @@ pub mod tokens;
 pub mod trails;
 pub mod validate;
 pub mod verification;
+pub mod webhooks;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -83,6 +84,15 @@ pub struct CoreConfig {
     pub mailer: Option<mail::Mailer>,
     /// Who may sign up.
     pub registration: registration::Registration,
+    /// 32-byte key sealing webhook secrets at rest (from
+    /// `security.secret_key`); `Debug` stays derived — the bytes render as
+    /// decimals, never hex, and the key never leaves the process.
+    pub webhook_key: [u8; 32],
+    /// Test-only escape hatch for the webhook SSRF gate: when true, delivery
+    /// may target loopback addresses (the integration suite's in-process
+    /// receiver). Always false in production; everything else non-global is
+    /// denied regardless.
+    pub allow_loopback_webhooks: bool,
 }
 
 /// The service layer. Cheap to clone; share one per process.
@@ -182,6 +192,8 @@ pub(crate) mod testing {
             base_url: "http://forge.test".into(),
             mailer: None,
             registration: registration::Registration::default(),
+            webhook_key: [7u8; 32],
+            allow_loopback_webhooks: false,
         };
         configure(&mut config, dir.path());
         (Core::new(db.db.clone(), config), Fixture { _db: db, dir })

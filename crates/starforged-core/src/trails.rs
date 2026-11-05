@@ -278,6 +278,12 @@ impl Core {
             "",
         )
         .await?;
+        self.dispatch(
+            access.repo.id,
+            "trail.opened",
+            serde_json::json!({"trail": row.number}),
+        )
+        .await;
         self.trail_view(&row).await
     }
     pub async fn trail_by_number(
@@ -545,6 +551,14 @@ impl Core {
             "",
         )
         .await?;
+        if state == "closed" {
+            self.dispatch(
+                access.repo.id,
+                "trail.closed",
+                serde_json::json!({"trail": number}),
+            )
+            .await;
+        }
         self.trail_view(&self.trail_row(access.repo.id, number).await?)
             .await
     }

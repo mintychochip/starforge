@@ -6,7 +6,7 @@ use anyhow::{Context, bail};
 
 use crate::config::{
     Config, DatabaseConfig, MailConfig, RegistrationConfig, SecurityConfig, ServerConfig,
-    SessionsConfig, StorageConfig,
+    SessionsConfig, StorageConfig, WebhooksConfig,
 };
 
 pub struct InitOptions<'a> {
@@ -43,6 +43,7 @@ pub fn run(opts: &InitOptions<'_>) -> anyhow::Result<Config> {
         mail: MailConfig::default(),
         registration: RegistrationConfig::default(),
         sessions: SessionsConfig::default(),
+        webhooks: WebhooksConfig::default(),
     };
     config.validate()?;
     // Document the blob_dir resolution rule in the generated file so operators

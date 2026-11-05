@@ -36,8 +36,22 @@ pub async fn open_core(config: &Config, hook_exe: PathBuf) -> anyhow::Result<Cor
             base_url: config.server.base_url.clone(),
             mailer: config.mailer()?,
             registration: config.registration_settings()?,
+            webhook_key: webhook_key(&config.security.secret_key)?,
+            // Test-only escape hatch for the integration suite's in-process
+            // receiver (`STARFORGE__WEBHOOKS__ALLOW_LOOPBACK=1` or
+            // `[webhooks] allow_loopback = true`). Production never sets it.
+            allow_loopback_webhooks: config.webhooks.allow_loopback,
         },
     ))
+}
+
+/// The 32-byte AEAD key sealing webhook secrets, from the validated
+/// `security.secret_key` (64 hex chars — `Config::validate` enforces it, and
+/// `TestServer` uses `"0".repeat(64)`).
+fn webhook_key(secret_key: &str) -> anyhow::Result<[u8; 32]> {
+    let raw = hex::decode(secret_key).context("decoding security.secret_key")?;
+    raw.try_into()
+        .map_err(|_| anyhow::anyhow!("security.secret_key must decode to 32 bytes"))
 }
 
 pub async fn migrate(config: &Config) -> anyhow::Result<()> {

@@ -6,7 +6,7 @@ use std::process::Output;
 
 use starforged::config::{
     Config, DatabaseConfig, MailConfig, RegistrationConfig, SecurityConfig, ServerConfig,
-    SessionsConfig, StorageConfig,
+    SessionsConfig, StorageConfig, WebhooksConfig,
 };
 use starforged_core::Core;
 use starforged_core::accounts::{CreateUser, User};
@@ -48,6 +48,7 @@ impl TestServer {
             mail: MailConfig::default(),
             registration: RegistrationConfig::default(),
             sessions: SessionsConfig::default(),
+            webhooks: WebhooksConfig::default(),
         };
         configure(&mut config);
         let app =

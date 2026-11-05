@@ -539,6 +539,15 @@ pub async fn webhooks_of_repo(db: &Db, repo_id: i64) -> DbResult<Vec<WebhookRow>
     webhooks_for_repo(db, repo_id).await
 }
 
+/// One webhook by id, if it still exists.
+pub async fn webhook_by_id(db: &Db, id: i64) -> DbResult<Option<WebhookRow>> {
+    let row = sqlx::query(select_webhook!("WHERE id = $1"))
+        .bind(id)
+        .fetch_optional(db.pool())
+        .await?;
+    row.as_ref().map(webhook_from_row).transpose()
+}
+
 pub async fn delete_webhook(db: &Db, id: i64, repo_id: i64) -> DbResult<bool> {
     let done = sqlx::query("DELETE FROM webhooks WHERE id = $1 AND repo_id = $2")
         .bind(id)

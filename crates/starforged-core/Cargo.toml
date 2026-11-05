@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 argon2.workspace = true
 askama.workspace = true
+base64.workspace = true
 getrandom.workspace = true
 hex.workspace = true
 lettre.workspace = true
@@ -19,6 +20,8 @@ percent-encoding.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+reqwest.workspace = true
+ring.workspace = true
 starforge-format = { path = "../starforge-format" }
 starforge-redact = { path = "../starforge-redact" }
 starforged-blob = { path = "../starforged-blob" }

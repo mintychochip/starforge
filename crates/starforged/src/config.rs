@@ -22,6 +22,9 @@ pub struct Config {
     /// `starforged.toml` files keep working.
     #[serde(default)]
     pub sessions: SessionsConfig,
+    /// Webhook delivery tuning. Missing section defaults cleanly (loopback denied).
+    #[serde(default)]
+    pub webhooks: WebhooksConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -186,6 +189,16 @@ impl Default for SessionsConfig {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebhooksConfig {
+    /// Test-only escape hatch for the delivery SSRF gate: when true, webhook
+    /// delivery may target loopback addresses (the integration suite's
+    /// in-process receiver). Always false in production; every other
+    /// non-global address is denied regardless.
+    #[serde(default)]
+    pub allow_loopback: bool,
+}
+
 impl Config {
     /// Reads `path`, applies environment overrides, and validates.
     pub fn load(path: &Path) -> anyhow::Result<Config> {
@@ -257,6 +270,9 @@ impl Config {
                     } else {
                         Some(value)
                     };
+                }
+                "webhooks__allow_loopback" => {
+                    self.webhooks.allow_loopback = parse_bool(&key, &value)?;
                 }
                 _ => bail!("unknown configuration override {key}"),
             }
@@ -378,6 +394,7 @@ mod tests {
             registration: RegistrationConfig::default(),
             mail: MailConfig::default(),
             sessions: SessionsConfig::default(),
+            webhooks: WebhooksConfig::default(),
         }
     }
 

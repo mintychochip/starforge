@@ -63,6 +63,13 @@ pub enum Job {
     /// Deduplicated per change: rapid pushes collapse into one run over the
     /// latest revision.
     ChangeMergeability { change_id: i64 },
+    /// One signed webhook delivery (H5). Never deduplicated: every event fans
+    /// out to its own job so retries never collapse distinct deliveries.
+    WebhookDelivery {
+        webhook_id: i64,
+        event: String,
+        payload: String,
+    },
 }
 
 impl Job {
@@ -79,6 +86,7 @@ impl Job {
             Job::UpdateSessionStats { .. } => "update_session_stats",
             Job::SessionWebhookOutbox { .. } => "session_webhook_outbox",
             Job::ChangeMergeability { .. } => "change_mergeability",
+            Job::WebhookDelivery { .. } => "webhook_delivery",
         }
     }
 
@@ -95,6 +103,7 @@ impl Job {
             Job::ResolveCommitLinks { .. } => None,
             Job::UpdateSessionStats { .. } => None,
             Job::ChangeMergeability { .. } => None,
+            Job::WebhookDelivery { .. } => None,
             Job::SessionWebhookOutbox { .. } => None,
         }
     }
@@ -206,6 +215,11 @@ impl Core {
                 self.update_session_stats(*session_id).await.map(|_| ())
             }
             Job::ChangeMergeability { change_id } => self.recompute_mergeability(*change_id).await,
+            Job::WebhookDelivery {
+                webhook_id,
+                event,
+                payload,
+            } => self.deliver_webhook(id, *webhook_id, event, payload).await,
             // M2/M5 own delivery; M1d only records the enqueue.
             Job::SessionWebhookOutbox { .. } => Ok(()),
             Job::SendEmail { to, subject, body } => {

@@ -11,6 +11,7 @@ mod statuses;
 mod time;
 mod trails;
 mod user;
+mod webhooks;
 
 use std::sync::Arc;
 
@@ -192,6 +193,14 @@ pub fn router(core: Core, base_url: String) -> Router {
         .route(
             "/repos/{owner}/{repo}/commits/{sha}/combined-status",
             get(statuses::combined_status),
+        )
+        .route(
+            "/repos/{owner}/{repo}/hooks",
+            get(webhooks::list_hooks).post(webhooks::create_hook),
+        )
+        .route(
+            "/repos/{owner}/{repo}/hooks/{id}",
+            patch(webhooks::patch_hook).delete(webhooks::delete_hook),
         )
         .fallback(|| async { ApiError::NotFound })
         .layer(axum::middleware::from_fn_with_state(

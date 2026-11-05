@@ -1,0 +1,1019 @@
+//! Repository webhooks (spec §6.5, M2c H5): CRUD on [`Core`], fan-out into
+//! the job queue, and signed delivery with the retry ladder.
+//!
+//! Secrets are random 32-byte hex strings, shown in plaintext exactly once at
+//! creation. At rest they are ChaCha20-Poly1305 (`ring`, already in the lock
+//! via `rustls`/`lettre`) under the server `webhook_key`, stored as
+//! `v1:<base64(nonce‖ciphertext)>` in `webhooks.secret_encrypted` — the exact
+//! shape the H1 schema comment promises. Delivery signs the exact JSON bytes
+//! with HMAC-SHA256 (`ring::hmac`) as `X-Starforge-Signature: sha256=<hex>`.
+//!
+//! Delivery is SSRF-gated: the host resolves at delivery time, non-globally-
+//! reachable addresses (loopback, RFC 1918, link-local incl. the metadata
+//! endpoint, unique-local, multicast, …) are denied fail-closed with no
+//! request and no retry, the client pins the checked address (no re-resolve,
+//! no redirects), and success bodies are capped at 64 KiB under the 10 s
+//! timeout. Only the test-only `allow_loopback_webhooks` flag admits
+//! loopback.
+//!
+//! Permissions: every mutation and every read needs ≥ `Maintain` on the repo
+//! (readers get `Forbidden`, never a leak-shaped `NotFound`). An archived
+//! repository refuses new hooks. Fan-out ([`Core::dispatch`]) never fails the
+//! caller: enqueue errors are logged, and delivery itself always runs on a
+//! worker — never inline in the request path.
+
+use std::time::Duration;
+
+use base64::Engine as _;
+use ring::aead::{self, BoundKey, Nonce, NonceSequence, OpeningKey, SealingKey, UnboundKey};
+use serde::{Deserialize, Serialize};
+use starforged_db::{
+    checks as db_checks, jobs as db_jobs, now, repos as db_repos, trails as db_trails,
+};
+
+use crate::accounts::User;
+use crate::jobs::{Job, MAX_ATTEMPTS};
+use crate::permission::Permission;
+use crate::{Core, CoreError, CoreResult};
+
+/// Events a hook may subscribe to. An empty subscription means all of them.
+pub const WEBHOOK_EVENTS: [&str; 7] = [
+    "trail.opened",
+    "trail.closed",
+    "change.opened",
+    "revision.pushed",
+    "review.submitted",
+    "change.merged",
+    "status.updated",
+];
+
+/// Delivery timeout per attempt (spec: 10 s).
+const DELIVERY_TIMEOUT: Duration = Duration::from_secs(10);
+/// Max response body the worker reads per delivery (spec: bodies ≤ 64 KiB).
+const MAX_BODY_BYTES: usize = 64 * 1024;
+
+/// One webhook for API and settings-page rendering. The secret is never here:
+/// creation returns it once; lists carry `has_secret` only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebhookDto {
+    pub id: i64,
+    pub url: String,
+    pub events: Vec<String>,
+    pub active: bool,
+    pub last_status: Option<i64>,
+    pub last_error: Option<String>,
+    pub created_at: i64,
+}
+
+fn dto_of(row: &db_checks::WebhookRow) -> CoreResult<WebhookDto> {
+    let events: Vec<String> =
+        serde_json::from_str(&row.events).map_err(|e| CoreError::Internal(e.to_string()))?;
+    Ok(WebhookDto {
+        id: row.id,
+        url: row.url.clone(),
+        events,
+        active: row.active != 0,
+        last_status: row.last_status,
+        last_error: row.last_error.clone(),
+        created_at: row.created_at,
+    })
+}
+
+fn check_url(url: &str) -> CoreResult<()> {
+    if url.is_empty() || url.len() > 2000 {
+        return Err(CoreError::Invalid(
+            "webhook url must be 1–2000 characters".into(),
+        ));
+    }
+    let parsed = url::Url::parse(url)
+        .map_err(|_| CoreError::Invalid(format!("invalid webhook url {url:?}")))?;
+    match parsed.scheme() {
+        "https" => Ok(()),
+        "http" => {
+            // Plain HTTP only for loopback receivers (tests and local dev).
+            // `host_str` keeps IPv6 brackets (`[::1]`), so strip them first.
+            let host = parsed.host_str().unwrap_or("");
+            let bare = host
+                .strip_prefix('[')
+                .and_then(|h| h.strip_suffix(']'))
+                .unwrap_or(host);
+            if matches!(bare, "localhost" | "127.0.0.1" | "::1") {
+                Ok(())
+            } else {
+                Err(CoreError::Invalid(
+                    "webhook url must be https (http is only allowed for localhost)".into(),
+                ))
+            }
+        }
+        _ => Err(CoreError::Invalid("webhook url must be http(s)".into())),
+    }
+}
+
+/// Every event must be known; an empty list subscribes to all. De-duplicated,
+/// order-preserving.
+fn check_events(events: &[String]) -> CoreResult<Vec<String>> {
+    let mut out = Vec::with_capacity(events.len());
+    for event in events {
+        if !WEBHOOK_EVENTS.contains(&event.as_str()) {
+            return Err(CoreError::Invalid(format!(
+                "unknown webhook event '{event}'"
+            )));
+        }
+        if !out.contains(event) {
+            out.push(event.clone());
+        }
+    }
+    Ok(out)
+}
+
+struct OneNonce([u8; 12]);
+
+impl NonceSequence for OneNonce {
+    fn advance(&mut self) -> Result<Nonce, ring::error::Unspecified> {
+        Ok(Nonce::assume_unique_for_key(self.0))
+    }
+}
+
+fn unbound(key: &[u8; 32]) -> Result<UnboundKey, CoreError> {
+    UnboundKey::new(&aead::CHACHA20_POLY1305, key)
+        .map_err(|_| CoreError::Internal("invalid webhook key length".into()))
+}
+
+/// `v1:<base64(nonce‖ciphertext)>` with a fresh 12-byte nonce per seal.
+fn seal_secret(key: &[u8; 32], plaintext: &str) -> CoreResult<String> {
+    let mut nonce = [0u8; 12];
+    getrandom::fill(&mut nonce)
+        .map_err(|e| CoreError::Internal(format!("randomness failed: {e}")))?;
+    let mut sealing = SealingKey::new(unbound(key)?, OneNonce(nonce));
+    let mut buf = plaintext.as_bytes().to_vec();
+    sealing
+        .seal_in_place_append_tag(aead::Aad::empty(), &mut buf)
+        .map_err(|_| CoreError::Internal("sealing the webhook secret failed".into()))?;
+    let mut packed = nonce.to_vec();
+    packed.extend_from_slice(&buf);
+    Ok(format!(
+        "v1:{}",
+        base64::engine::general_purpose::STANDARD.encode(&packed)
+    ))
+}
+
+fn open_secret(key: &[u8; 32], sealed: &str) -> CoreResult<String> {
+    let b64 = sealed
+        .strip_prefix("v1:")
+        .ok_or_else(|| CoreError::Invalid("unknown webhook secret format".into()))?;
+    let packed = base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .map_err(|_| CoreError::Invalid("corrupt webhook secret".into()))?;
+    if packed.len() < 12 + 16 {
+        return Err(CoreError::Invalid("corrupt webhook secret".into()));
+    }
+    let (nonce, ciphertext) = packed.split_at(12);
+    let mut opening = OpeningKey::new(
+        unbound(key)?,
+        OneNonce(
+            nonce
+                .try_into()
+                .map_err(|_| CoreError::Invalid("corrupt webhook secret".into()))?,
+        ),
+    );
+    let mut buf = ciphertext.to_vec();
+    let plain = opening
+        .open_in_place(aead::Aad::empty(), &mut buf)
+        .map_err(|_| CoreError::Invalid("cannot decrypt the webhook secret".into()))?;
+    String::from_utf8(plain.to_vec())
+        .map_err(|_| CoreError::Invalid("corrupt webhook secret".into()))
+}
+
+/// HMAC-SHA256 over `msg`, hex-encoded, via `ring` (keyed
+/// `Algorithm::HMAC_SHA256` over the exact body bytes).
+pub fn hmac_sha256_hex(key: &str, msg: &[u8]) -> String {
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, key.as_bytes());
+    hex::encode(ring::hmac::sign(&key, msg))
+}
+
+fn webhook_target(owner: &str, repo: &str, id: i64) -> String {
+    format!("webhook:{owner}/{repo}#{id}")
+}
+
+impl Core {
+    /// Creates a hook (≥ `Maintain`): validates, seals the fresh secret,
+    /// audits `webhook.created`, and returns the DTO plus the plaintext
+    /// secret — the only time it is ever exposed.
+    pub async fn create_webhook(
+        &self,
+        user: &User,
+        owner: &str,
+        repo: &str,
+        url: &str,
+        events: &[String],
+    ) -> CoreResult<(WebhookDto, String)> {
+        let access = self
+            .require_repo(Some(user), owner, repo, Permission::Maintain)
+            .await?;
+        if access.repo.archived_at.is_some() {
+            return Err(CoreError::Invalid("repository is archived".into()));
+        }
+        check_url(url)?;
+        let events = check_events(events)?;
+        let secret = crate::crypto::random_hex(32);
+        let sealed = seal_secret(&self.config().webhook_key, &secret)?;
+        let row = db_checks::insert_webhook(
+            self.db(),
+            access.repo.id,
+            url,
+            &sealed,
+            &serde_json::to_string(&events).map_err(|e| CoreError::Internal(e.to_string()))?,
+            now(),
+        )
+        .await?;
+        let payload = serde_json::json!({"id": row.id, "url": url}).to_string();
+        db_trails::insert_timeline(
+            self.db(),
+            access.repo.id,
+            None,
+            "webhook.created",
+            Some(user.id),
+            &payload,
+            now(),
+        )
+        .await?;
+        self.audit(
+            Some(user.id),
+            "webhook.created",
+            &webhook_target(owner, repo, row.id),
+            &payload,
+        )
+        .await?;
+        Ok((dto_of(&row)?, secret))
+    }
+
+    /// Hooks of the repo in insert order (≥ `Maintain`; readers get
+    /// `Forbidden`). Never contains secrets.
+    pub async fn list_webhooks(
+        &self,
+        viewer: Option<&User>,
+        owner: &str,
+        repo: &str,
+    ) -> CoreResult<Vec<WebhookDto>> {
+        let access = self.repo_for(viewer, owner, repo).await?;
+        if access.permission < Permission::Maintain {
+            return Err(CoreError::Forbidden);
+        }
+        let mut out = Vec::new();
+        for row in db_checks::webhooks_of_repo(self.db(), access.repo.id).await? {
+            out.push(dto_of(&row)?);
+        }
+        Ok(out)
+    }
+
+    /// Deletes a hook (≥ `Maintain`); missing ids are `NotFound`. Audits
+    /// `webhook.deleted`.
+    pub async fn delete_webhook(
+        &self,
+        user: &User,
+        owner: &str,
+        repo: &str,
+        id: i64,
+    ) -> CoreResult<()> {
+        let access = self
+            .require_repo(Some(user), owner, repo, Permission::Maintain)
+            .await?;
+        if !db_checks::delete_webhook(self.db(), id, access.repo.id).await? {
+            return Err(CoreError::NotFound);
+        }
+        let payload = serde_json::json!({"id": id}).to_string();
+        db_trails::insert_timeline(
+            self.db(),
+            access.repo.id,
+            None,
+            "webhook.deleted",
+            Some(user.id),
+            &payload,
+            now(),
+        )
+        .await?;
+        self.audit(
+            Some(user.id),
+            "webhook.deleted",
+            &webhook_target(owner, repo, id),
+            &payload,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Flips a hook's `active` flag (≥ `Maintain`); missing ids are `NotFound`.
+    pub async fn set_webhook_active(
+        &self,
+        user: &User,
+        owner: &str,
+        repo: &str,
+        id: i64,
+        active: bool,
+    ) -> CoreResult<WebhookDto> {
+        let access = self
+            .require_repo(Some(user), owner, repo, Permission::Maintain)
+            .await?;
+        let row = db_checks::webhooks_of_repo(self.db(), access.repo.id)
+            .await?
+            .into_iter()
+            .find(|row| row.id == id)
+            .ok_or(CoreError::NotFound)?;
+        if (row.active != 0) != active {
+            db_checks::set_webhook_active(self.db(), id, active).await?;
+        }
+        let row = db_checks::webhook_by_id(self.db(), id)
+            .await?
+            .ok_or(CoreError::Internal("webhook vanished".into()))?;
+        dto_of(&row)
+    }
+
+    /// Fan-out: enqueues one `WebhookDelivery` job per active hook whose
+    /// subscription matches `event` (empty subscription = all events). The
+    /// payload gains `event`, `repo` (`owner/name`), and `at` here; delivery
+    /// itself always runs on a worker. Never fails the caller: every error
+    /// is logged and swallowed.
+    pub async fn dispatch(&self, repo_id: i64, event: &str, data: serde_json::Value) {
+        if let Err(err) = self.dispatch_inner(repo_id, event, data).await {
+            tracing::warn!(repo = repo_id, event, error = %err, "webhook fan-out failed");
+        }
+    }
+
+    async fn dispatch_inner(
+        &self,
+        repo_id: i64,
+        event: &str,
+        data: serde_json::Value,
+    ) -> CoreResult<()> {
+        if !WEBHOOK_EVENTS.contains(&event) {
+            return Err(CoreError::Invalid(format!(
+                "unknown webhook event '{event}'"
+            )));
+        }
+        let repo = db_repos::by_id(self.db(), repo_id)
+            .await?
+            .ok_or(CoreError::NotFound)?;
+        let mut body = data.as_object().cloned().unwrap_or_default();
+        body.insert(
+            "event".to_owned(),
+            serde_json::Value::String(event.to_owned()),
+        );
+        body.insert(
+            "repo".to_owned(),
+            serde_json::Value::String(format!("{}/{}", repo.owner_handle, repo.name)),
+        );
+        body.insert("at".to_owned(), serde_json::Value::from(now()));
+        let payload =
+            serde_json::to_string(&body).map_err(|e| CoreError::Internal(e.to_string()))?;
+        for hook in db_checks::webhooks_of_repo(self.db(), repo_id).await? {
+            if hook.active == 0 {
+                continue;
+            }
+            let subscribed: Vec<String> = match serde_json::from_str(&hook.events) {
+                Ok(events) => events,
+                Err(err) => {
+                    tracing::warn!(hook = hook.id, error = %err, "webhook has unreadable events; skipping");
+                    continue;
+                }
+            };
+            if !subscribed.is_empty() && !subscribed.iter().any(|e| e == event) {
+                continue;
+            }
+            if let Err(err) = self
+                .enqueue(&Job::WebhookDelivery {
+                    webhook_id: hook.id,
+                    event: event.to_owned(),
+                    payload: payload.clone(),
+                })
+                .await
+            {
+                tracing::warn!(hook = hook.id, event, error = %err, "webhook enqueue failed");
+            }
+        }
+        Ok(())
+    }
+
+    /// Worker: POSTs `payload` to the hook with the `X-Starforge-*` headers,
+    /// records the delivery, and applies the retry ladder. Missing or
+    /// disabled hooks complete silently. A corrupt secret, like an exhausted
+    /// ladder, is terminal: the failure is recorded and the job completes, so
+    /// a dead endpoint never wedges the queue.
+    pub(crate) async fn deliver_webhook(
+        &self,
+        job_id: i64,
+        webhook_id: i64,
+        event: &str,
+        payload: &str,
+    ) -> CoreResult<()> {
+        let Some(hook) = db_checks::webhook_by_id(self.db(), webhook_id).await? else {
+            return Ok(());
+        };
+        if hook.active == 0 {
+            return Ok(());
+        }
+        let secret = match open_secret(&self.config().webhook_key, &hook.secret_encrypted) {
+            Ok(secret) => secret,
+            Err(err) => {
+                self.record_terminal(
+                    &hook,
+                    event,
+                    payload,
+                    None,
+                    &format!("cannot decrypt the webhook secret: {err}"),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+        let signature = format!("sha256:{}", hmac_sha256_hex(&secret, payload.as_bytes()));
+        // Resolve and classify before touching the network: denials
+        // (unresolvable or non-global hosts) are deterministic, so they are
+        // terminal — fail-closed, with no request and no retry.
+        let parsed = url::Url::parse(&hook.url)
+            .map_err(|_| CoreError::Internal("stored webhook url is invalid".into()))?;
+        let (pinned, target) =
+            match resolve_target(&parsed, self.config().allow_loopback_webhooks).await {
+                Ok(resolved) => resolved,
+                Err(err) => {
+                    self.record_terminal(&hook, event, payload, None, &err)
+                        .await?;
+                    return Ok(());
+                }
+            };
+        match post_hook(
+            &hook.url,
+            pinned.as_deref(),
+            target,
+            job_id,
+            event,
+            payload,
+            &signature,
+        )
+        .await
+        {
+            Ok(status) if (200..300).contains(&status) => {
+                db_checks::insert_delivery(
+                    self.db(),
+                    webhook_id,
+                    event,
+                    payload,
+                    Some(status),
+                    None,
+                    now(),
+                )
+                .await?;
+                db_checks::set_webhook_result(self.db(), webhook_id, Some(status), None).await?;
+                Ok(())
+            }
+            Ok(status) => {
+                self.fail_delivery(
+                    job_id,
+                    &hook,
+                    event,
+                    payload,
+                    Some(status),
+                    &format!("webhook returned HTTP {status}"),
+                )
+                .await
+            }
+            Err(err) => {
+                self.fail_delivery(job_id, &hook, event, payload, None, &err)
+                    .await
+            }
+        }
+    }
+
+    /// A failed attempt: terminal (this was the last rung) records the
+    /// outcome; anything earlier returns `Err` so the queue retries it.
+    async fn fail_delivery(
+        &self,
+        job_id: i64,
+        hook: &db_checks::WebhookRow,
+        event: &str,
+        payload: &str,
+        status: Option<i64>,
+        error: &str,
+    ) -> CoreResult<()> {
+        let terminal = db_jobs::by_id(self.db(), job_id)
+            .await?
+            .is_none_or(|row| row.attempts >= MAX_ATTEMPTS);
+        if terminal {
+            self.record_terminal(hook, event, payload, status, error)
+                .await?;
+            Ok(())
+        } else {
+            Err(CoreError::Internal(format!(
+                "webhook delivery failed: {error}"
+            )))
+        }
+    }
+
+    /// Records a terminal outcome: one `webhook_deliveries` row, the hook's
+    /// `last_status`/`last_error`, and a `webhook.failed` timeline row.
+    async fn record_terminal(
+        &self,
+        hook: &db_checks::WebhookRow,
+        event: &str,
+        payload: &str,
+        status: Option<i64>,
+        error: &str,
+    ) -> CoreResult<()> {
+        db_checks::insert_delivery(
+            self.db(),
+            hook.id,
+            event,
+            payload,
+            status,
+            Some(error),
+            now(),
+        )
+        .await?;
+        db_checks::set_webhook_result(self.db(), hook.id, status, Some(error)).await?;
+        let detail = serde_json::json!({"id": hook.id, "event": event, "error": error}).to_string();
+        db_trails::insert_timeline(
+            self.db(),
+            hook.repo_id,
+            None,
+            "webhook.failed",
+            None,
+            &detail,
+            now(),
+        )
+        .await?;
+        self.audit(
+            None,
+            "webhook.failed",
+            &format!("webhook#{}", hook.id),
+            &detail,
+        )
+        .await?;
+        Ok(())
+    }
+}
+
+/// Delivery-time SSRF gate: literal IPs and every resolved address are
+/// classified; anything that is not globally reachable is denied, with
+/// loopback additionally gated behind the test-only `allow_loopback` escape
+/// hatch. Denied: loopback (unless flagged), private (RFC 1918), shared
+/// (100.64/10), link-local (169.254/16 — including the 169.254.169.254
+/// metadata endpoint — and fe80::/10), unique-local (fc00::/7),
+/// unspecified, broadcast, multicast, documentation, benchmarking, and
+/// reserved ranges. The coarser checks use stable predicates, the rest
+/// explicit prefix matches.
+fn host_allowed(ip: std::net::IpAddr, allow_loopback: bool) -> bool {
+    if ip.is_loopback() {
+        return allow_loopback;
+    }
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            // Stable predicates cover unspecified, private (RFC 1918),
+            // link-local (169.254/16, incl. the 169.254.169.254 metadata
+            // endpoint), broadcast, and multicast; the rest are octet
+            // checks (this toolchain gates the finer predicates).
+            if v4.is_unspecified()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_multicast()
+            {
+                return false;
+            }
+            let o = v4.octets();
+            if o[0] == 0 || o[0] >= 240 {
+                return false; // 0/8 software-scope, 240/4 reserved.
+            }
+            if o[0] == 100 && (o[1] & 0b1100_0000) == 0b0100_0000 {
+                return false; // 100.64/10 shared.
+            }
+            if o[0] == 192 && o[1] == 0 && o[2] == 2 {
+                return false; // 192.0.2/24 documentation.
+            }
+            if o[0] == 198 && o[1] == 51 && o[2] == 100 {
+                return false; // 198.51.100/24 documentation.
+            }
+            if o[0] == 203 && o[1] == 0 && o[2] == 113 {
+                return false; // 203.0.113/24 documentation.
+            }
+            if o[0] == 198 && (o[1] == 18 || o[1] == 19) {
+                return false; // 198.18/15 benchmarking.
+            }
+            true
+        }
+        std::net::IpAddr::V6(v6) => {
+            // Stable predicates cover unspecified, multicast, link-local
+            // (fe80::/10), and unique-local (fc00::/7); documentation is a
+            // prefix check.
+            if v6.is_unspecified()
+                || v6.is_multicast()
+                || v6.is_unicast_link_local()
+                || v6.is_unique_local()
+            {
+                return false;
+            }
+            !matches!(v6.segments(), [0x2001, 0x0db8, ..])
+        }
+    }
+}
+
+/// Resolves the hook URL to one pinned socket address. Literal IPs classify
+/// directly (no DNS); hostnames resolve and keep only allowed addresses, and
+/// the first allowed one is pinned — the client below connects to exactly
+/// the address checked here, never re-resolving. Unresolvable hosts and
+/// hosts with no allowed address are denied (fail-closed).
+async fn resolve_target(
+    parsed: &url::Url,
+    allow_loopback: bool,
+) -> Result<(Option<String>, std::net::SocketAddr), String> {
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "webhook url has no host".to_owned())?;
+    let port = parsed
+        .port_or_known_default()
+        .ok_or_else(|| "webhook url has no port".to_owned())?;
+    // `host_str` keeps IPv6 brackets; strip them before parsing.
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
+        if !host_allowed(ip, allow_loopback) {
+            return Err(format!("webhook host {host} is not allowed"));
+        }
+        // IP literals never consult DNS: nothing to pin.
+        return Ok((None, std::net::SocketAddr::new(ip, port)));
+    }
+    let mut allowed: Option<std::net::SocketAddr> = None;
+    let addrs = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|e| format!("webhook host {host} does not resolve: {e}"))?;
+    for addr in addrs {
+        if allowed.is_none() && host_allowed(addr.ip(), allow_loopback) {
+            allowed = Some(addr);
+        }
+    }
+    allowed
+        .map(|addr| (Some(host.to_owned()), addr))
+        .ok_or_else(|| format!("webhook host {host} resolves to no allowed address"))
+}
+
+/// POSTs the exact `payload` bytes with the `X-Starforge-*` headers to the
+/// pinned `target` (no re-resolve, no redirects). Returns the HTTP status;
+/// transport failures (including the 10 s timeout) and over-cap bodies are
+/// `Err`. The error text never contains the secret or the signature.
+#[allow(clippy::too_many_arguments)]
+async fn post_hook(
+    url: &str,
+    pinned: Option<&str>,
+    target: std::net::SocketAddr,
+    job_id: i64,
+    event: &str,
+    payload: &str,
+    signature: &str,
+) -> Result<i64, String> {
+    let mut builder = reqwest::Client::builder()
+        .timeout(DELIVERY_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none());
+    if let Some(domain) = pinned {
+        // Pin the checked address: no re-resolve between check and connect.
+        builder = builder.resolve(domain, target);
+    }
+    let client = builder
+        .build()
+        .map_err(|e| format!("building the webhook client failed: {e}"))?;
+    let mut response = client
+        .post(url)
+        .header("content-type", "application/json")
+        .header("x-starforge-event", event)
+        .header("x-starforge-delivery", job_id.to_string())
+        .header("x-starforge-signature", signature)
+        .body(payload.to_owned())
+        .send()
+        .await
+        .map_err(|e| {
+            if e.is_timeout() {
+                "webhook delivery timed out after 10s".to_owned()
+            } else {
+                format!("webhook delivery failed: {e}")
+            }
+        })?;
+    let status = response.status();
+    if !status.is_success() {
+        // Never read error bodies: the status alone records the outcome.
+        return Ok(i64::from(status.as_u16()));
+    }
+    // Bound the success-body read chunk by chunk: never more than 64 KiB.
+    let mut total = 0usize;
+    loop {
+        let chunk = response
+            .chunk()
+            .await
+            .map_err(|e| format!("webhook delivery failed: {e}"))?;
+        let Some(bytes) = chunk else { break };
+        total += bytes.len();
+        if total > MAX_BODY_BYTES {
+            return Err("webhook response body exceeds the 64 KiB cap".to_owned());
+        }
+    }
+    Ok(i64::from(status.as_u16()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hmac_matches_rfc_4231_vector() {
+        // RFC 4231 test case 2.
+        assert_eq!(
+            hmac_sha256_hex("Jefe", b"what do ya want for nothing?"),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+    }
+
+    #[test]
+    fn secret_seal_round_trips() {
+        let key = [9u8; 32];
+        let sealed = seal_secret(&key, "topsecret").unwrap();
+        assert!(sealed.starts_with("v1:"));
+        assert_eq!(open_secret(&key, &sealed).unwrap(), "topsecret");
+        // Nonces differ, and the wrong key refuses.
+        assert_ne!(sealed, seal_secret(&key, "topsecret").unwrap());
+        assert!(open_secret(&[8u8; 32], &sealed).is_err());
+    }
+
+    #[test]
+    fn url_policy_allows_only_https_and_loopback() {
+        assert!(check_url("https://example.com/hook").is_ok());
+        assert!(check_url("http://127.0.0.1:9/hook").is_ok());
+        assert!(check_url("http://localhost/hook").is_ok());
+        assert!(check_url("http://[::1]/hook").is_ok());
+        assert!(check_url("http://example.com/hook").is_err());
+        assert!(check_url("ftp://example.com/hook").is_err());
+        assert!(check_url("not a url").is_err());
+    }
+
+    #[test]
+    fn ssrf_matrix_denies_everything_non_global() {
+        use std::net::IpAddr;
+        let denied = [
+            "127.0.0.1",
+            "::1",
+            "10.0.0.1",
+            "172.16.0.1",
+            "192.168.1.1",
+            "100.64.0.1",
+            "169.254.169.254",
+            "fe80::1",
+            "fc00::1",
+            "0.0.0.0",
+            "::",
+            "224.0.0.1",
+            "ff02::1",
+            "192.0.2.1",
+            "203.0.113.1",
+        ];
+        for host in denied {
+            let ip: IpAddr = host.parse().unwrap();
+            assert!(!host_allowed(ip, false), "{host} denied without the flag");
+            if !ip.is_loopback() {
+                assert!(!host_allowed(ip, true), "{host} denied even with the flag");
+            }
+        }
+        assert!(host_allowed("127.0.0.1".parse().unwrap(), true));
+        assert!(host_allowed("::1".parse::<IpAddr>().unwrap(), true));
+        for host in ["8.8.8.8", "1.1.1.1", "2606:4700:4700::1111"] {
+            let ip: IpAddr = host.parse().unwrap();
+            assert!(host_allowed(ip, false), "{host} allowed");
+            assert!(host_allowed(ip, true), "{host} allowed");
+        }
+    }
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A `Core` with `repo_id` ready, sealing hook secrets with its own key.
+    async fn seeded(allow_loopback: bool) -> (Core, crate::testing::Fixture, i64) {
+        let (core, fixture) = crate::testing::test_core_with(|c, _| {
+            c.allow_loopback_webhooks = allow_loopback;
+        })
+        .await;
+        let user = crate::testing::user(&core, "alice").await;
+        let repo = core
+            .create_repo(
+                &user,
+                crate::repos::CreateRepo {
+                    name: "proj".into(),
+                    description: String::new(),
+                    visibility: crate::permission::Visibility::Private,
+                    readme: false,
+                },
+            )
+            .await
+            .unwrap();
+        (core, fixture, repo.id)
+    }
+
+    async fn insert_hook(core: &Core, repo_id: i64, url: &str) -> db_checks::WebhookRow {
+        let sealed = seal_secret(&core.config().webhook_key, "s3cret").unwrap();
+        db_checks::insert_webhook(core.db(), repo_id, url, &sealed, "[]", now())
+            .await
+            .unwrap()
+    }
+
+    /// Enqueues a real delivery job and runs the worker arm against it once.
+    async fn deliver_once(core: &Core, hook_id: i64) -> CoreResult<()> {
+        let payload = "{\"a\":1}".to_owned();
+        core.enqueue(&Job::WebhookDelivery {
+            webhook_id: hook_id,
+            event: "status.updated".into(),
+            payload: payload.clone(),
+        })
+        .await
+        .unwrap();
+        let job = db_jobs::list_recent(core.db(), 5)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.kind == "webhook_delivery")
+            .unwrap();
+        core.deliver_webhook(job.id, hook_id, "status.updated", &payload)
+            .await
+    }
+
+    /// Hand-rolled loopback HTTP server (no axum in dev-deps): records hits
+    /// and answers every request with `response`.
+    async fn tcp_sink(response: Vec<u8>, hits: Arc<AtomicUsize>) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                hits.fetch_add(1, Ordering::SeqCst);
+                let mut acc = Vec::new();
+                let mut buf = [0u8; 4096];
+                let _ = tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        match sock.read(&mut buf).await {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                acc.extend_from_slice(&buf[..n]);
+                                if acc.windows(4).any(|w| w == b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                })
+                .await;
+                let _ = sock.write_all(&response).await;
+            }
+        });
+        addr
+    }
+
+    fn ok_response() -> Vec<u8> {
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec()
+    }
+
+    /// Denied literal-IP hosts are terminal with no request and no retry —
+    /// there is no server behind these addresses in the test at all.
+    #[tokio::test]
+    async fn denied_hosts_record_terminal_without_request() {
+        let (core, _f, repo_id) = seeded(false).await;
+        for url in [
+            "http://10.0.0.1/hook",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://224.0.0.1/hook",
+            "http://[fc00::1]/hook",
+        ] {
+            let hook = insert_hook(&core, repo_id, url).await;
+            deliver_once(&core, hook.id).await.unwrap();
+            let deliveries = db_checks::recent_deliveries(core.db(), hook.id, 5)
+                .await
+                .unwrap();
+            assert_eq!(deliveries.len(), 1, "{url}");
+            assert!(deliveries[0].status_code.is_none(), "{url}");
+            assert!(
+                deliveries[0]
+                    .error
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("not allowed")
+                    || deliveries[0]
+                        .error
+                        .as_deref()
+                        .unwrap_or("")
+                        .contains("no allowed address"),
+                "{url}: {:?}",
+                deliveries[0].error
+            );
+            // Denial is terminal: `deliver_once` returned `Ok` (no retry
+            // `Err`) and the outcome is already recorded above.
+        }
+    }
+
+    /// Loopback is denied by default and the denial precedes any connection:
+    /// the bound acceptor observes zero hits.
+    #[tokio::test]
+    async fn loopback_denied_by_default() {
+        let (core, _f, repo_id) = seeded(false).await;
+        let hits = Arc::new(AtomicUsize::new(0));
+        let addr = tcp_sink(ok_response(), hits.clone()).await;
+        let hook = insert_hook(&core, repo_id, &format!("http://{addr}/hook")).await;
+        deliver_once(&core, hook.id).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "no request was sent");
+        let deliveries = db_checks::recent_deliveries(core.db(), hook.id, 5)
+            .await
+            .unwrap();
+        assert_eq!(deliveries.len(), 1);
+        assert!(
+            deliveries[0]
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("not allowed")
+        );
+    }
+
+    /// A hostname resolving to loopback is denied too (fail-closed when it
+    /// does not resolve at all).
+    #[tokio::test]
+    async fn localhost_hostname_denied_by_default() {
+        let (core, _f, repo_id) = seeded(false).await;
+        let hook = insert_hook(&core, repo_id, "http://localhost:9/hook").await;
+        deliver_once(&core, hook.id).await.unwrap();
+        let deliveries = db_checks::recent_deliveries(core.db(), hook.id, 5)
+            .await
+            .unwrap();
+        assert_eq!(deliveries.len(), 1);
+        let error = deliveries[0].error.clone().unwrap_or_default();
+        assert!(
+            error.contains("no allowed address") || error.contains("does not resolve"),
+            "{error}"
+        );
+    }
+
+    /// With the test-only flag, loopback delivers normally.
+    #[tokio::test]
+    async fn loopback_allowed_with_flag() {
+        let (core, _f, repo_id) = seeded(true).await;
+        let hits = Arc::new(AtomicUsize::new(0));
+        let addr = tcp_sink(ok_response(), hits.clone()).await;
+        let hook = insert_hook(&core, repo_id, &format!("http://{addr}/hook")).await;
+        deliver_once(&core, hook.id).await.unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let deliveries = db_checks::recent_deliveries(core.db(), hook.id, 5)
+            .await
+            .unwrap();
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].status_code, Some(200));
+    }
+
+    /// A 302 is returned, never followed: the redirect target sees nothing
+    /// and the attempt stays retryable.
+    #[tokio::test]
+    async fn redirect_is_not_followed() {
+        let (core, _f, repo_id) = seeded(true).await;
+        let hits_b = Arc::new(AtomicUsize::new(0));
+        let addr_b = tcp_sink(ok_response(), hits_b.clone()).await;
+        let hits_a = Arc::new(AtomicUsize::new(0));
+        let redirect = format!(
+            "HTTP/1.1 302 Found\r\nLocation: http://{addr_b}/hook\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        .into_bytes();
+        let addr_a = tcp_sink(redirect, hits_a.clone()).await;
+        let hook = insert_hook(&core, repo_id, &format!("http://{addr_a}/hook")).await;
+        let err = deliver_once(&core, hook.id).await.unwrap_err();
+        assert!(err.to_string().contains("HTTP 302"), "{err}");
+        assert_eq!(hits_a.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            hits_b.load(Ordering::SeqCst),
+            0,
+            "redirect target untouched"
+        );
+    }
+
+    /// A 200 with a body past the cap fails the attempt.
+    #[tokio::test]
+    async fn body_cap_enforced() {
+        let (core, _f, repo_id) = seeded(true).await;
+        let big = vec![b'x'; MAX_BODY_BYTES + 1];
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            big.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(&big);
+        let hits = Arc::new(AtomicUsize::new(0));
+        let addr = tcp_sink(response, hits.clone()).await;
+        let hook = insert_hook(&core, repo_id, &format!("http://{addr}/hook")).await;
+        let err = deliver_once(&core, hook.id).await.unwrap_err();
+        assert!(err.to_string().contains("64 KiB"), "{err}");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+}

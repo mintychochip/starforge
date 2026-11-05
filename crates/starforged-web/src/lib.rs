@@ -167,6 +167,18 @@ fn page_routes() -> Router<AppState> {
             post(pages::repo_settings::change_visibility),
         )
         .route(
+            "/{owner}/{repo}/settings/hooks",
+            get(pages::webhooks::show).post(pages::webhooks::create),
+        )
+        .route(
+            "/{owner}/{repo}/settings/hooks/{id}/delete",
+            post(pages::webhooks::delete),
+        )
+        .route(
+            "/{owner}/{repo}/settings/hooks/{id}/toggle",
+            post(pages::webhooks::toggle),
+        )
+        .route(
             "/{owner}/{repo}/settings/refs-for-access",
             post(pages::repo_settings::change_refs_for_access),
         )

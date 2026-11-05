@@ -140,6 +140,12 @@ impl Core {
             actor = %user.handle,
             "status submitted"
         );
+        self.dispatch(
+            access.repo.id,
+            "status.updated",
+            serde_json::json!({"sha": sha, "context": context, "state": state}),
+        )
+        .await;
         status_dto(self, row).await
     }
 
