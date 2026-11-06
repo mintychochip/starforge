@@ -261,11 +261,22 @@ async fn push_and_open(c: &Ctx, n: i64, commits: &[&str]) -> (String, i64) {
 }
 
 async fn wait_for_revisions(s: &TestServer, change_id: i64, expected: usize) {
+    // Wait on the current-revision POINTER, not the row count: in
+    // `append_revision` the revision row commits first, then the git walk
+    // and `store_revision_commits`, and only then does the pointer move.
+    // Polling rows therefore races the walk/store and can observe revision
+    // 2 with zero commits under Postgres timing; the pointer is the
+    // visibility boundary the invariant guarantees commits behind.
     for _ in 0..200 {
-        let revs = starforged_db::changes::revisions_of_change(s.core.db(), change_id)
+        if let Some(change) = starforged_db::changes::change_by_id(s.core.db(), change_id)
             .await
-            .unwrap();
-        if revs.len() >= expected {
+            .unwrap()
+            && let Some(rev_id) = change.current_revision_id
+            && let Some(rev) = starforged_db::changes::revision_by_id(s.core.db(), rev_id)
+                .await
+                .unwrap()
+            && rev.number as usize == expected
+        {
             return;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
