@@ -22,7 +22,6 @@ use starforged_core::orgs::{
 use starforged_core::permission::Permission;
 use starforged_core::sessions::WebSession;
 
-use super::code;
 use crate::AppState;
 use crate::auth::{CsrfForm, MaybeUser, RequireUser, verify_csrf};
 use crate::error::WebError;
@@ -76,35 +75,11 @@ pub(crate) async fn lookup_org(
         Err(other) => Err(other.into()),
     }
 }
-/// What `/{org}/…` resolved to: the org, or the repository page response
-/// when `handle` is not an org (a user repository named `settings`,
-/// `members`, or `teams` keeps working).
-enum OrgOrRepo {
-    Org(OrgView),
-    Repo(Response),
-}
-
-async fn org_or_repo(
-    state: &AppState,
-    session: Option<WebSession>,
-    handle: &str,
-    repo: &str,
-) -> Result<OrgOrRepo, WebError> {
-    let viewer = session.as_ref().map(|s| &s.user);
-    if let Some(view) = lookup_org(state, viewer, handle).await? {
-        return Ok(OrgOrRepo::Org(view));
-    }
-    let response = code::repo_home(
-        State(state.clone()),
-        MaybeUser(session),
-        Path((handle.to_owned(), repo.to_owned())),
-    )
-    .await?;
-    Ok(OrgOrRepo::Repo(response))
-}
 
 /// Owners manage the org; plain members get `Forbidden` (403), everyone else
-/// `NotFound` (404). Site admins get no extra mutations (D9).
+/// `NotFound` (404). Site admins get no extra mutations (D9). Management
+/// pages live under the reserved `/orgs/{org}` prefix, which can never
+/// collide with a user or repository path, so no fallback is needed.
 async fn require_owner(
     state: &AppState,
     session: &WebSession,
@@ -243,17 +218,7 @@ async fn settings_page(
     handle: &str,
     error: Option<String>,
 ) -> Result<Response, WebError> {
-    let view = match org_or_repo(state, Some(session.clone()), handle, "settings").await? {
-        OrgOrRepo::Org(view) => view,
-        OrgOrRepo::Repo(response) => return Ok(response),
-    };
-    // Reaching here with a non-owner is a management attempt: members get
-    // 403, everyone else 404.
-    match view.viewer_role {
-        Some(OrgRole::Owner) => {}
-        Some(OrgRole::Member) => return Err(WebError::Forbidden),
-        None => return Err(WebError::NotFound),
-    }
+    let view = require_owner(state, session, handle).await?;
     let current = view.base_permission.unwrap_or_else(|| "none".into());
     let page = OrgSettingsPage {
         nav_user: Some(NavUser::from_session(session)),
@@ -308,7 +273,9 @@ pub async fn save_general(
         )
         .await;
     match result {
-        Ok(updated) => Ok(Redirect::to(&format!("/{}/settings", updated.handle)).into_response()),
+        Ok(updated) => {
+            Ok(Redirect::to(&format!("/orgs/{}/settings", updated.handle)).into_response())
+        }
         Err(CoreError::Invalid(message) | CoreError::Conflict(message)) => {
             settings_page(&state, &session, &view.handle, Some(message)).await
         }
@@ -337,7 +304,9 @@ pub async fn save_base(
         )
         .await;
     match result {
-        Ok(updated) => Ok(Redirect::to(&format!("/{}/settings", updated.handle)).into_response()),
+        Ok(updated) => {
+            Ok(Redirect::to(&format!("/orgs/{}/settings", updated.handle)).into_response())
+        }
         Err(CoreError::Invalid(message) | CoreError::Conflict(message)) => {
             settings_page(&state, &session, &view.handle, Some(message)).await
         }
@@ -415,16 +384,11 @@ async fn members_page(
     state: &AppState,
     session: &WebSession,
     handle: &str,
-    manage: bool,
     error: Option<String>,
 ) -> Result<Response, WebError> {
-    let view = if manage {
-        require_owner(state, session, handle).await?
-    } else {
-        state.core.org(Some(&session.user), handle).await?
-    };
-    // The Core member-only fn 404s outsiders; the management page never
-    // reaches here for non-owners (`require_owner` above).
+    let view = state.core.org(Some(&session.user), handle).await?;
+    // The Core member-only fn 404s outsiders; owners additionally see the
+    // management forms (`can_manage`).
     let rows = state.core.org_members(&session.user, &view.handle).await?;
     let page = OrgMembersPage {
         nav_user: Some(NavUser::from_session(session)),
@@ -437,35 +401,18 @@ async fn members_page(
     Ok(page.into_response())
 }
 
-/// `/{org}/members`: the read-only list for members and site admins; the
-/// Core member-only fn 404s everyone else.
+/// `/orgs/{org}/members`: members and site admins read; owners manage. The
+/// Core member-only fn 404s everyone else, and anonymous viewers get 404,
+/// never a login redirect: membership is not public.
 pub async fn members(
     State(state): State<AppState>,
     MaybeUser(session): MaybeUser,
     Path(org): Path<String>,
 ) -> Result<Response, WebError> {
     let Some(session) = session else {
-        // Anonymous viewers get 404, never a login redirect: membership is not public.
         return Err(WebError::NotFound);
     };
-    match org_or_repo(&state, Some(session.clone()), &org, "members").await? {
-        OrgOrRepo::Org(_) => {}
-        OrgOrRepo::Repo(response) => return Ok(response),
-    }
-    members_page(&state, &session, &org, false, None).await
-}
-
-/// `/{org}/settings/members`: the management page for owners. Like the
-/// read-only list it 404s anonymous viewers: membership is not public.
-pub async fn manage_members(
-    State(state): State<AppState>,
-    MaybeUser(session): MaybeUser,
-    Path(org): Path<String>,
-) -> Result<Response, WebError> {
-    let Some(session) = session else {
-        return Err(WebError::NotFound);
-    };
-    members_page(&state, &session, &org, true, None).await
+    members_page(&state, &session, &org, None).await
 }
 
 pub async fn add_member(
@@ -483,9 +430,9 @@ pub async fn add_member(
         .set_org_member(&session.user, &view.handle, &form.handle, role)
         .await
     {
-        Ok(_) => Ok(Redirect::to(&format!("/{}/settings/members", view.handle)).into_response()),
+        Ok(_) => Ok(Redirect::to(&format!("/orgs/{}/members", view.handle)).into_response()),
         Err(CoreError::Invalid(message) | CoreError::Conflict(message)) => {
-            members_page(&state, &session, &view.handle, true, Some(message)).await
+            members_page(&state, &session, &view.handle, Some(message)).await
         }
         Err(other) => Err(other.into()),
     }
@@ -504,9 +451,9 @@ pub async fn remove_member(
         .remove_org_member(&session.user, &view.handle, &handle)
         .await
     {
-        Ok(()) => Ok(Redirect::to(&format!("/{}/settings/members", view.handle)).into_response()),
+        Ok(()) => Ok(Redirect::to(&format!("/orgs/{}/members", view.handle)).into_response()),
         Err(CoreError::Invalid(message) | CoreError::Conflict(message)) => {
-            members_page(&state, &session, &view.handle, true, Some(message)).await
+            members_page(&state, &session, &view.handle, Some(message)).await
         }
         Err(other) => Err(other.into()),
     }
@@ -648,7 +595,7 @@ fn team_row(team: starforged_core::orgs::TeamView) -> TeamRow {
     }
 }
 
-/// `/{org}/teams`: members and site admins list; everyone else 404s.
+/// `/orgs/{org}/teams`: members and site admins list; everyone else 404s.
 pub async fn teams(
     State(state): State<AppState>,
     MaybeUser(session): MaybeUser,
@@ -657,10 +604,6 @@ pub async fn teams(
     let Some(session) = session else {
         return Err(WebError::NotFound);
     };
-    match org_or_repo(&state, Some(session.clone()), &org, "teams").await? {
-        OrgOrRepo::Org(_) => {}
-        OrgOrRepo::Repo(response) => return Ok(response),
-    }
     let view = state.core.org(Some(&session.user), &org).await?;
     let rows = state.core.teams(&session.user, &view.handle).await?;
     let page = OrgTeamsPage {
@@ -730,7 +673,7 @@ pub async fn create_team(
         .await
     {
         Ok(team) => {
-            Ok(Redirect::to(&format!("/{}/teams/{}", view.handle, team.slug)).into_response())
+            Ok(Redirect::to(&format!("/orgs/{}/teams/{}", view.handle, team.slug)).into_response())
         }
         Err(CoreError::Invalid(message) | CoreError::Conflict(message)) => {
             let page = team_new_page(&session, &view.handle, &form, Some(message));
@@ -784,8 +727,7 @@ async fn team_page(
     Ok(page.into_response())
 }
 
-/// `/{org}/teams/{team}`: members, repositories, and settings. Members and
-/// site admins read; only owners see the forms.
+/// `/orgs/{org}/teams/{team}`: members, repositories, and settings. Members and
 pub async fn team(
     State(state): State<AppState>,
     MaybeUser(session): MaybeUser,
@@ -824,9 +766,9 @@ pub async fn save_team(
         .update_team(&session.user, &view.handle, &slug, patch)
         .await
     {
-        Ok(updated) => {
-            Ok(Redirect::to(&format!("/{}/teams/{}", view.handle, updated.slug)).into_response())
-        }
+        Ok(updated) => Ok(
+            Redirect::to(&format!("/orgs/{}/teams/{}", view.handle, updated.slug)).into_response(),
+        ),
         Err(CoreError::Invalid(message) | CoreError::Conflict(message)) => {
             team_page(&state, &session, &view.handle, &slug, Some(message)).await
         }
@@ -856,7 +798,7 @@ pub async fn delete_team(
         .core
         .delete_team(&session.user, &view.handle, &slug)
         .await?;
-    Ok(Redirect::to(&format!("/{}/teams", view.handle)).into_response())
+    Ok(Redirect::to(&format!("/orgs/{}/teams", view.handle)).into_response())
 }
 
 pub async fn add_team_member(
@@ -872,7 +814,7 @@ pub async fn add_team_member(
         .set_team_member(&session.user, &view.handle, &slug, &form.handle)
         .await
     {
-        Ok(_) => Ok(Redirect::to(&format!("/{}/teams/{}", view.handle, slug)).into_response()),
+        Ok(_) => Ok(Redirect::to(&format!("/orgs/{}/teams/{}", view.handle, slug)).into_response()),
         Err(CoreError::Invalid(message) | CoreError::Conflict(message)) => {
             team_page(&state, &session, &view.handle, &slug, Some(message)).await
         }
@@ -892,7 +834,7 @@ pub async fn remove_team_member(
         .core
         .remove_team_member(&session.user, &view.handle, &slug, &handle)
         .await?;
-    Ok(Redirect::to(&format!("/{}/teams/{}", view.handle, slug)).into_response())
+    Ok(Redirect::to(&format!("/orgs/{}/teams/{}", view.handle, slug)).into_response())
 }
 
 pub async fn add_team_repo(
@@ -908,7 +850,9 @@ pub async fn add_team_repo(
         .add_team_repo(&session.user, &view.handle, &slug, &form.repo)
         .await
     {
-        Ok(()) => Ok(Redirect::to(&format!("/{}/teams/{}", view.handle, slug)).into_response()),
+        Ok(()) => {
+            Ok(Redirect::to(&format!("/orgs/{}/teams/{}", view.handle, slug)).into_response())
+        }
         Err(CoreError::Invalid(message) | CoreError::Conflict(message)) => {
             team_page(&state, &session, &view.handle, &slug, Some(message)).await
         }
@@ -928,5 +872,5 @@ pub async fn remove_team_repo(
         .core
         .remove_team_repo(&session.user, &view.handle, &slug, &repo)
         .await?;
-    Ok(Redirect::to(&format!("/{}/teams/{}", view.handle, slug)).into_response())
+    Ok(Redirect::to(&format!("/orgs/{}/teams/{}", view.handle, slug)).into_response())
 }

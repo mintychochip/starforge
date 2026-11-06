@@ -3,7 +3,7 @@
 {% block content %}
 <h1><a href="/{{ handle }}">{{ handle }}</a> / New team</h1>
 {% if let Some(e) = error %}<p class="error">{{ e }}</p>{% endif %}
-<form method="post" action="/{{ handle }}/teams/new" class="stack">
+<form method="post" action="/orgs/{{ handle }}/teams/new" class="stack">
   <input type="hidden" name="_csrf" value="{{ csrf }}">
   <label>Name <input name="name" required maxlength="64" value="{{ name }}"></label>
   <label>Description <input name="description" maxlength="350" value="{{ description }}"></label>

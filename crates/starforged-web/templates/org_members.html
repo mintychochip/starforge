@@ -3,9 +3,9 @@
 {% block content %}
 <h1><a href="/{{ handle }}">{{ handle }}</a></h1>
 <nav class="tabs" aria-label="Organization">
-  <a href="/{{ handle }}/members"{% if !can_manage %} aria-current="page"{% endif %}>Members</a>
-  <a href="/{{ handle }}/teams">Teams</a>
-  {% if can_manage %}<a href="/{{ handle }}/settings">Settings</a>{% endif %}
+  <a href="/orgs/{{ handle }}/members" aria-current="page">Members</a>
+  <a href="/orgs/{{ handle }}/teams">Teams</a>
+  {% if can_manage %}<a href="/orgs/{{ handle }}/settings">Settings</a>{% endif %}
 </nav>
 {% if let Some(e) = error %}<p class="error">{{ e }}</p>{% endif %}
 <h2>Members</h2>
@@ -17,14 +17,14 @@
 <tbody>
 {% for m in members %}
 <tr><td><a href="/{{ m.handle }}">{{ m.handle }}</a>{% if !m.display_name.is_empty() %} <span class="muted">{{ m.display_name }}</span>{% endif %}</td><td>{{ m.role }}</td>
-{% if can_manage %}<td><form method="post" action="/{{ handle }}/settings/members/{{ m.handle }}/remove" class="inline"><input type="hidden" name="_csrf" value="{{ csrf }}"><button type="submit">Remove</button></form></td>{% endif %}</tr>
+{% if can_manage %}<td><form method="post" action="/orgs/{{ handle }}/members/{{ m.handle }}/remove" class="inline"><input type="hidden" name="_csrf" value="{{ csrf }}"><button type="submit">Remove</button></form></td>{% endif %}</tr>
 {% endfor %}
 </tbody>
 </table>
 {% endif %}
 {% if can_manage %}
 <h2>Add or change a member</h2>
-<form method="post" action="/{{ handle }}/settings/members" class="stack">
+<form method="post" action="/orgs/{{ handle }}/members" class="stack">
   <input type="hidden" name="_csrf" value="{{ csrf }}">
   <label>Handle <input name="handle" required></label>
   <label>Role <select name="role"><option value="member">member</option><option value="owner">owner</option></select></label>

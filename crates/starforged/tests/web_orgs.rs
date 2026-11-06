@@ -1,9 +1,11 @@
 mod common;
 
-use common::{TestServer, extract_input, get_text};
+use common::{TestServer, extract_input, get_text, git_ok, work_repo};
 use starforged_core::accounts::CreateUser;
 use starforged_core::orgs::NewOrgInput;
 use starforged_core::permission::Visibility;
+use starforged_core::repos::CreateRepo;
+use starforged_core::tokens::Scope;
 
 async fn org(s: &TestServer, owner_handle: &str, org: &str) {
     let owner = s.core.user_by_handle(owner_handle).await.unwrap().unwrap();
@@ -14,6 +16,29 @@ async fn org(s: &TestServer, owner_handle: &str, org: &str) {
                 handle: org.into(),
                 display_name: String::new(),
                 description: String::new(),
+            },
+        )
+        .await
+        .unwrap();
+}
+
+async fn org_repo(
+    s: &TestServer,
+    owner_handle: &str,
+    org: &str,
+    name: &str,
+    visibility: Visibility,
+) {
+    let owner = s.core.user_by_handle(owner_handle).await.unwrap().unwrap();
+    s.core
+        .create_repo(
+            &owner,
+            org,
+            CreateRepo {
+                name: name.into(),
+                description: String::new(),
+                visibility,
+                readme: false,
             },
         )
         .await
@@ -56,7 +81,7 @@ async fn org_lifecycle_in_web() {
 
     // Set the display name and the base permission from settings.
     let saved = client
-        .post(s.url("/acme/settings"))
+        .post(s.url("/orgs/acme/settings"))
         .form(&[
             ("_csrf", csrf.as_str()),
             ("display_name", "Acme Inc"),
@@ -67,19 +92,19 @@ async fn org_lifecycle_in_web() {
         .unwrap();
     assert_eq!(saved.status(), 303, "general settings save");
     let based = client
-        .post(s.url("/acme/settings/base-permission"))
+        .post(s.url("/orgs/acme/settings/base-permission"))
         .form(&[("_csrf", csrf.as_str()), ("base_permission", "read")])
         .send()
         .await
         .unwrap();
     assert_eq!(based.status(), 303, "base permission save");
-    let settings = get_text(&client, &s.url("/acme/settings")).await;
+    let settings = get_text(&client, &s.url("/orgs/acme/settings")).await;
     assert!(settings.contains("Acme Inc"), "{settings}");
     assert!(settings.contains(r#"value="read" checked"#), "{settings}");
 
     // Add a member, then promote them to owner.
     let added = client
-        .post(s.url("/acme/settings/members"))
+        .post(s.url("/orgs/acme/members"))
         .form(&[
             ("_csrf", csrf.as_str()),
             ("handle", "mia"),
@@ -90,7 +115,7 @@ async fn org_lifecycle_in_web() {
         .unwrap();
     assert_eq!(added.status(), 303, "member add");
     let promoted = client
-        .post(s.url("/acme/settings/members"))
+        .post(s.url("/orgs/acme/members"))
         .form(&[
             ("_csrf", csrf.as_str()),
             ("handle", "mia"),
@@ -100,14 +125,14 @@ async fn org_lifecycle_in_web() {
         .await
         .unwrap();
     assert_eq!(promoted.status(), 303, "member promote");
-    let members = get_text(&client, &s.url("/acme/members")).await;
+    let members = get_text(&client, &s.url("/orgs/acme/members")).await;
     assert!(members.contains("mia"), "{members}");
     assert!(members.contains("owner"), "{members}");
 
     // Create a team, add the member and a repository to it.
     s.repo(&alice, "proj", Visibility::Public).await;
     let team = client
-        .post(s.url("/acme/teams/new"))
+        .post(s.url("/orgs/acme/teams/new"))
         .form(&[
             ("_csrf", csrf.as_str()),
             ("name", "eng"),
@@ -118,7 +143,7 @@ async fn org_lifecycle_in_web() {
         .await
         .unwrap();
     assert_eq!(team.status(), 303, "team create");
-    assert_eq!(team.headers()["location"], "/acme/teams/eng");
+    assert_eq!(team.headers()["location"], "/orgs/acme/teams/eng");
     // The repository must live in the org before the team can take it; move
     // it there first through the transfer form below, then link it.
     let moved = client
@@ -133,20 +158,20 @@ async fn org_lifecycle_in_web() {
     assert_eq!(old.status(), 301, "old path redirects");
     assert_eq!(old.headers()["location"], "/acme/proj");
     let with_member = client
-        .post(s.url("/acme/teams/eng/members"))
+        .post(s.url("/orgs/acme/teams/eng/members"))
         .form(&[("_csrf", csrf.as_str()), ("handle", "mia")])
         .send()
         .await
         .unwrap();
     assert_eq!(with_member.status(), 303, "team member add");
     let with_repo = client
-        .post(s.url("/acme/teams/eng/repos"))
+        .post(s.url("/orgs/acme/teams/eng/repos"))
         .form(&[("_csrf", csrf.as_str()), ("repo", "proj")])
         .send()
         .await
         .unwrap();
     assert_eq!(with_repo.status(), 303, "team repo add");
-    let team_page = get_text(&client, &s.url("/acme/teams/eng")).await;
+    let team_page = get_text(&client, &s.url("/orgs/acme/teams/eng")).await;
     assert!(team_page.contains("mia"), "{team_page}");
     assert!(team_page.contains("proj"), "{team_page}");
 
@@ -190,32 +215,9 @@ async fn org_page_access_rules() {
     s.user("walt").await;
     org(&s, "alice", "acme").await;
     let (alice_client, csrf) = s.login("alice").await;
-    s.core
-        .create_repo(
-            &alice,
-            "acme",
-            starforged_core::repos::CreateRepo {
-                name: "open".into(),
-                description: String::new(),
-                visibility: Visibility::Public,
-                readme: false,
-            },
-        )
-        .await
-        .unwrap();
-    s.core
-        .create_repo(
-            &alice,
-            "acme",
-            starforged_core::repos::CreateRepo {
-                name: "closed".into(),
-                description: String::new(),
-                visibility: Visibility::Private,
-                readme: false,
-            },
-        )
-        .await
-        .unwrap();
+    org_repo(&s, "alice", "acme", "open", Visibility::Public).await;
+    org_repo(&s, "alice", "acme", "closed", Visibility::Private).await;
+    let _ = alice;
 
     // The org page is public but lists only repositories the viewer can read.
     let anon = s.browser();
@@ -231,7 +233,7 @@ async fn org_page_access_rules() {
     assert!(!outsider_body.contains("closed"), "{outsider_body}");
 
     // Member and team pages give 404 to anonymous viewers and non-members.
-    for path in ["/acme/members", "/acme/teams", "/acme/settings/members"] {
+    for path in ["/orgs/acme/members", "/orgs/acme/teams"] {
         assert_eq!(
             anon.get(s.url(path)).send().await.unwrap().status(),
             404,
@@ -243,20 +245,52 @@ async fn org_page_access_rules() {
             "non-member GET {path}"
         );
     }
-    // Unknown teams 404 even for owners.
+
+    // A team exists for the detail checks below.
+    let team = alice_client
+        .post(s.url("/orgs/acme/teams/new"))
+        .form(&[
+            ("_csrf", csrf.as_str()),
+            ("name", "eng"),
+            ("description", ""),
+            ("permission", "read"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(team.status(), 303);
+    // Unknown teams 404 even for owners; the team page 404s outsiders.
     assert_eq!(
         alice_client
-            .get(s.url("/acme/teams/nope"))
+            .get(s.url("/orgs/acme/teams/nope"))
             .send()
             .await
             .unwrap()
             .status(),
         404
     );
+    assert_eq!(
+        anon.get(s.url("/orgs/acme/teams/eng"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404,
+        "anon team page"
+    );
+    assert_eq!(
+        walt.get(s.url("/orgs/acme/teams/eng"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404,
+        "non-member team page"
+    );
 
-    // Plain members read member and team pages but cannot manage.
+    // Plain members read member and team pages but cannot manage anything.
     let added = alice_client
-        .post(s.url("/acme/settings/members"))
+        .post(s.url("/orgs/acme/members"))
         .form(&[
             ("_csrf", csrf.as_str()),
             ("handle", "mia"),
@@ -267,54 +301,164 @@ async fn org_page_access_rules() {
         .unwrap();
     assert_eq!(added.status(), 303);
     let (mia, mia_csrf) = s.login("mia").await;
-    let members = mia.get(s.url("/acme/members")).send().await.unwrap();
-    assert_eq!(members.status(), 200);
+    assert_eq!(
+        mia.get(s.url("/orgs/acme/members"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    assert_eq!(
+        mia.get(s.url("/orgs/acme/teams"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
     for (path, form) in [
         (
-            "/acme/settings",
+            "/orgs/acme/settings",
             vec![("display_name", "Hijack"), ("description", "")],
         ),
         (
-            "/acme/settings/base-permission",
+            "/orgs/acme/settings/base-permission",
             vec![("base_permission", "write")],
         ),
         (
-            "/acme/settings/members",
+            "/orgs/acme/members",
             vec![("handle", "walt"), ("role", "member")],
         ),
         (
-            "/acme/teams/new",
+            "/orgs/acme/teams/new",
             vec![("name", "hijack"), ("permission", "admin")],
         ),
+        (
+            "/orgs/acme/teams/eng/settings",
+            vec![
+                ("name", "eng"),
+                ("description", "Hijacked"),
+                ("permission", "admin"),
+            ],
+        ),
+        ("/orgs/acme/teams/eng/delete", vec![("confirm", "eng")]),
+        ("/orgs/acme/teams/eng/members", vec![("handle", "walt")]),
+        ("/orgs/acme/teams/eng/members/mia/remove", vec![]),
+        ("/orgs/acme/teams/eng/repos", vec![("repo", "open")]),
+        ("/orgs/acme/teams/eng/repos/open/remove", vec![]),
     ] {
         let mut fields: Vec<(&str, &str)> = vec![("_csrf", mia_csrf.as_str())];
         fields.extend(form);
         let response = mia.post(s.url(path)).form(&fields).send().await.unwrap();
         assert_eq!(response.status(), 403, "member POST {path}");
     }
+    // Anonymous management attempts redirect to sign-in, like other settings pages.
+    assert_eq!(
+        anon.get(s.url("/orgs/acme/settings"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        303
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn org_forms_reject_forged_csrf() {
+async fn user_repo_named_teams_keeps_working() {
+    let s = TestServer::start().await;
+    let alice = s.user("alice").await;
+    s.repo(&alice, "teams", Visibility::Public).await;
+    let (client, _) = s.login("alice").await;
+    let anon = s.browser();
+
+    // The repository home, its sub-pages, and the settings page all answer:
+    // no org route swallows them.
+    for (who, path, want) in [
+        ("anon", "/alice/teams", 200),
+        ("alice", "/alice/teams/trails", 200),
+        ("alice", "/alice/teams/branches", 200),
+        ("alice", "/alice/teams/settings", 200),
+    ] {
+        let browser = if who == "anon" { &anon } else { &client };
+        let response = browser.get(s.url(path)).send().await.unwrap();
+        assert_eq!(response.status().as_u16(), want, "{who} GET {path}");
+    }
+
+    // Git over HTTP works: clone (upload-pack) and push (receive-pack).
+    let tmp = tempfile::tempdir().unwrap();
+    git_ok(
+        tmp.path(),
+        &["clone", "-q", &s.git_url("alice", "teams", None), "clone"],
+    )
+    .await;
+    let token = s.token(&alice, &[Scope::RepoWrite]).await;
+    let work = work_repo(tmp.path(), "work", &[("README.md", "# Teams\n")]).await;
+    git_ok(
+        &work,
+        &[
+            "push",
+            "-q",
+            &s.git_url("alice", "teams", Some(&token)),
+            "main",
+        ],
+    )
+    .await;
+    let home = get_text(&anon, &s.url("/alice/teams")).await;
+    assert!(home.contains("README.md"), "{home}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn org_repo_named_settings_keeps_home() {
+    let s = TestServer::start().await;
+    s.user("alice").await;
+    org(&s, "alice", "acme").await;
+    org_repo(&s, "alice", "acme", "settings", Visibility::Public).await;
+    let (client, _) = s.login("alice").await;
+
+    // The repository home answers under its own name…
+    let home = get_text(&client, &s.url("/acme/settings")).await;
+    assert!(home.contains("settings"), "{home}");
+    // …while the org settings live under the reserved prefix.
+    let org_settings = get_text(&client, &s.url("/orgs/acme/settings")).await;
+    assert!(org_settings.contains("Base permission"), "{org_settings}");
+    // And the org members page is not shadowed by a missing `members` repo.
+    assert_eq!(
+        client
+            .get(s.url("/acme/members"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn org_csrf_on_every_form() {
     let s = TestServer::start().await;
     let alice = s.user("alice").await;
     s.user("mia").await;
+    s.user("walt").await;
     let (client, csrf) = s.login("alice").await;
+    let forged = |fields: Vec<(&'static str, &'static str)>| {
+        let mut form: Vec<(&'static str, &'static str)> = vec![("_csrf", "forged")];
+        form.extend(fields);
+        form
+    };
 
-    // Forging the org-create form leaves no org behind.
-    let forged = client
+    // 1. Forging the org-create form leaves no org behind.
+    let response = client
         .post(s.url("/orgs/new"))
-        .form(&[
-            ("_csrf", "forged"),
+        .form(&forged(vec![
             ("handle", "evil"),
             ("display_name", ""),
             ("description", ""),
-        ])
+        ]))
         .send()
         .await
         .unwrap();
-    assert_eq!(forged.status(), 403);
-    assert!(s.core.user_by_handle("evil").await.unwrap().is_none());
+    assert_eq!(response.status(), 403);
     assert!(s.core.org(None, "evil").await.is_err());
 
     // Real creation for the remaining checks.
@@ -330,46 +474,26 @@ async fn org_forms_reject_forged_csrf() {
         .await
         .unwrap();
     assert_eq!(created.status(), 303);
-    s.repo(&alice, "proj", Visibility::Public).await;
+    s.repo(&alice, "solo", Visibility::Public).await;
+    org_repo(&s, "alice", "acme", "proj", Visibility::Public).await;
+    org_repo(&s, "alice", "acme", "other", Visibility::Public).await;
 
-    // Forging the member-add form adds nobody.
-    let forged_add = client
-        .post(s.url("/acme/settings/members"))
-        .form(&[("_csrf", "forged"), ("handle", "mia"), ("role", "member")])
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(forged_add.status(), 403);
-    let members = get_text(&client, &s.url("/acme/members")).await;
-    assert!(!members.contains("mia"), "{members}");
-
-    // Forging the base-permission form changes nothing.
-    let forged_base = client
-        .post(s.url("/acme/settings/base-permission"))
-        .form(&[("_csrf", "forged"), ("base_permission", "write")])
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(forged_base.status(), 403);
-    let settings = get_text(&client, &s.url("/acme/settings")).await;
-    assert!(settings.contains(r#"value="none" checked"#), "{settings}");
-
-    // Forging the team-create form creates no team.
-    let forged_team = client
-        .post(s.url("/acme/teams/new"))
-        .form(&[
-            ("_csrf", "forged"),
-            ("name", "eng"),
+    // 2. Forging the new-repository form creates nothing.
+    let response = client
+        .post(s.url("/new"))
+        .form(&forged(vec![
+            ("owner", "acme"),
+            ("name", "forged-repo"),
             ("description", ""),
-            ("permission", "write"),
-        ])
+            ("visibility", "private"),
+        ]))
         .send()
         .await
         .unwrap();
-    assert_eq!(forged_team.status(), 403);
+    assert_eq!(response.status(), 403);
     assert_eq!(
         client
-            .get(s.url("/acme/teams/eng"))
+            .get(s.url("/acme/forged-repo"))
             .send()
             .await
             .unwrap()
@@ -377,17 +501,167 @@ async fn org_forms_reject_forged_csrf() {
         404
     );
 
-    // Forging the transfer form leaves the repository in place.
-    let forged_move = client
-        .post(s.url("/alice/proj/settings/transfer"))
-        .form(&[("_csrf", "forged"), ("new_owner", "acme")])
+    // 3-4. Forging the general-settings form changes nothing.
+    for (path, fields) in [
+        (
+            "/orgs/acme/settings",
+            vec![("display_name", "Hacked"), ("description", "")],
+        ),
+        (
+            "/orgs/acme/settings/base-permission",
+            vec![("base_permission", "write")],
+        ),
+    ] {
+        let response = client
+            .post(s.url(path))
+            .form(&forged(fields))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 403, "forged POST {path}");
+    }
+    let settings = get_text(&client, &s.url("/orgs/acme/settings")).await;
+    assert!(settings.contains("Acme"), "{settings}");
+    assert!(!settings.contains("Hacked"), "{settings}");
+    assert!(settings.contains(r#"value="none" checked"#), "{settings}");
+
+    // 5. Forging the org-delete form deletes nothing.
+    let response = client
+        .post(s.url("/orgs/acme/settings/delete"))
+        .form(&forged(vec![("confirm", "acme")]))
         .send()
         .await
         .unwrap();
-    assert_eq!(forged_move.status(), 403);
+    assert_eq!(response.status(), 403);
     assert_eq!(
         client
-            .get(s.url("/acme/proj"))
+            .get(s.url("/orgs/acme/settings"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+
+    // 6-7. Forging the member forms changes nothing.
+    for (path, fields) in [
+        (
+            "/orgs/acme/members",
+            vec![("handle", "walt"), ("role", "member")],
+        ),
+        ("/orgs/acme/members/mia/remove", vec![]),
+    ] {
+        let response = client
+            .post(s.url(path))
+            .form(&forged(fields))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 403, "forged POST {path}");
+    }
+    // (mia is not a member yet, so the remove left nothing to check; the real
+    // adds below set up the team checks.)
+    let added = client
+        .post(s.url("/orgs/acme/members"))
+        .form(&[
+            ("_csrf", csrf.as_str()),
+            ("handle", "mia"),
+            ("role", "member"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(added.status(), 303);
+    let members = get_text(&client, &s.url("/orgs/acme/members")).await;
+    assert!(!members.contains("walt"), "{members}");
+
+    // 8. Forging the team-create form creates no team.
+    let response = client
+        .post(s.url("/orgs/acme/teams/new"))
+        .form(&forged(vec![
+            ("name", "eng"),
+            ("description", ""),
+            ("permission", "write"),
+        ]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 403);
+    assert_eq!(
+        client
+            .get(s.url("/orgs/acme/teams/eng"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+    let team = client
+        .post(s.url("/orgs/acme/teams/new"))
+        .form(&[
+            ("_csrf", csrf.as_str()),
+            ("name", "eng"),
+            ("description", "Engineers"),
+            ("permission", "read"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(team.status(), 303);
+    let with_member = client
+        .post(s.url("/orgs/acme/teams/eng/members"))
+        .form(&[("_csrf", csrf.as_str()), ("handle", "mia")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(with_member.status(), 303);
+    let with_repo = client
+        .post(s.url("/orgs/acme/teams/eng/repos"))
+        .form(&[("_csrf", csrf.as_str()), ("repo", "proj")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(with_repo.status(), 303);
+
+    // 9-14. Forging every team form changes nothing.
+    for (path, fields) in [
+        (
+            "/orgs/acme/teams/eng/settings",
+            vec![("description", "Hacked")],
+        ),
+        ("/orgs/acme/teams/eng/delete", vec![("confirm", "eng")]),
+        ("/orgs/acme/teams/eng/members", vec![("handle", "walt")]),
+        ("/orgs/acme/teams/eng/members/mia/remove", vec![]),
+        ("/orgs/acme/teams/eng/repos", vec![("repo", "other")]),
+        ("/orgs/acme/teams/eng/repos/proj/remove", vec![]),
+    ] {
+        let response = client
+            .post(s.url(path))
+            .form(&forged(fields))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 403, "forged POST {path}");
+    }
+    let team_page = get_text(&client, &s.url("/orgs/acme/teams/eng")).await;
+    assert!(!team_page.contains("Hacked"), "{team_page}");
+    assert!(team_page.contains("Engineers"), "{team_page}");
+    assert!(team_page.contains("mia"), "{team_page}");
+    assert!(!team_page.contains("walt"), "{team_page}");
+    assert!(team_page.contains("proj"), "{team_page}");
+    assert!(!team_page.contains("other"), "{team_page}");
+
+    // 15. Forging the transfer form leaves the repository in place.
+    let response = client
+        .post(s.url("/alice/solo/settings/transfer"))
+        .form(&forged(vec![("new_owner", "acme")]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 403);
+    assert_eq!(
+        client
+            .get(s.url("/acme/solo"))
             .send()
             .await
             .unwrap()
@@ -414,7 +688,7 @@ async fn org_pages_escape_hostile_text() {
         .unwrap();
     assert_eq!(created.status(), 303);
     let team = client
-        .post(s.url("/acme/teams/new"))
+        .post(s.url("/orgs/acme/teams/new"))
         .form(&[
             ("_csrf", csrf.as_str()),
             ("name", "eng"),
@@ -443,7 +717,7 @@ async fn org_pages_escape_hostile_text() {
     assert!(!org_page.contains(r#"<img src=x"#), "{org_page}");
     assert!(org_page.contains("&#60;img"), "{org_page}");
 
-    let team_page = get_text(&client, &s.url("/acme/teams/eng")).await;
+    let team_page = get_text(&client, &s.url("/orgs/acme/teams/eng")).await;
     assert!(!team_page.contains("<b>evil</b>"), "{team_page}");
     assert!(
         team_page.contains("&#60;b&#62;evil&#60;/b&#62;"),

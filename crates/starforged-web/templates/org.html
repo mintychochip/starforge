@@ -6,9 +6,9 @@
 {% if !description.is_empty() %}<p>{{ description }}</p>{% endif %}
 {% if is_member %}
 <nav class="tabs" aria-label="Organization">
-  <a href="/{{ handle }}/members">Members{% if let Some(n) = member_count %} ({{ n }}){% endif %}</a>
-  <a href="/{{ handle }}/teams">Teams</a>
-  {% if is_owner %}<a href="/{{ handle }}/settings">Settings</a>{% endif %}
+  <a href="/orgs/{{ handle }}/members">Members{% if let Some(n) = member_count %} ({{ n }}){% endif %}</a>
+  <a href="/orgs/{{ handle }}/teams">Teams</a>
+  {% if is_owner %}<a href="/orgs/{{ handle }}/settings">Settings</a>{% endif %}
 </nav>
 {% if let Some(base) = base_permission %}<p class="muted">Base permission: {{ base }}</p>{% endif %}
 {% endif %}

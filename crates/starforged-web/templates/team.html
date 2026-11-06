@@ -14,13 +14,13 @@
 <tbody>
 {% for m in members %}
 <tr><td><a href="/{{ m.handle }}">{{ m.handle }}</a> <span class="muted">{{ m.display_name }}</span></td>
-{% if can_manage %}<td><form method="post" action="/{{ handle }}/teams/{{ slug }}/members/{{ m.handle }}/remove" class="inline"><input type="hidden" name="_csrf" value="{{ csrf }}"><button type="submit">Remove</button></form></td>{% endif %}</tr>
+{% if can_manage %}<td><form method="post" action="/orgs/{{ handle }}/teams/{{ slug }}/members/{{ m.handle }}/remove" class="inline"><input type="hidden" name="_csrf" value="{{ csrf }}"><button type="submit">Remove</button></form></td>{% endif %}</tr>
 {% endfor %}
 </tbody>
 </table>
 {% endif %}
 {% if can_manage %}
-<form method="post" action="/{{ handle }}/teams/{{ slug }}/members" class="stack">
+<form method="post" action="/orgs/{{ handle }}/teams/{{ slug }}/members" class="stack">
   <input type="hidden" name="_csrf" value="{{ csrf }}">
   <label>Handle <input name="handle" required></label>
   <button type="submit">Add member</button>
@@ -32,20 +32,20 @@
 {% else %}
 <ul class="repo-list">
 {% for r in repos %}
-<li><a href="/{{ handle }}/{{ r.name }}">{{ r.name }}</a>{% if can_manage %} <form method="post" action="/{{ handle }}/teams/{{ slug }}/repos/{{ r.name }}/remove" class="inline"><input type="hidden" name="_csrf" value="{{ csrf }}"><button type="submit">Remove</button></form>{% endif %}</li>
+<li><a href="/{{ handle }}/{{ r.name }}">{{ r.name }}</a>{% if can_manage %} <form method="post" action="/orgs/{{ handle }}/teams/{{ slug }}/repos/{{ r.name }}/remove" class="inline"><input type="hidden" name="_csrf" value="{{ csrf }}"><button type="submit">Remove</button></form>{% endif %}</li>
 {% endfor %}
 </ul>
 {% endif %}
 {% if can_manage %}
 {% if !all_repos %}
-<form method="post" action="/{{ handle }}/teams/{{ slug }}/repos" class="stack">
+<form method="post" action="/orgs/{{ handle }}/teams/{{ slug }}/repos" class="stack">
   <input type="hidden" name="_csrf" value="{{ csrf }}">
   <label>Repository <input name="repo" required></label>
   <button type="submit">Add repository</button>
 </form>
 {% endif %}
 <h2>Settings</h2>
-<form method="post" action="/{{ handle }}/teams/{{ slug }}/settings" class="stack">
+<form method="post" action="/orgs/{{ handle }}/teams/{{ slug }}/settings" class="stack">
   <input type="hidden" name="_csrf" value="{{ csrf }}">
   <label>Name <input name="name" required maxlength="64" value="{{ name }}"></label>
   <label>Description <input name="description" maxlength="350" value="{{ description }}"></label>
@@ -54,7 +54,7 @@
   <button type="submit">Save</button>
 </form>
 <h2>Delete</h2>
-<form method="post" action="/{{ handle }}/teams/{{ slug }}/delete" class="stack">
+<form method="post" action="/orgs/{{ handle }}/teams/{{ slug }}/delete" class="stack">
   <input type="hidden" name="_csrf" value="{{ csrf }}">
   <p>Memberships and repository links go with the team.</p>
   <label>Type <code>{{ slug }}</code> to confirm <input name="confirm" required autocomplete="off"></label>

@@ -3,9 +3,9 @@
 {% block content %}
 <h1><a href="/{{ handle }}">{{ handle }}</a></h1>
 <nav class="tabs" aria-label="Organization">
-  <a href="/{{ handle }}/members">Members</a>
-  <a href="/{{ handle }}/teams" aria-current="page">Teams</a>
-  {% if can_manage %}<a href="/{{ handle }}/settings">Settings</a>{% endif %}
+  <a href="/orgs/{{ handle }}/members">Members</a>
+  <a href="/orgs/{{ handle }}/teams" aria-current="page">Teams</a>
+  {% if can_manage %}<a href="/orgs/{{ handle }}/settings">Settings</a>{% endif %}
 </nav>
 <h2>Teams</h2>
 {% if teams.is_empty() %}
@@ -15,12 +15,12 @@
 <thead><tr><th>Team</th><th>Permission</th><th>Repositories</th></tr></thead>
 <tbody>
 {% for t in teams %}
-<tr><td><a href="/{{ handle }}/teams/{{ t.slug }}">{{ t.name }}</a>{% if !t.description.is_empty() %} <span class="muted">{{ t.description }}</span>{% endif %}</td><td>{{ t.permission }}</td><td>{% if t.all_repos %}all{% else %}selected{% endif %}</td></tr>
+<tr><td><a href="/orgs/{{ handle }}/teams/{{ t.slug }}">{{ t.name }}</a>{% if !t.description.is_empty() %} <span class="muted">{{ t.description }}</span>{% endif %}</td><td>{{ t.permission }}</td><td>{% if t.all_repos %}all{% else %}selected{% endif %}</td></tr>
 {% endfor %}
 </tbody>
 </table>
 {% endif %}
 {% if can_manage %}
-<p><a href="/{{ handle }}/teams/new">New team</a></p>
+<p><a href="/orgs/{{ handle }}/teams/new">New team</a></p>
 {% endif %}
 {% endblock %}
