@@ -6,12 +6,10 @@
 //!
 //! Agent adapter hooks (C7): `enable` also calls every `starforge_capture`
 //! adapter's `install_hooks` (and `disable` their `remove_hooks`), printing
-//! every touched path. The [`Roots`](starforge_capture::Roots) mapping is:
-//!
-//! - `config_dir = <home>/.config` (each adapter appends its own subdir:
-//!   `claude-code/`, `pi/`),
-//! - `data_dir = <home>` (each adapter resolves its own store subpaths),
-//! - `worktree = <repo root>` (adapters keep sessions whose workdir is inside).
+//! every touched path. Per-agent [`Roots`](starforge_capture::Roots) are
+//! resolved by [`adapter_roots_for`] (base = `paths.home`; see its docs for
+//! the per-agent table and env overrides), and every adapter runs with its
+//! own roots (same `worktree` = repo root).
 //!
 //! A non-existent agent store is not an error: adapters decide via `detect`
 //! what to do, and the no-hook-surface adapters (codex, gemini, opencode)
@@ -38,7 +36,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::git::{common_dir, head_commit, remotes, staged_files};
+use crate::git::{common_dir, head_commit, head_commit_time, remotes, staged_files};
 use crate::hooks::{
     HOOKS, PendingLink, SessionCandidate, append_trailers, existing_trailer_ulids, install_hook,
     remove_hook, select_links,
@@ -61,14 +59,179 @@ struct PendingRecord {
     seq_end: u64,
 }
 
-/// Roots for the capture adapters: agent hook files live under
-/// `<home>/.config` (adapters append `claude-code/`, `pi/`, …), native
-/// stores resolve under `<home>`, and discovery is scoped to the repo root.
-pub fn adapter_roots(paths: &crate::config::CliPaths, repo: &Path) -> starforge_capture::Roots {
+fn env_lookup(key: &str) -> Option<String> {
+    std::env::var(key).ok()
+}
+
+/// Per-agent [`Roots`](starforge_capture::Roots) resolution. Pure: takes an
+/// injected env `lookup`. `base` is `paths.home`; when `STARFORGE_HOME` is
+/// set, agent env overrides are ignored (hermetic tests).
+///
+/// claude-code: `$CLAUDE_CONFIG_DIR` else `<base>/.claude` (data = config);
+/// codex: `$CODEX_HOME` else `<base>/.codex` (data = config);
+/// gemini: `<base>/.gemini` (data = config);
+/// opencode: `$XDG_DATA_HOME/opencode` else `<base>/.local/share/opencode`,
+///   `$XDG_CONFIG_HOME/opencode` else `<base>/.config/opencode`;
+/// pi: `<base>` for both (serves Pi + omp). `worktree` is the repo root.
+pub fn adapter_roots_for(
+    agent: &str,
+    paths: &crate::config::CliPaths,
+    repo: &Path,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> starforge_capture::Roots {
+    let base = paths.home.clone();
+    let has_sf_home = lookup("STARFORGE_HOME").is_some_and(|v| !v.is_empty());
+    let env_dir = |key: &str| -> Option<PathBuf> {
+        if has_sf_home {
+            return None;
+        }
+        lookup(key).filter(|v| !v.is_empty()).map(PathBuf::from)
+    };
+    let (data_dir, config_dir) = match agent {
+        "claude-code" => {
+            let dir = env_dir("CLAUDE_CONFIG_DIR").unwrap_or_else(|| base.join(".claude"));
+            (dir.clone(), dir)
+        }
+        "codex" => {
+            let dir = env_dir("CODEX_HOME").unwrap_or_else(|| base.join(".codex"));
+            (dir.clone(), dir)
+        }
+        "gemini" => {
+            let dir = base.join(".gemini");
+            (dir.clone(), dir)
+        }
+        "opencode" => {
+            let data = env_dir("XDG_DATA_HOME")
+                .map(|d| d.join("opencode"))
+                .unwrap_or_else(|| base.join(".local/share/opencode"));
+            let config = env_dir("XDG_CONFIG_HOME")
+                .map(|d| d.join("opencode"))
+                .unwrap_or_else(|| base.join(".config/opencode"));
+            (data, config)
+        }
+        _ => (base.clone(), base),
+    };
     starforge_capture::Roots {
-        config_dir: paths.home.join(".config"),
-        data_dir: paths.home.clone(),
+        config_dir,
+        data_dir,
         worktree: repo.to_path_buf(),
+    }
+}
+
+/// Roots for every adapter keyed by adapter id — the shape ingest takes.
+pub fn all_adapter_roots(
+    paths: &crate::config::CliPaths,
+    repo: &Path,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> BTreeMap<String, starforge_capture::Roots> {
+    ["claude-code", "codex", "pi", "opencode", "gemini"]
+        .into_iter()
+        .map(|agent| {
+            (
+                agent.to_string(),
+                adapter_roots_for(agent, paths, repo, &lookup),
+            )
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod root_tests {
+    use super::*;
+    fn paths() -> crate::config::CliPaths {
+        crate::config::CliPaths::from_home(PathBuf::from("/home/u"))
+    }
+    fn lookup(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: std::collections::HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |key: &str| map.get(key).cloned()
+    }
+    #[test]
+    fn defaults() {
+        let p = paths();
+        let repo = Path::new("/repo");
+        let no_env = |_: &str| None;
+        let claude = adapter_roots_for("claude-code", &p, repo, no_env);
+        assert_eq!(claude.data_dir, PathBuf::from("/home/u/.claude"));
+        assert_eq!(claude.config_dir, claude.data_dir);
+        assert_eq!(claude.worktree, repo);
+        let codex = adapter_roots_for("codex", &p, repo, no_env);
+        assert_eq!(codex.data_dir, PathBuf::from("/home/u/.codex"));
+        assert_eq!(codex.config_dir, codex.data_dir);
+        let gemini = adapter_roots_for("gemini", &p, repo, no_env);
+        assert_eq!(gemini.data_dir, PathBuf::from("/home/u/.gemini"));
+        assert_eq!(gemini.config_dir, gemini.data_dir);
+        let opencode = adapter_roots_for("opencode", &p, repo, no_env);
+        assert_eq!(
+            opencode.data_dir,
+            PathBuf::from("/home/u/.local/share/opencode")
+        );
+        assert_eq!(
+            opencode.config_dir,
+            PathBuf::from("/home/u/.config/opencode")
+        );
+        let pi = adapter_roots_for("pi", &p, repo, no_env);
+        assert_eq!(pi.data_dir, PathBuf::from("/home/u"));
+        assert_eq!(pi.config_dir, PathBuf::from("/home/u"));
+    }
+    #[test]
+    fn env_overrides() {
+        let p = paths();
+        let repo = Path::new("/repo");
+        let claude = adapter_roots_for(
+            "claude-code",
+            &p,
+            repo,
+            lookup(&[("CLAUDE_CONFIG_DIR", "/c")]),
+        );
+        assert_eq!(claude.data_dir, PathBuf::from("/c"));
+        assert_eq!(claude.config_dir, PathBuf::from("/c"));
+        let codex = adapter_roots_for("codex", &p, repo, lookup(&[("CODEX_HOME", "/x")]));
+        assert_eq!(codex.data_dir, PathBuf::from("/x"));
+        let opencode = adapter_roots_for(
+            "opencode",
+            &p,
+            repo,
+            lookup(&[("XDG_DATA_HOME", "/xd"), ("XDG_CONFIG_HOME", "/xc")]),
+        );
+        assert_eq!(opencode.data_dir, PathBuf::from("/xd/opencode"));
+        assert_eq!(opencode.config_dir, PathBuf::from("/xc/opencode"));
+    }
+    #[test]
+    fn starforge_home_ignores_overrides() {
+        let p = paths();
+        let repo = Path::new("/repo");
+        let lk = lookup(&[
+            ("STARFORGE_HOME", "/sf"),
+            ("CLAUDE_CONFIG_DIR", "/c"),
+            ("CODEX_HOME", "/x"),
+            ("XDG_DATA_HOME", "/xd"),
+            ("XDG_CONFIG_HOME", "/xc"),
+        ]);
+        assert_eq!(
+            adapter_roots_for("claude-code", &p, repo, &lk).data_dir,
+            PathBuf::from("/home/u/.claude")
+        );
+        assert_eq!(
+            adapter_roots_for("codex", &p, repo, &lk).data_dir,
+            PathBuf::from("/home/u/.codex")
+        );
+        assert_eq!(
+            adapter_roots_for("opencode", &p, repo, &lk).data_dir,
+            PathBuf::from("/home/u/.local/share/opencode")
+        );
+        assert_eq!(
+            adapter_roots_for("opencode", &p, repo, &lk).config_dir,
+            PathBuf::from("/home/u/.config/opencode")
+        );
+    }
+    #[test]
+    fn all_roots_keys() {
+        let all = all_adapter_roots(&paths(), Path::new("/repo"), |_: &str| None);
+        assert_eq!(all.len(), 5);
+        assert!(all.contains_key("pi"));
     }
 }
 
@@ -135,10 +298,10 @@ pub fn enable(repo: &Path, paths: &crate::config::CliPaths, dry_run: bool) -> (S
                 common.join("hooks").join(hook).display()
             ));
         }
-        lines.push(format!(
-            "would install agent hooks for claude-code, codex, pi, opencode, gemini under {}",
-            paths.home.join(".config").display()
-        ));
+        lines.push(
+            "would install agent hooks for claude-code, codex, pi, opencode, gemini under their per-agent config dirs"
+                .to_string(),
+        );
         return (lines.join("\n"), 0);
     }
     let spool = Spool::open(&common);
@@ -165,8 +328,8 @@ pub fn enable(repo: &Path, paths: &crate::config::CliPaths, dry_run: bool) -> (S
             Err(err) => return (format!("error: cannot install {hook}: {err}"), 1),
         }
     }
-    let roots = adapter_roots(paths, repo);
     for adapter in all_adapters() {
+        let roots = adapter_roots_for(adapter.id(), paths, repo, env_lookup);
         match adapter.install_hooks(&roots) {
             Ok(written) => {
                 tracing::debug!(
@@ -208,10 +371,10 @@ pub fn disable(repo: &Path, paths: &crate::config::CliPaths, dry_run: bool) -> (
                 common.join("hooks").join(hook).display()
             ));
         }
-        lines.push(format!(
-            "would remove agent hooks for claude-code, codex, pi, opencode, gemini under {}",
-            paths.home.join(".config").display()
-        ));
+        lines.push(
+            "would remove agent hooks for claude-code, codex, pi, opencode, gemini under their per-agent config dirs"
+                .to_string(),
+        );
         return (lines.join("\n"), 0);
     }
     let mut changed = Vec::new();
@@ -221,8 +384,8 @@ pub fn disable(repo: &Path, paths: &crate::config::CliPaths, dry_run: bool) -> (
             Err(err) => return (format!("error: cannot remove {hook}: {err}"), 1),
         }
     }
-    let roots = adapter_roots(paths, repo);
     for adapter in all_adapters() {
+        let roots = adapter_roots_for(adapter.id(), paths, repo, env_lookup);
         match adapter.remove_hooks(&roots) {
             Ok(removed) => {
                 tracing::debug!(
@@ -311,7 +474,7 @@ fn run_ingest(
     spool
         .ensure_layout()
         .map_err(|err| format!("cannot set up spool: {err}"))?;
-    let roots = adapter_roots(paths, repo);
+    let roots = all_adapter_roots(paths, repo, env_lookup);
     let now = time::OffsetDateTime::now_utc();
     let stats = crate::ingest::ingest(&spool, &roots, repo, now)
         .map_err(|err| format!("ingest failed: {err}"))?;
@@ -381,7 +544,8 @@ fn prepare_inner(
         eprintln!("warning: starforge ingest skipped: {err}");
     }
     let staged = staged_files(repo).map_err(|err| err.to_string())?;
-    let data = collect_candidates(&spool)?;
+    let head_time = head_commit_time(repo).map_err(|err| err.to_string())?;
+    let data = collect_candidates(&spool, head_time)?;
     let candidates: Vec<SessionCandidate> = data.iter().map(|d| d.candidate.clone()).collect();
     let links = select_links(&staged, &candidates);
     let msg = std::fs::read_to_string(msg_file)
@@ -564,12 +728,14 @@ fn segment_numbers(spool: &Spool, ulid: &str) -> Vec<u64> {
 ///
 /// Files come from `meta.json`'s `files_touched` plus tool-call (`edit` /
 /// `write` / `patch`) input paths and `file_change` event paths scanned out
-/// of the session's segment blobs. Only events at or past the stored spool
-/// cursor (`cursors.json`, defaulting to `0`) count as new; their `seq`
-/// range becomes the link's `[seq_start, seq_end)`. A session is `active`
-/// when it has new events or any recorded file touches.
-fn collect_candidates(spool: &Spool) -> Result<Vec<CandidateData>, String> {
-    let cursors = stored_cursors(spool)?;
+/// of the session's segment blobs. New events are those at or past the link
+/// watermark AND timestamped strictly after `head_time` (the previous
+/// commit's committer time; `None` = first commit, every event counts; an
+/// unparseable `ts` counts as new). The ingest cursor is NOT used: ingest
+/// runs before this and would floor out every fresh event. The new events'
+/// `seq` range becomes the link's `[seq_start, seq_end)`. A session is
+/// `active` when it has new events or any recorded file touches.
+fn collect_candidates(spool: &Spool, head_time: Option<i64>) -> Result<Vec<CandidateData>, String> {
     let sessions = spool.root.join("sessions");
     let entries = match std::fs::read_dir(&sessions) {
         Ok(entries) => entries,
@@ -612,7 +778,6 @@ fn collect_candidates(spool: &Spool) -> Result<Vec<CandidateData>, String> {
             .map_err(|err| format!("cannot read link watermark for {ulid}: {err}"))?
             .map(|w| w.last_linked_seq)
             .unwrap_or(0);
-        let floor = cursors.get(&ulid).copied().unwrap_or(0).max(watermark);
         let mut new_seqs: Vec<u64> = Vec::new();
         let mut all_seqs: Vec<u64> = Vec::new();
         for n in segment_numbers(spool, &ulid) {
@@ -642,7 +807,12 @@ fn collect_candidates(spool: &Spool) -> Result<Vec<CandidateData>, String> {
                     continue;
                 };
                 all_seqs.push(event.seq);
-                if event.seq >= floor {
+                let after_head = match (head_time, parse_ts_unix(&event.ts)) {
+                    (None, _) => true,
+                    (Some(_), None) => true,
+                    (Some(head), Some(ts)) => ts > head,
+                };
+                if event.seq >= watermark && after_head {
                     new_seqs.push(event.seq);
                 }
                 files.extend(event_files(&event));
@@ -673,31 +843,11 @@ fn collect_candidates(spool: &Spool) -> Result<Vec<CandidateData>, String> {
     Ok(out)
 }
 
-/// `ulid -> cursor.events` floor from `cursors.json` (missing file = empty).
-fn stored_cursors(spool: &Spool) -> Result<BTreeMap<String, u64>, String> {
-    let bytes = match std::fs::read(spool.root.join("cursors.json")) {
-        Ok(bytes) => bytes,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
-        Err(err) => return Err(format!("cannot read cursors: {err}")),
-    };
-    let value: serde_json::Value =
-        serde_json::from_slice(&bytes).map_err(|err| format!("cannot parse cursors: {err}"))?;
-    let mut out = BTreeMap::new();
-    if let Some(sessions) = value.get("sessions").and_then(|v| v.as_object()) {
-        for record in sessions.values() {
-            let (Some(ulid), Some(events)) = (
-                record.get("ulid").and_then(|v| v.as_str()),
-                record
-                    .get("cursor")
-                    .and_then(|c| c.get("events"))
-                    .and_then(|v| v.as_u64()),
-            ) else {
-                continue;
-            };
-            out.insert(ulid.to_string(), events);
-        }
-    }
-    Ok(out)
+/// Parse an event `ts` (RFC 3339) to unix seconds; `None` if unparseable.
+fn parse_ts_unix(ts: &str) -> Option<i64> {
+    time::OffsetDateTime::parse(ts, &Rfc3339)
+        .ok()
+        .map(|t| t.unix_timestamp())
 }
 
 /// File paths carried by one event: `file_change` paths plus `edit` /

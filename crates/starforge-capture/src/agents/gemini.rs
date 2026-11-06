@@ -1,33 +1,37 @@
-//! Gemini CLI + Antigravity adapter:
-//! `<data_dir>/tmp/<hash>/chats/*.json` (Gemini CLI) and
-//! `<data_dir>/antigravity/<version>/sessions/*.json` (Antigravity).
+//! Gemini CLI adapter: `<data_dir>/tmp/<hash>/chats/*.json`.
 //!
-//! Native shape (both stores): a single JSON chat document with `sessionId`,
-//! `version`, `cwd`, `startedAt`, and a `messages` array. Message records
-//! follow one `role` vocabulary: `user` records carry prompt text in
-//! `content`; `model` records carry response text plus `model`, token
-//! `usage`, and optional inline `reasoning`; `tool_call` records carry
-//! `name` and `input`; `tool_result` records carry `output` (and
-//! `is_error`); `summary` records carry compaction context in `summary`.
+//! Native shape: a single JSON chat document with `sessionId`, `version`,
+//! `cwd`, `startedAt`, and a `messages` array. Message records follow one
+//! `role` vocabulary: `user` records carry prompt text in `content`;
+//! `model` records carry response text plus `model`, token `usage`, and
+//! optional inline `reasoning`; `tool_call` records carry `name` and
+//! `input`; `tool_result` records carry `output` (and `is_error`);
+//! `summary` records carry compaction context in `summary`.
 //!
 //! Mapping: prompts → `user_message`; responses → `assistant_message`
 //! (plus `reasoning` when inline reasoning is present — the multi-event
 //! record the incremental test resumes across); tool records →
 //! `tool_call`/`tool_result` (`Edit`/`Write` inputs carrying `file_path`
 //! are noted in header `files_touched`); summaries → `compaction`.
-//! Antigravity records parse with the same mapper; unmapped shapes (e.g.
-//! the Antigravity-only `agent_state` record) fall back to
-//! `system { text: <raw JSON> }`: never dropped, never an error.
+//! Unmapped shapes fall back to `system { text: <raw JSON> }`: never
+//! dropped, never an error.
 //!
-//! Antigravity layout choice: the store is keyed by version directory,
-//! `<data_dir>/antigravity/<version>/sessions/*.json`, because Antigravity
-//! ships its own forked chat layout that drifts per release — the directory
-//! name is the source of truth for the reported version
-//! (`antigravity-<version>`) rather than any in-file field, and sessions
-//! from different installs never mix. That reported version ALWAYS ships
-//! `adapter_version_verified == false` (binding user decision, like omp).
-//! `detect` is true only when a store exists: a `chats` directory under any
-//! `<data_dir>/tmp/<hash>/`, or the `<data_dir>/antigravity` directory.
+//! Discovery attribution: a chat is captured only when its `cwd` is a
+//! non-empty path inside the worktree. A chat with unknown/empty `cwd`
+//! is normally skipped, with one positive-evidence exception: Gemini
+//! CLI stores chats under `~/.gemini/tmp/<project_hash>/chats/`, where
+//! `project_hash` is the sha256 hex digest of the absolute project
+//! root path string (`getProjectHash` in
+//! `packages/core/src/utils/paths.ts`:
+//! https://github.com/google-gemini/gemini-cli/blob/main/packages/core/src/utils/paths.ts).
+//! A `cwd`-less chat is therefore attributed only when its
+//! `<project_hash>` directory equals the hash of `roots.worktree`'s
+//! absolute path string. Consequence: a session started in a
+//! subdirectory of the worktree has a different project root (hence a
+//! different hash) and is NOT attributed.
+//!
+//! `detect` is true only when a `chats` directory exists under some
+//! `<data_dir>/tmp/<hash>/`.
 //!
 //! Cursor semantics: byte-offset semantics like the other file adapters —
 //! `offset` is the chat file length consumed and `lines` is messages
@@ -36,9 +40,11 @@
 //! document on growth, so resume addresses records by `lines` while `offset`
 //! only detects growth.
 //!
-//! Hook story: no hook surface is pinned for either store layout, so
+//! Hook story: no hook surface is pinned for the chat files, so
 //! [`Adapter::install_hooks`] and [`Adapter::remove_hooks`] both report
 //! `Ok(vec![])` and discovery of the chat files is the only capture path.
+//!
+//! Antigravity is not captured in v0.1.0 (closed format), see README Known gaps.
 
 use std::collections::{BTreeMap, HashMap};
 use std::io;
@@ -46,6 +52,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use serde_json::Value;
+use sha2::Digest as _;
 use starforge_format::{
     Agent, AgentName, AssistantMessage, CaptureInfo, CaptureMode, Compaction, Event, EventKind,
     FORMAT_TAG, Reasoning, SessionMeta, System, ToolCall, ToolOutcome, ToolRef, ToolResult, Usage,
@@ -57,7 +64,6 @@ use ulid::Ulid;
 use crate::{Adapter, Candidate, CaptureError, Cursor, ReadOutput, Roots, workdir_inside};
 
 /// Gemini adapter (unit struct; the [`Adapter`] trait is not object-safe).
-/// Also serves Antigravity sessions, which share [`AgentName::Gemini`].
 pub struct GeminiAdapter;
 
 fn valid_ts(s: &str) -> bool {
@@ -132,6 +138,7 @@ impl HeaderFold {
         }
         if self.workdir.is_none()
             && let Some(cwd) = doc.get("cwd").and_then(Value::as_str)
+            && !cwd.is_empty()
         {
             self.workdir = Some(cwd.to_string());
         }
@@ -152,6 +159,7 @@ impl HeaderFold {
     fn feed(&mut self, msg: &Value, ts: &str) {
         if self.workdir.is_none()
             && let Some(cwd) = msg.get("cwd").and_then(Value::as_str)
+            && !cwd.is_empty()
         {
             self.workdir = Some(cwd.to_string());
         }
@@ -210,8 +218,8 @@ fn record_ts(msg: &Value, fallback_ts: &str) -> String {
 
 /// Map one message to events (timestamps resolved, `seq` assigned by the
 /// caller). Mutates `fold` with header facts (models, usage, files).
-/// `raw` is the message re-serialized: unmapped (Antigravity-only) shapes
-/// fall back to `system { text: <raw JSON> }` so no message is ever dropped.
+/// `raw` is the message re-serialized: unmapped shapes fall back to
+/// `system { text: <raw JSON> }` so no message is ever dropped.
 fn message_events(raw: &str, msg: &Value, fold: &mut HeaderFold, workdir: &str) -> Vec<EventKind> {
     let mut kinds = Vec::new();
     let role = msg.get("role").and_then(Value::as_str).unwrap_or("");
@@ -293,30 +301,14 @@ fn message_events(raw: &str, msg: &Value, fold: &mut HeaderFold, workdir: &str) 
             }));
         }
         _ => {
-            // Unmapped (Antigravity-only) message shape: raw JSON into
-            // `system`. Never dropped, never an error.
+            // Unmapped message shape: raw JSON into `system`. Never
+            // dropped, never an error.
             kinds.push(EventKind::System(System {
                 text: raw.to_string(),
             }));
         }
     }
     kinds
-}
-
-/// Recursively collect `*.json` files under `dir`, sorted for determinism.
-fn collect_json(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    let mut entries: Vec<_> = entries.flatten().map(|e| e.path()).collect();
-    entries.sort();
-    for path in entries {
-        if path.is_dir() {
-            collect_json(&path, out);
-        } else if path.is_file() && path.extension().is_some_and(|x| x == "json") {
-            out.push(path);
-        }
-    }
 }
 
 /// Document `cwd` and `version` for `discover` (cheap identity scan).
@@ -331,13 +323,18 @@ fn scan_doc(native_path: &std::path::Path) -> (Option<String>, Option<String>) {
     let cwd = doc
         .get("cwd")
         .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
         .map(str::to_string)
         .or_else(|| {
             doc.get("messages")
                 .and_then(Value::as_array)
                 .and_then(|msgs| {
-                    msgs.iter()
-                        .find_map(|m| m.get("cwd").and_then(Value::as_str).map(str::to_string))
+                    msgs.iter().find_map(|m| {
+                        m.get("cwd")
+                            .and_then(Value::as_str)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string)
+                    })
                 })
         });
     let version = doc
@@ -347,34 +344,39 @@ fn scan_doc(native_path: &std::path::Path) -> (Option<String>, Option<String>) {
     (cwd, version)
 }
 
+/// Gemini CLI `getProjectHash`: sha256 hex digest of the absolute
+/// project root path string (see module docs for the source).
+fn project_hash(path: &std::path::Path) -> String {
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(path.to_string_lossy().as_bytes());
+    hex_encode(&hasher.finalize())
+}
+
+/// Lowercase hex encoding (avoids a `hex` dependency in this crate).
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
+}
+
 impl Adapter for GeminiAdapter {
     fn id(&self) -> AgentName {
         AgentName::Gemini
     }
-
-    /// Gemini CLI versions only; `antigravity-*` versions are NEVER members
-    /// (they ship unverified — see [`Adapter::version_status`]).
     const COVERED: &[&str] = &["0.12.0"];
-
-    /// Binding: any version starting with `antigravity-` reports
-    /// `covered: false`.
-    fn version_status(&self, version: &str) -> crate::AdapterVersion {
-        crate::AdapterVersion {
-            covered: !version.starts_with("antigravity-") && Self::COVERED.contains(&version),
-        }
-    }
 
     fn detect(&self, roots: &Roots) -> bool {
         let tmp = roots.data_dir.join("tmp");
-        if let Ok(entries) = std::fs::read_dir(&tmp)
-            && entries.flatten().any(|e| e.path().join("chats").is_dir())
-        {
-            return true;
-        }
-        roots.data_dir.join("antigravity").is_dir()
+        std::fs::read_dir(&tmp)
+            .map(|entries| entries.flatten().any(|e| e.path().join("chats").is_dir()))
+            .unwrap_or(false)
     }
 
-    /// No pinned hook story for either store layout: the installed versions
+    /// No pinned hook story for the chat files: the installed versions
     /// expose no stable hook surface to write to, so discovery of the chat
     /// files (below) is the only capture path and both directions report
     /// nothing.
@@ -426,10 +428,25 @@ impl Adapter for GeminiAdapter {
                         })
                         .unwrap_or_default();
                     let (workdir, version) = scan_doc(&native_path);
-                    let workdir = workdir
-                        .filter(|cwd| !cwd.is_empty())
-                        .map(PathBuf::from)
-                        .unwrap_or_else(|| roots.worktree.clone());
+                    // Privacy rule: unknown cwd (missing/empty) is
+                    // skipped, never defaulted to this worktree —
+                    // except when the chat's `<project_hash>` store
+                    // directory positively identifies the worktree
+                    // (see module docs).
+                    let workdir = match workdir.filter(|cwd| !cwd.is_empty()) {
+                        Some(cwd) => PathBuf::from(cwd),
+                        None => {
+                            let dir_name = hash
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_default();
+                            if dir_name == project_hash(&roots.worktree) {
+                                roots.worktree.clone()
+                            } else {
+                                continue;
+                            }
+                        }
+                    };
                     if !workdir_inside(&roots.worktree, &workdir) {
                         continue;
                     }
@@ -443,59 +460,6 @@ impl Adapter for GeminiAdapter {
                         session_key,
                         native_path,
                         agent_version: version.unwrap_or_default(),
-                        workdir,
-                    });
-                }
-            }
-        }
-        // Antigravity store: `<data_dir>/antigravity/<version>/sessions/`.
-        // The version directory is the source of truth for the reported
-        // `antigravity-<version>` string (see module docs).
-        let ag = roots.data_dir.join("antigravity");
-        if ag.is_dir()
-            && let Ok(versions) = std::fs::read_dir(&ag)
-        {
-            let mut versions: Vec<PathBuf> = versions
-                .flatten()
-                .map(|e| e.path())
-                .filter(|p| p.is_dir())
-                .collect();
-            versions.sort();
-            for vdir in versions {
-                let suffix = vdir
-                    .file_name()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                let mut files = Vec::new();
-                collect_json(&vdir, &mut files);
-                for native_path in files {
-                    let session_key = native_path
-                        .strip_prefix(&roots.data_dir)
-                        .map(|rel| {
-                            rel.components()
-                                .map(|c| c.as_os_str().to_string_lossy().into_owned())
-                                .collect::<Vec<_>>()
-                                .join("/")
-                        })
-                        .unwrap_or_default();
-                    let (workdir, _) = scan_doc(&native_path);
-                    let workdir = workdir
-                        .filter(|cwd| !cwd.is_empty())
-                        .map(PathBuf::from)
-                        .unwrap_or_else(|| roots.worktree.clone());
-                    if !workdir_inside(&roots.worktree, &workdir) {
-                        continue;
-                    }
-                    if let Some(cursor) = known.get(&session_key)
-                        && let Ok(meta) = std::fs::metadata(&native_path)
-                        && meta.len() <= cursor.offset
-                    {
-                        continue;
-                    }
-                    out.push(Candidate {
-                        session_key,
-                        native_path,
-                        agent_version: format!("antigravity-{suffix}"),
                         workdir,
                     });
                 }
@@ -586,13 +550,7 @@ impl Adapter for GeminiAdapter {
                 events: cursor.events + events.len() as u64,
             }
         };
-        // Antigravity candidates carry the directory-derived version; the
-        // in-file field is ignored for versioning (see module docs).
-        let version = if candidate.agent_version.starts_with("antigravity-") {
-            candidate.agent_version.clone()
-        } else {
-            fold.version.clone().unwrap_or_default()
-        };
+        let version = fold.version.clone().unwrap_or_default();
         let covered = self.version_status(&version).covered;
         let id = fold
             .session_id

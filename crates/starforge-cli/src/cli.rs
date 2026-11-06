@@ -68,6 +68,11 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: TrailCmd,
     },
+    /// Agent hook entry points (invoked by Claude Code hooks).
+    Hook {
+        #[command(subcommand)]
+        cmd: HookCmd,
+    },
     /// Git `prepare-commit-msg` hook entry point (invoked by installed hooks).
     #[command(hide = true, name = "_hook-prepare-commit-msg")]
     HookPrepare {
@@ -80,6 +85,13 @@ pub enum Cmd {
     /// Git `pre-push` hook entry point (invoked by installed hooks).
     #[command(hide = true, name = "_hook-pre-push")]
     HookPrePush,
+}
+/// `hook` subcommands: agent hook entry points (invoked by Claude Code).
+#[derive(Debug, Subcommand)]
+pub enum HookCmd {
+    /// Claude Code `SessionEnd`: ingest, mark the session ended, upload.
+    #[command(name = "session-end")]
+    SessionEnd,
 }
 
 /// `auth` subcommands.
@@ -368,6 +380,7 @@ pub fn run(cli: Cli, paths: CliPaths) -> std::process::ExitCode {
     | Cmd::Sync
     | Cmd::Doctor
     | Cmd::HookPrePush
+    | Cmd::Hook { .. }
     | Cmd::Trail { .. }
     | Cmd::Sessions {
         cmd:
@@ -405,6 +418,7 @@ fn sync_stub(cli: Cli, paths: CliPaths) -> std::process::ExitCode {
         Cmd::HookPrepare { msg_file } => run_hook_prepare(paths, msg_file),
         Cmd::HookPostCommit => run_hook_post_commit(paths),
         Cmd::HookPrePush => unreachable!("pre-push dispatches via run_async"),
+        Cmd::Hook { .. } => unreachable!("hook dispatches via run_async"),
         Cmd::Sync => unreachable!("sync dispatches via run_async"),
         Cmd::Export { .. } => unreachable!("export dispatches via run_async"),
         Cmd::Import { .. } => unreachable!("import dispatches via run_async"),
@@ -540,6 +554,16 @@ pub async fn run_async(cli: Cli, paths: CliPaths) -> std::process::ExitCode {
         Cmd::HookPrepare { msg_file } => run_hook_prepare(paths, msg_file),
         Cmd::HookPostCommit => run_hook_post_commit(paths),
         Cmd::HookPrePush => run_hook_pre_push_async(paths).await,
+        Cmd::Hook { cmd } => run_hook(cmd, paths).await,
+    }
+}
+/// `hook` subcommands: agent hook entry points (always exit 0, never break
+/// the agent; see [`crate::commands::hook`]).
+async fn run_hook(cmd: HookCmd, paths: CliPaths) -> std::process::ExitCode {
+    match cmd {
+        HookCmd::SessionEnd => {
+            std::process::ExitCode::from(crate::commands::hook::hook_session_end(&paths).await)
+        }
     }
 }
 
@@ -997,7 +1021,8 @@ async fn run_sync(paths: CliPaths, dry_run: bool) -> std::process::ExitCode {
     // nothing was ever queued. A bad transcript must not block a drainable
     // queue: warn and continue draining.
     {
-        let roots = crate::commands::hooks::adapter_roots(&paths, &repo);
+        let roots =
+            crate::commands::hooks::all_adapter_roots(&paths, &repo, |k| std::env::var(k).ok());
         match crate::ingest::ingest(&spool, &roots, &repo, time::OffsetDateTime::now_utc()) {
             Ok(stats) => tracing::debug!(
                 "sync ingest: {} session(s), {} new event(s)",

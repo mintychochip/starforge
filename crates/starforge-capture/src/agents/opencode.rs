@@ -1,41 +1,67 @@
-//! OpenCode adapter: `<data_dir>/opencode.db` (SQLite) or
-//! `<data_dir>/opencode-sessions/*.jsonl` (file storage, by version).
+//! OpenCode adapter: `<data_dir>/opencode.db` (SQLite, current schema).
 //!
-//! Native shape (SQLite): a `session` row per native session (`id`, `cwd`,
-//! `version`, `created_at`) plus one `message` row per record (`id` rowid
-//! cursor key, `session_id`, `role`, `name`, `content`, `reasoning`, token
-//! counters, `is_error`, `ts`). `role` is one of `user` | `assistant` |
-//! `tool_call` | `tool_result` | `summary`; `name` carries the model
-//! (assistant rows) or the tool name (tool rows); `content` carries text, or
-//! a JSON-encoded tool-input object for `tool_call` rows.
+//! Modeled on OpenCode v2.0.29 (tag `v2.0.29`, repo `anomalyco/opencode`):
+//! - tables: `packages/core/src/session/sql.ts` — `session_v2` (sessions),
+//!   `session_message` (one row per message, ordered by `seq`), and
+//!   `session_part` (one row per content part, keyed by `(message_id,
+//!   ordinal)`), plus `project` (`packages/core/src/project/sql.ts`) for
+//!   the `worktree` fallback.
+//! - message payloads: `packages/schema/src/session-message.ts` —
+//!   `session_message.data` is the message JSON minus `id`/`type` (the
+//!   `type` and `seq` live in dedicated columns); `session_part.data` is
+//!   one assistant content part (`text` | `reasoning` | `tool`). The
+//!   assistant message carries the step's model and token totals
+//!   (`model {id, providerID, variant?}`, `tokens {input, output, reasoning,
+//!   cache {read, write}}`); a tool part carries its call `id`, tool `name`,
+//!   and a `state` (`streaming` | `running` | `completed` | `error`) with
+//!   the input and, when finished, the result content.
 //!
-//! Native shape (file storage): one JSON object per line with the same
-//! logical columns (`role`, `name`, `content`, `reasoning`,
-//! `input_tokens`, `output_tokens`, `is_error`, plus `timestamp`/`ts`,
-//! `session`, `version`, `cwd` on every record).
+//! The workdir is `session_v2.directory`, falling back to the project's
+//! `worktree`. Archived sessions (`time_archived IS NOT NULL`) and child
+//! sessions (`parent_id IS NOT NULL`) are skipped: upstream treats both as
+//! non-user sessions — child sessions do not appear in session listings
+//! (anomalyco/opencode#27620, #29175) and the TUI picker needs root
+//! sessions only (#34936); archival hides a session from the list.
+//! The session key is the session id, and the agent version is
+//! `session_v2.version`.
 //!
-//! Mapping: `user` rows → `user_message`; `assistant` rows →
-//! `assistant_message` (plus `reasoning` when inline reasoning is present —
-//! the multi-event row the incremental test resumes across); `tool_call`
-//! rows → `tool_call`, with `Edit`/`Write` inputs carrying `file_path`
-//! additionally yielding `file_change { path, change, diff: None }` plus a
-//! `files_touched` entry (the other multi-event row); `tool_result` rows →
-//! `tool_result`; `summary` rows → `compaction`. Unmapped roles fall back to
+//! Mapping: `user` messages → `user_message`; `assistant` messages → one
+//! event per part (`text` → `assistant_message` with the step model and
+//! usage, `reasoning` → `reasoning`, `tool` → `tool_call` plus, when the
+//! state finished, a `tool_result` immediately after it — pairs ordered by
+//! the part's `call_id`/ordinal); `compaction` messages → `compaction`.
+//! Every other message or part type (including v1-era part types that
+//! survive in `data` such as `step-start`/`step-finish`) falls back to
 //! `system { text: <raw JSON> }`: never dropped, never an error.
 //!
-//! Cursor semantics: for the SQLite store `offset` is the last `message`
-//! rowid consumed (`0` = none) and `lines` is rows consumed; resume selects
-//! `WHERE session_id = ? AND id > offset ORDER BY id`. (`id INTEGER PRIMARY
-//! KEY` aliases the rowid.) For file-storage versions the cursor falls back
-//! to byte-offset semantics like the other JSONL adapters; both paths share
-//! `COVERED` gating.
+//! Cursor semantics: `offset` is the largest `session_message.seq` consumed
+//! (`seq` starts at 0 upstream — the v1→v2 migration numbers migrated
+//! messages from 0), `lines` is messages consumed, `events` is events
+//! emitted; resume selects `WHERE session_id = ? AND seq > offset ORDER BY
+//! seq`. A fresh [`Cursor::start`] cursor reads from the beginning, which
+//! is the only way to include a `seq = 0` first message. A session counts
+//! as grown when it holds more messages than `known` has consumed.
 //!
 //! Reads are read-only: the adapter opens the database with
 //! `SQLITE_OPEN_READ_ONLY` and issues `SELECT`s only, never `CREATE`/write.
+//! A database whose `session_v2`/`session_message`/`session_part` tables
+//! are absent (older or unrelated schema) is reported as not detected
+//! instead of panicking.
+//!
+//! Legacy stores: OpenCode ≤ 1.x kept a real SQLite store with
+//! `session`/`message`/`part` tables (same `opencode.db` file) whose
+//! `message.data` held v1 message JSON. OpenCode itself migrates those
+//! rows into `session_v2`/`session_message`/`session_part` exactly once
+//! (`packages/core/src/database/v1-migration.bun.ts`), so after the user
+//! runs v2 the v1 history is reachable through the current schema; this
+//! adapter does not parse the v1 tables separately. The earlier
+//! `opencode-sessions/*.jsonl` file store and the old adapter's
+//! `session(id, cwd, version, created_at)` / `message(role, name, ...)`
+//! column shapes were never used by any release and have been deleted.
 //!
 //! Hook story: no plugin-event surface is pinned for the covered versions,
 //! so [`Adapter::install_hooks`] and [`Adapter::remove_hooks`] both report
-//! `Ok(vec![])` and discovery of the stores is the only capture path.
+//! `Ok(vec![])` and discovery of the store is the only capture path.
 
 use std::collections::{BTreeMap, HashMap};
 use std::io;
@@ -46,8 +72,8 @@ use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 use starforge_format::{
     Agent, AgentName, AssistantMessage, CaptureInfo, CaptureMode, Compaction, Event, EventKind,
-    FORMAT_TAG, FileChange, FileChangeKind, Reasoning, SessionMeta, System, ToolCall, ToolOutcome,
-    ToolRef, ToolResult, Usage, UserMessage,
+    FORMAT_TAG, Reasoning, SessionMeta, System, ToolCall, ToolOutcome, ToolRef, ToolResult, Usage,
+    UserMessage,
 };
 use time::format_description::well_known::Rfc3339;
 use ulid::Ulid;
@@ -61,124 +87,78 @@ fn valid_ts(s: &str) -> bool {
     time::OffsetDateTime::parse(s, &Rfc3339).is_ok()
 }
 
-/// One normalized message row: a SQLite `message` row or a file-storage
-/// JSONL record. `ts_raw` is resolved against `fallback_ts` at read time.
-#[derive(Clone)]
-struct OcRow {
-    role: String,
-    name: String,
-    content: String,
-    reasoning: Option<String>,
-    input_tokens: u64,
-    output_tokens: u64,
-    is_error: bool,
-    ts_raw: String,
+/// Epoch-millis → RFC 3339 (UTC), or `None` outside the representable range.
+fn ms_to_rfc3339(ms: i64) -> Option<String> {
+    time::OffsetDateTime::from_unix_timestamp_nanos(ms as i128 * 1_000_000)
+        .ok()
+        .and_then(|dt| dt.format(&Rfc3339).ok())
 }
 
-/// Raw JSON for a SQLite row (sorted keys; the system-fallback text).
-fn raw_sql(oc: &OcRow) -> String {
-    let mut map = serde_json::Map::new();
-    map.insert("content".to_string(), Value::String(oc.content.clone()));
-    map.insert("input_tokens".to_string(), Value::from(oc.input_tokens));
-    map.insert("is_error".to_string(), Value::Bool(oc.is_error));
-    map.insert("name".to_string(), Value::String(oc.name.clone()));
-    map.insert("output_tokens".to_string(), Value::from(oc.output_tokens));
-    if let Some(reasoning) = &oc.reasoning {
-        map.insert("reasoning".to_string(), Value::String(reasoning.clone()));
-    }
-    map.insert("role".to_string(), Value::String(oc.role.clone()));
-    map.insert("ts".to_string(), Value::String(oc.ts_raw.clone()));
-    Value::Object(map).to_string()
+/// One message's timestamp: native `time_created` when representable,
+/// else `fallback_ts`.
+fn msg_ts(time_created: i64, fallback_ts: &str) -> String {
+    ms_to_rfc3339(time_created).unwrap_or_else(|| fallback_ts.to_string())
 }
 
-fn row_from_sql(row: &rusqlite::Row) -> Result<(OcRow, String), rusqlite::Error> {
-    let input_raw: i64 = row.get("input_tokens")?;
-    let output_raw: i64 = row.get("output_tokens")?;
-    let error_raw: i64 = row.get("is_error")?;
-    let oc = OcRow {
-        role: row.get("role")?,
-        name: row.get("name")?,
-        content: row.get("content")?,
-        reasoning: row.get("reasoning")?,
-        input_tokens: u64::try_from(input_raw).unwrap_or(0),
-        output_tokens: u64::try_from(output_raw).unwrap_or(0),
-        is_error: error_raw != 0,
-        ts_raw: row.get("ts")?,
+/// `model` struct (`{id, providerID}`) → OpenCode's `provider/model` string.
+fn model_ref(data: &Value) -> String {
+    let Some(m) = data.get("model") else {
+        return String::new();
     };
-    let raw = raw_sql(&oc);
-    Ok((oc, raw))
+    let id = m.get("id").and_then(Value::as_str).unwrap_or("");
+    let provider = m.get("providerID").and_then(Value::as_str).unwrap_or("");
+    if id.is_empty() {
+        String::new()
+    } else if provider.is_empty() {
+        id.to_string()
+    } else {
+        format!("{provider}/{id}")
+    }
 }
 
-fn row_from_value(record: &Value) -> OcRow {
-    let s = |key: &str| {
-        record
-            .get(key)
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string()
+/// Step usage from an assistant message's `tokens` (`{input, output,
+/// reasoning, cache {read, write}}`).
+fn parse_usage(data: &Value) -> Usage {
+    let Some(tokens) = data.get("tokens") else {
+        return Usage::default();
     };
-    let n = |key: &str| record.get(key).and_then(Value::as_u64).unwrap_or(0);
-    OcRow {
-        role: s("role"),
-        name: s("name"),
-        content: s("content"),
-        reasoning: record
-            .get("reasoning")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        input_tokens: n("input_tokens"),
-        output_tokens: n("output_tokens"),
-        is_error: record
-            .get("is_error")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
-        ts_raw: record
-            .get("timestamp")
-            .or_else(|| record.get("ts"))
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string(),
+    let n = |key: &str| tokens.get(key).and_then(Value::as_u64).unwrap_or(0);
+    let cache = tokens.get("cache");
+    Usage {
+        input: n("input"),
+        output: n("output"),
+        reasoning: n("reasoning"),
+        cache_read: cache
+            .and_then(|c| c.get("read"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        cache_write: cache
+            .and_then(|c| c.get("write"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
     }
 }
 
-/// Byte offset to resume from: `cursor.offset`, rounded back to the previous
-/// `\n` when it lands mid-line (a foreign cursor; cursors produced by `read`
-/// always sit on line starts). File-storage path only.
-fn round_to_line_start(bytes: &[u8], offset: u64) -> usize {
-    let offset = offset as usize;
-    if offset == 0 || bytes[offset - 1] == b'\n' {
-        return offset;
-    }
-    match bytes[..offset].iter().rposition(|&b| b == b'\n') {
-        Some(pos) => pos + 1,
-        None => 0,
+/// Render a tool-result `content` value (`string | [{type, text} | …]`) as text.
+fn content_to_string(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Array(items) => items
+            .iter()
+            .map(|item| match item.get("text").and_then(Value::as_str) {
+                Some(text) => text.to_string(),
+                None => item.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        other => other.to_string(),
     }
 }
 
-/// Byte ranges of complete (`\n`-terminated) lines in `bytes[start..]`.
-/// A trailing unterminated tail is live-write growth: left unconsumed.
-/// File-storage path only.
-fn complete_lines(bytes: &[u8], start: usize) -> Vec<(usize, usize)> {
-    let mut out = Vec::new();
-    let mut pos = start;
-    while let Some(rel) = bytes[pos..].iter().position(|&b| b == b'\n') {
-        out.push((pos, pos + rel));
-        pos += rel + 1;
-    }
-    out
-}
-
-fn line_text(bytes: &[u8], span: (usize, usize)) -> &str {
-    let mut s = &bytes[span.0..span.1];
-    if s.ends_with(b"\r") {
-        s = &s[..s.len() - 1];
-    }
-    std::str::from_utf8(s).unwrap_or("")
-}
-
-/// `file_path` carried by an `Edit`/`Write` tool input, if any.
+/// `file_path` carried by an `edit`/`write` tool input, if any.
 fn edit_path(tool_name: &str, input: &Value) -> Option<String> {
-    if tool_name != "Edit" && tool_name != "Write" {
+    let lowered = tool_name.to_lowercase();
+    if lowered != "edit" && lowered != "write" {
         return None;
     }
     input
@@ -187,37 +167,15 @@ fn edit_path(tool_name: &str, input: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Fold one parsed row into the session header accumulator.
+/// Fold one parsed message into the session header accumulator.
 #[derive(Default)]
 struct HeaderFold {
-    version: Option<String>,
-    session_id: Option<String>,
-    started_at: Option<String>,
     models: Vec<String>,
     usage: Usage,
     files_touched: Vec<String>,
 }
 
 impl HeaderFold {
-    fn feed_identity(&mut self, version: Option<&str>, session_id: Option<&str>) {
-        if self.version.is_none()
-            && let Some(v) = version
-        {
-            self.version = Some(v.to_string());
-        }
-        if self.session_id.is_none()
-            && let Some(id) = session_id
-        {
-            self.session_id = Some(id.to_string());
-        }
-    }
-
-    fn feed_ts(&mut self, ts: &str) {
-        if self.started_at.is_none() {
-            self.started_at = Some(ts.to_string());
-        }
-    }
-
     fn note_model(&mut self, model: &str) {
         if !model.is_empty() && !self.models.iter().any(|m| m == model) {
             self.models.push(model.to_string());
@@ -241,127 +199,216 @@ impl HeaderFold {
     }
 }
 
-/// One row's timestamp: native `ts` when valid RFC 3339, else `fallback_ts`.
-fn row_ts(ts_raw: &str, fallback_ts: &str) -> String {
-    if valid_ts(ts_raw) {
-        ts_raw.to_string()
-    } else {
-        fallback_ts.to_string()
-    }
+/// One native message row.
+#[derive(Clone)]
+struct OcMessage {
+    id: String,
+    mtype: String,
+    seq: i64,
+    time_created: i64,
+    data: Value,
 }
 
-/// Map one row to events (timestamps resolved, `seq` assigned by the
-/// caller). Mutates `fold` with header facts (models, usage, files).
-/// `raw` is the row's source bytes: unmapped roles fall back to
-/// `system { text: <raw JSON> }` so no row is ever dropped.
-fn row_events(row: &OcRow, raw: &str, fold: &mut HeaderFold, workdir: &str) -> Vec<EventKind> {
+/// One native content part row.
+#[derive(Clone)]
+struct OcPart {
+    ptype: String,
+    data: Value,
+}
+
+/// One `session_v2` row: (id, directory, version, project_id, parent_id,
+/// time_archived).
+type SessionRow = (String, String, String, String, Option<String>, Option<i64>);
+
+/// Raw JSON for a message (the system-fallback text).
+fn raw_message(msg: &OcMessage) -> String {
+    let mut value = msg.data.clone();
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("id".to_string(), Value::String(msg.id.clone()));
+        obj.insert("type".to_string(), Value::String(msg.mtype.clone()));
+    } else {
+        value = serde_json::json!({
+            "data": value,
+            "id": msg.id,
+            "type": msg.mtype,
+        });
+    }
+    value.to_string()
+}
+
+/// Map one part to events, in ordinal order. Unknown part types fall back
+/// to `system { text: <raw JSON> }` so no part is ever dropped.
+fn part_events(
+    part: &OcPart,
+    model: &str,
+    usage: Usage,
+    fold: &mut HeaderFold,
+    workdir: &str,
+) -> Vec<EventKind> {
     let mut kinds = Vec::new();
-    match row.role.as_str() {
-        "user" => {
-            if !row.content.is_empty() {
-                kinds.push(EventKind::UserMessage(UserMessage {
-                    text: row.content.clone(),
-                }));
-            }
-        }
-        "assistant" => {
-            if !row.name.is_empty() {
-                fold.note_model(&row.name);
-            }
-            let usage = Usage {
-                input: row.input_tokens,
-                output: row.output_tokens,
-                ..Usage::default()
-            };
-            fold.note_usage(usage);
-            if !row.content.is_empty() {
+    let ptype = part
+        .data
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or(&part.ptype);
+    match ptype {
+        "text" => {
+            if let Some(text) = part.data.get("text").and_then(Value::as_str)
+                && !text.is_empty()
+            {
                 kinds.push(EventKind::AssistantMessage(AssistantMessage {
-                    text: row.content.clone(),
-                    model: if row.name.is_empty() {
+                    text: text.to_string(),
+                    model: if model.is_empty() {
                         None
                     } else {
-                        Some(row.name.clone())
+                        Some(model.to_string())
                     },
                     usage,
                 }));
             }
-            // Inline reasoning emits a second event after the message (this
-            // is a multi-event row the incremental test resumes across).
-            if let Some(reasoning) = &row.reasoning
-                && !reasoning.is_empty()
+        }
+        "reasoning" => {
+            if let Some(text) = part.data.get("text").and_then(Value::as_str)
+                && !text.is_empty()
             {
                 kinds.push(EventKind::Reasoning(Reasoning {
-                    text: reasoning.clone(),
+                    text: text.to_string(),
                 }));
             }
         }
-        "tool_call" => {
-            let input: Value =
-                serde_json::from_str(&row.content).unwrap_or(Value::String(row.content.clone()));
-            let call = EventKind::ToolCall(ToolCall {
-                tool: ToolRef {
-                    name: row.name.clone(),
-                    input: input.clone(),
-                },
-            });
-            kinds.push(call);
-            if let Some(path) = edit_path(&row.name, &input) {
+        "tool" => {
+            let name = part
+                .data
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let state = part.data.get("state");
+            let input = state
+                .and_then(|s| s.get("input"))
+                .cloned()
+                .unwrap_or(Value::Null);
+            if let Some(path) = edit_path(name, &input) {
                 fold.note_file(workdir, &path);
-                // A file-write part emits a second event after the call
-                // (the other multi-event row the incremental test covers).
-                // Paths outside the workdir stay out of the upload entirely.
-                if let Some(rel) = crate::repo_relative(std::path::Path::new(workdir), &path) {
-                    kinds.push(EventKind::FileChange(FileChange {
-                        path: rel,
-                        change: if row.name == "Write" {
-                            FileChangeKind::Add
-                        } else {
-                            FileChangeKind::Modify
-                        },
-                        diff: None,
-                    }));
-                }
+            }
+            // The call half of the pair, keyed by the part's `call_id`/id.
+            kinds.push(EventKind::ToolCall(ToolCall {
+                tool: ToolRef {
+                    name: name.to_string(),
+                    input,
+                },
+            }));
+            // The result half, only once the state is terminal.
+            let status = state
+                .and_then(|s| s.get("status"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if status == "completed" || status == "error" {
+                let output = state
+                    .and_then(|s| s.get("content"))
+                    .map(content_to_string)
+                    .unwrap_or_default();
+                let output = if output.is_empty() {
+                    state
+                        .and_then(|s| s.get("error"))
+                        .map(|e| e.to_string())
+                        .unwrap_or_default()
+                } else {
+                    output
+                };
+                kinds.push(EventKind::ToolResult(ToolResult {
+                    result: ToolOutcome {
+                        original_bytes: output.len() as u64,
+                        output,
+                        is_error: status == "error",
+                        truncated: false,
+                    },
+                }));
             }
         }
-        "tool_result" => {
-            kinds.push(EventKind::ToolResult(ToolResult {
-                result: ToolOutcome {
-                    original_bytes: row.content.len() as u64,
-                    output: row.content.clone(),
-                    is_error: row.is_error,
-                    truncated: false,
-                },
-            }));
-        }
-        "summary" => {
-            kinds.push(EventKind::Compaction(Compaction {
-                summary: if row.content.is_empty() {
-                    None
-                } else {
-                    Some(row.content.clone())
-                },
-            }));
-        }
         _ => {
-            // Unmapped (file-storage-era) row shape: raw JSON into `system`.
-            // Never dropped, never an error.
+            // Unknown part type: raw JSON into `system`. Never dropped.
             kinds.push(EventKind::System(System {
-                text: raw.to_string(),
+                text: part.data.to_string(),
             }));
         }
     }
     kinds
 }
 
-/// Largest `message.id` for `session_id` (the rowid cursor space), or `None`
-/// when the session holds no rows.
-fn max_rowid(conn: &Connection, session_id: &str) -> Result<Option<i64>, CaptureError> {
-    conn.query_row(
-        "SELECT MAX(id) FROM message WHERE session_id = ?1",
-        rusqlite::params![session_id],
-        |row| row.get(0),
-    )
-    .map_err(|e| CaptureError::Sqlite(e.to_string()))
+/// Map one message (with its parts) to events. Mutates `fold` with header
+/// facts (models, usage, files). Unmapped message types fall back to
+/// `system { text: <raw JSON> }` so no message is ever dropped.
+fn message_events(
+    msg: &OcMessage,
+    parts: &[OcPart],
+    fold: &mut HeaderFold,
+    workdir: &str,
+) -> Vec<EventKind> {
+    let mut kinds = Vec::new();
+    match msg.mtype.as_str() {
+        "user" => {
+            if let Some(text) = msg.data.get("text").and_then(Value::as_str)
+                && !text.is_empty()
+            {
+                kinds.push(EventKind::UserMessage(UserMessage {
+                    text: text.to_string(),
+                }));
+            }
+        }
+        "assistant" => {
+            let model = model_ref(&msg.data);
+            fold.note_model(&model);
+            let usage = parse_usage(&msg.data);
+            fold.note_usage(usage);
+            // Fall back to `data.content` when the part rows are absent
+            // (e.g. a session projected before `session_part` existed).
+            let parts_data: Vec<OcPart>;
+            let parts_ref: &[OcPart] = if parts.is_empty() {
+                parts_data = msg
+                    .data
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .map(|items| {
+                        items
+                            .iter()
+                            .map(|item| OcPart {
+                                ptype: item
+                                    .get("type")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("")
+                                    .to_string(),
+                                data: item.clone(),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                &parts_data
+            } else {
+                parts
+            };
+            for part in parts_ref {
+                kinds.extend(part_events(part, &model, usage, fold, workdir));
+            }
+        }
+        "compaction" => {
+            kinds.push(EventKind::Compaction(Compaction {
+                summary: msg
+                    .data
+                    .get("summary")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            }));
+        }
+        _ => {
+            // Unmapped message type (system, synthetic, skill, shell, idle,
+            // *-switched, or unknown): raw JSON into `system`.
+            // Never dropped, never an error.
+            kinds.push(EventKind::System(System {
+                text: raw_message(msg),
+            }));
+        }
+    }
+    kinds
 }
 
 fn open_ro(path: &std::path::Path) -> Result<Connection, CaptureError> {
@@ -369,33 +416,54 @@ fn open_ro(path: &std::path::Path) -> Result<Connection, CaptureError> {
         .map_err(|e| CaptureError::Sqlite(e.to_string()))
 }
 
-/// First `cwd` and `version` seen in a file-storage transcript (cheap
-/// identity scan).
-fn scan_identity(native_path: &std::path::Path) -> (Option<String>, Option<String>) {
-    let Ok(bytes) = std::fs::read(native_path) else {
-        return (None, None);
-    };
-    for span in complete_lines(&bytes, 0) {
-        let text = line_text(&bytes, span);
-        if text.trim().is_empty() {
-            continue;
-        }
-        let Ok(record) = serde_json::from_str::<Value>(text) else {
-            continue;
-        };
-        let cwd = record
-            .get("cwd")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        let version = record
-            .get("version")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        if cwd.is_some() || version.is_some() {
-            return (cwd, version);
+/// True when the current `opencode.db` schema tables exist. A database
+/// without them is not our store (not detected, never a panic).
+fn tables_present(conn: &Connection) -> bool {
+    const TABLES: [&str; 3] = ["session_v2", "session_message", "session_part"];
+    for table in TABLES {
+        let present: Result<i64, _> = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            rusqlite::params![table],
+            |row| row.get(0),
+        );
+        if present.unwrap_or(0) == 0 {
+            return false;
         }
     }
-    (None, None)
+    true
+}
+
+/// Workdir for one session row: `directory` when non-empty, else the
+/// project's `worktree`, else the caller's worktree.
+fn resolve_workdir(
+    conn: &Connection,
+    directory: &str,
+    project_id: &str,
+    fallback_worktree: &std::path::Path,
+) -> PathBuf {
+    if !directory.is_empty() {
+        return PathBuf::from(directory);
+    }
+    let worktree: Result<Option<String>, _> = conn.query_row(
+        "SELECT worktree FROM project WHERE id = ?1",
+        rusqlite::params![project_id],
+        |row| row.get(0),
+    );
+    match worktree {
+        Ok(Some(w)) if !w.is_empty() => PathBuf::from(w),
+        _ => fallback_worktree.to_path_buf(),
+    }
+}
+
+/// Messages per session (`(count, max seq)`), `(-1)` when the session
+/// holds no messages yet.
+fn session_growth(conn: &Connection, session_id: &str) -> Result<(i64, Option<i64>), CaptureError> {
+    conn.query_row(
+        "SELECT COUNT(*), MAX(seq) FROM session_message WHERE session_id = ?1",
+        rusqlite::params![session_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .map_err(|e| CaptureError::Sqlite(e.to_string()))
 }
 
 impl Adapter for OpencodeAdapter {
@@ -403,17 +471,17 @@ impl Adapter for OpencodeAdapter {
         AgentName::Opencode
     }
 
-    /// Pinned SQLite-store versions. File-storage versions share this gate:
-    /// anything not listed ships unverified.
-    const COVERED: &[&str] = &["0.9.0"];
+    /// Pinned v2-store version. Anything else is parsed by the same reader
+    /// but ships unverified.
+    const COVERED: &[&str] = &["2.0.29"];
 
     fn detect(&self, roots: &Roots) -> bool {
-        roots.data_dir.join("opencode.db").is_file()
-            || roots.data_dir.join("opencode-sessions").is_dir()
+        let db = roots.data_dir.join("opencode.db");
+        db.is_file() && open_ro(&db).is_ok_and(|conn| tables_present(&conn))
     }
 
-    /// No pinned plugin-event story: the covered versions expose no stable
-    /// plugin surface to write to, so discovery of the stores (below) is
+    /// No pinned plugin-event story: the covered version exposes no stable
+    /// plugin surface to write to, so discovery of the store (below) is
     /// the only capture path and both directions report nothing.
     fn install_hooks(&self, _roots: &Roots) -> io::Result<Vec<PathBuf>> {
         Ok(vec![])
@@ -427,80 +495,57 @@ impl Adapter for OpencodeAdapter {
 
     fn discover(&self, roots: &Roots, known: &HashMap<String, Cursor>) -> Vec<Candidate> {
         let mut out = Vec::new();
-        // SQLite store: one candidate per session row-set newer than known.
         let db = roots.data_dir.join("opencode.db");
-        if db.is_file()
-            && let Ok(conn) = open_ro(&db)
-            && let Ok(mut stmt) = conn.prepare("SELECT id, cwd, version FROM session ORDER BY id")
-            && let Ok(rows) = stmt.query_map([], |row| {
+        let Ok(conn) = open_ro(&db) else {
+            return out;
+        };
+        if !tables_present(&conn) {
+            return out;
+        }
+        let sessions: Vec<SessionRow> = {
+            let Ok(mut stmt) = conn.prepare(
+                "SELECT id, directory, version, project_id, parent_id, time_archived \
+                 FROM session_v2 ORDER BY id",
+            ) else {
+                return out;
+            };
+            let Ok(rows) = stmt.query_map([], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
                 ))
-            })
-        {
-            for row in rows.flatten() {
-                let (id, cwd, version) = row;
-                let workdir = if cwd.is_empty() {
-                    roots.worktree.clone()
-                } else {
-                    PathBuf::from(&cwd)
-                };
-                if !workdir_inside(&roots.worktree, &workdir) {
-                    continue;
-                }
-                let max = max_rowid(&conn, &id).unwrap_or(None).unwrap_or(0).max(0) as u64;
-                if let Some(cursor) = known.get(&id)
-                    && max <= cursor.offset
-                {
-                    continue;
-                }
-                out.push(Candidate {
-                    session_key: id,
-                    native_path: db.clone(),
-                    agent_version: version,
-                    workdir,
-                });
+            }) else {
+                return out;
+            };
+            rows.flatten().collect()
+        };
+        for (id, directory, version, project_id, parent_id, time_archived) in sessions {
+            // Archived and child sessions are hidden from upstream
+            // session listings, so they are not user sessions.
+            if time_archived.is_some() || parent_id.is_some() {
+                continue;
             }
-        }
-        // File-storage store: one candidate per session file newer than known.
-        let dir = roots.data_dir.join("opencode-sessions");
-        if dir.is_dir()
-            && let Ok(entries) = std::fs::read_dir(&dir)
-        {
-            let mut files: Vec<PathBuf> = entries
-                .flatten()
-                .map(|e| e.path())
-                .filter(|p| p.is_file() && p.extension().is_some_and(|x| x == "jsonl"))
-                .collect();
-            files.sort();
-            for native_path in files {
-                let session_key = native_path
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                let (workdir, version) = scan_identity(&native_path);
-                let workdir = workdir
-                    .filter(|cwd| !cwd.is_empty())
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| roots.worktree.clone());
-                if !workdir_inside(&roots.worktree, &workdir) {
-                    continue;
-                }
-                if let Some(cursor) = known.get(&session_key)
-                    && let Ok(meta) = std::fs::metadata(&native_path)
-                    && meta.len() <= cursor.offset
-                {
-                    continue;
-                }
-                out.push(Candidate {
-                    session_key,
-                    native_path,
-                    agent_version: version.unwrap_or_default(),
-                    workdir,
-                });
+            let workdir = resolve_workdir(&conn, &directory, &project_id, &roots.worktree);
+            if !workdir_inside(&roots.worktree, &workdir) {
+                continue;
             }
+            if let Some(cursor) = known.get(&id) {
+                let (count, _) = session_growth(&conn, &id).unwrap_or((0, None));
+                // Grown when the store holds more messages than known.
+                if count <= cursor.lines as i64 {
+                    continue;
+                }
+            }
+            out.push(Candidate {
+                session_key: id,
+                native_path: db.clone(),
+                agent_version: version,
+                workdir,
+            });
         }
         out.sort_by(|a, b| a.session_key.cmp(&b.session_key));
         out
@@ -515,98 +560,129 @@ impl Adapter for OpencodeAdapter {
         if !valid_ts(fallback_ts) {
             return Err(CaptureError::BadTimestamp(fallback_ts.to_string()));
         }
-        if candidate
-            .native_path
-            .extension()
-            .is_some_and(|x| x == "jsonl")
-        {
-            return self.read_files(candidate, cursor, fallback_ts);
-        }
-        self.read_db(candidate, cursor, fallback_ts)
-    }
-}
-
-impl OpencodeAdapter {
-    /// Read from the SQLite store with rowid cursor semantics.
-    fn read_db(
-        &self,
-        candidate: &Candidate,
-        cursor: &Cursor,
-        fallback_ts: &str,
-    ) -> Result<ReadOutput, CaptureError> {
         let conn = open_ro(&candidate.native_path)?;
-        let (version, cwd, created_at): (String, String, String) = conn
+        let (directory, version, project_id, title, time_created): (
+            String,
+            String,
+            String,
+            Option<String>,
+            i64,
+        ) = conn
             .query_row(
-                "SELECT version, cwd, created_at FROM session WHERE id = ?1",
+                "SELECT directory, version, project_id, title, time_created \
+                 FROM session_v2 WHERE id = ?1",
                 rusqlite::params![candidate.session_key],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .map_err(|e| CaptureError::Sqlite(e.to_string()))?;
-        let workdir = if cwd.is_empty() {
-            candidate.workdir.to_string_lossy().into_owned()
-        } else {
-            cwd
-        };
-        // Header pass: fold every row so the header always reflects the full
-        // session, even on incremental reads.
-        let mut all: Vec<(OcRow, String)> = Vec::new();
+        let workdir = resolve_workdir(&conn, &directory, &project_id, &candidate.workdir)
+            .to_string_lossy()
+            .into_owned();
+        // All messages and parts: the header pass folds the whole session,
+        // the event pass emits only messages newer than the cursor.
+        let mut messages: Vec<OcMessage> = Vec::new();
         {
             let mut stmt = conn
                 .prepare(
-                    "SELECT role, name, content, reasoning, input_tokens, output_tokens, is_error, ts \
-                     FROM message WHERE session_id = ?1 ORDER BY id",
+                    "SELECT id, type, seq, time_created, data \
+                     FROM session_message WHERE session_id = ?1 ORDER BY seq",
                 )
                 .map_err(|e| CaptureError::Sqlite(e.to_string()))?;
             let rows = stmt
-                .query_map(rusqlite::params![candidate.session_key], row_from_sql)
+                .query_map(rusqlite::params![candidate.session_key], |row| {
+                    let raw: String = row.get(4)?;
+                    let data: Value = serde_json::from_str(&raw).map_err(|_| {
+                        rusqlite::Error::InvalidColumnType(
+                            4,
+                            "data".to_string(),
+                            rusqlite::types::Type::Text,
+                        )
+                    })?;
+                    Ok(OcMessage {
+                        id: row.get(0)?,
+                        mtype: row.get(1)?,
+                        seq: row.get(2)?,
+                        time_created: row.get(3)?,
+                        data,
+                    })
+                })
                 .map_err(|e| CaptureError::Sqlite(e.to_string()))?;
             for row in rows {
-                all.push(row.map_err(|e| CaptureError::Sqlite(e.to_string()))?);
+                messages.push(row.map_err(|e| CaptureError::Sqlite(e.to_string()))?);
+            }
+        }
+        let mut parts_by_message: HashMap<String, Vec<OcPart>> = HashMap::new();
+        {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT message_id, type, data FROM session_part \
+                     WHERE session_id = ?1 ORDER BY message_id, ordinal",
+                )
+                .map_err(|e| CaptureError::Sqlite(e.to_string()))?;
+            let rows = stmt
+                .query_map(rusqlite::params![candidate.session_key], |row| {
+                    let raw: String = row.get(2)?;
+                    let data: Value = serde_json::from_str(&raw).map_err(|_| {
+                        rusqlite::Error::InvalidColumnType(
+                            2,
+                            "data".to_string(),
+                            rusqlite::types::Type::Text,
+                        )
+                    })?;
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        OcPart {
+                            ptype: row.get(1)?,
+                            data,
+                        },
+                    ))
+                })
+                .map_err(|e| CaptureError::Sqlite(e.to_string()))?;
+            for row in rows {
+                let (message_id, part) = row.map_err(|e| CaptureError::Sqlite(e.to_string()))?;
+                parts_by_message.entry(message_id).or_default().push(part);
             }
         }
         let mut fold = HeaderFold::default();
-        fold.feed_identity(None, Some(&candidate.session_key));
-        for (row, _) in &all {
-            fold.feed_ts(&row_ts(&row.ts_raw, fallback_ts));
+        let mut with_ts: Vec<(String, OcMessage, Vec<EventKind>)> =
+            Vec::with_capacity(messages.len());
+        for msg in messages {
+            let ts = msg_ts(msg.time_created, fallback_ts);
+            let parts = parts_by_message.remove(&msg.id).unwrap_or_default();
+            let kinds = message_events(&msg, &parts, &mut fold, &workdir);
+            with_ts.push((ts, msg, kinds));
         }
-        // Event pass: now that the fold holds the session identity, map
-        // each row to its kinds (workdir known for relativizing).
-        let mut kinds: Vec<(String, Vec<EventKind>)> = Vec::with_capacity(all.len());
-        for (row, raw) in &all {
-            let ts = row_ts(&row.ts_raw, fallback_ts);
-            let ks = row_events(row, raw, &mut fold, &workdir);
-            kinds.push((ts, ks));
-        }
-        // New rows are those with `id > cursor.offset`, in rowid order.
-        let max = max_rowid(&conn, &candidate.session_key)?
+        // New messages are those with `seq > cursor.offset`; a fresh cursor
+        // reads everything (upstream seqs start at 0).
+        let fresh = *cursor == Cursor::start();
+        let max_seq = with_ts
+            .iter()
+            .map(|(_, msg, _)| msg.seq)
+            .max()
             .unwrap_or(0)
             .max(0) as u64;
-        if cursor.offset > max {
-            return Err(CaptureError::CursorBeyondEnd(cursor.offset, max));
+        if !fresh && cursor.offset > max_seq {
+            return Err(CaptureError::CursorBeyondEnd(cursor.offset, max_seq));
         }
-        let new_ids: Vec<i64> = {
-            let mut stmt = conn
-                .prepare("SELECT id FROM message WHERE session_id = ?1 AND id > ?2 ORDER BY id")
-                .map_err(|e| CaptureError::Sqlite(e.to_string()))?;
-            let ceiling = cursor.offset.min(i64::MAX as u64) as i64;
-            let rows = stmt
-                .query_map(rusqlite::params![candidate.session_key, ceiling], |row| {
-                    row.get(0)
-                })
-                .map_err(|e| CaptureError::Sqlite(e.to_string()))?;
-            let mut ids = Vec::new();
-            for id in rows {
-                ids.push(id.map_err(|e| CaptureError::Sqlite(e.to_string()))?);
-            }
-            ids
-        };
-        // Rows come back in the same `ORDER BY id` as `all`, so the new rows
-        // are the trailing `new_ids.len()` kinds entries.
-        let skip = all.len().saturating_sub(new_ids.len());
         let mut events = Vec::new();
         let mut seq = cursor.next_seq();
-        for (ts, ks) in kinds.iter().skip(skip) {
-            for kind in ks {
+        let mut new_count: u64 = 0;
+        let mut new_offset = cursor.offset;
+        for (ts, msg, kinds) in &with_ts {
+            if !fresh && (msg.seq as u64) <= cursor.offset {
+                continue;
+            }
+            new_count += 1;
+            new_offset = msg.seq.max(0) as u64;
+            for kind in kinds {
                 events.push(Event {
                     v: 1,
                     seq,
@@ -617,22 +693,22 @@ impl OpencodeAdapter {
                 seq += 1;
             }
         }
-        let next = if new_ids.is_empty() {
+        let next = if new_count == 0 {
             // Empty growth: events empty, cursor unchanged.
             *cursor
         } else {
             Cursor {
-                offset: new_ids.last().copied().unwrap_or(0).max(0) as u64,
-                lines: cursor.lines + new_ids.len() as u64,
+                offset: new_offset,
+                lines: cursor.lines + new_count,
                 events: cursor.events + events.len() as u64,
             }
         };
         let covered = Self::COVERED.contains(&version.as_str());
-        let started_at = fold.started_at.clone().or(if valid_ts(&created_at) {
-            Some(created_at)
+        let started_at = if time_created > 0 {
+            msg_ts(time_created, fallback_ts)
         } else {
-            None
-        });
+            fallback_ts.to_string()
+        };
         let header = SessionMeta {
             format: FORMAT_TAG.to_string(),
             id: Ulid::from_str(&candidate.session_key)
@@ -643,145 +719,8 @@ impl OpencodeAdapter {
                 version,
             },
             models: fold.models.clone(),
-            title: None,
-            started_at: started_at.unwrap_or_else(|| fallback_ts.to_string()),
-            ended_at: None,
-            repo: Default::default(),
-            parent_id: None,
-            usage: fold.usage,
-            files_touched: fold.files_touched.clone(),
-            redaction: Default::default(),
-            capture: CaptureInfo {
-                mode: CaptureMode::Discovery,
-                cli_version: String::new(),
-                adapter_version_verified: covered,
-            },
-        };
-        Ok(ReadOutput {
-            events,
-            next,
-            header,
-        })
-    }
-
-    /// Read from the file-storage JSONL store with byte-offset semantics.
-    fn read_files(
-        &self,
-        candidate: &Candidate,
-        cursor: &Cursor,
-        fallback_ts: &str,
-    ) -> Result<ReadOutput, CaptureError> {
-        let bytes = std::fs::read(&candidate.native_path)?;
-        let len = bytes.len() as u64;
-        if cursor.offset > len {
-            return Err(CaptureError::CursorBeyondEnd(cursor.offset, len));
-        }
-        // Header pass: fold every complete line so the header always reflects
-        // the full session, even on incremental reads.
-        let all = complete_lines(&bytes, 0);
-        let mut parsed: Vec<(String, OcRow, Value)> = Vec::with_capacity(all.len());
-        for span in &all {
-            let text = line_text(&bytes, *span);
-            if text.trim().is_empty() {
-                continue;
-            }
-            let record: Value =
-                serde_json::from_str(text).map_err(|e| CaptureError::BadNative(e.to_string()))?;
-            if !record.is_object() {
-                return Err(CaptureError::BadNative(
-                    "record is not an object".to_string(),
-                ));
-            }
-            parsed.push((text.to_string(), row_from_value(&record), record));
-        }
-        let mut fold = HeaderFold::default();
-        for (raw, row, record) in &parsed {
-            let _ = raw;
-            fold.feed_identity(
-                record.get("version").and_then(Value::as_str),
-                record.get("session").and_then(Value::as_str).or(
-                    if candidate.session_key.is_empty() {
-                        None
-                    } else {
-                        Some(candidate.session_key.as_str())
-                    },
-                ),
-            );
-            fold.feed_ts(&row_ts(&row.ts_raw, fallback_ts));
-        }
-        let workdir = parsed
-            .iter()
-            .find_map(|(_, _, record)| {
-                record
-                    .get("cwd")
-                    .and_then(Value::as_str)
-                    .filter(|cwd| !cwd.is_empty())
-            })
-            .map(str::to_string)
-            .unwrap_or_else(|| candidate.workdir.to_string_lossy().into_owned());
-        // Event pass: now that the fold holds the session identity (workdir
-        // known for relativizing), map each record to its kinds.
-        let mut kinds: Vec<(String, Vec<EventKind>)> = Vec::with_capacity(parsed.len());
-        for (raw, row, _) in &parsed {
-            let ts = row_ts(&row.ts_raw, fallback_ts);
-            let ks = row_events(row, raw, &mut fold, &workdir);
-            kinds.push((ts, ks));
-        }
-
-        // New records are those at index >= `cursor.lines`; the byte resume
-        // point rounds a foreign mid-line cursor back to the previous `\n`.
-        let start = round_to_line_start(&bytes, cursor.offset);
-        let new_spans = complete_lines(&bytes, start);
-        let total = parsed.len() as u64;
-        let fresh = total.saturating_sub(cursor.lines.min(total));
-        let mut events = Vec::new();
-        let mut seq = cursor.next_seq();
-        for (i, (ts, ks)) in kinds.iter().enumerate() {
-            if (i as u64) < cursor.lines {
-                continue;
-            }
-            for kind in ks {
-                events.push(Event {
-                    v: 1,
-                    seq,
-                    ts: ts.clone(),
-                    kind: kind.clone(),
-                    extra: BTreeMap::new(),
-                });
-                seq += 1;
-            }
-        }
-        let next = if fresh == 0 {
-            // Empty growth: events empty, cursor unchanged.
-            *cursor
-        } else {
-            let advanced = new_spans
-                .last()
-                .map(|&(_, end)| (end + 1) as u64)
-                .unwrap_or(start as u64);
-            Cursor {
-                offset: advanced,
-                lines: cursor.lines + fresh,
-                events: cursor.events + events.len() as u64,
-            }
-        };
-        let version = fold.version.clone().unwrap_or_default();
-        let covered = Self::COVERED.contains(&version.as_str());
-        let session_id = fold.session_id.clone();
-        let started_at = fold.started_at.clone();
-        let header = SessionMeta {
-            format: FORMAT_TAG.to_string(),
-            id: session_id
-                .as_deref()
-                .and_then(|s| Ulid::from_str(s).ok())
-                .unwrap_or(Ulid::nil()),
-            agent: Agent {
-                name: AgentName::Opencode,
-                version,
-            },
-            models: fold.models.clone(),
-            title: None,
-            started_at: started_at.unwrap_or_else(|| fallback_ts.to_string()),
+            title: title.filter(|t| !t.is_empty()),
+            started_at,
             ended_at: None,
             repo: Default::default(),
             parent_id: None,

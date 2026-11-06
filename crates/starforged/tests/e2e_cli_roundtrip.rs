@@ -54,7 +54,7 @@ async fn real_cli_ingest_sync_round_trip() {
         .id;
 
     // Temp `STARFORGE_HOME`-equivalent layout: the worktree doubles as the
-    // ingest repo root, `data/sessions` is the Pi native store.
+    // ingest repo root, `data/.pi/agent/sessions/--x--` is the Pi store.
     let tmp = tempfile::tempdir().unwrap();
     let work = tmp.path().join("work");
     let data = tmp.path().join("data");
@@ -63,7 +63,7 @@ async fn real_cli_ingest_sync_round_trip() {
     for dir in [&work, &data, &config, &spool_parent] {
         std::fs::create_dir_all(dir).unwrap();
     }
-    std::fs::create_dir_all(data.join("sessions")).unwrap();
+    std::fs::create_dir_all(data.join(".pi/agent/sessions/--x--")).unwrap();
 
     let work_str = work.to_string_lossy().into_owned();
     // Spaces delimit the token from the path: the high-entropy alphabet
@@ -107,16 +107,23 @@ async fn real_cli_ingest_sync_round_trip() {
         .collect::<Vec<_>>()
         .join("\n")
         + "\n";
-    std::fs::write(data.join("sessions").join("roundtrip.jsonl"), &native).unwrap();
+    std::fs::write(
+        data.join(".pi/agent/sessions/--x--/roundtrip.jsonl"),
+        &native,
+    )
+    .unwrap();
 
     // Real CLI ingest: discover → redact → spool. September timestamps are
     // older than the 24 h idle rule, so the session is also marked ended and
     // the sync below exercises the complete path.
-    let roots = Roots {
-        config_dir: config,
-        data_dir: data,
-        worktree: work.clone(),
-    };
+    let roots = std::collections::BTreeMap::from([(
+        "pi".to_string(),
+        Roots {
+            config_dir: config,
+            data_dir: data,
+            worktree: work.clone(),
+        },
+    )]);
     let spool = starforge_cli::spool::Spool::open(&spool_parent);
     spool.ensure_layout().unwrap();
     let now = time::OffsetDateTime::now_utc();

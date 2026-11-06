@@ -330,22 +330,27 @@ fn enable_disable_wire_agent_hooks() {
 
     let (out, code) = hooks::enable(&repo, &paths, false);
     assert_eq!(code, 0, "enable output: {out}");
-    for rel in ["pi/starforge.json", "claude-code/settings.json"] {
-        let path = home.path().join(".config").join(rel);
-        assert!(path.is_file(), "enable must install {rel}: {out}");
-        assert!(
-            out.contains(&path.display().to_string()),
-            "enable must print every touched path ({rel}): {out}"
-        );
-    }
+    let claude_hook = home.path().join(".claude/settings.json");
+    assert!(
+        claude_hook.is_file(),
+        "enable must install .claude/settings.json: {out}"
+    );
+    assert!(
+        out.contains(&claude_hook.display().to_string()),
+        "enable must print every touched path: {out}"
+    );
+    let body = std::fs::read_to_string(&claude_hook).unwrap();
+    assert!(
+        body.contains("starforge hook session-end"),
+        "enable must install the SessionEnd command: {body:?}"
+    );
 
     let (out, code) = hooks::disable(&repo, &paths, false);
     assert_eq!(code, 0, "disable output: {out}");
-    let pi_hook = home.path().join(".config/pi/starforge.json");
-    let body = std::fs::read_to_string(&pi_hook).unwrap_or_default();
+    let body = std::fs::read_to_string(&claude_hook).unwrap_or_default();
     assert!(
         !body.contains("starforge"),
-        "disable must remove the starforge hook key: {body:?}"
+        "disable must remove the starforge hook command: {body:?}"
     );
 }
 

@@ -1,9 +1,8 @@
-//! Golden tests for the Gemini CLI / Antigravity capture adapter.
+//! Golden tests for the Gemini CLI capture adapter.
 //!
 //! Drives tempdirs only (never `$HOME`): the fixture chat JSON is copied
-//! into `<tmp>/data/tmp/<hash>/chats/` (Gemini CLI) or
-//! `<tmp>/data/antigravity/<version>/sessions/` (Antigravity), and `Roots`
-//! points at the tempdirs with `worktree` set to the transcript's own `cwd`
+//! into `<tmp>/data/tmp/<hash>/chats/` (Gemini CLI), and `Roots` points
+//! at the tempdirs with `worktree` set to the transcript's own `cwd`
 //! (`/repo`, lexical only).
 
 use std::collections::HashMap;
@@ -16,7 +15,6 @@ use starforge_format::{SessionMeta, kind_name};
 
 const FALLBACK_TS: &str = "2026-11-04T12:00:00Z";
 const CLI_SESSION_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FB1";
-const ANTIGRAVITY_SESSION_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FB2";
 
 fn fixture_dir(version: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -31,37 +29,7 @@ fn setup_cli(version: &str) -> (tempfile::TempDir, Roots, PathBuf) {
     let fixture = std::fs::read_to_string(fixture_dir(version).join("transcript.json")).unwrap();
     let store = tmp.path().join("data/tmp/abc123def456/chats");
     std::fs::create_dir_all(&store).unwrap();
-    let session = if version.starts_with("antigravity") {
-        ANTIGRAVITY_SESSION_ID
-    } else {
-        CLI_SESSION_ID
-    };
-    let native = store.join(format!("{session}.json"));
-    std::fs::write(&native, &fixture).unwrap();
-    let roots = Roots {
-        config_dir: tmp.path().join("cfg"),
-        data_dir: tmp.path().join("data"),
-        worktree: PathBuf::from("/repo"),
-    };
-    (tmp, roots, native)
-}
-
-/// Copy `transcript.json` into the Antigravity store layout and build
-/// `Roots` whose worktree is the transcript's own `cwd` (`/repo`, lexical
-/// only).
-fn setup_antigravity(version: &str) -> (tempfile::TempDir, Roots, PathBuf) {
-    let tmp = tempfile::tempdir().unwrap();
-    let fixture = std::fs::read_to_string(fixture_dir(version).join("transcript.json")).unwrap();
-    let short = version
-        .strip_prefix("antigravity-")
-        .expect("antigravity fixture dir carries the version suffix");
-    let store = tmp
-        .path()
-        .join("data/antigravity")
-        .join(short)
-        .join("sessions");
-    std::fs::create_dir_all(&store).unwrap();
-    let native = store.join(format!("{ANTIGRAVITY_SESSION_ID}.json"));
+    let native = store.join(format!("{CLI_SESSION_ID}.json"));
     std::fs::write(&native, &fixture).unwrap();
     let roots = Roots {
         config_dir: tmp.path().join("cfg"),
@@ -120,69 +88,6 @@ fn gemini_golden_pinned_version() {
 }
 
 #[test]
-fn gemini_antigravity_version_unverified_with_system_fallback() {
-    let (_tmp, roots, _native) = setup_antigravity("antigravity-1.2.3");
-    let a = GeminiAdapter;
-    assert!(a.detect(&roots));
-    let found = a.discover(&roots, &HashMap::new());
-    assert_eq!(found.len(), 1);
-    assert_eq!(found[0].agent_version, "antigravity-1.2.3");
-    let out = a.read(&found[0], &Cursor::start(), FALLBACK_TS).unwrap();
-    let expected =
-        std::fs::read_to_string(fixture_dir("antigravity-1.2.3").join("expected.jsonl")).unwrap();
-    let got = event_lines(&out.events);
-    assert_eq!(got.join("\n") + "\n", expected);
-
-    // seq is 0..n contiguous.
-    for (i, e) in out.events.iter().enumerate() {
-        assert_eq!(e.seq, i as u64, "event {i} seq");
-    }
-    // Antigravity shares the Gemini agent name per §7.8's five-name table.
-    assert_eq!(out.header.agent.name, starforge_format::AgentName::Gemini);
-    assert_eq!(out.header.agent.version, "antigravity-1.2.3");
-    let kinds: Vec<&str> = out.events.iter().map(|e| kind_name(&e.kind)).collect();
-    assert_eq!(
-        kinds,
-        vec![
-            "user_message",
-            "assistant_message",
-            "reasoning",
-            "tool_call",
-            "tool_result",
-            "system",
-            "compaction",
-        ]
-    );
-    // The Antigravity-only record shape is never dropped: it maps to
-    // `system` whose text carries the raw native JSON.
-    let system = out
-        .events
-        .iter()
-        .find(|e| kind_name(&e.kind) == "system")
-        .expect("antigravity fixture must contain a system fallback event");
-    let starforge_format::EventKind::System(body) = &system.kind else {
-        unreachable!("kind_name already matched system");
-    };
-    assert!(
-        body.text.contains("\"agent_state\""),
-        "system text must carry the raw record JSON: {}",
-        body.text
-    );
-    assert!(
-        body.text.contains("starforge-lint"),
-        "system text must preserve the unmapped payload: {}",
-        body.text
-    );
-    // Antigravity versions ship unverified.
-    assert!(!out.header.capture.adapter_version_verified);
-
-    // Header matches meta.json exactly.
-    let meta = std::fs::read_to_string(fixture_dir("antigravity-1.2.3").join("meta.json")).unwrap();
-    let want = SessionMeta::parse(meta.trim()).unwrap();
-    assert_eq!(out.header, want);
-}
-
-#[test]
 fn gemini_unknown_version_parses_unverified() {
     let (_tmp, roots, _native) = setup_cli("unknown");
     let a = GeminiAdapter;
@@ -209,7 +114,7 @@ fn gemini_hooks_are_noops() {
         worktree: PathBuf::from("/repo"),
     };
     let a = GeminiAdapter;
-    // No pinned hook story for either store layout: discovery of the chat
+    // No pinned hook story for the chat files: discovery of the chat
     // files is the only capture path, so both directions report nothing.
     assert!(a.install_hooks(&roots).unwrap().is_empty());
     assert!(a.remove_hooks(&roots).unwrap().is_empty());
@@ -290,7 +195,6 @@ fn gemini_incremental_read_resumes() {
 }
 
 /// `detect` is true only when a store exists: false on an empty data dir,
-/// true with only the CLI chats, true with only the Antigravity store.
 #[test]
 fn gemini_detect_matches_store_presence() {
     let tmp = tempfile::tempdir().unwrap();
@@ -304,7 +208,4 @@ fn gemini_detect_matches_store_presence() {
 
     let (_tmp_cli, cli_roots, _) = setup_cli("0.12.0");
     assert!(a.detect(&cli_roots));
-
-    let (_tmp_ag, ag_roots, _) = setup_antigravity("antigravity-1.2.3");
-    assert!(a.detect(&ag_roots));
 }

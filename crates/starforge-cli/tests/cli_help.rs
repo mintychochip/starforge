@@ -9,7 +9,7 @@ fn starforge_help_lists_core_surface() {
     let mut help = Vec::new();
     cmd.write_long_help(&mut help).unwrap();
     let help = String::from_utf8(help).unwrap();
-    for sub in ["enable", "sync", "sessions", "auth"] {
+    for sub in ["enable", "sync", "sessions", "auth", "hook"] {
         assert!(help.contains(sub), "help missing {sub}:\n{help}");
     }
 }

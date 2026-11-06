@@ -1,10 +1,10 @@
 //! Golden tests for the Pi and omp capture adapters.
 //!
 //! Drives tempdirs only (never `$HOME`): the fixture transcript bytes are
-//! copied into `<tmp>/data/sessions/` (Pi) or
-//! `<tmp>/data/omp/agent/sessions/<date>/` (omp), and `Roots` points at the
-//! tempdirs with `worktree` set to the transcript's own `cwd` (`/repo`,
-//! lexical only).
+//! copied into `<tmp>/data/.pi/agent/sessions/<cwd-slug>/` (Pi) or
+//! `<tmp>/data/.omp/agent/sessions/<cwd-slug>/` (omp), and `Roots` points
+//! at the tempdirs with `worktree` set to the transcript's own `cwd`
+//! (`/repo`, lexical only).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -29,7 +29,7 @@ fn fixture_dir(version: &str) -> PathBuf {
 fn setup_pi(version: &str) -> (tempfile::TempDir, Roots, PathBuf) {
     let tmp = tempfile::tempdir().unwrap();
     let fixture = std::fs::read_to_string(fixture_dir(version).join("transcript.jsonl")).unwrap();
-    let store = tmp.path().join("data/sessions");
+    let store = tmp.path().join("data/.pi/agent/sessions/--home-u-proj--");
     std::fs::create_dir_all(&store).unwrap();
     let native = store.join(format!("{PI_SESSION_ID}.jsonl"));
     std::fs::write(&native, &fixture).unwrap();
@@ -46,7 +46,7 @@ fn setup_pi(version: &str) -> (tempfile::TempDir, Roots, PathBuf) {
 fn setup_omp(version: &str) -> (tempfile::TempDir, Roots, PathBuf) {
     let tmp = tempfile::tempdir().unwrap();
     let fixture = std::fs::read_to_string(fixture_dir(version).join("transcript.jsonl")).unwrap();
-    let store = tmp.path().join("data/omp/agent/sessions/2026/11/04");
+    let store = tmp.path().join("data/.omp/agent/sessions/-home-u-proj");
     std::fs::create_dir_all(&store).unwrap();
     let native = store.join(format!("{OMP_SESSION_ID}.jsonl"));
     std::fs::write(&native, &fixture).unwrap();
@@ -193,7 +193,7 @@ fn pi_unknown_version_parses_unverified() {
 }
 
 #[test]
-fn pi_hooks_round_trip() {
+fn pi_install_hooks_is_noop_and_remove_cleans_legacy() {
     let tmp = tempfile::tempdir().unwrap();
     let roots = Roots {
         config_dir: tmp.path().join("cfg"),
@@ -201,17 +201,17 @@ fn pi_hooks_round_trip() {
         worktree: PathBuf::from("/repo"),
     };
     let a = PiAdapter;
-    let written = a.install_hooks(&roots).unwrap();
-    assert_eq!(written.len(), 1);
-    assert!(written[0].starts_with(&roots.config_dir));
-    let body = std::fs::read_to_string(&written[0]).unwrap();
-    assert!(body.contains("starforge"), "hook file must carry marker");
+    // No verified hook surface: install writes nothing.
+    assert!(a.install_hooks(&roots).unwrap().is_empty());
+    // Legacy file carrying the marker is removed and reported.
+    let legacy = roots.config_dir.join(".config/pi/starforge.json");
+    std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+    std::fs::write(&legacy, r#"{"starforge": {"extensionEvents": {}}}"#).unwrap();
     let removed = a.remove_hooks(&roots).unwrap();
-    assert_eq!(removed, written);
-    assert!(!written[0].exists());
+    assert_eq!(removed, vec![legacy.clone()]);
+    assert!(!legacy.exists());
     // Second removal removes nothing.
-    let removed_again = a.remove_hooks(&roots).unwrap();
-    assert!(removed_again.is_empty());
+    assert!(a.remove_hooks(&roots).unwrap().is_empty());
 }
 
 #[test]
@@ -295,7 +295,7 @@ fn pi_hooks_never_touch_foreign_files() {
     };
     let a = PiAdapter;
     assert!(!a.detect(&roots));
-    let foreign = roots.config_dir.join("pi/starforge.json");
+    let foreign = roots.config_dir.join(".config/pi/starforge.json");
     std::fs::create_dir_all(foreign.parent().unwrap()).unwrap();
     std::fs::write(&foreign, r#"{"hooks": []}"#).unwrap();
     let removed = a.remove_hooks(&roots).unwrap();
@@ -303,11 +303,10 @@ fn pi_hooks_never_touch_foreign_files() {
     assert!(foreign.exists());
 }
 
-/// Installing over a foreign hook file merges under the single `starforge`
-/// key: unrelated keys survive, the marker is present, and removal restores
-/// the foreign file (a second removal is a no-op).
+/// Legacy removal drops only the `starforge` key, preserving unrelated keys
+/// (a second removal is a no-op); install never touches the file.
 #[test]
-fn pi_install_merges_into_foreign_settings() {
+fn pi_remove_legacy_preserves_foreign_keys() {
     let tmp = tempfile::tempdir().unwrap();
     let roots = Roots {
         config_dir: tmp.path().join("cfg"),
@@ -315,28 +314,12 @@ fn pi_install_merges_into_foreign_settings() {
         worktree: PathBuf::from("/repo"),
     };
     let a = PiAdapter;
-    let path = roots.config_dir.join("pi/starforge.json");
+    let path = roots.config_dir.join(".config/pi/starforge.json");
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    let foreign = r#"{"extensionEvents":{"sessionStart":[]},"theme":"dark"}"#;
+    let foreign = r#"{"extensionEvents":{"sessionStart":[]},"theme":"dark","starforge":{}}"#;
     std::fs::write(&path, foreign).unwrap();
-
-    let written = a.install_hooks(&roots).unwrap();
-    assert_eq!(written, vec![path.clone()]);
-    let body = std::fs::read_to_string(&path).unwrap();
-    assert!(body.contains("starforge"), "hook file must carry marker");
-    let merged: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(
-        merged.get("theme").and_then(|v| v.as_str()),
-        Some("dark"),
-        "unrelated keys preserved"
-    );
-    assert!(
-        merged.get("extensionEvents").is_some(),
-        "unrelated keys preserved"
-    );
-    assert!(merged.get("starforge").is_some(), "dedicated starforge key");
-
-    // Removal drops only the `starforge` key and keeps the rest.
+    assert!(a.install_hooks(&roots).unwrap().is_empty());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), foreign);
     let removed = a.remove_hooks(&roots).unwrap();
     assert_eq!(removed, vec![path.clone()]);
     let after: serde_json::Value =
@@ -344,40 +327,7 @@ fn pi_install_merges_into_foreign_settings() {
     assert!(after.get("starforge").is_none());
     assert_eq!(after.get("theme").and_then(|v| v.as_str()), Some("dark"));
     assert!(after.get("extensionEvents").is_some());
-
-    // Second removal touches nothing.
     let before = std::fs::read(&path).unwrap();
-    let removed_again = a.remove_hooks(&roots).unwrap();
-    assert!(removed_again.is_empty());
+    assert!(a.remove_hooks(&roots).unwrap().is_empty());
     assert_eq!(std::fs::read(&path).unwrap(), before);
-}
-
-/// Installing over an unparseable (or non-object) hook file fails with
-/// `InvalidData` naming the path and leaves the bytes untouched.
-#[test]
-fn pi_install_rejects_non_object_hook_file() {
-    let tmp = tempfile::tempdir().unwrap();
-    let roots = Roots {
-        config_dir: tmp.path().join("cfg"),
-        data_dir: tmp.path().join("data"),
-        worktree: PathBuf::from("/repo"),
-    };
-    let a = PiAdapter;
-    let path = roots.config_dir.join("pi/starforge.json");
-    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-
-    for bad in ["{not valid json", "[1, 2, 3]", "\"just a string\""] {
-        std::fs::write(&path, bad).unwrap();
-        let err = a.install_hooks(&roots).unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
-        assert!(
-            err.to_string().contains(&path.display().to_string()),
-            "error names the path: {err}"
-        );
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), bad);
-    }
-    // A foreign file with no `starforge` key is never removed.
-    let removed = a.remove_hooks(&roots).unwrap();
-    assert!(removed.is_empty());
-    assert!(path.exists());
 }

@@ -1,5 +1,13 @@
 //! Claude Code adapter: `~/.claude/projects/<slug>/<session-id>.jsonl`.
 //!
+//! Hook integration (`install_hooks` / `remove_hooks`) merges the
+//! `SessionEnd` command `starforge hook session-end` into the user's
+//! Claude Code settings file at `<config_dir>/settings.json`, in Claude
+//! Code's own schema (`"hooks": { "SessionEnd": [ { "hooks": [ ... ] } ] }`).
+//! Merge preserves every unrelated key and hook entry; removal deletes only
+//! entries whose command is exactly ours and prunes the empty arrays or
+//! objects it left behind.
+//!
 //! Native shape (one JSON object per line): `user` / `assistant` records
 //! carrying a `message` object whose `content` array holds `text`, `thinking`,
 //! `tool_use`, and `tool_result` blocks (assistant messages also carry
@@ -7,6 +15,10 @@
 //! context. Top-level `tool_use` / `tool_result` record shapes are accepted
 //! too, for forward compatibility with hook-emitted events. Every record may
 //! carry `cwd`, `sessionId`, `version`, and `timestamp`.
+//!
+//! Discovery attribution: a session is captured only when a record
+//! carries a non-empty `cwd` inside the worktree; a session with
+//! unknown/empty `cwd` is skipped (never defaulted to the worktree).
 
 use std::collections::{BTreeMap, HashMap};
 use std::io;
@@ -27,10 +39,27 @@ use crate::{Adapter, Candidate, CaptureError, Cursor, ReadOutput, Roots, workdir
 /// Claude Code adapter (unit struct implementing [`Adapter`]).
 pub struct ClaudeAdapter;
 
-/// Hook snippet path relative to `Roots.config_dir`.
-const HOOK_REL_PATH: &str = "claude-code/settings.json";
-/// Marker proving a hook file was written by starforge.
-const MARKER: &str = "starforge";
+/// Hook file path relative to `Roots.config_dir`: Claude Code's real user
+/// settings file.
+const HOOK_REL_PATH: &str = "settings.json";
+/// The `SessionEnd` hook command starforge installs.
+const HOOK_COMMAND: &str = "starforge hook session-end";
+/// Write `body` to `path` atomically: temp file in the same directory, then
+/// rename, preserving the existing file mode.
+fn write_settings(path: &std::path::Path, body: &Value) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let bytes = serde_json::to_string_pretty(body).unwrap();
+    let mode = std::fs::metadata(path).map(|m| m.permissions().mode()).ok();
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let tmp = parent.join(format!(".settings.json.tmp.{}", std::process::id()));
+    std::fs::write(&tmp, &bytes)?;
+    if let Some(mode) = mode {
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))?;
+    }
+    std::fs::rename(&tmp, path)?;
+    let _ = std::fs::remove_file(&tmp);
+    Ok(())
+}
 
 fn valid_ts(s: &str) -> bool {
     time::OffsetDateTime::parse(s, &Rfc3339).is_ok()
@@ -141,6 +170,7 @@ impl HeaderFold {
         }
         if self.workdir.is_none()
             && let Some(cwd) = record.get("cwd").and_then(Value::as_str)
+            && !cwd.is_empty()
         {
             self.workdir = Some(cwd.to_string());
         }
@@ -393,36 +423,29 @@ impl Adapter for ClaudeAdapter {
         }
     }
 
-    /// Merge starforge's hook fragment under the single top-level `starforge`
-    /// key, preserving every unrelated key. A missing file is created; a
-    /// present file must be a JSON object (anything else is an `InvalidData`
-    /// error and the file is left untouched).
+    /// Merge starforge's `SessionEnd` hook into `<config_dir>/settings.json`
+    /// in Claude Code's schema, preserving every unrelated key and hook
+    /// entry. A missing file is created with just our hooks; a present file
+    /// must be a JSON object (anything else is an `InvalidData` error and the
+    /// file is left untouched). Appends our group only when no existing
+    /// `SessionEnd` entry already carries our command (idempotent). Writes
+    /// atomically (temp file + rename, preserving the existing file mode).
     fn install_hooks(&self, roots: &Roots) -> io::Result<Vec<PathBuf>> {
         let path = roots.config_dir.join(HOOK_REL_PATH);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let fragment = serde_json::json!({
-            "_note": "starforge-managed SessionEnd hook; remove_hooks deletes this key",
-            "hooks": {
-                "SessionEnd": [
-                    {
-                        "matcher": "starforge",
-                        "hooks": [
-                            { "type": "command", "command": "starforge hook session-end" }
-                        ]
-                    }
-                ]
-            }
+        let our_group = serde_json::json!({
+            "hooks": [
+                { "type": "command", "command": HOOK_COMMAND }
+            ]
         });
         match std::fs::read(&path) {
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 let mut obj = serde_json::Map::new();
-                obj.insert(MARKER.to_string(), fragment);
-                std::fs::write(
-                    &path,
-                    serde_json::to_string_pretty(&Value::Object(obj)).unwrap(),
-                )?;
+                let hooks = serde_json::json!({ "SessionEnd": [our_group] });
+                obj.insert("hooks".to_string(), hooks);
+                write_settings(&path, &Value::Object(obj))?;
                 Ok(vec![path])
             }
             Err(e) => Err(e),
@@ -439,16 +462,55 @@ impl Adapter for ClaudeAdapter {
                         format!("hook file is not a JSON object: {}", path.display()),
                     )
                 })?;
-                obj.insert(MARKER.to_string(), fragment);
-                std::fs::write(&path, serde_json::to_string_pretty(&body).unwrap())?;
+                if obj.contains_key("hooks") && !obj.get("hooks").is_some_and(|h| h.is_object()) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("hook file has a non-object hooks value: {}", path.display()),
+                    ));
+                }
+                let hooks = obj
+                    .entry("hooks".to_string())
+                    .or_insert_with(|| Value::Object(serde_json::Map::new()));
+                let hooks_obj = hooks.as_object_mut().expect("checked object");
+                if hooks_obj.contains_key("SessionEnd")
+                    && !hooks_obj.get("SessionEnd").is_some_and(|s| s.is_array())
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "hook file has a non-array SessionEnd value: {}",
+                            path.display()
+                        ),
+                    ));
+                }
+                let groups = hooks_obj
+                    .entry("SessionEnd".to_string())
+                    .or_insert_with(|| Value::Array(Vec::new()));
+                let groups = groups.as_array_mut().expect("checked array");
+                let already = groups.iter().any(|g| {
+                    g.get("hooks")
+                        .and_then(|h| h.as_array())
+                        .is_some_and(|entries| {
+                            entries.iter().any(|e| {
+                                e.get("command").and_then(|c| c.as_str()) == Some(HOOK_COMMAND)
+                            })
+                        })
+                });
+                if already {
+                    return Ok(vec![path]);
+                }
+                groups.push(our_group);
+                write_settings(&path, &body)?;
                 Ok(vec![path])
             }
         }
     }
 
-    /// Remove only the `starforge` key, preserving every unrelated key. An
-    /// emptied object deletes the file; a file without the key (or no file)
-    /// is left untouched and yields nothing.
+    /// Remove only the hook entries whose command is exactly ours, then prune
+    /// the empty arrays or objects left behind. Never touches anything else;
+    /// reports the path only when the file changed. A missing file, an
+    /// invalid file, or a file without our command is left untouched and
+    /// yields nothing.
     fn remove_hooks(&self, roots: &Roots) -> io::Result<Vec<PathBuf>> {
         let path = roots.config_dir.join(HOOK_REL_PATH);
         let Ok(bytes) = std::fs::read(&path) else {
@@ -460,14 +522,40 @@ impl Adapter for ClaudeAdapter {
         let Some(obj) = body.as_object_mut() else {
             return Ok(vec![]);
         };
-        if obj.remove(MARKER).is_none() {
+        let Some(hooks) = obj.get_mut("hooks") else {
+            return Ok(vec![]);
+        };
+        let Some(hooks_obj) = hooks.as_object_mut() else {
+            return Ok(vec![]);
+        };
+        let Some(groups) = hooks_obj.get_mut("SessionEnd") else {
+            return Ok(vec![]);
+        };
+        let Some(group_arr) = groups.as_array_mut() else {
+            return Ok(vec![]);
+        };
+        let mut changed = false;
+        group_arr.retain_mut(|g| {
+            let Some(entries) = g.get_mut("hooks").and_then(|h| h.as_array_mut()) else {
+                return true;
+            };
+            let before = entries.len();
+            entries.retain(|e| e.get("command").and_then(|c| c.as_str()) != Some(HOOK_COMMAND));
+            if entries.len() != before {
+                changed = true;
+            }
+            !entries.is_empty()
+        });
+        if !changed {
             return Ok(vec![]);
         }
-        if obj.is_empty() {
-            std::fs::remove_file(&path)?;
-        } else {
-            std::fs::write(&path, serde_json::to_string_pretty(&body).unwrap())?;
+        if group_arr.is_empty() {
+            hooks_obj.remove("SessionEnd");
         }
+        if hooks_obj.is_empty() {
+            obj.remove("hooks");
+        }
+        write_settings(&path, &body)?;
         Ok(vec![path])
     }
 
@@ -503,9 +591,11 @@ impl Adapter for ClaudeAdapter {
                     .unwrap_or_default();
                 let session_key = format!("{slug}/{stem}");
                 let (workdir, version) = scan_identity(&native_path);
-                let workdir = workdir
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| roots.worktree.clone());
+                // Privacy rule: unknown cwd (missing/empty) is skipped,
+                // never defaulted to this worktree.
+                let Some(workdir) = workdir.filter(|cwd| !cwd.is_empty()).map(PathBuf::from) else {
+                    continue;
+                };
                 if !workdir_inside(&roots.worktree, &workdir) {
                     continue;
                 }
@@ -669,6 +759,7 @@ fn scan_identity(native_path: &std::path::Path) -> (Option<String>, Option<Strin
         };
         if cwd.is_none()
             && let Some(c) = record.get("cwd").and_then(Value::as_str)
+            && !c.is_empty()
         {
             cwd = Some(c.to_string());
         }

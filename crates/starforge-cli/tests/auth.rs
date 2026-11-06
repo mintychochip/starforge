@@ -476,6 +476,33 @@ fn dry_run_writes_nothing() {
     assert!(!paths.credential_file.exists());
 }
 
+#[tokio::test]
+async fn login_dry_run_pins_real_scopes_and_writes_nothing() {
+    let (_dir, paths) = test_paths();
+    let sleeper = FakeSleeper::new();
+    let out = starforge_cli::commands::auth::login(
+        &paths,
+        "https://forge.example.com",
+        &sleeper,
+        test_now(),
+        true,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        out,
+        format!(
+            "would POST https://forge.example.com/api/v1/oauth/device/code \
+             with client_id=starforge-cli&scope={}, \
+             poll POST https://forge.example.com/api/v1/oauth/token, \
+             and store [forge.example.com] in {}",
+            starforge_cli::auth::CLI_SCOPES,
+            paths.credential_file.display()
+        )
+    );
+    assert!(!paths.credential_file.exists());
+}
+
 #[test]
 fn url_crate_available_for_form_parsing() {
     // Pin the dev-only helper used above: `url` must stay resolvable for tests.

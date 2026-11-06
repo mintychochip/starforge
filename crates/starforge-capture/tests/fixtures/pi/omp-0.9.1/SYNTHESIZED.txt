@@ -1,6 +1,6 @@
 SYNTHESIZED — no real omp transcript was available on this machine.
 
-This fixture mimics the native shape of `<data_dir>/omp/agent/sessions/**/<session>.jsonl`
+This fixture mimics the native shape of `<data_dir>/.omp/agent/sessions/<cwd-slug>/<session>.jsonl`
 as written by omp: one JSON object per line with the same Pi-compatible record
 shapes (`message` with `role`, `content`, `model`, `reasoning`, `usage`;
 `tool_call` with `name` / `input`; `tool_result`; `subagent_start` /

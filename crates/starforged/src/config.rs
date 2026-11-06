@@ -675,8 +675,18 @@ impl Config {
         if key.len() != 64 || !key.bytes().all(|b| b.is_ascii_hexdigit()) {
             bail!("security.secret_key must be 64 hex characters");
         }
-        if self.server.base_url.ends_with('/') {
-            bail!("server.base_url must not end with '/'");
+        // Every route is mounted at the origin root and discovery advertises
+        // `api_url = base_url`, so a path prefix would silently produce
+        // broken links. A lone trailing `/` is a valid empty path.
+        if let Ok(url) = url::Url::parse(&self.server.base_url) {
+            let not_origin = !matches!(url.path(), "" | "/")
+                || url.query().is_some()
+                || url.fragment().is_some();
+            if not_origin {
+                bail!(
+                    "server.base_url must be an origin like https://forge.example.com (Starforge cannot be served under a path prefix)"
+                );
+            }
         }
         if !matches!(self.log.format.as_str(), "text" | "json") {
             bail!("log.format must be \"text\" or \"json\"");
@@ -944,13 +954,32 @@ mod tests {
         let mut short_key = sample();
         short_key.security.secret_key = "abc".into();
         assert!(short_key.validate().is_err());
+        // A trailing slash is an empty path and stays accepted.
         let mut slash = sample();
         slash.server.base_url = "http://x/".into();
-        assert!(slash.validate().is_err());
+        assert!(slash.validate().is_ok());
         let mut https = sample();
         https.server.base_url = "https://forge.example.com".into();
         assert!(https.secure_cookies());
         assert!(!sample().secure_cookies());
+    }
+
+    #[test]
+    fn base_url_must_be_an_origin() {
+        for good in ["http://127.0.0.1:3000", "https://h/"] {
+            let mut config = sample();
+            config.server.base_url = good.into();
+            assert!(config.validate().is_ok(), "{good}");
+        }
+        for bad in ["https://h/forge", "https://h/?x=1", "https://h/#frag"] {
+            let mut config = sample();
+            config.server.base_url = bad.into();
+            let err = config.validate().unwrap_err().to_string();
+            assert!(
+                err.contains("server.base_url must be an origin"),
+                "{bad}: {err}"
+            );
+        }
     }
 
     #[test]

@@ -4,8 +4,13 @@
 //! Tempdir git repos (`git init`, local `user.email`/`user.name`); no network.
 
 use std::collections::BTreeMap;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+mod common;
+
+use common::hermetic_command;
 
 use starforge_cli::commands::hooks::{
     disable, enable, hook_post_commit, hook_pre_push, hook_prepare,
@@ -49,7 +54,21 @@ fn init_repo() -> (TempDir, PathBuf) {
     git_ok(&repo, &["init"]);
     git_ok(&repo, &["config", "user.email", "t@t.t"]);
     git_ok(&repo, &["config", "user.name", "t"]);
-    git_ok(&repo, &["commit", "--allow-empty", "-m", "init"]);
+    // Deterministic HEAD time so seeded event timestamps (2026-10-01) are
+    // always after the previous commit.
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["commit", "--allow-empty", "-m", "init"])
+        .env("GIT_COMMITTER_DATE", "2026-01-01T00:00:00+00:00")
+        .env("GIT_AUTHOR_DATE", "2026-01-01T00:00:00+00:00")
+        .output()
+        .expect("git runs");
+    assert!(
+        out.status.success(),
+        "init commit failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     (dir, repo)
 }
 /// Isolated home for `enable`/`disable` (agent adapter hooks install under it).
@@ -206,12 +225,11 @@ fn orig_hook_chains_and_exact_trailer_is_appended_on_real_commit() {
 
     // PATH shim so the dispatcher reaches this build's binary.
     let shim_dir = install_shim(&repo);
-    let status = Command::new("git")
+    let status = hermetic_command("git", home.path())
         .arg("-C")
         .arg(&repo)
         .args(["commit", "-m", "add tracked"])
         .env("PATH", path_with(&shim_dir))
-        .env("STARFORGE_HOME", home.path())
         .output()
         .unwrap();
     assert!(
@@ -320,7 +338,7 @@ fn disable_restores_original_and_second_is_noop() {
 #[test]
 fn untouched_session_yields_no_trailer() {
     let (_dir, repo) = init_repo();
-    let (_home, paths) = test_paths();
+    let (home, paths) = test_paths();
     let (_, code) = enable(&repo, &paths, false);
     assert_eq!(code, 0);
 
@@ -336,7 +354,7 @@ fn untouched_session_yields_no_trailer() {
     let msg = repo.join("COMMIT_MSG");
     std::fs::write(&msg, "subject\n").unwrap();
     let shim_dir = install_shim(&repo);
-    let status = Command::new("sh")
+    let status = hermetic_command("sh", home.path())
         .arg(hooks_dir(&repo).join("prepare-commit-msg"))
         .arg(&msg)
         .current_dir(&repo)
@@ -356,7 +374,7 @@ fn untouched_session_yields_no_trailer() {
 #[test]
 fn hook_failure_never_blocks_commit() {
     let (_dir, repo) = init_repo();
-    let (_home, paths) = test_paths();
+    let (home, paths) = test_paths();
     let (_, code) = enable(&repo, &paths, false);
     assert_eq!(code, 0);
 
@@ -375,7 +393,7 @@ fn hook_failure_never_blocks_commit() {
     git_ok(&repo, &["add", "tracked.txt"]);
 
     let shim_dir = install_shim(&repo);
-    let status = Command::new("git")
+    let status = hermetic_command("git", home.path())
         .arg("-C")
         .arg(&repo)
         .args(["commit", "-m", "despite broken spool"])
@@ -460,6 +478,106 @@ fn fileless_active_session_gets_heuristic_trailer() {
     let links = spool.links().unwrap();
     assert_eq!(links.len(), 1);
     assert_eq!(links[0].confidence, LinkConfidence::Heuristic);
+}
+
+fn commit_with_msg(repo: &Path, msg: &Path, date: &str) {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["commit", "--no-verify", "-F"])
+        .arg(msg)
+        .env("GIT_COMMITTER_DATE", date)
+        .env("GIT_AUTHOR_DATE", date)
+        .output()
+        .expect("git runs");
+    assert!(
+        out.status.success(),
+        "commit failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+// Real ingest (not a seeded spool): a fileless Pi session whose events are
+// after the previous commit gets a heuristic trailer; with no new events it
+// gets none; a new event after the next commit re-arms it.
+#[test]
+fn real_ingest_fileless_session_trailer_lifecycle() {
+    let (_dir, repo) = init_repo();
+    let (home, paths) = test_paths();
+    let (_, code) = enable(&repo, &paths, false);
+    assert_eq!(code, 0);
+
+    let cwd = repo.to_string_lossy().into_owned();
+    let native = |ts: &str| {
+        format!(
+            "{{\"type\":\"message\",\"role\":\"user\",\"content\":\"hi\",\"cwd\":\"{cwd}\",\"session\":\"s1\",\"version\":\"0.5.2\",\"timestamp\":\"{ts}\"}}\n"
+        )
+    };
+    let store = home.path().join(".pi/agent/sessions/--x--");
+    std::fs::create_dir_all(&store).unwrap();
+    let native_path = store.join("s.jsonl");
+    // Events at 2026-06-01: after the init commit (2026-01-01), before
+    // commit 1's committer date (2026-07-01).
+    std::fs::write(&native_path, native("2026-06-01T12:00:00Z")).unwrap();
+
+    let msg = repo.join("COMMIT_MSG");
+    let spool = Spool::open(&common_dir(&repo).unwrap());
+
+    // Commit 1: exactly one heuristic trailer.
+    std::fs::write(repo.join("tracked.txt"), "one\n").unwrap();
+    git_ok(&repo, &["add", "tracked.txt"]);
+    std::fs::write(&msg, "subject\n").unwrap();
+    assert_eq!(hook_prepare(&repo, &msg, &paths), 0);
+    let body = std::fs::read_to_string(&msg).unwrap();
+    assert_eq!(
+        body.lines()
+            .filter(|l| l.starts_with("Starforge-Session:"))
+            .count(),
+        1,
+        "commit 1 trailer; body:\n{body}"
+    );
+    commit_with_msg(&repo, &msg, "2026-07-01T00:00:00+00:00");
+    assert_eq!(hook_post_commit(&repo, &paths), 0);
+    let links = spool.links().unwrap();
+    assert_eq!(links.len(), 1);
+    assert_eq!(links[0].confidence, LinkConfidence::Heuristic);
+
+    // Commit 2: no new events → no trailer.
+    std::fs::write(repo.join("tracked.txt"), "two\n").unwrap();
+    git_ok(&repo, &["add", "tracked.txt"]);
+    std::fs::write(&msg, "subject\n").unwrap();
+    assert_eq!(hook_prepare(&repo, &msg, &paths), 0);
+    let body = std::fs::read_to_string(&msg).unwrap();
+    assert!(
+        !body.contains("Starforge-Session:"),
+        "commit 2 must have no trailer; body:\n{body}"
+    );
+    commit_with_msg(&repo, &msg, "2026-08-01T00:00:00+00:00");
+    assert_eq!(hook_post_commit(&repo, &paths), 0);
+    assert_eq!(spool.links().unwrap().len(), 1);
+
+    // Append an event after commit 2's date, then commit 3: trailer back.
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&native_path)
+        .unwrap()
+        .write_all(native("2026-09-01T12:00:00Z").as_bytes())
+        .unwrap();
+    std::fs::write(repo.join("tracked.txt"), "three\n").unwrap();
+    git_ok(&repo, &["add", "tracked.txt"]);
+    std::fs::write(&msg, "subject\n").unwrap();
+    assert_eq!(hook_prepare(&repo, &msg, &paths), 0);
+    let body = std::fs::read_to_string(&msg).unwrap();
+    assert_eq!(
+        body.lines()
+            .filter(|l| l.starts_with("Starforge-Session:"))
+            .count(),
+        1,
+        "commit 3 trailer; body:\n{body}"
+    );
+    commit_with_msg(&repo, &msg, "2026-10-01T00:00:00+00:00");
+    assert_eq!(hook_post_commit(&repo, &paths), 0);
+    assert_eq!(spool.links().unwrap().len(), 2);
 }
 
 // pre-push enqueues uploads for sessions with unwritten segments.
@@ -630,11 +748,10 @@ fn pre_push_dispatcher_propagates_orig_exit_status() {
         if !orig_present {
             std::fs::remove_file(&orig).ok();
         }
-        Command::new("sh")
+        hermetic_command("sh", &paths.home)
             .arg(&dispatcher)
             .current_dir(&repo)
             .env("PATH", path_with(&shim_dir))
-            .env("STARFORGE_HOME", &paths.home)
             .output()
             .expect("dispatcher runs")
     };

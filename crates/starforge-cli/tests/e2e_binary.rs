@@ -11,9 +11,12 @@
 //! `127.0.0.1`, no real `$HOME`.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::str::FromStr as _;
 use std::sync::{Arc, Mutex};
+
+mod common;
+
+use common::hermetic_command;
 
 use axum::{
     Router,
@@ -30,11 +33,10 @@ use tempfile::TempDir;
 const TOKEN: &str = "test-token";
 
 fn git(repo: &Path, args: &[&str], home: &Path, path: &str) -> std::process::Output {
-    Command::new("git")
+    hermetic_command("git", home)
         .arg("-C")
         .arg(repo)
         .args(args)
-        .env("STARFORGE_HOME", home)
         .env("PATH", path)
         .output()
         .expect("git runs")
@@ -68,10 +70,9 @@ fn init_repo(home: &Path, path: &str) -> (TempDir, PathBuf) {
 }
 
 fn starforge(repo: &Path, home: &Path, path: &str, args: &[&str]) -> std::process::Output {
-    Command::new("starforge")
+    hermetic_command("starforge", home)
         .current_dir(repo)
         .args(args)
-        .env("STARFORGE_HOME", home)
         .env("PATH", path)
         .env("STARFORGE_TOKEN", TOKEN)
         .output()
@@ -225,8 +226,9 @@ async fn real_binary_enable_commit_sync() {
 
     // Native Pi session whose cwd and touched file live in this repo: ingest
     // (run by the hooks) discovers it without any manual spool seeding.
-    std::fs::create_dir_all(home.join("sessions")).unwrap();
-    std::fs::write(home.join("sessions/pi-e2e.jsonl"), fixture_body(&repo)).unwrap();
+    let store = home.join(".pi/agent/sessions/--x--");
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::write(store.join("pi-e2e.jsonl"), fixture_body(&repo)).unwrap();
 
     // Commit a file the session touched, through the installed dispatcher.
     std::fs::create_dir_all(repo.join("src")).unwrap();
@@ -395,12 +397,10 @@ async fn trail_list_without_token_hints_login() {
         &path,
     );
 
-    let out = Command::new("starforge")
+    let out = hermetic_command("starforge", home.path())
         .current_dir(&repo)
         .args(["trail", "list"])
-        .env("STARFORGE_HOME", home.path())
         .env("PATH", &path)
-        .env_remove("STARFORGE_TOKEN")
         .output()
         .expect("starforge runs");
     assert_eq!(out.status.code(), Some(1), "trail list exits 1");

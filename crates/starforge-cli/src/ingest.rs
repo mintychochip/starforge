@@ -143,15 +143,17 @@ fn parse_ts(ts: &str) -> Option<OffsetDateTime> {
     OffsetDateTime::parse(ts, &time::format_description::well_known::Rfc3339).ok()
 }
 
-/// Discover → read → redact → spool for every detecting adapter.
+/// Discover → read → redact → spool for every detecting adapter, each with
+/// its own [`Roots`] (keyed by agent key: `claude-code`, `codex`, `pi`,
+/// `opencode`, `gemini`; adapters without a roots entry are skipped).
 ///
-/// `repo_root` scopes discovery (`roots.worktree` should equal it) and
-/// supplies the redaction rules plus `RepoInfo`. `now` is caller-supplied
-/// (production passes `OffsetDateTime::now_utc()`); it stamps `fallback_ts`,
-/// queue `not_before`, and the 24 h idle rule.
+/// `repo_root` scopes discovery (each roots' `worktree` should equal it)
+/// and supplies the redaction rules plus `RepoInfo`. `now` is
+/// caller-supplied (production passes `OffsetDateTime::now_utc()`); it
+/// stamps `fallback_ts`, queue `not_before`, and the 24 h idle rule.
 pub fn ingest(
     spool: &crate::spool::Spool,
-    roots: &Roots,
+    roots: &BTreeMap<String, Roots>,
     repo_root: &Path,
     now: OffsetDateTime,
 ) -> Result<IngestStats, IngestError> {
@@ -187,10 +189,13 @@ pub fn ingest(
         Box::new(GeminiAdapter),
     ];
     for adapter in &adapters {
+        let agent = agent_key(&adapter.id()).to_string();
+        let Some(roots) = roots.get(&agent) else {
+            continue;
+        };
         if !adapter.detect(roots) {
             continue;
         }
-        let agent = agent_key(&adapter.id()).to_string();
         let mut known: HashMap<String, starforge_capture::Cursor> = HashMap::new();
         for (key, rec) in &records {
             if let Some(session_key) = key.strip_prefix(&format!("{agent}/")) {

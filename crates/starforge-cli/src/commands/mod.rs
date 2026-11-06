@@ -3,6 +3,7 @@
 pub mod auth;
 pub mod bundle;
 pub mod doctor;
+pub mod hook;
 pub mod hooks;
 pub mod session_admin;
 pub mod sessions;

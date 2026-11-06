@@ -5,7 +5,7 @@
 //! fixture bytes into the adapter's native store layout (same layout as the
 //! golden tests), reads from [`Cursor::start`], grows the native store,
 //! and asserts the resume yields only the new events with contiguous `seq`.
-//! OpenCode growth is a SQL `INSERT` (rowid cursor); every other adapter
+//! OpenCode growth is a SQL `INSERT` (seq cursor); every other adapter
 //! grows by appending to (or rewriting) its transcript file.
 
 use std::collections::HashMap;
@@ -80,7 +80,7 @@ fn setup_codex(version: &str) -> (tempfile::TempDir, Roots) {
 
 fn setup_pi(version: &str) -> (tempfile::TempDir, Roots) {
     let tmp = tempfile::tempdir().unwrap();
-    let store = tmp.path().join("data/sessions");
+    let store = tmp.path().join("data/.pi/agent/sessions/--x--");
     std::fs::create_dir_all(&store).unwrap();
     std::fs::write(
         store.join(format!("{PI_SESSION_ID}.jsonl")),
@@ -484,37 +484,66 @@ fn pi_discover_incremental() {
     assert_eq!(regrown[0].session_key, cand.session_key);
 }
 
-// --- OpenCode (rowid cursors) ---
+// --- OpenCode (seq cursors) ---
 
-fn opencode_insert(db: &Path, role: &str, content: &str, ts: &str) {
+fn opencode_insert_user(db: &Path, text: &str, seq: i64, time_ms: i64) {
+    let data = serde_json::json!({
+        "text": text,
+        "files": [],
+        "agents": [],
+        "skills": [],
+        "time": { "created": time_ms },
+    });
+    let id = format!("msg_growth_{seq}");
     rusqlite::Connection::open(db)
         .unwrap()
         .execute(
-            "INSERT INTO message(session_id, role, content, ts) VALUES(?1, ?2, ?3, ?4)",
-            rusqlite::params![OPENCODE_SESSION_ID, role, content, ts],
+            "INSERT INTO session_message(id, session_id, type, seq, time_created, time_updated, data)
+             VALUES(?1, ?2, 'user', ?3, ?4, ?4, ?5)",
+            rusqlite::params![id, OPENCODE_SESSION_ID, seq, time_ms, data.to_string()],
+        )
+        .unwrap();
+}
+
+fn opencode_insert_compaction(db: &Path, summary: &str, seq: i64, time_ms: i64) {
+    let data = serde_json::json!({
+        "status": "completed",
+        "reason": "manual",
+        "summary": summary,
+        "recent": "",
+        "time": { "created": time_ms },
+    });
+    let id = format!("msg_growth_{seq}");
+    rusqlite::Connection::open(db)
+        .unwrap()
+        .execute(
+            "INSERT INTO session_message(id, session_id, type, seq, time_created, time_updated, data)
+             VALUES(?1, ?2, 'compaction', ?3, ?4, ?4, ?5)",
+            rusqlite::params![id, OPENCODE_SESSION_ID, seq, time_ms, data.to_string()],
         )
         .unwrap();
 }
 
 #[test]
 fn opencode_growing_transcript_resume() {
-    let (_tmp, roots, db) = setup_opencode_db("0.9.0");
+    let (_tmp, roots, db) = setup_opencode_db("2.0.29");
     let a = OpencodeAdapter;
     let cand = single_candidate(&a, &roots);
     let first = a.read(&cand, &Cursor::start(), FALLBACK_TS).unwrap();
     assert_eq!(first.events.len(), 7);
     let resume_at = first.next;
-    // Rowid cursor: offset is the last message id consumed.
-    assert_eq!(resume_at.offset, 5);
+    // Seq cursor: offset is the last message seq consumed.
+    assert_eq!(resume_at.offset, 2);
+    assert_eq!(resume_at.lines, 3);
 
-    opencode_insert(&db, "user", FOLLOW_UP_TEXT, GROWTH_TS);
+    opencode_insert_user(&db, FOLLOW_UP_TEXT, 3, 1_793_793_630_000);
 
     let tail = a.read(&cand, &resume_at, FALLBACK_TS).unwrap();
     assert_eq!(tail.events.len(), 1);
     assert_eq!(tail.events[0].seq, resume_at.next_seq());
     assert_eq!(kind_name(&tail.events[0].kind), "user_message");
     assert_eq!(user_text(&tail.events[0]), FOLLOW_UP_TEXT);
-    assert_eq!(tail.next.offset, 6);
+    assert_eq!(tail.next.offset, 3);
     assert_eq!(tail.next.lines, resume_at.lines + 1);
 
     let fresh = a.read(&cand, &Cursor::start(), FALLBACK_TS).unwrap();
@@ -524,13 +553,13 @@ fn opencode_growing_transcript_resume() {
 
 #[test]
 fn opencode_compaction_boundary() {
-    let (_tmp, roots, db) = setup_opencode_db("0.9.0");
+    let (_tmp, roots, db) = setup_opencode_db("2.0.29");
     let a = OpencodeAdapter;
     let cand = single_candidate(&a, &roots);
     let first = a.read(&cand, &Cursor::start(), FALLBACK_TS).unwrap();
     let resume_at = first.next;
 
-    opencode_insert(&db, "summary", COMPACTION_TEXT, COMPACTION_TS);
+    opencode_insert_compaction(&db, COMPACTION_TEXT, 3, 1_793_793_635_000);
 
     let tail = a.read(&cand, &resume_at, FALLBACK_TS).unwrap();
     assert_eq!(tail.events.len(), 1);
@@ -543,7 +572,7 @@ fn opencode_compaction_boundary() {
 
 #[test]
 fn opencode_discover_incremental() {
-    let (_tmp, roots, db) = setup_opencode_db("0.9.0");
+    let (_tmp, roots, db) = setup_opencode_db("2.0.29");
     let a = OpencodeAdapter;
     let cand = single_candidate(&a, &roots);
     let first = a.read(&cand, &Cursor::start(), FALLBACK_TS).unwrap();
@@ -552,7 +581,7 @@ fn opencode_discover_incremental() {
     known.insert(cand.session_key.clone(), first.next);
     assert!(a.discover(&roots, &known).is_empty());
 
-    opencode_insert(&db, "user", FOLLOW_UP_TEXT, GROWTH_TS);
+    opencode_insert_user(&db, FOLLOW_UP_TEXT, 3, 1_793_793_630_000);
 
     let regrown = a.discover(&roots, &known);
     assert_eq!(regrown.len(), 1);

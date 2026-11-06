@@ -88,6 +88,17 @@ pub fn head_commit(repo: &Path) -> Result<String, GitError> {
     Ok(stdout_utf8(output, "HEAD")?.trim().to_string())
 }
 
+/// `git log -1 --format=%ct HEAD`: HEAD's committer time as unix seconds,
+/// or `None` when there is no HEAD (first commit / unborn branch).
+pub fn head_commit_time(repo: &Path) -> Result<Option<i64>, GitError> {
+    let output = git_output(repo, &["log", "-1", "--format=%ct", "HEAD"])?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let text = stdout_utf8(output, "HEAD time")?;
+    Ok(text.trim().parse::<i64>().ok())
+}
+
 /// `git config --get <key>`: `Ok(None)` when the key is unset (exit status 1),
 /// `Err` only when git itself fails.
 pub fn config_get(repo: &Path, key: &str) -> Result<Option<String>, GitError> {

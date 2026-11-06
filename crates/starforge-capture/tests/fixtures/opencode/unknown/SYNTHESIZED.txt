@@ -1,7 +1,7 @@
 SYNTHESIZED — no real OpenCode store was available on this machine.
 
-Same synthesized rows as the `0.9.0` fixture (see its `SYNTHESIZED.txt`),
-but the `session` row reports version `0.0.0-unknown`, which is not in the
-adapter's `COVERED` list. The closest known parser still parses every row,
-so `expected.jsonl` is byte-identical to the pinned fixture's; only the
+Same synthesized store as the `2.0.29` fixture (see its `SYNTHESIZED.txt`),
+but every session row reports version `9.9.9`, which is not in the
+adapter's `COVERED` list. The pinned reader still parses every row, so
+`expected.jsonl` is byte-identical to the pinned fixture's; only the
 header differs (`agent.version`, `adapter_version_verified == false`).

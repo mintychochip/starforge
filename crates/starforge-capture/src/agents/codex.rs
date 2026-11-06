@@ -16,6 +16,10 @@
 //! (consumed, counted in `lines`, assigned `seq`), so records after it are
 //! neither reordered nor dropped.
 //!
+//! Discovery attribution: a session is captured only when a record
+//! carries a non-empty `cwd` inside the worktree; a session with
+//! unknown/empty `cwd` is skipped (never defaulted to the worktree).
+//!
 //! There is no pinned hook story for the covered Codex versions: the CLI
 //! exposes no stable hook surface these versions commit to, so
 //! [`Adapter::install_hooks`] and [`Adapter::remove_hooks`] both report
@@ -139,13 +143,16 @@ fn decode_arguments(v: &Value) -> Value {
     }
 }
 
-/// First `cwd` and `version` seen in a transcript (cheap identity scan).
-/// Accepts both `session_id` and `sessionId` keys (identity only; the header
-/// fold below does the same).
+/// First non-empty `cwd` and `version` seen in a transcript (cheap
+/// identity scan). An empty `cwd` counts as unknown and does not stop
+/// the scan. Accepts both `session_id` and `sessionId` keys (identity
+/// only; the header fold below does the same).
 fn scan_identity(native_path: &std::path::Path) -> (Option<String>, Option<String>) {
     let Ok(bytes) = std::fs::read(native_path) else {
         return (None, None);
     };
+    let mut cwd = None;
+    let mut version = None;
     for span in complete_lines(&bytes, 0) {
         let text = line_text(&bytes, span);
         if text.trim().is_empty() {
@@ -154,19 +161,22 @@ fn scan_identity(native_path: &std::path::Path) -> (Option<String>, Option<Strin
         let Ok(record) = serde_json::from_str::<Value>(text) else {
             continue;
         };
-        let cwd = record
-            .get("cwd")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        let version = record
-            .get("version")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        if cwd.is_some() || version.is_some() {
-            return (cwd, version);
+        if cwd.is_none()
+            && let Some(c) = record.get("cwd").and_then(Value::as_str)
+            && !c.is_empty()
+        {
+            cwd = Some(c.to_string());
+        }
+        if version.is_none()
+            && let Some(v) = record.get("version").and_then(Value::as_str)
+        {
+            version = Some(v.to_string());
+        }
+        if cwd.is_some() && version.is_some() {
+            break;
         }
     }
-    (None, None)
+    (cwd, version)
 }
 
 /// Fold one parsed record into the session header accumulator.
@@ -190,6 +200,7 @@ impl HeaderFold {
         }
         if self.workdir.is_none()
             && let Some(cwd) = record.get("cwd").and_then(Value::as_str)
+            && !cwd.is_empty()
         {
             self.workdir = Some(cwd.to_string());
         }
@@ -480,9 +491,11 @@ impl Adapter for CodexAdapter {
                 })
                 .unwrap_or_default();
             let (workdir, version) = scan_identity(&native_path);
-            let workdir = workdir
-                .map(PathBuf::from)
-                .unwrap_or_else(|| roots.worktree.clone());
+            // Privacy rule: unknown cwd (missing/empty) is skipped,
+            // never defaulted to this worktree.
+            let Some(workdir) = workdir.filter(|cwd| !cwd.is_empty()).map(PathBuf::from) else {
+                continue;
+            };
             if !workdir_inside(&roots.worktree, &workdir) {
                 continue;
             }

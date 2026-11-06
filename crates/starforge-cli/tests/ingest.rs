@@ -5,6 +5,7 @@
 //! with no native growth must write nothing new, and re-discovery must map to
 //! the same ULID. No network, no real `$HOME`.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -45,6 +46,19 @@ fn fixture_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pi-session.jsonl")
 }
 
+/// The Pi fixture with every `/work/repo` cwd/file path rewritten to the
+/// test repo, so discovery (which only captures sessions whose cwd lies
+/// inside the repo) sees it.
+fn fixture_body(repo: &Path) -> String {
+    std::fs::read_to_string(fixture_path())
+        .unwrap()
+        .replace("/work/repo", &repo.to_string_lossy())
+}
+
+fn write_fixture(repo: &Path, dest: &Path) {
+    std::fs::write(dest, fixture_body(repo)).unwrap();
+}
+
 fn parse_now(s: &str) -> time::OffsetDateTime {
     time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339).unwrap()
 }
@@ -55,23 +69,22 @@ fn ingest_redacts_seed_spool_and_records_fingerprint() {
     let home = TempDir::new().unwrap();
     let _paths = CliPaths::from_home(home.path().to_path_buf());
     // Native Pi session under the fake home (Pi store layout).
-    std::fs::create_dir_all(home.path().join("sessions")).unwrap();
-    std::fs::copy(
-        fixture_path(),
-        home.path().join("sessions/pi-ingest-1.jsonl"),
-    )
-    .unwrap();
+    let store = home.path().join(".pi/agent/sessions/--x--");
+    std::fs::create_dir_all(&store).unwrap();
+    write_fixture(&repo, &store.join("pi-ingest-1.jsonl"));
 
     let common = common_dir(&repo).unwrap();
     let spool = Spool::open(&common);
     spool.ensure_layout().unwrap();
-    let roots = Roots {
-        config_dir: home.path().join(".config"),
-        data_dir: home.path().to_path_buf(),
-        worktree: PathBuf::from("/"),
-    };
+    let roots = BTreeMap::from([(
+        "pi".to_string(),
+        Roots {
+            config_dir: home.path().join(".config"),
+            data_dir: home.path().to_path_buf(),
+            worktree: repo.clone(),
+        },
+    )]);
     let now = parse_now("2026-11-04T00:00:00Z");
-
     let stats = ingest(&spool, &roots, &repo, now).unwrap();
     assert_eq!(stats.sessions, 1, "one native session seen");
     assert!(stats.new_events >= 3, "fixture yields 3+ events");
@@ -180,16 +193,24 @@ fn unreadable_native_file_does_not_starve_later_adapters() {
         "this is not json\n",
     )
     .unwrap();
-    std::fs::copy(fixture_path(), home.path().join("sessions/pi-good.jsonl")).unwrap();
+    let store = home.path().join(".pi/agent/sessions/--x--");
+    std::fs::create_dir_all(&store).unwrap();
+    write_fixture(&repo, &store.join("pi-good.jsonl"));
 
     let common = common_dir(&repo).unwrap();
     let spool = Spool::open(&common);
     spool.ensure_layout().unwrap();
-    let roots = Roots {
+    // Codex roots keep the old shared layout so its unreadable rollout is
+    // still discovered (and fails) before Pi runs.
+    let shared = Roots {
         config_dir: home.path().join(".config"),
         data_dir: home.path().to_path_buf(),
-        worktree: PathBuf::from("/"),
+        worktree: repo.clone(),
     };
+    let roots = BTreeMap::from([
+        ("codex".to_string(), shared.clone()),
+        ("pi".to_string(), shared),
+    ]);
 
     let stats = ingest(&spool, &roots, &repo, parse_now("2026-11-04T00:00:00Z")).unwrap();
     assert_eq!(
@@ -224,25 +245,25 @@ fn unreadable_native_file_does_not_starve_later_adapters() {
 fn raw_only_detector_hit_increments_counts() {
     let (_repo_dir, repo) = init_repo();
     let home = TempDir::new().unwrap();
-    let native = concat!(
-        "{\"type\":\"message\",\"role\":\"user\",\"session\":\"raw-only-1\",",
-        "\"cwd\":\"/\",\"version\":\"0.5.2\",\"timestamp\":\"2026-10-01T12:00:00Z\",",
-        "\"content\":\"hello\"}\n",
-        "{\"type\":\"message\",\"role\":\"assistant\",\"session\":\"raw-only-1\",",
-        "\"cwd\":\"/\",\"version\":\"0.5.2\",\"timestamp\":\"2026-10-01T12:01:00Z\",",
-        "\"model\":\"sk-ant-abcdefghij1234567890\",\"content\":\"all good\"}\n",
+    let cwd = repo.to_string_lossy();
+    let native = format!(
+        "{{\"type\":\"message\",\"role\":\"user\",\"session\":\"raw-only-1\",\"cwd\":\"{cwd}\",\"version\":\"0.5.2\",\"timestamp\":\"2026-10-01T12:00:00Z\",\"content\":\"hello\"}}\n{{\"type\":\"message\",\"role\":\"assistant\",\"session\":\"raw-only-1\",\"cwd\":\"{cwd}\",\"version\":\"0.5.2\",\"timestamp\":\"2026-10-01T12:01:00Z\",\"model\":\"sk-ant-abcdefghij1234567890\",\"content\":\"all good\"}}\n"
     );
-    std::fs::create_dir_all(home.path().join("sessions")).unwrap();
-    std::fs::write(home.path().join("sessions/raw-only-1.jsonl"), native).unwrap();
+    let store = home.path().join(".pi/agent/sessions/--x--");
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::write(store.join("raw-only-1.jsonl"), native).unwrap();
 
     let common = common_dir(&repo).unwrap();
     let spool = Spool::open(&common);
     spool.ensure_layout().unwrap();
-    let roots = Roots {
-        config_dir: home.path().join(".config"),
-        data_dir: home.path().to_path_buf(),
-        worktree: PathBuf::from("/"),
-    };
+    let roots = BTreeMap::from([(
+        "pi".to_string(),
+        Roots {
+            config_dir: home.path().join(".config"),
+            data_dir: home.path().to_path_buf(),
+            worktree: repo.clone(),
+        },
+    )]);
 
     let stats = ingest(&spool, &roots, &repo, parse_now("2026-11-04T00:00:00Z")).unwrap();
     assert_eq!(stats.sessions, 1);
@@ -291,17 +312,21 @@ fn credentialed_remote_url_never_reaches_spool_or_show() {
         ],
     );
     let home = TempDir::new().unwrap();
-    std::fs::create_dir_all(home.path().join("sessions")).unwrap();
-    std::fs::copy(fixture_path(), home.path().join("sessions/pi-cred.jsonl")).unwrap();
+    let store = home.path().join(".pi/agent/sessions/--x--");
+    std::fs::create_dir_all(&store).unwrap();
+    write_fixture(&repo, &store.join("pi-cred.jsonl"));
 
     let common = common_dir(&repo).unwrap();
     let spool = Spool::open(&common);
     spool.ensure_layout().unwrap();
-    let roots = Roots {
-        config_dir: home.path().join(".config"),
-        data_dir: home.path().to_path_buf(),
-        worktree: PathBuf::from("/"),
-    };
+    let roots = BTreeMap::from([(
+        "pi".to_string(),
+        Roots {
+            config_dir: home.path().join(".config"),
+            data_dir: home.path().to_path_buf(),
+            worktree: repo.clone(),
+        },
+    )]);
     ingest(&spool, &roots, &repo, parse_now("2026-11-04T00:00:00Z")).unwrap();
 
     let mut ulids = Vec::new();
@@ -343,18 +368,22 @@ fn credentialed_remote_url_never_reaches_spool_or_show() {
 fn spool_failure_leaves_cursor_and_replays_without_loss_or_dupes() {
     let (_repo_dir, repo) = init_repo();
     let home = TempDir::new().unwrap();
-    std::fs::create_dir_all(home.path().join("sessions")).unwrap();
-    let native = home.path().join("sessions/pi-replay-1.jsonl");
-    std::fs::copy(fixture_path(), &native).unwrap();
+    let store = home.path().join(".pi/agent/sessions/--x--");
+    std::fs::create_dir_all(&store).unwrap();
+    let native = store.join("pi-replay-1.jsonl");
+    write_fixture(&repo, &native);
 
     let common = common_dir(&repo).unwrap();
     let spool = Spool::open(&common);
     spool.ensure_layout().unwrap();
-    let roots = Roots {
-        config_dir: home.path().join(".config"),
-        data_dir: home.path().to_path_buf(),
-        worktree: PathBuf::from("/"),
-    };
+    let roots = BTreeMap::from([(
+        "pi".to_string(),
+        Roots {
+            config_dir: home.path().join(".config"),
+            data_dir: home.path().to_path_buf(),
+            worktree: repo.clone(),
+        },
+    )]);
     let now = parse_now("2026-11-04T00:00:00Z");
 
     let stats = ingest(&spool, &roots, &repo, now).unwrap();
@@ -365,12 +394,12 @@ fn spool_failure_leaves_cursor_and_replays_without_loss_or_dupes() {
     let (key, ulid, prev_cursor) = (key.clone(), rec.ulid.clone(), rec.cursor);
 
     // Grow the native transcript by one record so the next sweep has work.
-    let mut grown = std::fs::read(fixture_path()).unwrap();
+    let mut grown = fixture_body(&repo).into_bytes();
     grown.extend_from_slice(
-        concat!(
-            "{\"cwd\":\"/work/repo\",\"input\":{\"edits\":2,\"file_path\":\"/work/repo/src/main.rs\"},",
-            "\"name\":\"Edit\",\"session\":\"pi-session-1\",\"timestamp\":\"2026-10-01T12:03:00Z\",",
-            "\"type\":\"tool_call\",\"version\":\"0.5.2\"}\n",
+        format!(
+            "{{\"cwd\":\"{}\",\"input\":{{\"edits\":2,\"file_path\":\"{}/src/main.rs\"}},\"name\":\"Edit\",\"session\":\"pi-session-1\",\"timestamp\":\"2026-10-01T12:03:00Z\",\"type\":\"tool_call\",\"version\":\"0.5.2\"}}\n",
+            repo.to_string_lossy(),
+            repo.to_string_lossy()
         )
         .as_bytes(),
     );

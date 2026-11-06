@@ -84,10 +84,31 @@ releases or purges it.
 
 `starforge-capture` (MIT OR Apache-2.0) reads native agent transcripts into normalized
 Trace Format v1 events without redaction: five adapters cover Claude Code, Codex CLI, Pi,
-OpenCode (SQLite `opencode.db` plus file-storage layouts), and Gemini CLI. omp transcripts
-parse through the Pi adapter and Antigravity stores through the Gemini adapter, both
-best-effort and always reported `unverified` (`adapter_version_verified == false`).
+OpenCode (SQLite `opencode.db`, the v2 `session_v2`/`session_message` store), and Gemini CLI. omp transcripts
+parse through the Pi adapter, best-effort and always reported `unverified`
+(`adapter_version_verified == false`).
 Adapters take explicit root paths (no `$HOME`, no clock), resume with stable cursors, and
 preserve unmapped native fields so re-normalization stays lossless; raw-transcript storage
 defaults ON for new repos. Test fixtures are synthesized in the native shape — each fixture
 directory carries a `SYNTHESIZED.txt` noting the native source it mimics.
+
+## Where sessions are read from
+
+Capture is discovery-based (at commit, push, and `sync`): the CLI reads each
+agent's native store under a per-agent root derived from `$STARFORGE_HOME`
+else `$HOME`. When `STARFORGE_HOME` is set, the agent env overrides below
+are ignored.
+
+| Agent | Sessions read from | Hook/config dir | Env overrides |
+|---|---|---|---|
+| Claude Code | `<base>/.claude/projects/<slug>/<id>.jsonl` | `<base>/.claude` (`settings.json`) | `$CLAUDE_CONFIG_DIR` for both dirs |
+| Codex CLI | `<base>/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` | `<base>/.codex` | `$CODEX_HOME` for both dirs |
+| Gemini CLI | `<base>/.gemini/tmp/<hash>/chats/*.json` | `<base>/.gemini` | — |
+| OpenCode | `$XDG_DATA_HOME/opencode` else `<base>/.local/share/opencode` (`opencode.db`) | `$XDG_CONFIG_HOME/opencode` else `<base>/.config/opencode` | `$XDG_DATA_HOME`, `$XDG_CONFIG_HOME` |
+| Pi and omp | `<base>/.pi/agent/sessions/**/*.jsonl` (Pi) and `<base>/.omp/agent/sessions/**/*.jsonl` (omp), both recursive | `<base>` | — |
+
+Antigravity CLI sessions are not captured in v0.1.0 (see Known gaps).
+
+Pi/omp capture is discovery-only: they have no verified JSON-config hook
+surface, so `starforge enable` installs no Pi/omp hook files; sessions are
+picked up by discovery at commit/push/sync.

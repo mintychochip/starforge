@@ -1,6 +1,6 @@
 SYNTHESIZED — no real Pi agent transcript was available on this machine.
 
-This fixture mimics the native shape of `<data_dir>/sessions/<session>.jsonl`
+This fixture mimics the native shape of `<data_dir>/.pi/agent/sessions/<cwd-slug>/<session>.jsonl`
 as written by the Pi coding agent: one JSON object per line, each with `type`,
 `cwd`, `session`, `version`, and `timestamp`, plus per-type fields — `message`
 records carry `role` (`user` | `assistant`), `content` text, and (assistant

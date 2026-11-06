@@ -91,8 +91,11 @@ Explicit v0.1.0 non-goals (program rulings):
 - **Per-response CSP nonce (§11.1):** the CSP forbids inline scripts entirely
   and serves scripts only from the origin, which is stricter than a nonce
   allowance. Cost: none.
-
-
+- **Antigravity CLI capture:** current Antigravity CLI releases keep sessions
+  under `~/.gemini/antigravity-cli/brain/<id>/` in an undocumented, closed
+  format, which the Gemini adapter does not read. Gemini CLI sessions are
+  captured. Cost: Antigravity sessions are not uploaded until a later
+  release adds the format.
 
 ## License
 

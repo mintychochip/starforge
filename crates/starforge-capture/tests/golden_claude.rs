@@ -120,12 +120,26 @@ fn claude_hooks_round_trip() {
     let a = ClaudeAdapter;
     let written = a.install_hooks(&roots).unwrap();
     assert_eq!(written.len(), 1);
+    assert_eq!(written[0], roots.config_dir.join("settings.json"));
     assert!(written[0].starts_with(&roots.config_dir));
-    let body = std::fs::read_to_string(&written[0]).unwrap();
-    assert!(body.contains("starforge"), "hook file must carry marker");
+    let body: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&written[0]).unwrap()).unwrap();
+    assert_eq!(
+        body.pointer("/hooks/SessionEnd/0/hooks/0/command")
+            .and_then(|v| v.as_str()),
+        Some("starforge hook session-end")
+    );
+    assert_eq!(
+        body.pointer("/hooks/SessionEnd/0/hooks/0/type")
+            .and_then(|v| v.as_str()),
+        Some("command")
+    );
     let removed = a.remove_hooks(&roots).unwrap();
     assert_eq!(removed, written);
-    assert!(!written[0].exists());
+    // The emptied settings file remains (an empty object), never deleted.
+    let after: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&written[0]).unwrap()).unwrap();
+    assert_eq!(after, serde_json::json!({}));
     // Second removal removes nothing.
     let removed_again = a.remove_hooks(&roots).unwrap();
     assert!(removed_again.is_empty());
@@ -245,9 +259,9 @@ fn claude_multiblock_record_resume_keeps_seq_unique() {
     assert_eq!(full.events, joined, "resumed concat equals a fresh read");
 }
 
-/// Installing over a foreign `settings.json` merges under the single
-/// `starforge` key: unrelated keys survive, the marker is present, and
-/// removal restores the foreign file (a second removal is a no-op).
+/// Installing over a foreign `settings.json` preserves unrelated keys and
+/// another `SessionEnd` group; installing twice is idempotent, and removal
+/// deletes only our command (a second removal is a no-op).
 #[test]
 fn claude_install_merges_into_foreign_settings() {
     let tmp = tempfile::tempdir().unwrap();
@@ -257,32 +271,57 @@ fn claude_install_merges_into_foreign_settings() {
         worktree: PathBuf::from("/repo"),
     };
     let a = ClaudeAdapter;
-    let path = roots.config_dir.join("claude-code/settings.json");
+    let path = roots.config_dir.join("settings.json");
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    let foreign = r#"{"hooks":{"PreToolUse":[{"matcher":"x","hooks":[{"type":"command","command":"echo hi"}]}]},"theme":"dark"}"#;
+    let foreign = r#"{"hooks":{"PreToolUse":[{"matcher":"x","hooks":[{"type":"command","command":"echo hi"}]}],"SessionEnd":[{"matcher":"other","hooks":[{"type":"command","command":"echo bye"}]}]},"theme":"dark"}"#;
     std::fs::write(&path, foreign).unwrap();
 
     let written = a.install_hooks(&roots).unwrap();
     assert_eq!(written, vec![path.clone()]);
-    let body = std::fs::read_to_string(&path).unwrap();
-    assert!(body.contains("starforge"), "hook file must carry marker");
-    let merged: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let merged: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     assert_eq!(
         merged.get("theme").and_then(|v| v.as_str()),
         Some("dark"),
         "unrelated keys preserved"
     );
-    assert!(merged.get("hooks").is_some(), "unrelated keys preserved");
-    assert!(merged.get("starforge").is_some(), "dedicated starforge key");
+    assert_eq!(
+        merged
+            .pointer("/hooks/PreToolUse/0/hooks/0/command")
+            .and_then(|v| v.as_str()),
+        Some("echo hi"),
+        "unrelated hooks preserved"
+    );
+    // Our group is appended after the foreign SessionEnd group.
+    assert_eq!(
+        merged
+            .pointer("/hooks/SessionEnd/0/hooks/0/command")
+            .and_then(|v| v.as_str()),
+        Some("echo bye"),
+        "foreign SessionEnd group preserved"
+    );
+    assert_eq!(
+        merged
+            .pointer("/hooks/SessionEnd/1/hooks/0/command")
+            .and_then(|v| v.as_str()),
+        Some("starforge hook session-end"),
+        "our group appended"
+    );
+    assert!(merged.get("starforge").is_none(), "no top-level marker key");
 
-    // Removal drops only the `starforge` key and keeps the rest.
+    // Installing twice is idempotent: no second group, identical bytes.
+    let before = std::fs::read(&path).unwrap();
+    let written2 = a.install_hooks(&roots).unwrap();
+    assert_eq!(written2, vec![path.clone()]);
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+
+    // Removal deletes only our command and prunes the emptied group.
     let removed = a.remove_hooks(&roots).unwrap();
     assert_eq!(removed, vec![path.clone()]);
     let after: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-    assert!(after.get("starforge").is_none());
-    assert_eq!(after.get("theme").and_then(|v| v.as_str()), Some("dark"));
-    assert!(after.get("hooks").is_some());
+    let expected: serde_json::Value = serde_json::from_str(foreign).unwrap();
+    assert_eq!(after, expected, "foreign file restored exactly");
 
     // Second removal touches nothing.
     let before = std::fs::read(&path).unwrap();
@@ -302,7 +341,7 @@ fn claude_install_rejects_non_object_hook_file() {
         worktree: PathBuf::from("/repo"),
     };
     let a = ClaudeAdapter;
-    let path = roots.config_dir.join("claude-code/settings.json");
+    let path = roots.config_dir.join("settings.json");
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
 
     for bad in ["{not valid json", "[1, 2, 3]", "\"just a string\""] {
@@ -315,7 +354,8 @@ fn claude_install_rejects_non_object_hook_file() {
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), bad);
     }
-    // A foreign file with no `starforge` key is never removed.
+    // A foreign file with no SessionEnd entry is never removed.
+    std::fs::write(&path, r#"{"theme":"dark"}"#).unwrap();
     let removed = a.remove_hooks(&roots).unwrap();
     assert!(removed.is_empty());
     assert!(path.exists());

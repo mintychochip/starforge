@@ -5,7 +5,7 @@
 | Key | Meaning |
 |---|---|
 | `server.http_addr` | Address to bind, e.g. `127.0.0.1:3000` |
-| `server.base_url` | Public URL without a trailing slash; `https://` turns on secure cookies |
+| `server.base_url` | Public URL of the server without a trailing slash; `https://` turns on secure cookies. Must be an origin like `https://forge.example.com` — a path prefix, query, or fragment (e.g. `https://example.com/forge`) is refused because Starforge cannot be served under a path prefix |
 | `database.url` | Empty for SQLite in the data directory, or a `postgres://` URL |
 | `database.auto_migrate` | Migrate the schema at startup (default `true`) |
 | `storage.data_dir` | Repositories, SQLite database, and runtime files |

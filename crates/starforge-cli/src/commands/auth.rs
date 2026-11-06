@@ -2,7 +2,7 @@
 
 use crate::auth::AuthError;
 use crate::auth::{
-    DeviceFlow, credentials_for, load_credentials, logout_host, normalize_server,
+    CLI_SCOPES, DeviceFlow, credentials_for, load_credentials, logout_host, normalize_server,
     redact_for_status, save_credentials,
 };
 use crate::config::CliPaths;
@@ -22,7 +22,7 @@ pub async fn login(
     if dry_run {
         return Ok(format!(
             "would POST {api_base}/api/v1/oauth/device/code \
-             with client_id=starforge-cli&scope=sessions:read sessions:write, \
+             with client_id=starforge-cli&scope={CLI_SCOPES}, \
              poll POST {api_base}/api/v1/oauth/token, \
              and store [{host}] in {}",
             paths.credential_file.display()

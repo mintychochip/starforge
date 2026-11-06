@@ -1,8 +1,8 @@
 /// Resume cursor for one native session.
 ///
 /// For JSONL-file agents `offset` is bytes consumed and `lines` is records
-/// consumed; for OpenCode `offset` is the last SQLite `rowid` consumed and
-/// `lines` is rows consumed. `events` counts events already emitted, which is
+/// consumed; for OpenCode `offset` is the last SQLite `seq` consumed and
+/// `lines` is messages consumed. `events` counts events already emitted, which is
 /// not the record count: one native record can carry several content blocks
 /// and therefore several events. Never wall-clock, never mtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]

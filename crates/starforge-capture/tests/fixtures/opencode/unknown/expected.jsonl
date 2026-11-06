@@ -1,7 +1,7 @@
 {"kind":"user_message","seq":0,"text":"Help me refactor the auth module.","ts":"2026-11-04T12:00:00Z","v":1}
-{"kind":"assistant_message","model":"opencode-medium","seq":1,"text":"I will start by reading the auth module.","ts":"2026-11-04T12:00:05Z","usage":{"cache_read":0,"cache_write":0,"input":1200,"output":60,"reasoning":0},"v":1}
+{"kind":"assistant_message","model":"anthropic/claude-sonnet-4-5","seq":1,"text":"I will start by reading the auth module.","ts":"2026-11-04T12:00:05Z","usage":{"cache_read":0,"cache_write":0,"input":1200,"output":60,"reasoning":0},"v":1}
 {"kind":"reasoning","seq":2,"text":"The auth module has tangled session logic; check src/auth.rs first.","ts":"2026-11-04T12:00:05Z","v":1}
-{"kind":"tool_call","seq":3,"tool":{"input":{"file_path":"/repo/src/auth.rs"},"name":"Edit"},"ts":"2026-11-04T12:00:09Z","v":1}
-{"change":"modify","diff":null,"kind":"file_change","path":"src/auth.rs","seq":4,"ts":"2026-11-04T12:00:09Z","v":1}
-{"kind":"tool_result","result":{"is_error":false,"original_bytes":24,"output":"Edited /repo/src/auth.rs","truncated":false},"seq":5,"ts":"2026-11-04T12:00:10Z","v":1}
+{"kind":"tool_call","seq":3,"tool":{"input":{"file_path":"/repo/src/auth.rs"},"name":"edit"},"ts":"2026-11-04T12:00:05Z","v":1}
+{"kind":"tool_result","result":{"is_error":false,"original_bytes":24,"output":"Edited /repo/src/auth.rs","truncated":false},"seq":4,"ts":"2026-11-04T12:00:05Z","v":1}
+{"kind":"system","seq":5,"text":"{\"type\":\"future-part\",\"weird\":true}","ts":"2026-11-04T12:00:05Z","v":1}
 {"kind":"compaction","seq":6,"summary":"Refactored the auth module.","ts":"2026-11-04T12:00:15Z","v":1}

@@ -64,13 +64,18 @@ pub async fn doctor(repo: &Path, paths: &CliPaths, dry_run: bool) -> (String, u8
         use starforge_capture::agents::{
             ClaudeAdapter, CodexAdapter, GeminiAdapter, OpencodeAdapter, PiAdapter,
         };
-        let roots = super::hooks::adapter_roots(paths, repo);
+        let roots_for = |agent: &str| {
+            super::hooks::adapter_roots_for(agent, paths, repo, |k| std::env::var(k).ok())
+        };
         let adapters: [(&str, bool); 5] = [
-            ("claude-code", ClaudeAdapter.detect(&roots)),
-            ("codex", CodexAdapter.detect(&roots)),
-            ("pi", PiAdapter.detect(&roots)),
-            ("opencode", OpencodeAdapter.detect(&roots)),
-            ("gemini", GeminiAdapter.detect(&roots)),
+            (
+                "claude-code",
+                ClaudeAdapter.detect(&roots_for("claude-code")),
+            ),
+            ("codex", CodexAdapter.detect(&roots_for("codex"))),
+            ("pi", PiAdapter.detect(&roots_for("pi"))),
+            ("opencode", OpencodeAdapter.detect(&roots_for("opencode"))),
+            ("gemini", GeminiAdapter.detect(&roots_for("gemini"))),
         ];
         for (name, present) in adapters {
             lines.push(if present {

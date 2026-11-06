@@ -1,5 +1,6 @@
-//! Pi and omp adapters: `<data_dir>/sessions/*.jsonl` (Pi) and
-//! `<data_dir>/omp/agent/sessions/**/*.jsonl` (omp).
+//! Pi and omp adapters: `<data_dir>/.pi/agent/sessions/**/*.jsonl` (Pi,
+//! recursive — real installs nest one dir per cwd) and
+//! `<data_dir>/.omp/agent/sessions/**/*.jsonl` (omp, recursive).
 //!
 //! Native shape (one JSON object per line): `message` records carrying a `role`
 //! (`user` | `assistant`), `content` text, and — assistant only — `model`,
@@ -14,13 +15,28 @@
 //!
 //! omp sessions parse with the same mapper and share [`AgentName::Pi`] (the
 //! five-name table has no omp entry); their versions are reported as
-//! `omp-<version>`. omp-only record shapes (e.g. `extension_state`) map to
-//! `system { text: <raw JSON> }`: never dropped, never an error.
+//! `omp-<version>` (kept by store). omp-only record shapes (e.g.
+//! `extension_state`) map to `system { text: <raw JSON> }`: never dropped,
+//! never an error.
 //!
-//! Hook story: Pi owns a single extension-event snippet under `config_dir`;
-//! the omp side has no hook surface, so both directions for omp are
-//! documented as `Ok(vec![])` and discovery of the session files is the only
-//! omp capture path.
+//! Discovery attribution: a session is captured only when a non-empty
+//! `cwd` inside the worktree is found; unknown/empty `cwd` is skipped
+//! (never defaulted to the worktree). Pi stores `cwd` in the
+//! `{"type":"session",...}` header record (first line of the file):
+//! https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/src/core/session-manager.ts
+//! and https://pi.dev/docs/latest/session-format (`SessionHeader`).
+//! The header carries no per-record `cwd` on later entries, so the
+//! identity scan reads the header's `cwd` (an empty header `cwd` means
+//! an old session whose cwd is unknown: skipped). omp has no public
+//! session-format spec, so omp records keep the per-record `cwd`
+//! lookup and rely on the same skip-unknown rule.
+//!
+//! Hook story: Pi/omp have no verified JSON-config hook surface, so
+//! [`Adapter::install_hooks`] is a no-op (`Ok(vec![])`). Capture happens
+//! through discovery at commit/push/sync (the M1 plan allows this for
+//! adapters without a hook story). [`Adapter::remove_hooks`] only cleans up
+//! the legacy `<config_dir>/.config/pi/starforge.json` hook file when it
+//! carries the starforge marker.
 
 use std::collections::{BTreeMap, HashMap};
 use std::io;
@@ -42,8 +58,9 @@ use crate::{Adapter, Candidate, CaptureError, Cursor, ReadOutput, Roots, workdir
 /// sessions, which share [`AgentName::Pi`].
 pub struct PiAdapter;
 
-/// Hook snippet path relative to `Roots.config_dir`.
-const HOOK_REL_PATH: &str = "pi/starforge.json";
+/// Legacy hook path relative to `Roots.config_dir` (pre per-agent-roots
+/// layout, when `config_dir` was `<home>/.config`).
+const LEGACY_HOOK_REL_PATH: &str = ".config/pi/starforge.json";
 /// Marker proving a hook file was written by starforge.
 const MARKER: &str = "starforge";
 
@@ -141,6 +158,7 @@ impl HeaderFold {
         }
         if self.workdir.is_none()
             && let Some(cwd) = record.get("cwd").and_then(Value::as_str)
+            && !cwd.is_empty()
         {
             self.workdir = Some(cwd.to_string());
         }
@@ -344,11 +362,16 @@ fn collect_jsonl(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// First `cwd` and `version` seen in a transcript (cheap identity scan).
+/// First non-empty `cwd` and `version` seen in a transcript (cheap
+/// identity scan). Pi's `{"type":"session"}` header record (first
+/// line) carries `cwd`; per-record `cwd` is accepted too (omp shape).
+/// An empty `cwd` counts as unknown and does not stop the scan.
 fn scan_identity(native_path: &std::path::Path) -> (Option<String>, Option<String>) {
     let Ok(body) = std::fs::read_to_string(native_path) else {
         return (None, None);
     };
+    let mut cwd = None;
+    let mut version = None;
     for line in body.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -357,19 +380,22 @@ fn scan_identity(native_path: &std::path::Path) -> (Option<String>, Option<Strin
         let Ok(record): Result<Value, _> = serde_json::from_str(line) else {
             continue;
         };
-        let cwd = record
-            .get("cwd")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        let version = record
-            .get("version")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        if cwd.is_some() || version.is_some() {
-            return (cwd, version);
+        if cwd.is_none()
+            && let Some(c) = record.get("cwd").and_then(Value::as_str)
+            && !c.is_empty()
+        {
+            cwd = Some(c.to_string());
+        }
+        if version.is_none()
+            && let Some(v) = record.get("version").and_then(Value::as_str)
+        {
+            version = Some(v.to_string());
+        }
+        if cwd.is_some() && version.is_some() {
+            break;
         }
     }
-    (None, None)
+    (cwd, version)
 }
 
 impl Adapter for PiAdapter {
@@ -389,68 +415,21 @@ impl Adapter for PiAdapter {
     }
 
     fn detect(&self, roots: &Roots) -> bool {
-        roots.data_dir.join("sessions").is_dir()
-            || roots.data_dir.join("omp/agent/sessions").is_dir()
+        roots.data_dir.join(".pi/agent/sessions").is_dir()
+            || roots.data_dir.join(".omp/agent/sessions").is_dir()
     }
 
-    /// Merge starforge's hook fragment under the single top-level `starforge`
-    /// key, preserving every unrelated key. A missing file is created; a
-    /// present file must be a JSON object (anything else is an `InvalidData`
-    /// error and the file is left untouched).
-    fn install_hooks(&self, roots: &Roots) -> io::Result<Vec<PathBuf>> {
-        let path = roots.config_dir.join(HOOK_REL_PATH);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let fragment = serde_json::json!({
-            "_note": "starforge-managed extension-event hook; remove_hooks deletes this key",
-            "extensionEvents": {
-                "sessionEnd": [
-                    {
-                        "matcher": "starforge",
-                        "hooks": [
-                            { "type": "command", "command": "starforge hook session-end" }
-                        ]
-                    }
-                ]
-            }
-        });
-        match std::fs::read(&path) {
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                let mut obj = serde_json::Map::new();
-                obj.insert(MARKER.to_string(), fragment);
-                std::fs::write(
-                    &path,
-                    serde_json::to_string_pretty(&Value::Object(obj)).unwrap(),
-                )?;
-                Ok(vec![path])
-            }
-            Err(e) => Err(e),
-            Ok(bytes) => {
-                let mut body: Value = serde_json::from_slice(&bytes).map_err(|_| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("hook file is not valid JSON: {}", path.display()),
-                    )
-                })?;
-                let obj = body.as_object_mut().ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("hook file is not a JSON object: {}", path.display()),
-                    )
-                })?;
-                obj.insert(MARKER.to_string(), fragment);
-                std::fs::write(&path, serde_json::to_string_pretty(&body).unwrap())?;
-                Ok(vec![path])
-            }
-        }
+    /// No verified JSON-config hook surface for Pi/omp: no-op. Capture is
+    /// discovery-based (commit/push/sync).
+    fn install_hooks(&self, _roots: &Roots) -> io::Result<Vec<PathBuf>> {
+        Ok(vec![])
     }
 
-    /// Remove only the `starforge` key, preserving every unrelated key. An
-    /// emptied object deletes the file; a file without the key (or no file)
-    /// is left untouched and yields nothing.
+    /// Remove only the legacy hook file, and only when it carries the
+    /// starforge marker (top-level `starforge` key). The key is dropped,
+    /// preserving unrelated keys; an emptied object deletes the file.
     fn remove_hooks(&self, roots: &Roots) -> io::Result<Vec<PathBuf>> {
-        let path = roots.config_dir.join(HOOK_REL_PATH);
+        let path = roots.config_dir.join(LEGACY_HOOK_REL_PATH);
         let Ok(bytes) = std::fs::read(&path) else {
             return Ok(vec![]);
         };
@@ -473,51 +452,15 @@ impl Adapter for PiAdapter {
 
     fn discover(&self, roots: &Roots, known: &HashMap<String, Cursor>) -> Vec<Candidate> {
         let mut out = Vec::new();
-        // Pi store: flat `<data_dir>/sessions/*.jsonl`.
-        let sessions = roots.data_dir.join("sessions");
-        if sessions.is_dir() {
-            let Ok(files) = std::fs::read_dir(&sessions) else {
-                return out;
-            };
-            let mut files: Vec<_> = files
-                .flatten()
-                .map(|e| e.path())
-                .filter(|p| p.is_file() && p.extension().is_some_and(|x| x == "jsonl"))
-                .collect();
-            files.sort();
-            for native_path in files {
-                let session_key = native_path
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                let (workdir, version) = scan_identity(&native_path);
-                let workdir = workdir
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| roots.worktree.clone());
-                if !workdir_inside(&roots.worktree, &workdir) {
-                    continue;
-                }
-                if let Some(cursor) = known.get(&session_key)
-                    && let Ok(meta) = std::fs::metadata(&native_path)
-                    && meta.len() <= cursor.offset
-                {
-                    continue;
-                }
-                out.push(Candidate {
-                    session_key,
-                    native_path,
-                    agent_version: version.unwrap_or_default(),
-                    workdir,
-                });
+        // Both stores are recursive; session keys are the path relative to
+        // `data_dir` joined with `/` (stable and unique across stores).
+        for store in [".pi/agent/sessions", ".omp/agent/sessions"] {
+            let dir = roots.data_dir.join(store);
+            if !dir.is_dir() {
+                continue;
             }
-        }
-        // omp store: recursive `<data_dir>/omp/agent/sessions/**/*.jsonl`.
-        // omp versions are reported as `omp-<version>` (the store is the
-        // `<data_dir>/omp/agent/sessions/` layout, not the Pi flat layout).
-        let omp_sessions = roots.data_dir.join("omp/agent/sessions");
-        if omp_sessions.is_dir() {
             let mut files = Vec::new();
-            collect_jsonl(&omp_sessions, &mut files);
+            collect_jsonl(&dir, &mut files);
             for native_path in files {
                 let session_key = native_path
                     .strip_prefix(&roots.data_dir)
@@ -529,9 +472,11 @@ impl Adapter for PiAdapter {
                     })
                     .unwrap_or_default();
                 let (workdir, version) = scan_identity(&native_path);
-                let workdir = workdir
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| roots.worktree.clone());
+                // Privacy rule: unknown cwd (missing/empty) is skipped,
+                // never defaulted to this worktree.
+                let Some(workdir) = workdir.filter(|cwd| !cwd.is_empty()).map(PathBuf::from) else {
+                    continue;
+                };
                 if !workdir_inside(&roots.worktree, &workdir) {
                     continue;
                 }
