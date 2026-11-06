@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block title %}Settings · {{ handle }}{% endblock %}
+{% block content %}
+<h1><a href="/{{ handle }}">{{ handle }}</a></h1>
+<nav class="tabs" aria-label="Organization settings">
+  <a href="/{{ handle }}/settings" aria-current="page">General</a>
+  <a href="/{{ handle }}/settings/members">Members ({{ member_count }})</a>
+  <a href="/{{ handle }}/teams">Teams</a>
+</nav>
+{% if let Some(e) = error %}<p class="error">{{ e }}</p>{% endif %}
+<h2>General</h2>
+<form method="post" action="/{{ handle }}/settings" class="stack">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <label>Display name <input name="display_name" maxlength="100" value="{{ display_name }}"></label>
+  <label>Description <input name="description" maxlength="350" value="{{ description }}"></label>
+  <button type="submit">Save</button>
+</form>
+<h2>Base permission</h2>
+<p class="muted">Every member gets this permission on every repository of the organization.</p>
+<form method="post" action="/{{ handle }}/settings/base-permission" class="stack">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <fieldset>
+    <legend>Base permission</legend>
+    {% for c in base_choices %}<label class="check"><input type="radio" name="base_permission" value="{{ c.value }}"{% if c.selected %} checked{% endif %}> {{ c.label }}</label>
+    {% endfor %}
+  </fieldset>
+  <button type="submit">Change base permission</button>
+</form>
+<h2>Delete</h2>
+<form method="post" action="/{{ handle }}/settings/delete" class="stack">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <p>Deleting frees the handle <code>{{ handle }}</code>. It works only while the organization owns no repositories.</p>
+  <label>Type <code>{{ handle }}</code> to confirm <input name="confirm" required autocomplete="off"></label>
+  <button type="submit">Delete this organization</button>
+</form>
+{% endblock %}

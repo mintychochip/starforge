@@ -325,6 +325,51 @@ pub async fn rename(
     finish(&state, &session, &owner, &repo, result).await
 }
 
+#[derive(Deserialize)]
+pub struct TransferForm {
+    #[serde(rename = "_csrf")]
+    csrf: String,
+    #[serde(default)]
+    new_owner: String,
+}
+
+/// Moves the repository to another owner: the actor, or an org the actor
+/// owns. The old path keeps working through the rename redirect. Admins
+/// only; success lands on the repository's new home.
+pub async fn transfer(
+    State(state): State<AppState>,
+    RequireUser(session): RequireUser,
+    Path((owner, repo)): Path<(String, String)>,
+    Form(form): Form<TransferForm>,
+) -> Result<Response, WebError> {
+    verify_csrf(&session.csrf_token, &form.csrf)?;
+    if form.new_owner.trim().is_empty() {
+        let page = page(
+            &state,
+            &session,
+            &owner,
+            &repo,
+            Some("choose a new owner".into()),
+        )
+        .await?;
+        return Ok((StatusCode::UNPROCESSABLE_ENTITY, page).into_response());
+    }
+    match state
+        .core
+        .transfer_repo(&session.user, &owner, &repo, &form.new_owner)
+        .await
+    {
+        Ok(updated) => {
+            Ok(Redirect::to(&format!("/{}/{}", updated.owner, updated.name)).into_response())
+        }
+        Err(CoreError::Invalid(message) | CoreError::Conflict(message)) => {
+            let page = page(&state, &session, &owner, &repo, Some(message)).await?;
+            Ok((StatusCode::UNPROCESSABLE_ENTITY, page).into_response())
+        }
+        Err(other) => Err(other.into()),
+    }
+}
+
 pub async fn archive(
     State(state): State<AppState>,
     RequireUser(session): RequireUser,

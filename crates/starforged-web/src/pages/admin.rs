@@ -534,6 +534,48 @@ pub async fn repositories(
     })
 }
 
+/// One org row: the handle links to the org page; counts are live members
+/// and live repositories.
+pub struct OrgRow {
+    handle: String,
+    display_name: String,
+    member_count: i64,
+    repo_count: i64,
+}
+
+#[derive(Template, WebTemplate)]
+#[template(path = "admin_orgs.html")]
+pub struct OrgsPage {
+    nav_user: Option<NavUser>,
+    admin_tab: &'static str,
+    orgs: Vec<OrgRow>,
+}
+
+/// `/admin/orgs`: every org for site admins; anyone else gets 404 from
+/// [`RequireAdmin`] like every other admin page.
+pub async fn orgs(
+    State(state): State<AppState>,
+    RequireAdmin(session): RequireAdmin,
+) -> Result<OrgsPage, WebError> {
+    let orgs = state
+        .core
+        .org_summaries(&session.user)
+        .await?
+        .into_iter()
+        .map(|o| OrgRow {
+            handle: o.handle,
+            display_name: o.display_name,
+            member_count: o.member_count,
+            repo_count: o.repo_count,
+        })
+        .collect();
+    Ok(OrgsPage {
+        nav_user: Some(NavUser::from_session(&session)),
+        admin_tab: "orgs",
+        orgs,
+    })
+}
+
 pub async fn restore_repo(
     State(state): State<AppState>,
     RequireAdmin(session): RequireAdmin,

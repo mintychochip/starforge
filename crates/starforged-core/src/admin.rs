@@ -8,6 +8,7 @@ use crate::accounts::{CreateUser, User};
 use crate::permission::Visibility;
 use crate::repos::{RESTORE_SECS, Repo};
 use crate::{Core, CoreError, CoreResult};
+use starforged_db::orgs as db_orgs;
 use starforged_db::{jobs as db_jobs, now, repos as db_repos, users, web_sessions};
 
 /// A user plus how many live repositories they own, for the admin detail page.
@@ -26,6 +27,15 @@ pub struct AdminRepo {
     pub visibility: String,
     pub archived: bool,
     pub deleted_at: Option<i64>,
+}
+
+/// An org with its member and live-repository counts, for the site-admin org list.
+#[derive(Debug, Clone)]
+pub struct OrgSummary {
+    pub handle: String,
+    pub display_name: String,
+    pub member_count: i64,
+    pub repo_count: i64,
 }
 
 /// Site-wide counts plus the sign-up and mail configuration, for the admin overview page.
@@ -307,6 +317,22 @@ impl Core {
                 visibility: row.visibility,
                 archived: row.archived_at.is_some(),
                 deleted_at: row.deleted_at,
+            })
+            .collect())
+    }
+
+    /// Every org with its member and live-repository counts, ordered by
+    /// handle, for the site-admin org list (D9).
+    pub async fn org_summaries(&self, admin: &User) -> CoreResult<Vec<OrgSummary>> {
+        forbidden_unless_admin(admin)?;
+        Ok(db_orgs::summaries(self.db())
+            .await?
+            .into_iter()
+            .map(|row| OrgSummary {
+                handle: row.handle,
+                display_name: row.display_name,
+                member_count: row.member_count,
+                repo_count: row.repo_count,
             })
             .collect())
     }

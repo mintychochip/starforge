@@ -74,6 +74,10 @@ fn page_routes() -> Router<AppState> {
             "/new",
             get(pages::repo_new::form).post(pages::repo_new::submit),
         )
+        .route(
+            "/orgs/new",
+            get(pages::orgs::new_form).post(pages::orgs::create),
+        )
         .route("/settings", get(pages::settings::index))
         .route(
             "/settings/profile",
@@ -146,6 +150,7 @@ fn page_routes() -> Router<AppState> {
             post(pages::admin::revoke_invite),
         )
         .route("/admin/repositories", get(pages::admin::repositories))
+        .route("/admin/orgs", get(pages::admin::orgs))
         .route(
             "/admin/repositories/{id}/restore",
             post(pages::admin::restore_repo),
@@ -158,6 +163,48 @@ fn page_routes() -> Router<AppState> {
         .route("/admin/jobs/{id}/retry", post(pages::admin::retry_job))
         .route("/admin/jobs/{id}/delete", post(pages::admin::delete_job))
         .route("/{owner}", get(pages::owner::show))
+        .route(
+            "/{org}/settings",
+            get(pages::orgs::settings).post(pages::orgs::save_general),
+        )
+        .route(
+            "/{org}/settings/base-permission",
+            post(pages::orgs::save_base),
+        )
+        .route("/{org}/settings/delete", post(pages::orgs::delete))
+        .route("/{org}/members", get(pages::orgs::members))
+        .route(
+            "/{org}/settings/members",
+            get(pages::orgs::manage_members).post(pages::orgs::add_member),
+        )
+        .route(
+            "/{org}/settings/members/{handle}/remove",
+            post(pages::orgs::remove_member),
+        )
+        .route("/{org}/teams", get(pages::orgs::teams))
+        .route(
+            "/{org}/teams/new",
+            get(pages::orgs::new_team_form).post(pages::orgs::create_team),
+        )
+        .route("/{org}/teams/{team}", get(pages::orgs::team))
+        .route("/{org}/teams/{team}/settings", post(pages::orgs::save_team))
+        .route("/{org}/teams/{team}/delete", post(pages::orgs::delete_team))
+        .route(
+            "/{org}/teams/{team}/members",
+            post(pages::orgs::add_team_member),
+        )
+        .route(
+            "/{org}/teams/{team}/members/{handle}/remove",
+            post(pages::orgs::remove_team_member),
+        )
+        .route(
+            "/{org}/teams/{team}/repos",
+            post(pages::orgs::add_team_repo),
+        )
+        .route(
+            "/{org}/teams/{team}/repos/{repo}/remove",
+            post(pages::orgs::remove_team_repo),
+        )
         .route(
             "/{owner}/{repo}/settings",
             get(pages::repo_settings::show).post(pages::repo_settings::save_general),
@@ -205,6 +252,10 @@ fn page_routes() -> Router<AppState> {
         .route(
             "/{owner}/{repo}/settings/rename",
             post(pages::repo_settings::rename),
+        )
+        .route(
+            "/{owner}/{repo}/settings/transfer",
+            post(pages::repo_settings::transfer),
         )
         .route(
             "/{owner}/{repo}/settings/archive",

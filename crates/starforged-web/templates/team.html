@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+{% block title %}{{ name }} · {{ handle }}{% endblock %}
+{% block content %}
+<h1><a href="/{{ handle }}">{{ handle }}</a> / {{ name }}</h1>
+{% if !description.is_empty() %}<p>{{ description }}</p>{% endif %}
+<p class="muted">Permission: {{ permission }} · {% if all_repos %}all repositories{% else %}selected repositories{% endif %}</p>
+{% if let Some(e) = error %}<p class="error">{{ e }}</p>{% endif %}
+<h2>Members</h2>
+{% if members.is_empty() %}
+<p class="muted">No members yet.</p>
+{% else %}
+<table class="list">
+<thead><tr><th>User</th>{% if can_manage %}<th></th>{% endif %}</tr></thead>
+<tbody>
+{% for m in members %}
+<tr><td><a href="/{{ m.handle }}">{{ m.handle }}</a> <span class="muted">{{ m.display_name }}</span></td>
+{% if can_manage %}<td><form method="post" action="/{{ handle }}/teams/{{ slug }}/members/{{ m.handle }}/remove" class="inline"><input type="hidden" name="_csrf" value="{{ csrf }}"><button type="submit">Remove</button></form></td>{% endif %}</tr>
+{% endfor %}
+</tbody>
+</table>
+{% endif %}
+{% if can_manage %}
+<form method="post" action="/{{ handle }}/teams/{{ slug }}/members" class="stack">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <label>Handle <input name="handle" required></label>
+  <button type="submit">Add member</button>
+</form>
+{% endif %}
+<h2>Repositories</h2>
+{% if repos.is_empty() %}
+<p class="muted">{% if all_repos %}This team covers every repository of the organization.{% else %}No repositories yet.{% endif %}</p>
+{% else %}
+<ul class="repo-list">
+{% for r in repos %}
+<li><a href="/{{ handle }}/{{ r.name }}">{{ r.name }}</a>{% if can_manage %} <form method="post" action="/{{ handle }}/teams/{{ slug }}/repos/{{ r.name }}/remove" class="inline"><input type="hidden" name="_csrf" value="{{ csrf }}"><button type="submit">Remove</button></form>{% endif %}</li>
+{% endfor %}
+</ul>
+{% endif %}
+{% if can_manage %}
+{% if !all_repos %}
+<form method="post" action="/{{ handle }}/teams/{{ slug }}/repos" class="stack">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <label>Repository <input name="repo" required></label>
+  <button type="submit">Add repository</button>
+</form>
+{% endif %}
+<h2>Settings</h2>
+<form method="post" action="/{{ handle }}/teams/{{ slug }}/settings" class="stack">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <label>Name <input name="name" required maxlength="64" value="{{ name }}"></label>
+  <label>Description <input name="description" maxlength="350" value="{{ description }}"></label>
+  <label>Permission <select name="permission">{% for c in permission_choices %}<option value="{{ c.value }}"{% if c.selected %} selected{% endif %}>{{ c.value }}</option>{% endfor %}</select></label>
+  <label class="check"><input type="checkbox" name="all_repos" value="on"{% if all_repos %} checked{% endif %}> Grant on all repositories of the organization</label>
+  <button type="submit">Save</button>
+</form>
+<h2>Delete</h2>
+<form method="post" action="/{{ handle }}/teams/{{ slug }}/delete" class="stack">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <p>Memberships and repository links go with the team.</p>
+  <label>Type <code>{{ slug }}</code> to confirm <input name="confirm" required autocomplete="off"></label>
+  <button type="submit">Delete this team</button>
+</form>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %}Organizations · Site administration{% endblock %}
+{% block content %}
+<h1>Site administration</h1>
+{% include "admin_nav.html" %}
+<section>
+  <h2>Organizations</h2>
+  {% if orgs.is_empty() %}
+  <p>No organizations.</p>
+  {% else %}
+  <table>
+    <thead>
+      <tr><th>Organization</th><th>Members</th><th>Repositories</th></tr>
+    </thead>
+    <tbody>
+      {% for o in orgs %}
+      <tr>
+        <td><a href="/{{ o.handle }}">{{ o.handle }}</a>{% if !o.display_name.is_empty() %} <span class="muted">{{ o.display_name }}</span>{% endif %}</td>
+        <td>{{ o.member_count }}</td>
+        <td>{{ o.repo_count }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+</section>
+{% endblock %}

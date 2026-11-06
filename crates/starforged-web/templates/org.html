@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block title %}{{ display_name }} · Starforge{% endblock %}
+{% block content %}
+<h1>{{ display_name }}</h1>
+<p class="muted">@{{ handle }}</p>
+{% if !description.is_empty() %}<p>{{ description }}</p>{% endif %}
+{% if is_member %}
+<nav class="tabs" aria-label="Organization">
+  <a href="/{{ handle }}/members">Members{% if let Some(n) = member_count %} ({{ n }}){% endif %}</a>
+  <a href="/{{ handle }}/teams">Teams</a>
+  {% if is_owner %}<a href="/{{ handle }}/settings">Settings</a>{% endif %}
+</nav>
+{% if let Some(base) = base_permission %}<p class="muted">Base permission: {{ base }}</p>{% endif %}
+{% endif %}
+<h2>Repositories</h2>
+{% if repos.is_empty() %}
+<p class="muted">No repositories to show.</p>
+{% else %}
+<ul class="repo-list">
+{% for r in repos %}
+<li><a href="/{{ r.owner }}/{{ r.name }}">{{ r.name }}</a> <span class="badge">{{ r.visibility }}</span>{% if !r.description.is_empty() %} <span class="muted">{{ r.description }}</span>{% endif %}</li>
+{% endfor %}
+</ul>
+{% endif %}
+{% endblock %}

@@ -423,6 +423,15 @@ impl Core {
         .await
     }
 
+    /// Handles of orgs where `user` is an owner, ordered by handle: the
+    /// new-repository owner selector. Suspended users own nothing new.
+    pub async fn owned_orgs(&self, user: &User) -> CoreResult<Vec<String>> {
+        if !user.active {
+            return Ok(Vec::new());
+        }
+        Ok(db_orgs::owned_by(self.db(), user.id).await?)
+    }
+
     /// The viewer's org role, if any. Unknown orgs are `None` (callers that
     /// need 404 check existence first).
     pub(crate) async fn org_role(&self, org_id: i64, user_id: i64) -> CoreResult<Option<OrgRole>> {

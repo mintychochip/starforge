@@ -12,6 +12,7 @@ pub mod history;
 pub mod join;
 pub mod login;
 pub mod message;
+pub mod orgs;
 pub mod owner;
 pub mod password;
 pub mod refs;

@@ -713,3 +713,46 @@ pub async fn repo_name_taken_by_other(db: &Db, org_id: i64, lower_name: &str) ->
     .await?;
     Ok(count > 0)
 }
+
+/// Handles of orgs where `user_id` is an owner, ordered by handle: the
+/// new-repository owner selector.
+pub async fn owned_by(db: &Db, user_id: i64) -> DbResult<Vec<String>> {
+    Ok(sqlx::query_scalar(
+        "SELECT o.handle FROM org_members m JOIN owners o ON o.id = m.org_id \
+         WHERE m.user_id = $1 AND m.role = 'owner' ORDER BY o.handle",
+    )
+    .bind(user_id)
+    .fetch_all(db.pool())
+    .await?)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrgSummaryRow {
+    pub handle: String,
+    pub display_name: String,
+    pub member_count: i64,
+    pub repo_count: i64,
+}
+
+/// Every org with its member and live-repository counts, ordered by handle,
+/// for the site-admin org list.
+pub async fn summaries(db: &Db) -> DbResult<Vec<OrgSummaryRow>> {
+    let rows = sqlx::query(
+        "SELECT o.handle, g.display_name, \
+         (SELECT COUNT(*) FROM org_members m WHERE m.org_id = o.id) AS member_count, \
+         (SELECT COUNT(*) FROM repos r WHERE r.owner_id = o.id AND r.deleted_at IS NULL) AS repo_count \
+         FROM orgs g JOIN owners o ON o.id = g.id ORDER BY o.handle",
+    )
+    .fetch_all(db.pool())
+    .await?;
+    rows.iter()
+        .map(|row| {
+            Ok(OrgSummaryRow {
+                handle: row.try_get("handle")?,
+                display_name: row.try_get("display_name")?,
+                member_count: row.try_get("member_count")?,
+                repo_count: row.try_get("repo_count")?,
+            })
+        })
+        .collect()
+}

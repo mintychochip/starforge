@@ -81,6 +81,13 @@
   <p class="muted">Links, clones, and API calls that use the old name are redirected to the new one.</p>
   <button type="submit">Rename</button>
 </form>
+<h2>Transfer</h2>
+<form method="post" action="/{{ head.owner }}/{{ head.name }}/settings/transfer" class="stack">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <label>New owner <input name="new_owner" required maxlength="39" placeholder="you or an organization you own"></label>
+  <p class="muted">Moves the repository to another owner. Links, clones, and API calls that use the old path are redirected to the new one.</p>
+  <button type="submit">Transfer</button>
+</form>
 <h2>Archive</h2>
 {% if head.archived %}
 <form method="post" action="/{{ head.owner }}/{{ head.name }}/settings/unarchive" class="stack">

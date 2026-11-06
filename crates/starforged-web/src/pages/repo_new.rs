@@ -19,6 +19,9 @@ use crate::views::NavUser;
 pub struct NewRepoForm {
     #[serde(rename = "_csrf")]
     csrf: String,
+    /// The owner handle: the user or an org they own. Empty means the user.
+    #[serde(default)]
+    owner: String,
     name: String,
     #[serde(default)]
     description: String,
@@ -28,29 +31,50 @@ pub struct NewRepoForm {
     readme: Option<String>,
 }
 
+pub struct OwnerOption {
+    value: String,
+    selected: bool,
+}
+
 #[derive(Template, WebTemplate)]
 #[template(path = "repo_new.html")]
 pub struct RepoNewPage {
     nav_user: Option<NavUser>,
     csrf: String,
-    owner: String,
+    owners: Vec<OwnerOption>,
     name: String,
     description: String,
     readme: bool,
     error: Option<String>,
 }
 
-fn page(
+async fn page(
+    state: &AppState,
     session: &WebSession,
+    owner: String,
     name: String,
     description: String,
     readme: bool,
     error: Option<String>,
 ) -> RepoNewPage {
+    let mut owners = vec![OwnerOption {
+        selected: owner == session.user.handle,
+        value: session.user.handle.clone(),
+    }];
+    // `create_repo` rechecks ownership at submit; a failed lookup here only
+    // hides the selector options, never grants anything.
+    if let Ok(orgs) = state.core.owned_orgs(&session.user).await {
+        for handle in orgs {
+            owners.push(OwnerOption {
+                selected: owner == handle,
+                value: handle,
+            });
+        }
+    }
     RepoNewPage {
         nav_user: Some(NavUser::from_session(session)),
         csrf: session.csrf_token.clone(),
-        owner: session.user.handle.clone(),
+        owners,
         name,
         description,
         readme,
@@ -58,8 +82,18 @@ fn page(
     }
 }
 
-pub async fn form(RequireUser(session): RequireUser) -> RepoNewPage {
-    page(&session, String::new(), String::new(), false, None)
+pub async fn form(State(state): State<AppState>, RequireUser(session): RequireUser) -> RepoNewPage {
+    let owner = session.user.handle.clone();
+    page(
+        &state,
+        &session,
+        owner,
+        String::new(),
+        String::new(),
+        false,
+        None,
+    )
+    .await
 }
 
 pub async fn submit(
@@ -68,6 +102,11 @@ pub async fn submit(
     Form(form): Form<NewRepoForm>,
 ) -> Result<Response, WebError> {
     verify_csrf(&session.csrf_token, &form.csrf)?;
+    let owner = if form.owner.trim().is_empty() {
+        session.user.handle.clone()
+    } else {
+        form.owner.trim().to_ascii_lowercase()
+    };
     let visibility = Visibility::parse(&form.visibility)
         .ok_or_else(|| WebError::BadRequest("unknown visibility".into()))?;
     let readme = form.readme.is_some();
@@ -77,14 +116,19 @@ pub async fn submit(
         visibility,
         readme,
     };
-    match state
-        .core
-        .create_repo(&session.user, &session.user.handle, input)
-        .await
-    {
+    match state.core.create_repo(&session.user, &owner, input).await {
         Ok(repo) => Ok(Redirect::to(&format!("/{}/{}", repo.owner, repo.name)).into_response()),
         Err(CoreError::Invalid(message) | CoreError::Conflict(message)) => {
-            let page = page(&session, form.name, form.description, readme, Some(message));
+            let page = page(
+                &state,
+                &session,
+                owner,
+                form.name,
+                form.description,
+                readme,
+                Some(message),
+            )
+            .await;
             Ok((StatusCode::UNPROCESSABLE_ENTITY, page).into_response())
         }
         Err(other) => Err(other.into()),
