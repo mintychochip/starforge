@@ -4,12 +4,14 @@ use std::path::Path;
 
 use starforged_db::collaborators;
 use starforged_db::now;
+use starforged_db::orgs as db_orgs;
 use starforged_db::redirects;
 use starforged_db::repos::{self as db_repos, NewRepo, RepoRow};
 use starforged_git::write::Identity;
 
 use crate::accounts::User;
-use crate::permission::{self, Permission, Viewer, Visibility};
+use crate::orgs::base_grant;
+use crate::permission::{self, CollectedGrants, Permission, Viewer, Visibility};
 use crate::{Core, CoreError, CoreResult, validate};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -266,30 +268,62 @@ impl Core {
         Ok(access)
     }
 
-    pub async fn permission_on(
+    /// Gathers every grant source for `repo` and `user` (D4): the org base
+    /// permission and membership role when the owner is an org (one query),
+    /// the collaborator grant when signed in (one query), and the covering
+    /// team grants (A2; none today). Suspended users are anonymous.
+    pub async fn grants_for(
         &self,
         repo: &Repo,
         user: Option<&User>,
-    ) -> CoreResult<Option<Permission>> {
+    ) -> CoreResult<CollectedGrants> {
         let v = viewer(user);
-        let collaborator = match v {
-            Some(v) => collaborators::permission(self.db(), repo.id, v.user_id)
+        let user_id = v.map(|v| v.user_id);
+        let org =
+            db_orgs::grant_for_repo_owner(self.db(), repo.owner_id, user_id.unwrap_or(0)).await?;
+        let (org_owner, org_base) = match &org {
+            Some((base, role)) => (
+                role.as_deref() == Some("owner"),
+                match role.as_deref() {
+                    Some(_) => base_grant(base),
+                    None => None,
+                },
+            ),
+            None => (false, None),
+        };
+        let collaborator = match user_id {
+            Some(id) => collaborators::permission(self.db(), repo.id, id)
                 .await?
                 .as_deref()
                 .and_then(Permission::parse),
             None => None,
         };
-        Ok(permission::effective(
-            repo.owner_id,
-            repo.visibility,
-            v,
+        Ok(CollectedGrants {
+            site_admin: v.map(|v| v.is_admin).unwrap_or(false),
+            user_owner: org.is_none() && user_id == Some(repo.owner_id),
+            org_owner,
+            org_base,
+            teams: Vec::new(),
             collaborator,
+            visibility: repo.visibility,
+            signed_in: v.is_some(),
+        })
+    }
+
+    pub async fn permission_on(
+        &self,
+        repo: &Repo,
+        user: Option<&User>,
+    ) -> CoreResult<Option<Permission>> {
+        Ok(permission::effective(
+            &self.grants_for(repo, user).await?.as_grants(),
         ))
     }
 
     /// Repositories of `owner` that `user` can read, by name. `NotFound` when the owner does not exist.
+    /// Owners are users and orgs alike: the handle namespace is shared (D1).
     pub async fn repos_of(&self, user: Option<&User>, owner: &str) -> CoreResult<Vec<Repo>> {
-        let owner_row = starforged_db::users::by_handle(self.db(), &owner.to_ascii_lowercase())
+        let owner_row = db_orgs::owner_by_handle(self.db(), &owner.to_ascii_lowercase())
             .await?
             .ok_or(CoreError::NotFound)?;
         let mut visible = Vec::new();

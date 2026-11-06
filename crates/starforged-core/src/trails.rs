@@ -1227,12 +1227,8 @@ impl Core {
         let session = db_sessions::session_by_ulid(self.db(), access.repo.id, ulid)
             .await?
             .ok_or(CoreError::NotFound)?;
-        // Suspended users are anonymous, mirroring `authorize_session_read`.
-        let viewer = user.active.then_some(Viewer {
-            user_id: user.id,
-            is_admin: user.is_admin,
-        });
-        self.authorize_session_read(viewer, &access.repo, &session)
+        // Suspended users are anonymous inside `authorize_session_read`.
+        self.authorize_session_read(Some(user), &access.repo, &session)
             .await?;
         let triage = access.permission >= Permission::Triage;
         let own_upload = row.author_id == Some(user.id) && session.uploader_id == user.id;
@@ -1290,11 +1286,7 @@ impl Core {
         let session = db_sessions::session_by_ulid(self.db(), access.repo.id, ulid)
             .await?
             .ok_or(CoreError::NotFound)?;
-        let viewer = user.active.then_some(Viewer {
-            user_id: user.id,
-            is_admin: user.is_admin,
-        });
-        self.authorize_session_read(viewer, &access.repo, &session)
+        self.authorize_session_read(Some(user), &access.repo, &session)
             .await?;
         let triage = access.permission >= Permission::Triage;
         let own_upload = row.author_id == Some(user.id) && session.uploader_id == user.id;

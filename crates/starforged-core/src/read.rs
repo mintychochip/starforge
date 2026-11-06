@@ -6,14 +6,12 @@
 
 use starforge_format::{Event, decompress_bounded, parse_event};
 use starforge_redact::redact_event;
-use starforged_db::{
-    collaborators, repos as db_repos, sessions as db_sessions, sessions::SessionRow,
-};
+use starforged_db::{repos as db_repos, sessions as db_sessions, sessions::SessionRow};
 
 use crate::{
     Core, CoreError, CoreResult,
     accounts::User,
-    permission::{Permission, Viewer, effective},
+    permission::{self, Permission, Viewer, effective},
     repos::{Repo, RepoAccess},
 };
 
@@ -40,51 +38,50 @@ pub struct SessionPage {
 }
 
 impl Core {
-    /// Whether `user_id` holds an explicit grant on the repository: ownership or a
-    /// collaborator row. Implicit public/internal read does not count.
-    ///
-    /// Team grants and org base permissions do not exist yet (orgs are M3); only
-    /// what exists today is counted.
+    /// Whether an explicit grant exists on the repository (D4): user or org
+    /// ownership, an org base permission, a covering team grant, or a
+    /// collaborator grant. Implicit public/internal read does not count.
     pub async fn is_repo_member(&self, repo_id: i64, user_id: i64) -> CoreResult<bool> {
         let row = db_repos::by_id(self.db(), repo_id)
             .await?
             .ok_or(CoreError::NotFound)?;
-        if row.owner_id == user_id {
-            return Ok(true);
-        }
-        Ok(collaborators::permission(self.db(), repo_id, user_id)
-            .await?
-            .is_some())
+        let repo = crate::repos::to_repo(row)?;
+        let user = self.user_by_id(user_id).await?;
+        let Some(user) = user else {
+            return Ok(false);
+        };
+        Ok(permission::is_member(
+            &self.grants_for(&repo, Some(&user)).await?.as_grants(),
+        ))
     }
 
     /// The read-rule check over already-loaded rows. The caller must have
     /// established repo readability separately (or use
     /// [`Core::authorize_session_read_by_ulid`], which does); a viewer with no
-    /// effective repo permission is denied (row 1).
+    /// effective repo permission is denied (row 1). Suspended users are
+    /// anonymous.
     pub async fn authorize_session_read(
         &self,
-        viewer: Option<Viewer>,
+        user: Option<&User>,
         repo: &Repo,
         session: &SessionRow,
     ) -> CoreResult<()> {
         if session.repo_id != repo.id {
             return Err(CoreError::NotFound);
         }
-        // The collaborator lookup below serves both the effective-permission
-        // check and membership, so no separate `is_repo_member` query is
-        // needed here; that helper exists for callers holding only ids.
-        let collaborator = match viewer {
-            Some(v) => collaborators::permission(self.db(), repo.id, v.user_id)
-                .await?
-                .as_deref()
-                .and_then(Permission::parse),
-            None => None,
-        };
+        let active = user.filter(|u| u.active);
+        // The grant lookup below serves both the effective-permission check
+        // and membership, so no separate `is_repo_member` query is needed
+        // here; that helper exists for callers holding only ids.
+        let collected = self.grants_for(repo, active).await?;
+        let grants = collected.as_grants();
         // Row 1: no effective read → 404 (not 403, so ULIDs stay undiscoverable).
-        let permission = effective(repo.owner_id, repo.visibility, viewer, collaborator)
-            .ok_or(CoreError::NotFound)?;
-        let is_owner = viewer.map(|v| v.user_id == repo.owner_id).unwrap_or(false);
-        let is_member = is_owner || collaborator.is_some();
+        let permission = effective(&grants).ok_or(CoreError::NotFound)?;
+        let viewer = active.map(|u| Viewer {
+            user_id: u.id,
+            is_admin: u.is_admin,
+        });
+        let is_member = permission::is_member(&grants);
         let is_admin = permission >= Permission::Admin;
         if can_read_session(viewer, repo, session, is_member, is_admin) {
             Ok(())
@@ -108,12 +105,7 @@ impl Core {
         let session = db_sessions::session_by_ulid(self.db(), access.repo.id, ulid)
             .await?
             .ok_or(CoreError::NotFound)?;
-        // Suspended users are anonymous, mirroring `permission_on`.
-        let viewer = user.filter(|u| u.active).map(|u| Viewer {
-            user_id: u.id,
-            is_admin: u.is_admin,
-        });
-        self.authorize_session_read(viewer, &access.repo, &session)
+        self.authorize_session_read(user, &access.repo, &session)
             .await?;
         Ok((access, session))
     }
@@ -143,10 +135,7 @@ impl Core {
     /// are not a member of (rule 2) never appear. Suspended users are
     /// anonymous and see nothing.
     pub async fn recent_sessions_for(&self, user: &User) -> CoreResult<Vec<SessionSummary>> {
-        let viewer = user.active.then_some(Viewer {
-            user_id: user.id,
-            is_admin: user.is_admin,
-        });
+        let viewer = user.active.then_some(user);
         let mut out = Vec::new();
         for session in
             db_sessions::sessions_uploaded_by(self.db(), user.id, DASHBOARD_SESSION_CANDIDATES)
@@ -357,21 +346,13 @@ impl Core {
         links: Vec<db_sessions::CommitLinkRow>,
     ) -> CoreResult<Vec<(db_sessions::CommitLinkRow, SessionRow)>> {
         // Mirror `authorize_session_read_by_ulid`: suspended users are anonymous.
-        let viewer_opt = viewer.filter(|u| u.active).map(|u| Viewer {
+        let active = viewer.filter(|u| u.active);
+        let grants = self.grants_for(&access.repo, active).await?;
+        let viewer_opt = active.map(|u| Viewer {
             user_id: u.id,
             is_admin: u.is_admin,
         });
-        let collaborator = match viewer_opt {
-            Some(v) => collaborators::permission(self.db(), access.repo.id, v.user_id)
-                .await?
-                .as_deref()
-                .and_then(Permission::parse),
-            None => None,
-        };
-        let is_owner = viewer_opt
-            .map(|v| v.user_id == access.repo.owner_id)
-            .unwrap_or(false);
-        let is_member = is_owner || collaborator.is_some();
+        let is_member = permission::is_member(&grants.as_grants());
         let is_admin = access.permission >= Permission::Admin;
         let mut out = Vec::new();
         for link in links {
@@ -925,8 +906,12 @@ mod tests {
             repo: &Repo,
             session: &SessionRow,
         ) -> Result<(), CoreError> {
+            let user = match viewer {
+                Some(v) => self.core.user_by_id(v.user_id).await.unwrap(),
+                None => None,
+            };
             self.core
-                .authorize_session_read(viewer, repo, session)
+                .authorize_session_read(user.as_ref(), repo, session)
                 .await
         }
     }

@@ -6,6 +6,7 @@ pub mod error;
 mod gate_rules;
 mod moved;
 mod oauth;
+mod orgs;
 mod repos;
 mod sessions;
 mod statuses;
@@ -50,6 +51,17 @@ pub fn router(core: Core, base_url: String) -> Router {
     Router::new()
         .route("/user", get(user::show))
         .route("/user/repos", post(repos::create))
+        .route("/orgs", post(orgs::create))
+        .route(
+            "/orgs/{org}",
+            get(orgs::show).patch(orgs::patch).delete(orgs::delete),
+        )
+        .route("/orgs/{org}/repos", get(orgs::list_repos))
+        .route("/orgs/{org}/members", get(orgs::list_members))
+        .route(
+            "/orgs/{org}/members/{handle}",
+            put(orgs::set_member).delete(orgs::remove_member),
+        )
         .route("/oauth/device/code", post(oauth::device_code))
         .route("/oauth/token", post(oauth::token))
         .route(

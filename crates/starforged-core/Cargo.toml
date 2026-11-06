@@ -39,6 +39,7 @@ ulid.workspace = true
 testing = []
 
 [dev-dependencies]
+proptest.workspace = true
 sqlx.workspace = true
 starforged-db = { path = "../starforged-db", features = ["testing"] }
 tempfile.workspace = true

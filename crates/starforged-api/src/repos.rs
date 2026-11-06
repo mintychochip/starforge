@@ -12,7 +12,7 @@ use crate::auth::ApiAuth;
 use crate::error::ApiError;
 
 #[derive(Serialize)]
-pub struct RepoJson {
+pub(crate) struct RepoJson {
     id: i64,
     owner: String,
     name: String,
@@ -26,7 +26,7 @@ pub struct RepoJson {
     created_at: i64,
 }
 
-fn repo_json(state: &ApiState, access: RepoAccess) -> RepoJson {
+pub(crate) fn repo_json(state: &ApiState, access: RepoAccess) -> RepoJson {
     let repo = access.repo;
     RepoJson {
         clone_url: format!("{}/{}/{}.git", state.base_url, repo.owner, repo.name),

@@ -20,6 +20,7 @@ pub mod jobs;
 pub mod mail;
 pub mod merge;
 pub mod oauth;
+pub mod orgs;
 pub mod passwords;
 pub mod permission;
 pub mod quota;

@@ -21,6 +21,7 @@ pub mod email_tokens;
 pub mod invites;
 pub mod jobs;
 pub mod oauth;
+pub mod orgs;
 pub mod redirects;
 pub mod repos;
 pub mod sessions;

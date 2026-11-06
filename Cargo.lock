@@ -4480,6 +4480,7 @@ dependencies = [
  "hex",
  "lettre",
  "percent-encoding",
+ "proptest",
  "reqwest",
  "ring",
  "serde",
