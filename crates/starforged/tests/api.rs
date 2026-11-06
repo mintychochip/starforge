@@ -391,3 +391,88 @@ async fn repo_transfer_rejects_bad_targets_and_non_admins() {
         .unwrap();
     assert_eq!(ghost.status(), 404);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repo_transfer_denies_site_admin_without_target_rights() {
+    let s = TestServer::start().await;
+    let alice = s.user("alice").await;
+    s.user("bob").await;
+    let root = s
+        .core
+        .create_user(starforged_core::accounts::CreateUser {
+            handle: "root".into(),
+            password: Some(common::PASSWORD.into()),
+            is_admin: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let alice_t = s.token(&alice, &[Scope::RepoWrite]).await;
+    let root_t = s.token(&root, &[Scope::RepoWrite]).await;
+    let client = reqwest::Client::new();
+    let api = |path: &str| s.url(&format!("/api/v1{path}"));
+
+    let res = client
+        .post(api("/orgs"))
+        .bearer_auth(&alice_t)
+        .json(&json!({"handle": "acme"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 201);
+    let res = client
+        .post(api("/user/repos"))
+        .bearer_auth(&alice_t)
+        .json(&json!({"name": "proj", "visibility": "private"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 201);
+
+    // Root is a repo admin through site administration, but owns neither
+    // the org nor bob's namespace: both targets are 403 (D6).
+    let foreign_org = client
+        .post(api("/repos/alice/proj/transfer"))
+        .bearer_auth(&root_t)
+        .json(&json!({"new_owner": "acme"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(foreign_org.status(), 403, "site admin into unowned org");
+    let foreign_user = client
+        .post(api("/repos/alice/proj/transfer"))
+        .bearer_auth(&root_t)
+        .json(&json!({"new_owner": "bob"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(foreign_user.status(), 403, "site admin into another user");
+
+    // A site admin transferring to themselves or their own org still works.
+    let res = client
+        .post(api("/orgs"))
+        .bearer_auth(&root_t)
+        .json(&json!({"handle": "rootorg"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 201);
+    let res = client
+        .post(api("/user/repos"))
+        .bearer_auth(&root_t)
+        .json(&json!({"name": "mine", "visibility": "private"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 201);
+    let moved = client
+        .post(api("/repos/root/mine/transfer"))
+        .bearer_auth(&root_t)
+        .json(&json!({"new_owner": "rootorg"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(moved.status(), 200, "site admin into own org");
+    let body: Value = moved.json().await.unwrap();
+    assert_eq!(body["full_name"], "rootorg/mine");
+}

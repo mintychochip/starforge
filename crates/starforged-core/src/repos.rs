@@ -170,17 +170,23 @@ impl Core {
             visibility: input.visibility.as_str(),
             default_branch: "main",
         };
-        let insert = if in_org {
-            db_repos::insert_org_repo(self.db(), owner_id, &new).await
-        } else {
-            db_repos::insert(self.db(), &new).await
-        };
-        let id = match insert {
-            Ok(id) => id,
-            Err(e) if e.is_unique_violation() => {
-                return Err(self.name_taken(owner_id, owner.trim(), &name).await);
+        let id = if in_org {
+            match db_repos::insert_org_repo(self.db(), owner_id, &new).await {
+                Ok(Some(id)) => id,
+                Ok(None) => return Err(CoreError::NotFound),
+                Err(e) if e.is_unique_violation() => {
+                    return Err(self.name_taken(owner_id, owner.trim(), &name).await);
+                }
+                Err(e) => return Err(e.into()),
             }
-            Err(e) => return Err(e.into()),
+        } else {
+            match db_repos::insert(self.db(), &new).await {
+                Ok(id) => id,
+                Err(e) if e.is_unique_violation() => {
+                    return Err(self.name_taken(owner_id, owner.trim(), &name).await);
+                }
+                Err(e) => return Err(e.into()),
+            }
         };
         let path = self.repo_path(id);
         if let Err(err) = self
@@ -597,11 +603,12 @@ impl Core {
 
     /// Admins: moves the repository to another owner (D6, §8.5). Allowed when
     /// the actor is a repo admin and may create repositories under the new
-    /// owner: the actor, or an org the actor owns (site admins may move
-    /// anywhere). The old `<owner>/<repo>` path redirects to the new one,
-    /// the old org's team links drop, collaborators stay, and one
-    /// `repo.transfer` audit row records the move. Archived repositories
-    /// may be transferred; the name must be free at the target (422).
+    /// owner: the actor, or an org the actor owns (D6 — no site-admin
+    /// bypass, matching org repository creation). The old `<owner>/<repo>`
+    /// path redirects to the new one, the old org's team links drop,
+    /// collaborators stay, and one `repo.transfer` audit row records the
+    /// move. Archived repositories may be transferred; the name must be free
+    /// at the target (422).
     pub async fn transfer_repo(
         &self,
         actor: &User,
@@ -620,9 +627,9 @@ impl Core {
             if !actor.active {
                 return Err(CoreError::Forbidden);
             }
-            self.org_role(target.id, actor.id).await? == Some(OrgRole::Owner) || actor.is_admin
+            self.org_role(target.id, actor.id).await? == Some(OrgRole::Owner)
         } else {
-            target.id == actor.id || actor.is_admin
+            target.id == actor.id
         };
         if !newcomer {
             return Err(CoreError::Forbidden);

@@ -1334,3 +1334,49 @@ async fn racing_team_renames_conflict_as_422() {
         "one team owns the slug: {teams:?}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_org_vs_create_repo_never_500s() {
+    let s = TestServer::start().await;
+    s.user("alice").await;
+    let alice = s.core.user_by_handle("alice").await.unwrap().unwrap();
+    for i in 0..10 {
+        let org = format!("race{i}");
+        s.core
+            .create_org(
+                &alice,
+                starforged_core::orgs::NewOrgInput {
+                    handle: org.clone(),
+                    display_name: org.clone(),
+                    description: String::new(),
+                },
+            )
+            .await
+            .unwrap();
+        // A deletion that commits first (or while blocked on the per-org
+        // lock) turns the create's lock into a no-op: the create must 404,
+        // never 500 on the `owner_id` foreign key.
+        let (del, mk) = tokio::join!(
+            s.core.delete_org(&alice, &org),
+            s.core.create_repo(
+                &alice,
+                &org,
+                starforged_core::repos::CreateRepo {
+                    name: "proj".into(),
+                    description: String::new(),
+                    visibility: starforged_core::permission::Visibility::Private,
+                    readme: false,
+                },
+            ),
+        );
+        assert!(
+            !matches!(del, Err(starforged_core::CoreError::Internal(_))),
+            "round {i}: delete never 500s: {del:?}"
+        );
+        assert!(
+            !matches!(mk, Err(starforged_core::CoreError::Internal(_))),
+            "round {i}: create never 500s: {mk:?}"
+        );
+        assert!(del.is_ok() ^ mk.is_ok(), "round {i}: exactly one wins");
+    }
+}

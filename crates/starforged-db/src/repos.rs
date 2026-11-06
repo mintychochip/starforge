@@ -63,13 +63,22 @@ pub async fn insert(db: &Db, repo: &NewRepo<'_>) -> DbResult<i64> {
 }
 
 /// Inserts a repository owned by an org behind the per-org lock, so a racing
-/// org deletion cannot slip it into a namespace being removed.
-pub async fn insert_org_repo(db: &Db, org_id: i64, repo: &NewRepo<'_>) -> DbResult<i64> {
+/// org deletion cannot slip it into a namespace being removed. When the org
+/// row is gone (a deletion committed first, or while blocked on the lock),
+/// returns `None` instead of hitting the `owner_id` foreign key as a 500.
+pub async fn insert_org_repo(db: &Db, org_id: i64, repo: &NewRepo<'_>) -> DbResult<Option<i64>> {
     let mut tx = db.pool().begin().await?;
     crate::orgs::lock_org(&mut tx, org_id).await?;
+    let kept: Option<i64> = sqlx::query_scalar("SELECT id FROM orgs WHERE id = $1")
+        .bind(org_id)
+        .fetch_optional(tx.as_mut())
+        .await?;
+    if kept.is_none() {
+        return Ok(None);
+    }
     let id = insert_in(&mut tx, repo).await?;
     tx.commit().await?;
-    Ok(id)
+    Ok(Some(id))
 }
 
 async fn insert_in(tx: &mut sqlx::Transaction<'_, sqlx::Any>, repo: &NewRepo<'_>) -> DbResult<i64> {
@@ -269,7 +278,7 @@ pub enum TransferOutcome {
     },
     /// The new owner already has a live repository with this name.
     Clash,
-    /// The repository is gone.
+    /// The repository is gone — or the new owner vanished mid-transaction.
     Gone,
 }
 
@@ -304,6 +313,16 @@ pub async fn transfer(db: &Db, id: i64, new_owner_id: i64) -> DbResult<TransferO
         old_owner_id.max(new_owner_id),
     ] {
         crate::orgs::lock_org(&mut tx, org_id).await?;
+    }
+    // A deletion that committed first (or while blocked on the lock) turns
+    // the lock into a no-op: re-check the new owner instead of hitting the
+    // `owner_id` foreign key as a 500.
+    let kept: Option<i64> = sqlx::query_scalar("SELECT id FROM owners WHERE id = $1")
+        .bind(new_owner_id)
+        .fetch_optional(tx.as_mut())
+        .await?;
+    if kept.is_none() {
+        return Ok(TransferOutcome::Gone);
     }
     let clash: Option<i64> = sqlx::query_scalar(
         "SELECT id FROM repos WHERE owner_id = $1 AND lower_name = $2 AND deleted_at IS NULL AND id <> $3",
