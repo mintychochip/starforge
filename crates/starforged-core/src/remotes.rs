@@ -394,6 +394,11 @@ pub struct PushMirrorInput {
     pub auth: ImportAuth,
 }
 
+/// The pull-mirror pause notice: an archived repository is read-only, so a
+/// sync records this (not a real failure) and reschedules at the normal
+/// interval.
+const MIRROR_PAUSED_MESSAGE: &str = "repository is archived; mirror paused";
+
 /// What the API and pages show for one push mirror: never a secret, only
 /// `has_credentials` and, for SSH, the public key.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -526,6 +531,19 @@ fn pull_creds(core: &Core, row: &db_remotes::RemoteRow) -> Result<RemoteCreds, S
         }
         _ => Ok(RemoteCreds::None),
     }
+}
+
+/// The per-remote SSH known-hosts file (`<data_dir>/known_hosts/<remote
+/// id>`): every import and mirror trusts only the keys recorded for its
+/// own remote. The git layer creates it (0600, parent 0700) on demand.
+fn remote_known_hosts(core: &Core, remote_id: i64) -> std::path::PathBuf {
+    let data_dir = core
+        .config()
+        .repos_dir
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| core.config().repos_dir.clone());
+    data_dir.join("known_hosts").join(remote_id.to_string())
 }
 
 fn now_plus(secs: i64) -> i64 {
@@ -769,7 +787,9 @@ impl Core {
         if state != "pending" && state != "running" {
             return Ok(());
         }
-        db_repos::set_import_state(self.db(), repo_id, "running").await?;
+        if !db_remotes::set_import_state_if_remote(self.db(), repo_id, "running").await? {
+            return Ok(());
+        }
         let outcome = self.fetch_import(repo_id, &row).await;
         // The remote row may have been deleted mid-fetch: never write a
         // terminal state against a deleted row.
@@ -833,15 +853,24 @@ impl Core {
             _ => RemoteCreds::None,
         };
         let repo_dir = self.repo_path(repo_id);
+        let known_hosts = remote_known_hosts(self, row.id);
         let refspecs: Vec<String> = IMPORT_REFSPECS.iter().map(|s| s.to_string()).collect();
-        starforged_git::remote::fetch(&repo_dir, &pinned, &creds, &refspecs, IMPORT_FETCH_TIMEOUT)
-            .await
-            .map_err(|e| starforged_git::remote::scrub(&e.to_string(), &row.url))?;
+        starforged_git::remote::fetch(
+            &repo_dir,
+            &pinned,
+            &creds,
+            &refspecs,
+            IMPORT_FETCH_TIMEOUT,
+            &known_hosts,
+        )
+        .await
+        .map_err(|e| starforged_git::remote::scrub(&e.to_string(), &row.url))?;
         let head = starforged_git::remote::ls_remote_head(
             &repo_dir,
             &pinned,
             &creds,
             IMPORT_FETCH_TIMEOUT,
+            &known_hosts,
         )
         .await
         .map_err(|e| starforged_git::remote::scrub(&e.to_string(), &row.url))?;
@@ -1067,11 +1096,11 @@ impl Core {
                 "repository is archived; mirror paused".into(),
             ));
         }
-        if db_remotes::by_repo_role(self.db(), access.repo.id, "pull")
+        let row = db_remotes::by_repo_role(self.db(), access.repo.id, "pull")
             .await?
-            .is_none()
-        {
-            return Err(CoreError::NotFound);
+            .ok_or(CoreError::NotFound)?;
+        if row.enabled == 0 {
+            return Err(CoreError::Invalid("mirror is disabled".into()));
         }
         self.enqueue_or_expedite(&crate::jobs::Job::PullMirror {
             repo_id: access.repo.id,
@@ -1100,13 +1129,7 @@ impl Core {
             .await?
             .is_some_and(|repo| repo.archived_at.is_some());
         if archived {
-            db_remotes::record_attempt(
-                self.db(),
-                row.id,
-                false,
-                "repository is archived; mirror paused",
-            )
-            .await?;
+            db_remotes::record_attempt(self.db(), row.id, false, MIRROR_PAUSED_MESSAGE).await?;
             return Ok(());
         }
         let outcome = self.fetch_pull(repo_id, &row).await;
@@ -1133,7 +1156,7 @@ impl Core {
         if row.enabled == 0 {
             return Ok(());
         }
-        let delay = if row.last_error.is_empty() {
+        let delay = if row.last_error.is_empty() || row.last_error == MIRROR_PAUSED_MESSAGE {
             row.interval_secs.max(300)
         } else {
             300
@@ -1184,14 +1207,17 @@ impl Core {
             &creds,
             &refspecs,
             PULL_MIRROR_FETCH_TIMEOUT,
+            &remote_known_hosts(self, row.id),
         )
         .await
         .map_err(|e| starforged_git::remote::scrub(&e.to_string(), &row.url))?;
+        // A snapshot failure must not silently drop the moves: the failed
+        // fetch is recorded and backed off instead.
         let Some(before) = before else {
-            return Ok(());
+            return Err("ref snapshot failed".to_owned());
         };
         let Some(after) = self.snapshot_refs(&repo_dir).await else {
-            return Ok(());
+            return Err("ref snapshot failed".to_owned());
         };
         // Diff the tips and run the same ingest as post-receive (D4):
         // revisions for branch changes, mergeability, push webhooks with
@@ -1270,16 +1296,6 @@ impl Core {
                 "archived repositories cannot mirror".into(),
             ));
         }
-        let existing = db_remotes::list_by_repo(self.db(), access.repo.id)
-            .await?
-            .into_iter()
-            .filter(|row| row.role == "push")
-            .count();
-        if existing >= PUSH_MIRROR_MAX {
-            return Err(CoreError::Invalid(format!(
-                "a repository may have at most {PUSH_MIRROR_MAX} push mirrors"
-            )));
-        }
         let prepared = self
             .prepare_import(&ImportInput {
                 url: input.url.clone(),
@@ -1287,7 +1303,10 @@ impl Core {
             })
             .await?;
         let target = format!("repo:{owner}/{name}");
-        let id = db_remotes::insert(
+        // Count and insert serialize under the repository row lock
+        // (`insert_push_remote_capped`), so concurrent adds cannot
+        // exceed the cap.
+        let Some(id) = db_remotes::insert_push_remote_capped(
             self.db(),
             &db_remotes::NewRemote {
                 repo_id: access.repo.id,
@@ -1299,8 +1318,14 @@ impl Core {
                 ssh_public_key: prepared.ssh_public_key.as_deref(),
                 created_by: actor.id,
             },
+            PUSH_MIRROR_MAX as i64,
         )
-        .await?;
+        .await?
+        else {
+            return Err(CoreError::Invalid(format!(
+                "a repository may have at most {PUSH_MIRROR_MAX} push mirrors"
+            )));
+        };
         self.audit(Some(actor.id), "mirror.create", &target, &prepared.url)
             .await?;
         if prepared.sealed_secret.is_some() {
@@ -1485,6 +1510,7 @@ impl Core {
             &creds,
             &refspecs,
             PUSH_MIRROR_PUSH_TIMEOUT,
+            &remote_known_hosts(self, row.id),
         )
         .await
         .map_err(|e| starforged_git::remote::scrub(&e.to_string(), &row.url))?;

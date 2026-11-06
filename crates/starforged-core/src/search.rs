@@ -880,8 +880,9 @@ impl Core {
     /// required — a repository the viewer cannot read is `NotFound` — and
     /// archived repositories remain searchable (only pushes refuse them).
     /// An empty query, or one longer than the git layer's cap, is
-    /// [`CoreError::Invalid`]; an empty repository (no branches) yields an
-    /// empty result, never an error.
+    /// [`CoreError::Invalid`]; an empty repository (and a repository whose
+    /// default branch does not exist) yields an empty result, never an
+    /// arbitrary branch.
     pub async fn code_search(
         &self,
         viewer: Option<&User>,
@@ -898,19 +899,18 @@ impl Core {
         }
         let access = self.repo_for(viewer, owner, repo).await?;
         let branches = self.branches(&access).await?;
-        let ref_name = if branches.contains(&access.repo.default_branch) {
-            Some(access.repo.default_branch.clone())
-        } else {
-            branches.into_iter().next()
-        };
-        let Some(ref_name) = ref_name else {
+        // Default branch only: a missing default branch never falls back to
+        // an arbitrary branch. An empty repository (and a repository whose
+        // default branch does not exist) yield an empty result.
+        if !branches.contains(&access.repo.default_branch) {
             return Ok(CodeSearchResult {
                 ref_name: access.repo.default_branch.clone(),
                 commit: String::new(),
                 matches: Vec::new(),
                 truncated: false,
             });
-        };
+        }
+        let ref_name = access.repo.default_branch.clone();
         let resolved = self.resolve(&access, &ref_name).await?;
         let repo_dir = self.repo_path(access.repo.id);
         let result = starforged_git::grep::grep(

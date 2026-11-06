@@ -289,7 +289,7 @@ async fn dns_rebinding_fails_closed_and_pinning_is_used() {
         .core
         .check_remote_url_with_resolver("ssh://git@git.example.com:2222/x.git", &flipping)
         .expect("public resolution is allowed");
-    let ssh_args = pinned.ssh_args();
+    let ssh_args = pinned.ssh_args(None);
     assert!(
         ssh_args.iter().any(|a| a == "HostName=93.184.216.34"),
         "{ssh_args:?}"

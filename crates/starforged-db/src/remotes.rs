@@ -256,3 +256,50 @@ pub async fn enabled_push_remote_ids(db: &Db) -> DbResult<Vec<i64>> {
             .await?;
     Ok(rows)
 }
+
+/// Inserts one push remote, refusing when the repository already has
+/// `max` push mirrors (`None` in that case). The count and the insert run
+/// in one transaction after a parent-row lock on the repository, so
+/// concurrent adds serialize and the cap holds on both engines (under
+/// Postgres READ COMMITTED a bare count-then-insert could let two
+/// transactions both pass the count).
+pub async fn insert_push_remote_capped(
+    db: &Db,
+    remote: &NewRemote<'_>,
+    max: i64,
+) -> DbResult<Option<i64>> {
+    let ts = now();
+    let mut tx = db.pool().begin().await?;
+    sqlx::query("UPDATE repos SET updated_at = updated_at WHERE id = $1")
+        .bind(remote.repo_id)
+        .execute(tx.as_mut())
+        .await?;
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM repo_remotes WHERE repo_id = $1 AND role = 'push'",
+    )
+    .bind(remote.repo_id)
+    .fetch_one(tx.as_mut())
+    .await?;
+    if count >= max {
+        return Ok(None);
+    }
+    let id: i64 = sqlx::query_scalar(
+        "INSERT INTO repo_remotes (repo_id, role, url, auth, username, sealed_secret, \
+         ssh_public_key, created_by, created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id",
+    )
+    .bind(remote.repo_id)
+    .bind(remote.role)
+    .bind(remote.url)
+    .bind(remote.auth)
+    .bind(remote.username)
+    .bind(remote.sealed_secret)
+    .bind(remote.ssh_public_key)
+    .bind(remote.created_by)
+    .bind(ts)
+    .bind(ts)
+    .fetch_one(tx.as_mut())
+    .await?;
+    tx.commit().await?;
+    Ok(Some(id))
+}

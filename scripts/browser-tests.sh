@@ -54,5 +54,7 @@ python3 tests/browser/seed.py \
 
 cd tests/browser
 npm ci
+# System libraries for Chromium are a runner concern: CI installs them with
+# `npx playwright install --with-deps chromium` before calling this script.
 npx playwright install chromium
 npx playwright test

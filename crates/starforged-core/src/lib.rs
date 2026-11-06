@@ -205,6 +205,11 @@ struct Inner {
     /// every loop, and [`Core::run_due_jobs`] refreshes it too (tests run
     /// jobs directly, without workers).
     worker_heartbeat: std::sync::atomic::AtomicI64,
+    /// Whether this instance's SSH listener is bound and serving (the
+    /// `/readyz` SSH check, plan M5b D5). Set by `starforged_ssh` after
+    /// bind, cleared when the server task ends. Per-instance (not
+    /// process-global) so concurrent test servers stay independent.
+    ssh_listening: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Core {
@@ -224,6 +229,7 @@ impl Core {
                 limits: limits::Limiters::default(),
                 metrics: metrics::Metrics::new(),
                 worker_heartbeat: std::sync::atomic::AtomicI64::new(starforged_db::now()),
+                ssh_listening: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             }),
         }
     }
@@ -251,6 +257,17 @@ impl Core {
     /// Prometheus counters and histograms (plan M5b D6).
     pub fn metrics(&self) -> &metrics::Metrics {
         &self.inner.metrics
+    }
+
+    /// Whether this instance's SSH listener is bound and serving.
+    pub fn ssh_listening(&self) -> &std::sync::atomic::AtomicBool {
+        &self.inner.ssh_listening
+    }
+
+    /// A guard clone of the SSH-listening flag, for the SSH server task to
+    /// set/clear on this instance.
+    pub fn ssh_listening_guard(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        std::sync::Arc::clone(&self.inner.ssh_listening)
     }
 
     /// Records a job-worker heartbeat at `now`.

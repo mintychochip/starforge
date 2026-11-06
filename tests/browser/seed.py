@@ -95,7 +95,8 @@ def main():
     # Real git history over HTTP: main + feature/x with a file change.
     host = base.removeprefix("http://")
     git_url = f"http://git:{token}@{host}/alice/proj.git"
-    work = tempfile.mkdtemp(prefix="sf-browser-seed-")
+    work_dir = tempfile.TemporaryDirectory(prefix="sf-browser-seed-")
+    work = work_dir.name
     w = Path(work)
     run(["git", "init", "-q", "-b", "main"], cwd=work)
     (w / "a.txt").write_text("one\n")

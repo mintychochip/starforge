@@ -46,6 +46,7 @@ async fn file_fetch_brings_only_heads_and_tags() {
         &RemoteCreds::None,
         &refspecs(),
         Duration::from_secs(30),
+        tmp.path(),
     )
     .await
     .expect("file fetch succeeds");
@@ -60,9 +61,15 @@ async fn file_fetch_brings_only_heads_and_tags() {
         );
     }
     // ls-remote reports the default branch.
-    let head = remote::ls_remote_head(&dest, &pinned, &RemoteCreds::None, Duration::from_secs(30))
-        .await
-        .expect("ls-remote succeeds");
+    let head = remote::ls_remote_head(
+        &dest,
+        &pinned,
+        &RemoteCreds::None,
+        Duration::from_secs(30),
+        tmp.path(),
+    )
+    .await
+    .expect("ls-remote succeeds");
     assert_eq!(head.symref.as_deref(), Some("refs/heads/main"));
     assert!(head.oid.is_some());
 }
@@ -121,9 +128,16 @@ async fn http_fetch_uses_a_token_from_the_environment_only() {
         &["init", "-q", "--bare", dest.to_str().unwrap()],
     )
     .await;
-    remote::fetch(&dest, &pinned, &creds, &refspecs(), Duration::from_secs(30))
-        .await
-        .expect("fetch with a token succeeds");
+    remote::fetch(
+        &dest,
+        &pinned,
+        &creds,
+        &refspecs(),
+        Duration::from_secs(30),
+        tmp.path(),
+    )
+    .await
+    .expect("fetch with a token succeeds");
     let refs = git_ok(&dest, &["for-each-ref", "--format=%(refname)"]).await;
     assert!(refs.contains("refs/heads/main"), "refs:\n{refs}");
 
@@ -144,6 +158,7 @@ async fn http_fetch_uses_a_token_from_the_environment_only() {
         },
         &refspecs(),
         Duration::from_secs(30),
+        tmp.path(),
     )
     .await
     .expect_err("fetch with a wrong token must fail");

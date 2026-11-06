@@ -17,12 +17,7 @@ done
 # cargo-zigbuild has no --version flag; --help succeeds when it is installed.
 cargo zigbuild --help >/dev/null 2>&1 || { echo "error: cargo-zigbuild not installed (cargo install --locked cargo-zigbuild)" >&2; exit 1; }
 
-VERSION="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
-# Workspace root package version: the workspace version (0.0.0 until the
-# v0.1.0 bump in Task R4). Fall back to the git-known workspace version.
-if [[ "$VERSION" == "0.0.0" ]]; then
-  VERSION="$(grep -m1 '^version' Cargo.toml | sed 's/version *= *"\(.*\)"/\1/')"
-fi
+VERSION="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; pkgs=json.load(sys.stdin)["packages"]; print(next(p["version"] for p in pkgs if p["name"] == "starforged"))')"
 
 TARGETS=(x86_64-unknown-linux-musl aarch64-unknown-linux-musl)
 OUT_DIR="target/release-artifacts"
@@ -30,6 +25,9 @@ OUT_DIR="target/release-artifacts"
 # worktree's target/ so the Containerfile can COPY them from the context.
 TARGET_DIR="${CARGO_TARGET_DIR:-target}"
 mkdir -p "$OUT_DIR"
+# Delete stale artifacts so the Containerfile COPY glob
+# (starforged-*-<target>.tar.gz) never matches more than one file.
+rm -f "$OUT_DIR"/starforged-*.tar.gz "$OUT_DIR"/starforged-*-SHA256SUMS
 
 for target in "${TARGETS[@]}"; do
   echo "==> building $target"
@@ -39,7 +37,7 @@ for target in "${TARGETS[@]}"; do
   rm -rf "$stage"
   mkdir -p "$stage"
   cp "$TARGET_DIR/$target/release/starforged" "$TARGET_DIR/$target/release/starforge" "$stage/"
-  tar -czf "$OUT_DIR/starforged-$VERSION-$target.tar.gz" -C "$OUT_DIR" "$target"
+  tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner -cf - -C "$OUT_DIR" "$target" | gzip -n > "$OUT_DIR/starforged-$VERSION-$target.tar.gz"
   rm -rf "$stage"
 done
 

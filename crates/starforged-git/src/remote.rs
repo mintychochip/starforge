@@ -78,14 +78,25 @@ impl PinnedRemote {
 
     /// Extra `ssh` options pinning the connection to the checked address:
     /// `HostName=<ip>` connects to the pinned IP while `HostKeyAlias=<host>`
-    /// keeps host-key verification against the original name.
-    pub fn ssh_args(&self) -> Vec<String> {
+    /// keeps host-key verification against the original name. `known_hosts`
+    /// is this remote's own host-key file (created 0600, parent 0700): one
+    /// remote's keys are never trusted by another, and the system-wide
+    /// known-hosts files are never read or written.
+    pub fn ssh_args(&self, known_hosts: Option<&Path>) -> Vec<String> {
         let mut args = vec![
             "-o".to_owned(),
             "BatchMode=yes".to_owned(),
             "-o".to_owned(),
             "StrictHostKeyChecking=accept-new".to_owned(),
         ];
+        if self.scheme == RemoteScheme::Ssh
+            && let Some(path) = known_hosts
+        {
+            args.push("-o".to_owned());
+            args.push(format!("UserKnownHostsFile={}", path.to_string_lossy()));
+            args.push("-o".to_owned());
+            args.push("GlobalKnownHostsFile=/dev/null".to_owned());
+        }
         if self.scheme == RemoteScheme::Ssh
             && let Some(ip) = self.pinned_ip
         {
@@ -99,12 +110,16 @@ impl PinnedRemote {
 
     /// The full `GIT_SSH_COMMAND` for an SSH remote, or `None` otherwise.
     /// `key_file`, when given, is passed as `-i <key_file>`.
-    pub fn ssh_command(&self, key_file: Option<&Path>) -> Option<String> {
+    pub fn ssh_command(
+        &self,
+        key_file: Option<&Path>,
+        known_hosts: Option<&Path>,
+    ) -> Option<String> {
         if self.scheme != RemoteScheme::Ssh {
             return None;
         }
         let mut parts = vec!["ssh".to_owned()];
-        parts.extend(self.ssh_args());
+        parts.extend(self.ssh_args(known_hosts));
         if let Some(key) = key_file {
             parts.push("-i".to_owned());
             parts.push(key.to_string_lossy().into_owned());
@@ -315,6 +330,7 @@ async fn run_remote(
     creds: &RemoteCreds,
     args: Vec<String>,
     timeout: Duration,
+    known_hosts: Option<&Path>,
 ) -> Result<RemoteOutput, GitError> {
     // An SSH key lives in a 0600 temp file for the duration of the command
     // and is removed afterwards, including on failure and timeout.
@@ -331,6 +347,7 @@ async fn run_remote(
         &args,
         timeout,
         key_file.as_ref().map(KeyFile::path),
+        known_hosts,
     )
     .await;
     // Removal happens here on every path (success, failure, timeout);
@@ -348,7 +365,15 @@ async fn run_remote_inner(
     args: &[String],
     timeout: Duration,
     key_file: Option<&Path>,
+    known_hosts: Option<&Path>,
 ) -> Result<RemoteOutput, GitError> {
+    // The remote's own known-hosts file (0600, parent 0700) is created
+    // before ssh runs: `accept-new` then only ever writes there.
+    if pinned.scheme == RemoteScheme::Ssh
+        && let Some(path) = known_hosts
+    {
+        ensure_known_hosts(path)?;
+    }
     let scrubbed_url = pinned.url.clone();
     let command = args.join(" ");
     let mut cmd = git();
@@ -359,7 +384,7 @@ async fn run_remote_inner(
     for (key, value) in credential_env(creds) {
         cmd.env(key, value);
     }
-    if let Some(ssh_command) = pinned.ssh_command(key_file) {
+    if let Some(ssh_command) = pinned.ssh_command(key_file, known_hosts) {
         cmd.env("GIT_SSH_COMMAND", ssh_command);
     }
     let output = tokio::time::timeout(timeout, cmd.output())
@@ -426,6 +451,29 @@ fn write_key_file(private_key: &str) -> Result<KeyFile, GitError> {
     Ok(KeyFile { _dir: dir, path })
 }
 
+/// Creates one remote's known-hosts file (0600) with owner-only parents
+/// (0700) when missing; an existing file is left alone. ssh then only ever
+/// trusts keys recorded under this remote.
+fn ensure_known_hosts(path: &Path) -> Result<(), GitError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+        }
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)?;
+    Ok(())
+}
+
 /// `git fetch --prune -- <url> <refspec>...` with a timeout. Only the given
 /// refspecs are fetched (callers pass the heads/tags refspecs), so
 /// `refs/notes/*`, `refs/pull/*`, and friends never arrive.
@@ -435,10 +483,11 @@ pub async fn fetch(
     creds: &RemoteCreds,
     refspecs: &[String],
     timeout: Duration,
+    known_hosts: &Path,
 ) -> Result<FetchOutcome, GitError> {
     let args = fetch_args(pinned, refspecs);
     validate_positionals(pinned, refspecs, &args)?;
-    let output = run_remote(repo_dir, pinned, creds, args, timeout).await?;
+    let output = run_remote(repo_dir, pinned, creds, args, timeout, Some(known_hosts)).await?;
     Ok(FetchOutcome {
         stderr: output.stderr,
     })
@@ -451,10 +500,11 @@ pub async fn push(
     creds: &RemoteCreds,
     refspecs: &[String],
     timeout: Duration,
+    known_hosts: &Path,
 ) -> Result<FetchOutcome, GitError> {
     let args = push_args(pinned, refspecs);
     validate_positionals(pinned, refspecs, &args)?;
-    let output = run_remote(repo_dir, pinned, creds, args, timeout).await?;
+    let output = run_remote(repo_dir, pinned, creds, args, timeout, Some(known_hosts)).await?;
     Ok(FetchOutcome {
         stderr: output.stderr,
     })
@@ -467,10 +517,11 @@ pub async fn ls_remote_head(
     pinned: &PinnedRemote,
     creds: &RemoteCreds,
     timeout: Duration,
+    known_hosts: &Path,
 ) -> Result<LsRemoteHead, GitError> {
     let args = ls_remote_args(pinned);
     validate_positionals(pinned, &[], &args)?;
-    let output = run_remote(repo_dir, pinned, creds, args, timeout).await?;
+    let output = run_remote(repo_dir, pinned, creds, args, timeout, Some(known_hosts)).await?;
     Ok(parse_ls_remote_head(&output.stdout))
 }
 /// `git ls-remote <url> <ref>` argv (no credentials, ever). The explicit
@@ -495,10 +546,11 @@ pub async fn ls_remote_ref(
     creds: &RemoteCreds,
     refname: &str,
     timeout: Duration,
+    known_hosts: &Path,
 ) -> Result<Option<String>, GitError> {
     let args = ls_remote_ref_args(pinned, refname);
     validate_positionals(pinned, &[refname.to_owned()], &args)?;
-    let output = run_remote(repo_dir, pinned, creds, args, timeout).await?;
+    let output = run_remote(repo_dir, pinned, creds, args, timeout, Some(known_hosts)).await?;
     for line in output.stdout.lines() {
         let mut parts = line.splitn(2, '\t');
         if let (Some(oid), Some(name)) = (parts.next(), parts.next())
@@ -537,12 +589,13 @@ pub async fn fetch_pull_head(
     creds: &RemoteCreds,
     number: i64,
     timeout: Duration,
+    known_hosts: &Path,
 ) -> Result<FetchOutcome, GitError> {
     let refspecs = pull_head_refspecs(number).ok_or_else(|| GitError::Failed {
         command: "fetch pull head".to_owned(),
         stderr: format!("pull number must be positive: {number}"),
     })?;
-    fetch(repo_dir, pinned, creds, &refspecs, timeout).await
+    fetch(repo_dir, pinned, creds, &refspecs, timeout, known_hosts).await
 }
 
 fn parse_ls_remote_head(stdout: &str) -> LsRemoteHead {
@@ -604,7 +657,7 @@ mod tests {
             port: 22,
             pinned_ip: Some(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))),
         };
-        let ssh_args = ssh.ssh_args();
+        let ssh_args = ssh.ssh_args(Some(Path::new("/data/known_hosts/7")));
         assert!(
             ssh_args.iter().any(|a| a == "HostName=93.184.216.34"),
             "{ssh_args:?}"
@@ -613,6 +666,66 @@ mod tests {
             ssh_args.iter().any(|a| a == "HostKeyAlias=git.example.com"),
             "{ssh_args:?}"
         );
+        // The per-remote known-hosts file is wired through, and the global
+        // files are never consulted.
+        assert!(
+            ssh_args
+                .iter()
+                .any(|a| a == "UserKnownHostsFile=/data/known_hosts/7"),
+            "{ssh_args:?}"
+        );
+        assert!(
+            ssh_args
+                .iter()
+                .any(|a| a == "GlobalKnownHostsFile=/dev/null"),
+            "{ssh_args:?}"
+        );
+    }
+
+    #[test]
+    fn two_remotes_get_separate_known_hosts_files() {
+        let ssh = PinnedRemote {
+            url: "ssh://git@git.example.com/owner/repo.git".to_owned(),
+            scheme: RemoteScheme::Ssh,
+            host: "git.example.com".to_owned(),
+            port: 22,
+            pinned_ip: None,
+        };
+        let a = ssh.ssh_args(Some(Path::new("/data/known_hosts/7")));
+        let b = ssh.ssh_args(Some(Path::new("/data/known_hosts/9")));
+        assert_ne!(a, b, "each remote needs its own host-key file");
+        assert!(
+            a.iter()
+                .any(|x| x == "UserKnownHostsFile=/data/known_hosts/7"
+                    && b.iter()
+                        .any(|y| y == "UserKnownHostsFile=/data/known_hosts/9")),
+            "{a:?} {b:?}"
+        );
+        // Without a file (non-SSH callers) no known-hosts option appears.
+        assert!(
+            !ssh.ssh_args(None)
+                .iter()
+                .any(|x| x.starts_with("UserKnownHostsFile"))
+        );
+    }
+
+    #[test]
+    fn known_hosts_file_is_created_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known_hosts").join("7");
+        ensure_known_hosts(&path).unwrap();
+        assert!(path.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "file mode {mode:o}");
+            let parent_mode = std::fs::metadata(path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(parent_mode & 0o777, 0o700, "parent mode {parent_mode:o}");
+        }
     }
 
     #[test]
@@ -705,6 +818,7 @@ mod tests {
             &RemoteCreds::None,
             &["--upload-pack=id".to_owned()],
             timeout,
+            Path::new("/nonexistent-starforged-known-hosts"),
         )
         .await
         .unwrap_err();
@@ -715,6 +829,7 @@ mod tests {
             &RemoteCreds::None,
             &["--receive-pack=id".to_owned()],
             timeout,
+            Path::new("/nonexistent-starforged-known-hosts"),
         )
         .await
         .unwrap_err();
@@ -728,13 +843,20 @@ mod tests {
             &RemoteCreds::None,
             &["+refs/heads/*:refs/heads/*".to_owned()],
             timeout,
+            Path::new("/nonexistent-starforged-known-hosts"),
         )
         .await
         .unwrap_err();
         assert!(err.to_string().contains("must not start with '-'"), "{err}");
-        let err = ls_remote_head(dir, &bad, &RemoteCreds::None, timeout)
-            .await
-            .unwrap_err();
+        let err = ls_remote_head(
+            dir,
+            &bad,
+            &RemoteCreds::None,
+            timeout,
+            Path::new("/nonexistent-starforged-known-hosts"),
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("must not start with '-'"), "{err}");
     }
 

@@ -881,3 +881,55 @@ async fn pull_mirror_pauses_on_archived_repo() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pull_mirror_sync_refused_when_disabled() {
+    let s = TestServer::start_with(|c| c.remotes.allow_file_urls = true).await;
+    let alice = s.user("alice").await;
+    let rw = s.token(&alice, &[Scope::RepoRead, Scope::RepoWrite]).await;
+    let _repo = s.repo(&alice, "proj", Visibility::Private).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (url, _src) = make_source(dir.path(), "src").await;
+
+    let client = reqwest::Client::new();
+    let (status, _) = api(
+        &client,
+        "PUT",
+        &s.url("/api/v1/repos/alice/proj/mirror/pull"),
+        &rw,
+        Some(&json!({"url": url, "interval_secs": 300})),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let done = poll_mirror(&s, &rw, "alice", "proj").await;
+    assert!(done["last_success_at"].is_number(), "{done}");
+
+    let (status, v) = api(
+        &client,
+        "POST",
+        &s.url("/api/v1/repos/alice/proj/mirror/pull/enabled"),
+        &rw,
+        Some(&json!({"enabled": false})),
+    )
+    .await;
+    assert_eq!(status, 200, "{v}");
+    assert_eq!(v["enabled"], false);
+
+    // "Sync now" on a disabled mirror is refused, not a silent no-op.
+    let (status, body) = api(
+        &client,
+        "POST",
+        &s.url("/api/v1/repos/alice/proj/mirror/pull/sync"),
+        &rw,
+        None,
+    )
+    .await;
+    assert_eq!(status, 422, "{body}");
+    assert!(body.to_string().contains("mirror is disabled"), "{body}");
+
+    // The settings page hides the Sync button while disabled.
+    let (browser, _) = s.login("alice").await;
+    let page = get_text(&browser, &s.url("/alice/proj/settings/mirrors")).await;
+    assert!(page.contains("Enable mirror"), "{page}");
+    assert!(!page.contains("Sync now"), "{page}");
+}

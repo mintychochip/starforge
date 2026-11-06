@@ -872,12 +872,13 @@ impl Core {
             .await?
             .map(|row| row.number)
             .unwrap_or(0);
-        let author = match review.author_id {
-            Some(id) => self
+        let author = match (review.author_id, &review.imported_author) {
+            (Some(id), _) => self
                 .sender_of(id)
                 .await
                 .unwrap_or_else(|| "deleted user".to_owned()),
-            None => "deleted user".to_owned(),
+            (None, Some(login)) => format!("{login} (imported)"),
+            (None, None) => "deleted user".to_owned(),
         };
         Ok(serde_json::json!({
             "id": review.id,

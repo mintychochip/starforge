@@ -129,7 +129,9 @@ async fn readyz(State(state): State<OpsState>) -> Response {
         failing.push("search");
     }
     if state.ssh_enabled
-        && starforged_core::metrics::SSH_CONNECTIONS.load(std::sync::atomic::Ordering::Relaxed) < 0
+        && !core
+            .ssh_listening()
+            .load(std::sync::atomic::Ordering::Relaxed)
     {
         failing.push("ssh");
     }

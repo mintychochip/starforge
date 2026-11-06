@@ -612,6 +612,26 @@ async fn importer_maps_issues_pulls_and_reviews() {
             "audit {action}"
         );
     }
+    // Imported Trails are indexed (the drained jobs indexed them):
+    // searching finds the imported issue by title.
+    let hits = s
+        .core
+        .search_trails(
+            Some(&alice),
+            &starforged_core::search::SearchQuery {
+                q: "First issue".to_owned(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        hits.items
+            .iter()
+            .any(|t| t.number == 1 && t.title == "First issue"),
+        "search finds the imported issue: {:?}",
+        hits.items
+    );
     // (Last: this live create dispatches a webhook delivery; it runs after
     // the import-only assertions above.)
     // The next new Trail continues after the highest imported number.

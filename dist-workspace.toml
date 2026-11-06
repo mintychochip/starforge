@@ -27,3 +27,6 @@ pr-run-mode = "plan"
 # auto-includes would otherwise bundle from the workspace root.
 auto-includes = false
 include = ["LICENSE-MIT", "LICENSE-APACHE-2.0", "README.md"]
+# .github/workflows/release.yml is hand-scoped (contents: read at the top
+# level, write only on host); don't let `dist generate` clobber that.
+allow-dirty = ["ci"]

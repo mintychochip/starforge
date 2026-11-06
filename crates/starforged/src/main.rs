@@ -264,10 +264,17 @@ async fn main() -> anyhow::Result<()> {
 /// Initializes tracing from the config (plan M5b D1): `log.format` picks
 /// text or JSON output, `log.level` is the `EnvFilter` string. A
 /// `RUST_LOG` environment override still wins, matching the old behavior.
+/// Text output is colored only on a terminal (and never under `NO_COLOR`),
+/// so container, journald, and file logs carry no ANSI escapes.
 fn init_tracing(config: &Config) {
+    use std::io::IsTerminal as _;
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(config.log.level.clone()));
-    let builder = tracing_subscriber::fmt().with_env_filter(filter);
+    let ansi = std::io::stdout().is_terminal()
+        && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty());
+    let builder = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_ansi(ansi);
     if config.log.format == "json" {
         builder.json().init();
     } else {

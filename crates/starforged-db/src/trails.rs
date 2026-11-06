@@ -310,6 +310,8 @@ pub async fn insert_imported_trail_full(
     labels: &[String],
     assignees: &[i64],
     is_pull: bool,
+    closed_at: Option<i64>,
+    merged_at: Option<i64>,
     now: i64,
 ) -> DbResult<TrailRow> {
     let mut tx = db.pool().begin().await?;
@@ -322,8 +324,8 @@ pub async fn insert_imported_trail_full(
     .execute(&mut *tx)
     .await?;
     let row = sqlx::query(
-        "INSERT INTO trails (repo_id, number, title, intent, state, ready, author_id, imported_author, github_id, created_at, updated_at) \
-         VALUES ($1, $2, $3, $4, $5, 0, $6, $7, $8, $9, $9) \
+        "INSERT INTO trails (repo_id, number, title, intent, state, ready, author_id, imported_author, github_id, created_at, updated_at, closed_at, merged_at) \
+         VALUES ($1, $2, $3, $4, $5, 0, $6, $7, $8, $9, $9, $10, $11) \
          RETURNING id, repo_id, number, title, intent, state, ready, author_id, imported_author, github_id, created_at, updated_at, closed_at, merged_at",
     )
     .bind(repo_id)
@@ -335,6 +337,8 @@ pub async fn insert_imported_trail_full(
     .bind(imported_author)
     .bind(github_id)
     .bind(now)
+    .bind(closed_at)
+    .bind(merged_at)
     .fetch_one(&mut *tx)
     .await?;
     let trail = trail_from_row(&row)?;

@@ -464,3 +464,50 @@ async fn push_mirror_cap_and_access() {
         denied.status()
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn push_mirror_cap_is_serialized() {
+    let s = TestServer::start_with(|c| c.remotes.allow_file_urls = true).await;
+    let alice = s.user("alice").await;
+    let rw = s.token(&alice, &[Scope::RepoRead, Scope::RepoWrite]).await;
+    s.repo(&alice, "proj", Visibility::Private).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (target_url, _target) = make_target(dir.path(), "target.git");
+
+    // 11 concurrent adds against a cap of 10: at most 10 may succeed. The
+    // count-and-insert is serialized under the repository row lock, so the
+    // cap holds even under concurrency (no write skew).
+    let client = reqwest::Client::new();
+    let url = s.url("/api/v1/repos/alice/proj/mirror/push");
+    let mut handles = Vec::new();
+    for _ in 0..11 {
+        let client = client.clone();
+        let url = url.clone();
+        let token = rw.clone();
+        let target_url = target_url.clone();
+        handles.push(tokio::spawn(async move {
+            api(
+                &client,
+                "POST",
+                &url,
+                &token,
+                Some(&json!({"url": target_url})),
+            )
+            .await
+            .0
+        }));
+    }
+    let mut created = 0;
+    let mut refused = 0;
+    for h in handles {
+        match h.await.unwrap() {
+            201 => created += 1,
+            422 => refused += 1,
+            other => panic!("unexpected status {other}"),
+        }
+    }
+    assert_eq!(created, 10, "exactly 10 concurrent adds may succeed");
+    assert_eq!(refused, 1, "the 11th concurrent add must be refused");
+    let listed = push_mirrors(&s, &rw).await;
+    assert_eq!(listed.as_array().unwrap().len(), 10, "{listed}");
+}

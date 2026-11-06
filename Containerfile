@@ -19,6 +19,13 @@
 # (and a matching build host / --platform).
 #
 # The image tag is the version (see `scripts/build-release.sh`).
+# Runtime env (set via `podman run -e`): STARFORGE_BASE_URL and
+# STARFORGE_HTTP_ADDR are mapped by packaging/entrypoint.sh onto
+# STARFORGE__SERVER__BASE_URL / STARFORGE__SERVER__HTTP_ADDR, which
+# Config::load applies via apply_env on every start — so changing them
+# later (e.g. behind a real hostname) takes effect without re-init.
+# STARFORGE_CONFIG / STARFORGE_DATA_DIR override /data/starforged.toml
+# and the data directory. See packaging/entrypoint.sh.
 
 FROM docker.io/library/alpine:3
 

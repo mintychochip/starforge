@@ -16,5 +16,11 @@ if [ ! -f "$CONFIG" ]; then
     --http-addr "${STARFORGE_HTTP_ADDR:-0.0.0.0:3000}" \
     --base-url "${STARFORGE_BASE_URL:-http://127.0.0.1:3000}"
 fi
+# STARFORGE_BASE_URL / STARFORGE_HTTP_ADDR also change the running
+# server on every start (they are mapped onto the config overrides
+# STARFORGE__SERVER__BASE_URL / STARFORGE__SERVER__HTTP_ADDR that
+# Config::load applies via apply_env), not only at init time.
+[ -n "${STARFORGE_BASE_URL:-}" ] && export STARFORGE__SERVER__BASE_URL="$STARFORGE_BASE_URL"
+[ -n "${STARFORGE_HTTP_ADDR:-}" ] && export STARFORGE__SERVER__HTTP_ADDR="$STARFORGE_HTTP_ADDR"
 
 exec starforged --config "$CONFIG" serve

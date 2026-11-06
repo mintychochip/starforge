@@ -20,11 +20,20 @@ test.describe('session viewer', () => {
     await signIn(page, 'alice', m.users.alice.password);
     await page.goto(sessionPath(m));
 
-    // Keyboard focus lands in the search box (it is the first focusable
-    // control of the viewer and submits with the keyboard alone).
+    // Keyboard focus reaches the search box by tabbing from the top of
+    // the page (bounded loop; the header's own search box comes first).
     // Scoped to <main>: the site header carries its own search form.
     const search = page.locator('main .session-search input[name="q"]');
-    await search.focus();
+    const searchEl = await search.elementHandle();
+    let tabbed = false;
+    for (let i = 0; i < 40 && !tabbed; i++) {
+      await page.keyboard.press('Tab');
+      tabbed = await page.evaluate(
+        (el) => document.activeElement === el,
+        searchEl,
+      );
+    }
+    expect(tabbed).toBe(true);
     await expect(search).toBeFocused();
     await search.pressSequentially('quasar-needle', { delay: 0 });
     await search.press('Enter');

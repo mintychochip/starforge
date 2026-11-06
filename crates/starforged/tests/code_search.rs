@@ -320,3 +320,29 @@ async fn empty_repo_private_404_and_xss() {
         "hostile content renders escaped: {html}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn missing_default_branch_never_falls_back() {
+    let s = TestServer::start().await;
+    pushed(&s, Visibility::Public, &[("a.txt", "the needle\n")]).await;
+
+    // Point the row's default branch at a branch that does not exist,
+    // while `main` holds a match. No other branch is ever searched.
+    let row = starforged_db::repos::by_owner_and_name(s.core.db(), "alice", "proj")
+        .await
+        .unwrap()
+        .unwrap();
+    starforged_db::repos::set_default_branch(s.core.db(), row.id, "ghost")
+        .await
+        .unwrap();
+
+    let client = reqwest::Client::new();
+    let (status, body) = api_search(&client, &s, "q=needle", None).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["ref"], "ghost");
+    assert_eq!(body["commit"], "");
+    assert!(
+        body["matches"].as_array().unwrap().is_empty(),
+        "no fallback to main"
+    );
+}

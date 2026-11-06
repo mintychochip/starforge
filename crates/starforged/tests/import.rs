@@ -329,6 +329,63 @@ async fn import_start_with_empty_body_keeps_stored_credentials() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_before_run_leaves_repo_pushable() {
+    // Delete the import between enqueue and run: the job must abort
+    // without writing `running` (which would refuse pushes forever).
+    let s = TestServer::start_with(|c| {
+        c.remotes.allow_file_urls = true;
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let url = make_source(dir.path(), "src").await;
+    let alice = s.user("alice").await;
+    s.core
+        .create_repo_with_import(
+            &alice,
+            "alice",
+            starforged_core::repos::CreateRepo {
+                name: "gone".into(),
+                description: String::new(),
+                visibility: Visibility::Private,
+                readme: false,
+            },
+            Some(starforged_core::remotes::ImportInput {
+                url,
+                auth: starforged_core::remotes::ImportAuth::None,
+            }),
+        )
+        .await
+        .unwrap();
+    s.core.delete_import(&alice, "alice", "gone").await.unwrap();
+    s.core.run_due_jobs().await.unwrap();
+    let access = s
+        .core
+        .repo_for(Some(&alice), "alice", "gone")
+        .await
+        .unwrap();
+    assert_eq!(access.repo.import_state, "none");
+    // Pushes are allowed (the fetch never ran, so no objects; push a
+    // fresh branch from an unrelated work tree).
+    let write = s.token(&alice, &[Scope::RepoWrite]).await;
+    let work = work_repo(dir.path(), "pusher", &[("README.md", "# x\n")]).await;
+    let ok = git(
+        &work,
+        &[
+            "push",
+            "-q",
+            &s.git_url("alice", "gone", Some(&write)),
+            "main",
+        ],
+    )
+    .await;
+    assert!(
+        ok.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ok.stderr)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn import_policy_refusal_is_422() {
     // No test flag: file:// is refused at creation.
     let s = TestServer::start().await;

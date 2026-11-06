@@ -100,9 +100,18 @@ pub async fn serve_on(
     };
 
     let addr = listener.local_addr()?;
+    let listening = core.ssh_listening_guard();
     let shared = server::Shared::new(core, &cfg);
     let russh_cfg = std::sync::Arc::new(russh_cfg);
+    listening.store(true, std::sync::atomic::Ordering::Relaxed);
     let task = tokio::spawn(async move {
+        struct ClearOnDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for ClearOnDrop {
+            fn drop(&mut self) {
+                self.0.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        let _clear = ClearOnDrop(listening);
         let mut forge = ForgeServer::new(shared);
         let running = forge.run_on_socket(russh_cfg, &listener);
         let shutdown_handle = running.handle();

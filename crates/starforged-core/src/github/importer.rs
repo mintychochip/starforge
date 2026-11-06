@@ -115,6 +115,8 @@ struct TrailSubject<'a> {
     github_id: i64,
     labels: &'a [GhLabel],
     assignees: &'a [GhUser],
+    closed_at: &'a Option<String>,
+    merged_at: &'a Option<String>,
 }
 
 impl Core {
@@ -421,12 +423,16 @@ impl Core {
                     github_id: issue.id,
                     labels: &issue.labels,
                     assignees: &issue.assignees,
+                    closed_at: &issue.closed_at,
+                    merged_at: &None,
                 },
                 cursor,
             )
             .await?;
         self.import_issue_comments(ctx, issue.number, trail.id, cursor)
             .await?;
+        self.enqueue_index(&crate::jobs::Job::IndexTrail { trail_id: trail.id })
+            .await;
         Ok(())
     }
 
@@ -474,6 +480,8 @@ impl Core {
                     github_id: pull.id,
                     labels: &pull.labels,
                     assignees: &pull.assignees,
+                    closed_at: &pull.closed_at,
+                    merged_at: &pull.merged_at,
                 },
                 cursor,
             )
@@ -543,6 +551,8 @@ impl Core {
             self.import_review_comments(ctx, pull.number, change.id, revision.id, &trail, cursor)
                 .await?;
         }
+        self.enqueue_index(&crate::jobs::Job::IndexTrail { trail_id: trail.id })
+            .await;
         Ok(())
     }
 
@@ -581,6 +591,7 @@ impl Core {
             creds,
             &head_ref,
             PULL_HEAD_FETCH_TIMEOUT,
+            &repo_dir.join("known_hosts"),
         )
         .await
         .map_err(|e| Fail::Fatal(remote::scrub(&e.to_string(), &pinned.url)))?
@@ -598,6 +609,7 @@ impl Core {
             creds,
             pull.number,
             PULL_HEAD_FETCH_TIMEOUT,
+            &repo_dir.join("known_hosts"),
         )
         .await
         .map_err(|e| Fail::Fatal(remote::scrub(&e.to_string(), &pinned.url)))?;
@@ -723,6 +735,16 @@ impl Core {
                 cursor.dropped.push(login);
             }
         }
+        let closed_at = if subject.state == "open" {
+            None
+        } else {
+            Some(parse_ts(subject.closed_at.as_ref().map(String::as_str)))
+        };
+        let merged_at = if subject.state == "merged" {
+            Some(parse_ts(subject.merged_at.as_ref().map(String::as_str)))
+        } else {
+            None
+        };
         db_trails::insert_imported_trail_full(
             self.db(),
             ctx.row.id,
@@ -737,6 +759,8 @@ impl Core {
             &labels,
             &assignees,
             subject.is_pull,
+            closed_at,
+            merged_at,
             now(),
         )
         .await
@@ -1184,4 +1208,15 @@ fn trail_state(github_state: &str, merged: bool) -> &'static str {
     } else {
         "open"
     }
+}
+/// Unix seconds for a GitHub RFC 3339 timestamp; import time when the
+/// timestamp is absent or unparseable (state timestamps are historical
+/// metadata, not control flow, so this never fails the import).
+fn parse_ts(raw: Option<&str>) -> i64 {
+    raw.and_then(|s| {
+        time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
+            .ok()
+            .map(|parsed| parsed.unix_timestamp())
+    })
+    .unwrap_or_else(now)
 }

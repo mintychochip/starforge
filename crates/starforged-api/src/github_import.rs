@@ -97,10 +97,11 @@ fn import_json(row: &GithubImportView) -> GithubImportJson {
     ),
     request_body = StartGithubImportBody,
     responses(
-        (status = 201, description = "GitHub import started", body = GithubImportJson),
+        (status = 202, description = "GitHub import started", body = GithubImportJson),
         (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
         (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
         (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 422, description = "Invalid", body = crate::openapi::ApiErrorBody),
         (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
     ),
     security(("bearer_auth" = [])),

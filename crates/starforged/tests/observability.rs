@@ -51,6 +51,16 @@ async fn readyz_is_200_on_a_healthy_server() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn readyz_is_200_with_ssh_enabled_after_start() {
+    // TestServer enables SSH by default; its serve_on sets SSH_LISTENING.
+    let s = TestServer::start().await;
+    assert!(!s.ssh_base.is_empty(), "SSH is enabled in TestServer");
+    let client = reqwest::Client::new();
+    let response = client.get(s.url("/readyz")).send().await.unwrap();
+    assert_eq!(response.status(), 200);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn readyz_is_503_naming_jobs_when_workers_stop() {
     let s = TestServer::start().await;
     let client = reqwest::Client::new();
