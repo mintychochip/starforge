@@ -121,7 +121,7 @@ pub async fn by_owner_and_name(
     ))
     .bind(owner_handle.to_ascii_lowercase())
     .bind(name.to_ascii_lowercase())
-    .fetch_optional(db.pool())
+    .fetch_optional(db.read_pool())
     .await?;
     row.as_ref().map(from_row).transpose()
 }
@@ -130,7 +130,7 @@ pub async fn by_owner_and_name(
 pub async fn by_id(db: &Db, id: i64) -> DbResult<Option<RepoRow>> {
     let row = sqlx::query(select_repo!("WHERE r.id = $1"))
         .bind(id)
-        .fetch_optional(db.pool())
+        .fetch_optional(db.read_pool())
         .await?;
     row.as_ref().map(from_row).transpose()
 }
@@ -139,7 +139,7 @@ pub async fn by_id(db: &Db, id: i64) -> DbResult<Option<RepoRow>> {
 pub async fn redact_rules(db: &Db, id: i64) -> DbResult<String> {
     let rules: Option<String> = sqlx::query_scalar("SELECT redact_rules FROM repos WHERE id = $1")
         .bind(id)
-        .fetch_optional(db.pool())
+        .fetch_optional(db.read_pool())
         .await?
         .flatten();
     Ok(rules.unwrap_or_default())
@@ -151,7 +151,7 @@ pub async fn list_by_owner(db: &Db, owner_id: i64) -> DbResult<Vec<RepoRow>> {
         "WHERE r.owner_id = $1 AND r.deleted_at IS NULL ORDER BY r.lower_name"
     ))
     .bind(owner_id)
-    .fetch_all(db.pool())
+    .fetch_all(db.read_pool())
     .await?;
     rows.iter().map(from_row).collect()
 }
@@ -163,7 +163,7 @@ pub async fn list_collaborating(db: &Db, user_id: i64) -> DbResult<Vec<RepoRow>>
          ORDER BY o.handle, r.lower_name"
     ))
     .bind(user_id)
-    .fetch_all(db.pool())
+    .fetch_all(db.read_pool())
     .await?;
     rows.iter().map(from_row).collect()
 }
@@ -191,7 +191,7 @@ pub async fn list_org_member_repos(db: &Db, user_id: i64) -> DbResult<Vec<RepoRo
          ORDER BY owner_handle, name",
     )
     .bind(user_id)
-    .fetch_all(db.pool())
+    .fetch_all(db.read_pool())
     .await?;
     rows.iter().map(from_row).collect()
 }
@@ -388,7 +388,7 @@ pub async fn list_deleted_by_owner(db: &Db, owner_id: i64) -> DbResult<Vec<RepoR
         "WHERE r.owner_id = $1 AND r.deleted_at IS NOT NULL ORDER BY r.deleted_at DESC"
     ))
     .bind(owner_id)
-    .fetch_all(db.pool())
+    .fetch_all(db.read_pool())
     .await?;
     rows.iter().map(from_row).collect()
 }
@@ -399,7 +399,7 @@ pub async fn list_all_deleted(db: &Db, limit: i64) -> DbResult<Vec<RepoRow>> {
         "WHERE r.deleted_at IS NOT NULL ORDER BY r.deleted_at DESC LIMIT $1"
     ))
     .bind(limit)
-    .fetch_all(db.pool())
+    .fetch_all(db.read_pool())
     .await?;
     rows.iter().map(from_row).collect()
 }
@@ -409,7 +409,7 @@ pub async fn list_all_live(db: &Db, limit: i64) -> DbResult<Vec<RepoRow>> {
         "WHERE r.deleted_at IS NULL ORDER BY o.handle, r.lower_name LIMIT $1"
     ))
     .bind(limit)
-    .fetch_all(db.pool())
+    .fetch_all(db.read_pool())
     .await?;
     rows.iter().map(from_row).collect()
 }
@@ -417,7 +417,7 @@ pub async fn list_all_live(db: &Db, limit: i64) -> DbResult<Vec<RepoRow>> {
 /// Live plus deleted repositories, for the admin overview.
 pub async fn count_all(db: &Db) -> DbResult<i64> {
     Ok(sqlx::query_scalar("SELECT COUNT(*) FROM repos")
-        .fetch_one(db.pool())
+        .fetch_one(db.read_pool())
         .await?)
 }
 
@@ -427,7 +427,7 @@ pub async fn deleted_before(db: &Db, cutoff: i64) -> DbResult<Vec<RepoRow>> {
         "WHERE r.deleted_at IS NOT NULL AND r.deleted_at <= $1 ORDER BY r.deleted_at"
     ))
     .bind(cutoff)
-    .fetch_all(db.pool())
+    .fetch_all(db.read_pool())
     .await?;
     rows.iter().map(from_row).collect()
 }
@@ -450,7 +450,7 @@ pub async fn deleted_name_exists(db: &Db, owner_id: i64, name: &str) -> DbResult
     )
     .bind(owner_id)
     .bind(name.to_ascii_lowercase())
-    .fetch_one(db.pool())
+    .fetch_one(db.read_pool())
     .await?;
     Ok(count > 0)
 }
@@ -463,7 +463,7 @@ pub async fn refs_for_access(db: &Db, id: i64) -> DbResult<String> {
     let value: Option<String> =
         sqlx::query_scalar("SELECT refs_for_access FROM repos WHERE id = $1")
             .bind(id)
-            .fetch_optional(db.pool())
+            .fetch_optional(db.read_pool())
             .await?
             .flatten();
     Ok(value.unwrap_or_else(|| "anyone_with_read".to_owned()))
@@ -483,7 +483,7 @@ pub async fn set_refs_for_access(db: &Db, id: i64, value: &str) -> DbResult<()> 
 pub async fn import_state(db: &Db, id: i64) -> DbResult<String> {
     let value: Option<String> = sqlx::query_scalar("SELECT import_state FROM repos WHERE id = $1")
         .bind(id)
-        .fetch_optional(db.pool())
+        .fetch_optional(db.read_pool())
         .await?
         .flatten();
     Ok(value.unwrap_or_else(|| "none".to_owned()))

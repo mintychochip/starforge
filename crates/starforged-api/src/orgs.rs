@@ -15,7 +15,7 @@ use crate::auth::ApiAuth;
 use crate::error::ApiError;
 use crate::repos::{RepoJson, repo_json};
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct OrgJson {
     handle: String,
     display_name: String,
@@ -39,7 +39,7 @@ fn org_json(view: OrgView) -> OrgJson {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct OrgMemberJson {
     handle: String,
     display_name: String,
@@ -54,7 +54,7 @@ fn member_json(view: OrgMemberView) -> OrgMemberJson {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct CreateOrgBody {
     handle: String,
     #[serde(default)]
@@ -65,6 +65,20 @@ pub struct CreateOrgBody {
 
 /// `POST /orgs`: any active signed-in user may create an org and becomes its
 /// first owner (D1). Handle clashes and reserved handles are 422.
+#[utoipa::path(
+    post,
+    path = "/api/v1/orgs",
+    request_body = CreateOrgBody,
+    responses(
+        (status = 201, description = "Created org", body = OrgJson),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn create(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -88,6 +102,20 @@ pub async fn create(
 
 /// `GET /orgs/{org}`: the public profile; member-only fields appear for
 /// members and site admins.
+#[utoipa::path(
+    get,
+    path = "/api/v1/orgs/{org}",
+    params(("org" = String, Path, description = "Organization name")),
+    responses(
+        (status = 200, description = "Organization", body = OrgJson),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn show(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -97,7 +125,7 @@ pub async fn show(
     Ok(Json(org_json(view)))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct PatchOrgBody {
     #[serde(default)]
     display_name: Option<String>,
@@ -108,6 +136,21 @@ pub struct PatchOrgBody {
 }
 
 /// `PATCH /orgs/{org}`: owners only.
+#[utoipa::path(
+    patch,
+    path = "/api/v1/orgs/{org}",
+    params(("org" = String, Path, description = "Organization name")),
+    request_body = PatchOrgBody,
+    responses(
+        (status = 200, description = "Updated org", body = OrgJson),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn patch(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -133,6 +176,20 @@ pub async fn patch(
 
 /// `DELETE /orgs/{org}` (D7): owners only, and only when the org owns no
 /// repositories (422 otherwise).
+#[utoipa::path(
+    delete,
+    path = "/api/v1/orgs/{org}",
+    params(("org" = String, Path, description = "Organization name")),
+    responses(
+        (status = 204, description = "Deleted"),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn delete(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -144,6 +201,20 @@ pub async fn delete(
 }
 
 /// `GET /orgs/{org}/repos`: the org's repositories the viewer can read.
+#[utoipa::path(
+    get,
+    path = "/api/v1/orgs/{org}/repos",
+    params(("org" = String, Path, description = "Organization name")),
+    responses(
+        (status = 200, description = "Repositories", body = Vec<RepoJson>),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn list_repos(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -167,6 +238,21 @@ pub async fn list_repos(
 
 /// `POST /orgs/{org}/repos` (D5): org owners create repositories in the org.
 /// The body matches user repository creation; anything else is 422.
+#[utoipa::path(
+    post,
+    path = "/api/v1/orgs/{org}/repos",
+    params(("org" = String, Path, description = "Organization name")),
+    request_body = crate::repos::CreateRepoBody,
+    responses(
+        (status = 201, description = "Created repository", body = RepoJson),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn create_repo(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -209,6 +295,20 @@ pub async fn create_repo(
 }
 
 /// `GET /orgs/{org}/members`: members and site admins only, 404 otherwise.
+#[utoipa::path(
+    get,
+    path = "/api/v1/orgs/{org}/members",
+    params(("org" = String, Path, description = "Organization name")),
+    responses(
+        (status = 200, description = "Members", body = Vec<OrgMemberJson>),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn list_members(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -221,12 +321,30 @@ pub async fn list_members(
     Ok(Json(members.into_iter().map(member_json).collect()))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct SetMemberBody {
     role: String,
 }
 
 /// `PUT /orgs/{org}/members/{handle}`: owners add users or change roles.
+#[utoipa::path(
+    put,
+    path = "/api/v1/orgs/{org}/members/{handle}",
+    params(
+        ("org" = String, Path, description = "Organization name"),
+        ("handle" = String, Path, description = "User handle"),
+    ),
+    request_body = SetMemberBody,
+    responses(
+        (status = 200, description = "Member set", body = OrgMemberJson),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn set_member(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -245,6 +363,23 @@ pub async fn set_member(
 }
 
 /// `DELETE /orgs/{org}/members/{handle}`: owners remove anyone, members leave.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/orgs/{org}/members/{handle}",
+    params(
+        ("org" = String, Path, description = "Organization name"),
+        ("handle" = String, Path, description = "User handle"),
+    ),
+    responses(
+        (status = 204, description = "Removed"),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn remove_member(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -260,7 +395,7 @@ pub async fn remove_member(
 
 // --- Teams (A2, D8). -----------------------------------------------------------
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct TeamJson {
     name: String,
     slug: String,
@@ -279,13 +414,13 @@ fn team_json(view: TeamView) -> TeamJson {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct TeamMemberJson {
     handle: String,
     display_name: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct TeamRepoJson {
     owner: String,
     name: String,
@@ -294,7 +429,7 @@ pub struct TeamRepoJson {
     visibility: &'static str,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct CreateTeamBody {
     name: String,
     #[serde(default)]
@@ -305,6 +440,21 @@ pub struct CreateTeamBody {
 }
 
 /// `POST /orgs/{org}/teams`: org owners only.
+#[utoipa::path(
+    post,
+    path = "/api/v1/orgs/{org}/teams",
+    params(("org" = String, Path, description = "Organization name")),
+    request_body = CreateTeamBody,
+    responses(
+        (status = 201, description = "Created team", body = TeamJson),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn create_team(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -330,6 +480,20 @@ pub async fn create_team(
 }
 
 /// `GET /orgs/{org}/teams`: members and site admins only, 404 otherwise.
+#[utoipa::path(
+    get,
+    path = "/api/v1/orgs/{org}/teams",
+    params(("org" = String, Path, description = "Organization name")),
+    responses(
+        (status = 200, description = "Teams", body = Vec<TeamJson>),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn list_teams(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -343,6 +507,23 @@ pub async fn list_teams(
 }
 
 /// `GET /orgs/{org}/teams/{team}`: members and site admins only, 404 otherwise.
+#[utoipa::path(
+    get,
+    path = "/api/v1/orgs/{org}/teams/{team}",
+    params(
+        ("org" = String, Path, description = "Organization name"),
+        ("team" = String, Path, description = "Team name"),
+    ),
+    responses(
+        (status = 200, description = "Team", body = TeamJson),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn show_team(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -355,7 +536,7 @@ pub async fn show_team(
     Ok(Json(team_json(view)))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct PatchTeamBody {
     #[serde(default)]
     name: Option<String>,
@@ -368,6 +549,24 @@ pub struct PatchTeamBody {
 }
 
 /// `PATCH /orgs/{org}/teams/{team}`: org owners only.
+#[utoipa::path(
+    patch,
+    path = "/api/v1/orgs/{org}/teams/{team}",
+    params(
+        ("org" = String, Path, description = "Organization name"),
+        ("team" = String, Path, description = "Team name"),
+    ),
+    request_body = PatchTeamBody,
+    responses(
+        (status = 200, description = "Updated team", body = TeamJson),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn patch_team(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -394,6 +593,23 @@ pub async fn patch_team(
 }
 
 /// `DELETE /orgs/{org}/teams/{team}`: org owners only.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/orgs/{org}/teams/{team}",
+    params(
+        ("org" = String, Path, description = "Organization name"),
+        ("team" = String, Path, description = "Team name"),
+    ),
+    responses(
+        (status = 204, description = "Deleted"),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn delete_team(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -405,6 +621,23 @@ pub async fn delete_team(
 }
 
 /// `GET /orgs/{org}/teams/{team}/members`: members and site admins only.
+#[utoipa::path(
+    get,
+    path = "/api/v1/orgs/{org}/teams/{team}/members",
+    params(
+        ("org" = String, Path, description = "Organization name"),
+        ("team" = String, Path, description = "Team name"),
+    ),
+    responses(
+        (status = 200, description = "Team members", body = Vec<TeamMemberJson>),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn list_team_members(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -426,6 +659,24 @@ pub async fn list_team_members(
 }
 
 /// `PUT /orgs/{org}/teams/{team}/members/{handle}`: org owners only.
+#[utoipa::path(
+    put,
+    path = "/api/v1/orgs/{org}/teams/{team}/members/{handle}",
+    params(
+        ("org" = String, Path, description = "Organization name"),
+        ("team" = String, Path, description = "Team name"),
+        ("handle" = String, Path, description = "User handle"),
+    ),
+    responses(
+        (status = 200, description = "Team member set", body = TeamMemberJson),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn set_team_member(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -443,6 +694,24 @@ pub async fn set_team_member(
 }
 
 /// `DELETE /orgs/{org}/teams/{team}/members/{handle}`: org owners only.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/orgs/{org}/teams/{team}/members/{handle}",
+    params(
+        ("org" = String, Path, description = "Organization name"),
+        ("team" = String, Path, description = "Team name"),
+        ("handle" = String, Path, description = "User handle"),
+    ),
+    responses(
+        (status = 204, description = "Removed"),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn remove_team_member(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -457,6 +726,23 @@ pub async fn remove_team_member(
 }
 
 /// `GET /orgs/{org}/teams/{team}/repos`: members and site admins only.
+#[utoipa::path(
+    get,
+    path = "/api/v1/orgs/{org}/teams/{team}/repos",
+    params(
+        ("org" = String, Path, description = "Organization name"),
+        ("team" = String, Path, description = "Team name"),
+    ),
+    responses(
+        (status = 200, description = "Team repositories", body = Vec<TeamRepoJson>),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn list_team_repos(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -481,6 +767,24 @@ pub async fn list_team_repos(
 }
 
 /// `PUT /orgs/{org}/teams/{team}/repos/{repo}`: org owners only.
+#[utoipa::path(
+    put,
+    path = "/api/v1/orgs/{org}/teams/{team}/repos/{repo}",
+    params(
+        ("org" = String, Path, description = "Organization name"),
+        ("team" = String, Path, description = "Team name"),
+        ("repo" = String, Path, description = "Repository name"),
+    ),
+    responses(
+        (status = 204, description = "Repository added"),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn add_team_repo(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -495,6 +799,24 @@ pub async fn add_team_repo(
 }
 
 /// `DELETE /orgs/{org}/teams/{team}/repos/{repo}`: org owners only.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/orgs/{org}/teams/{team}/repos/{repo}",
+    params(
+        ("org" = String, Path, description = "Organization name"),
+        ("team" = String, Path, description = "Team name"),
+        ("repo" = String, Path, description = "Repository name"),
+    ),
+    responses(
+        (status = 204, description = "Repository removed"),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn remove_team_repo(
     State(state): State<ApiState>,
     auth: ApiAuth,

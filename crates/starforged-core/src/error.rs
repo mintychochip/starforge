@@ -21,7 +21,20 @@ pub enum CoreError {
     #[error("internal error: {0}")]
     Internal(String),
     #[error(transparent)]
-    Db(#[from] DbError),
+    Db(DbError),
+}
+
+impl From<DbError> for CoreError {
+    fn from(e: DbError) -> CoreError {
+        // A repo-scoped write that loses an FK race with its parent's
+        // deletion (org/account/repo gone) is a 404, not a 500: the parent
+        // row the caller just authorized against no longer exists.
+        if e.is_foreign_key_violation() {
+            CoreError::NotFound
+        } else {
+            CoreError::Db(e)
+        }
+    }
 }
 
 impl From<starforged_git::GitError> for CoreError {

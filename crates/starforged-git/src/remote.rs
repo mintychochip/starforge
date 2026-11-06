@@ -116,7 +116,7 @@ impl PinnedRemote {
 /// Credentials for one remote operation. HTTPS credentials become an
 /// `http.extraHeader` env entry; an SSH private key is written to a 0600
 /// temporary file for the duration of one command and removed afterwards.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub enum RemoteCreds {
     #[default]
     None,
@@ -127,6 +127,21 @@ pub enum RemoteCreds {
     SshKey {
         private_key: String,
     },
+}
+impl std::fmt::Debug for RemoteCreds {
+    /// Redacted: the password and private key never render in any format.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RemoteCreds::None => f.write_str("None"),
+            RemoteCreds::Basic { username, .. } => {
+                write!(
+                    f,
+                    "Basic {{ username: {username:?}, password: <redacted> }}"
+                )
+            }
+            RemoteCreds::SshKey { .. } => f.write_str("SshKey { private_key: <redacted> }"),
+        }
+    }
 }
 
 /// Removes the password from any URL userinfo in `stderr` (and any exact

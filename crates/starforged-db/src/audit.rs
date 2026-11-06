@@ -68,7 +68,7 @@ pub async fn recent(db: &Db, limit: i64) -> DbResult<Vec<AuditRow>> {
         "{SELECT_ROWS} ORDER BY a.id DESC LIMIT $1"
     )))
     .bind(limit)
-    .fetch_all(db.pool())
+    .fetch_all(db.read_pool())
     .await?;
     rows.iter().map(from_row).collect()
 }
@@ -167,7 +167,7 @@ pub async fn search(db: &Db, filter: &AuditFilter) -> DbResult<Vec<AuditRow>> {
             Bind::Int(value) => query.bind(value),
         };
     }
-    let rows = query.fetch_all(db.pool()).await?;
+    let rows = query.fetch_all(db.read_pool()).await?;
     rows.iter().map(from_row).collect()
 }
 
@@ -187,7 +187,7 @@ pub async fn count_action_target_since(
     .bind(action)
     .bind(target)
     .bind(since)
-    .fetch_one(db.pool())
+    .fetch_one(db.read_pool())
     .await?;
     Ok(count)
 }

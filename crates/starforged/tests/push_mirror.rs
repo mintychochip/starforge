@@ -77,22 +77,21 @@ async fn push_mirrors(s: &TestServer, token: &str) -> Value {
     v
 }
 
-/// Runs due jobs (making debounced jobs due first) until the first push
-/// mirror reports success or an error, bounded at 10 s.
-async fn poll_push(s: &TestServer, token: &str) -> Value {
+/// Runs due jobs (making debounced jobs due first) until a NEW push-mirror
+/// job completes (`done count > before`), bounded at 10 s. Waiting on the
+/// jobs-table count — not on `last_success_at`, which a previous sync has
+/// already set — so a second sync can't be observed as the first's stale
+/// success.
+async fn poll_push(s: &TestServer, token: &str, before: i64) -> Value {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         make_due(s).await;
         s.core.run_due_jobs().await.unwrap();
-        let v = push_mirrors(s, token).await;
-        let first = v.as_array().and_then(|a| a.first());
-        match first {
-            Some(m) if m["last_success_at"].is_number() => return v,
-            Some(m) if !m["last_error"].as_str().unwrap_or("").is_empty() => return v,
-            _ => {}
+        if done_push_jobs(s).await > before {
+            return push_mirrors(s, token).await;
         }
         if Instant::now() > deadline {
-            return v;
+            return push_mirrors(s, token).await;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -157,7 +156,7 @@ async fn push_mirror_debounces_and_mirrors() {
     // The job is debounced: nothing reached the target before time moves.
     assert!(target_refs(&target).await.is_empty());
 
-    let done = poll_push(&s, &rw).await;
+    let done = poll_push(&s, &rw, 0).await;
     assert!(done[0]["last_success_at"].is_number(), "{done}");
     assert_eq!(done[0]["last_error"], "");
     // Credentials never come back.
@@ -257,7 +256,7 @@ async fn push_mirror_prunes_tags_and_hides_trail_refs() {
         String::from_utf8_lossy(&for_push.stderr)
     );
 
-    poll_push(&s, &rw).await;
+    poll_push(&s, &rw, 0).await;
     let refs = target_refs(&target).await;
     assert!(refs.contains("refs/heads/main"), "{refs}");
     assert!(refs.contains("refs/heads/topic"), "{refs}");
@@ -269,8 +268,9 @@ async fn push_mirror_prunes_tags_and_hides_trail_refs() {
     assert!(!refs.contains("refs/for"), "refs/for never mirrors: {refs}");
 
     // Delete the topic branch and the tag on the server: prune propagates.
+    let before = done_push_jobs(&s).await;
     git_ok(&work, &["push", "-q", &url, ":topic", ":v1"]).await;
-    poll_push(&s, &rw).await;
+    poll_push(&s, &rw, before).await;
     let refs = target_refs(&target).await;
     assert!(refs.contains("refs/heads/main"), "{refs}");
     assert!(
@@ -316,7 +316,8 @@ async fn push_mirror_failure_scrubs_and_backs_off() {
     )
     .await;
     assert_eq!(status, 201);
-    let failed = poll_push(&s, &rw).await;
+    let before = done_push_jobs(&s).await;
+    let failed = poll_push(&s, &rw, before).await;
     let err = failed[0]["last_error"].as_str().unwrap_or("");
     assert!(!err.is_empty(), "{failed}");
     assert!(!err.contains(secret), "secret in stored error: {err}");

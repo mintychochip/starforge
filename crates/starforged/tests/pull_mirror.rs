@@ -86,9 +86,11 @@ async fn audit_count(s: &TestServer, action: &str, target: &str) -> i64 {
 }
 
 async fn server_refs(s: &TestServer, repo_id: i64) -> String {
+    // Ref names AND tips: a sync that only moves a branch tip must still
+    // count as changed (comparing names alone would miss it.
     git_ok(
         &s.core.repo_path(repo_id),
-        &["for-each-ref", "--format=%(refname)"],
+        &["for-each-ref", "--format=%(refname) %(objectname)"],
     )
     .await
 }
@@ -798,4 +800,84 @@ async fn pull_mirror_reconciler_revives_lost_schedule() {
     .await
     .unwrap();
     assert_eq!(queued, 1, "reconciler must re-queue the mirror");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pull_mirror_pauses_on_archived_repo() {
+    let s = TestServer::start_with(|c| c.remotes.allow_file_urls = true).await;
+    let alice = s.user("alice").await;
+    let rw = s.token(&alice, &[Scope::RepoRead, Scope::RepoWrite]).await;
+    let repo = s.repo(&alice, "proj", Visibility::Private).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (url, src) = make_source(dir.path(), "src").await;
+
+    let client = reqwest::Client::new();
+    let (status, _) = api(
+        &client,
+        "PUT",
+        &s.url("/api/v1/repos/alice/proj/mirror/pull"),
+        &rw,
+        Some(&json!({"url": url, "interval_secs": 300})),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let done = poll_mirror(&s, &rw, "alice", "proj").await;
+    assert!(done["last_success_at"].is_number(), "{done}");
+    let refs_before = server_refs(&s, repo.id).await;
+
+    // Archive the mirror, then advance the upstream. A sync must not
+    // fetch into the read-only repository.
+    s.core.archive_repo(&alice, "alice", "proj").await.unwrap();
+    commit_files(&src, &[("archived.txt", b"a\n")], "upstream advance").await;
+    // Make the scheduled sync due and run it.
+    sqlx::query("UPDATE jobs SET run_at = $1 WHERE kind = 'pull_mirror' AND state = 'queued'")
+        .bind(starforged_db::now())
+        .execute(s.core.db().pool())
+        .await
+        .unwrap();
+    s.core.run_due_jobs().await.unwrap();
+    let view = s.core.pull_mirror_for(repo.id).await.unwrap().unwrap();
+    assert_eq!(view.last_error, "repository is archived; mirror paused");
+    assert_eq!(
+        server_refs(&s, repo.id).await,
+        refs_before,
+        "no fetch into an archived repo"
+    );
+
+    // "Sync now" on an archived repo is a 422.
+    let (status, body) = api(
+        &client,
+        "POST",
+        &s.url("/api/v1/repos/alice/proj/mirror/pull/sync"),
+        &rw,
+        None,
+    )
+    .await;
+    assert_eq!(status, 422, "{body}");
+    assert!(body.to_string().contains("mirror paused"), "{body}");
+
+    // Unarchiving resumes syncing: the refs now match upstream.
+    s.core
+        .unarchive_repo(&alice, "alice", "proj")
+        .await
+        .unwrap();
+    let (status, _) = api(
+        &client,
+        "POST",
+        &s.url("/api/v1/repos/alice/proj/mirror/pull/sync"),
+        &rw,
+        None,
+    )
+    .await;
+    assert_eq!(status, 200);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        s.core.run_due_jobs().await.unwrap();
+        let refs = server_refs(&s, repo.id).await;
+        if refs != refs_before || Instant::now() > deadline {
+            assert_ne!(refs, refs_before, "sync after unarchive must fetch");
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }

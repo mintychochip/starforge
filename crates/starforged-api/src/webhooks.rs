@@ -24,7 +24,7 @@ use crate::auth::ApiAuth;
 use crate::error::ApiError;
 use crate::time::rfc3339;
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct WebhookJson {
     pub id: i64,
     pub url: String,
@@ -51,7 +51,7 @@ fn webhook_json(view: &WebhookDto) -> WebhookJson {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 struct DeliverySummaryJson {
     id: i64,
     delivery_id: String,
@@ -85,20 +85,37 @@ pub struct DeliveriesQuery {
     pub limit: Option<i64>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct CreateHookBody {
     pub url: String,
     #[serde(default)]
     pub events: Vec<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct PatchHookBody {
     pub active: bool,
 }
 
 /// `GET /repos/{owner}/{repo}/hooks` (200): the repo's hooks in insert
 /// order, maintainer-only, never containing secrets.
+#[utoipa::path(
+    get,
+    path = "/api/v1/repos/{owner}/{repo}/hooks",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+    ),
+    responses(
+        (status = 200, description = "Webhooks", body = serde_json::Value),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn list_hooks(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -118,6 +135,24 @@ pub async fn list_hooks(
 /// with the plaintext `secret` — the only response that ever carries one.
 /// `events` must be a subset of `push, trail, review, check, session`
 /// (empty means all); anything else is `422`.
+#[utoipa::path(
+    post,
+    path = "/api/v1/repos/{owner}/{repo}/hooks",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+    ),
+    request_body = CreateHookBody,
+    responses(
+        (status = 201, description = "Created webhook", body = serde_json::Value),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn create_hook(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -138,6 +173,25 @@ pub async fn create_hook(
 
 /// `PATCH /repos/{owner}/{repo}/hooks/{id}` (200): flips the hook's `active`
 /// flag (enable/disable).
+#[utoipa::path(
+    patch,
+    path = "/api/v1/repos/{owner}/{repo}/hooks/{id}",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("id" = i64, Path, description = "Webhook id"),
+    ),
+    request_body = PatchHookBody,
+    responses(
+        (status = 200, description = "Updated webhook", body = WebhookJson),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn patch_hook(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -154,6 +208,24 @@ pub async fn patch_hook(
 }
 
 /// `DELETE /repos/{owner}/{repo}/hooks/{id}` (204): removes the hook.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/repos/{owner}/{repo}/hooks/{id}",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("id" = i64, Path, description = "Webhook id"),
+    ),
+    responses(
+        (status = 204, description = "Deleted"),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn delete_hook(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -169,6 +241,24 @@ pub async fn delete_hook(
 
 /// `GET /repos/{owner}/{repo}/hooks/{id}/deliveries[?limit=]` (200): the
 /// hook's logged attempts, newest first (maintainer-only).
+#[utoipa::path(
+    get,
+    path = "/api/v1/repos/{owner}/{repo}/hooks/{id}/deliveries",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("id" = i64, Path, description = "Webhook id"),
+    ),
+    responses(
+        (status = 200, description = "Deliveries", body = serde_json::Value),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn list_deliveries(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -187,6 +277,25 @@ pub async fn list_deliveries(
 
 /// `GET /repos/{owner}/{repo}/hooks/{id}/deliveries/{row}` (200): one
 /// logged attempt in full (maintainer-only).
+#[utoipa::path(
+    get,
+    path = "/api/v1/repos/{owner}/{repo}/hooks/{id}/deliveries/{row}",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("id" = i64, Path, description = "Webhook id"),
+        ("row" = i64, Path, description = "Delivery row"),
+    ),
+    responses(
+        (status = 200, description = "Delivery", body = serde_json::Value),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn get_delivery(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -217,6 +326,25 @@ pub async fn get_delivery(
 
 /// `POST /repos/{owner}/{repo}/hooks/{id}/deliveries/{row}/redeliver`
 /// (202): replays the logged attempt as a new delivery (maintainer-only).
+#[utoipa::path(
+    post,
+    path = "/api/v1/repos/{owner}/{repo}/hooks/{id}/deliveries/{row}/redeliver",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("id" = i64, Path, description = "Webhook id"),
+        ("row" = i64, Path, description = "Delivery row"),
+    ),
+    responses(
+        (status = 202, description = "Delivery replay queued", body = serde_json::Value),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn redeliver(
     State(state): State<ApiState>,
     auth: ApiAuth,

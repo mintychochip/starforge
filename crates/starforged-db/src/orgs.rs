@@ -47,7 +47,7 @@ fn from_org(row: &AnyRow) -> DbResult<OrgRow> {
 pub async fn owner_by_handle(db: &Db, handle: &str) -> DbResult<Option<OwnerRow>> {
     let row = sqlx::query("SELECT id, kind FROM owners WHERE handle = $1")
         .bind(handle)
-        .fetch_optional(db.pool())
+        .fetch_optional(db.read_pool())
         .await?;
     row.map(|row| {
         Ok(OwnerRow {
@@ -62,7 +62,7 @@ pub async fn owner_by_handle(db: &Db, handle: &str) -> DbResult<Option<OwnerRow>
 pub async fn owner_handle_by_id(db: &Db, id: i64) -> DbResult<Option<String>> {
     let handle: Option<String> = sqlx::query_scalar("SELECT handle FROM owners WHERE id = $1")
         .bind(id)
-        .fetch_optional(db.pool())
+        .fetch_optional(db.read_pool())
         .await?;
     Ok(handle)
 }
@@ -115,7 +115,7 @@ pub async fn by_handle(db: &Db, handle: &str) -> DbResult<Option<OrgRow>> {
          FROM orgs g JOIN owners o ON o.id = g.id WHERE o.handle = $1",
     )
     .bind(handle)
-    .fetch_optional(db.pool())
+    .fetch_optional(db.read_pool())
     .await?;
     row.as_ref().map(from_org).transpose()
 }
@@ -186,7 +186,7 @@ pub async fn grant_for_repo_owner(
     )
     .bind(org_id)
     .bind(user_id)
-    .fetch_optional(db.pool())
+    .fetch_optional(db.read_pool())
     .await?;
     row.map(|row| {
         Ok((
@@ -203,7 +203,7 @@ pub async fn role(db: &Db, org_id: i64, user_id: i64) -> DbResult<Option<String>
         sqlx::query_scalar("SELECT role FROM org_members WHERE org_id = $1 AND user_id = $2")
             .bind(org_id)
             .bind(user_id)
-            .fetch_optional(db.pool())
+            .fetch_optional(db.read_pool())
             .await?
             .flatten();
     Ok(role)
@@ -213,7 +213,7 @@ pub async fn member_count(db: &Db, org_id: i64) -> DbResult<i64> {
     let count: Option<i64> =
         sqlx::query_scalar("SELECT COUNT(*) FROM org_members WHERE org_id = $1")
             .bind(org_id)
-            .fetch_optional(db.pool())
+            .fetch_optional(db.read_pool())
             .await?
             .flatten();
     Ok(count.unwrap_or(0))
@@ -227,7 +227,7 @@ pub async fn list_members(db: &Db, org_id: i64) -> DbResult<Vec<MemberRow>> {
          WHERE m.org_id = $1 ORDER BY o.handle",
     )
     .bind(org_id)
-    .fetch_all(db.pool())
+    .fetch_all(db.read_pool())
     .await?;
     rows.iter()
         .map(|row| {
@@ -403,7 +403,7 @@ pub async fn sole_owned_orgs(db: &Db, user_id: i64) -> DbResult<Vec<String>> {
          ORDER BY o.handle",
     )
     .bind(user_id)
-    .fetch_all(db.pool())
+    .fetch_all(db.read_pool())
     .await?;
     Ok(rows)
 }
@@ -577,7 +577,7 @@ pub async fn team_by_slug(db: &Db, org_id: i64, slug: &str) -> DbResult<Option<T
     )
     .bind(org_id)
     .bind(slug)
-    .fetch_optional(db.pool())
+    .fetch_optional(db.read_pool())
     .await?;
     row.as_ref().map(from_team).transpose()
 }
@@ -589,7 +589,7 @@ pub async fn team_by_id(db: &Db, id: i64) -> DbResult<Option<TeamRow>> {
          FROM teams WHERE id = $1",
     )
     .bind(id)
-    .fetch_optional(db.pool())
+        .fetch_optional(db.read_pool())
     .await?;
     row.as_ref().map(from_team).transpose()
 }
@@ -600,7 +600,7 @@ pub async fn list_teams(db: &Db, org_id: i64) -> DbResult<Vec<TeamRow>> {
          FROM teams WHERE org_id = $1 ORDER BY lower_name",
     )
     .bind(org_id)
-    .fetch_all(db.pool())
+        .fetch_all(db.read_pool())
     .await?;
     rows.iter().map(from_team).collect()
 }
@@ -706,7 +706,7 @@ pub async fn list_team_members(db: &Db, team_id: i64) -> DbResult<Vec<TeamMember
          WHERE m.team_id = $1 ORDER BY o.handle",
     )
     .bind(team_id)
-    .fetch_all(db.pool())
+    .fetch_all(db.read_pool())
     .await?;
     rows.iter()
         .map(|row| {
@@ -750,7 +750,7 @@ pub async fn list_team_repo_ids(db: &Db, team_id: i64) -> DbResult<Vec<i64>> {
          WHERE t.team_id = $1 ORDER BY r.lower_name",
     )
     .bind(team_id)
-    .fetch_all(db.pool())
+    .fetch_all(db.read_pool())
     .await?;
     Ok(rows)
 }
@@ -771,7 +771,7 @@ pub async fn covering_team_grants(
     .bind(org_id)
     .bind(user_id)
     .bind(repo_id)
-    .fetch_all(db.pool())
+    .fetch_all(db.read_pool())
     .await?;
     Ok(rows)
 }
@@ -784,7 +784,7 @@ pub async fn repo_name_taken_by_other(db: &Db, org_id: i64, lower_name: &str) ->
     )
     .bind(lower_name)
     .bind(org_id)
-    .fetch_one(db.pool())
+    .fetch_one(db.read_pool())
     .await?;
     Ok(count > 0)
 }
@@ -797,7 +797,7 @@ pub async fn owned_by(db: &Db, user_id: i64) -> DbResult<Vec<String>> {
          WHERE m.user_id = $1 AND m.role = 'owner' ORDER BY o.handle",
     )
     .bind(user_id)
-    .fetch_all(db.pool())
+    .fetch_all(db.read_pool())
     .await?)
 }
 
@@ -818,7 +818,7 @@ pub async fn summaries(db: &Db) -> DbResult<Vec<OrgSummaryRow>> {
          (SELECT COUNT(*) FROM repos r WHERE r.owner_id = o.id AND r.deleted_at IS NULL) AS repo_count \
          FROM orgs g JOIN owners o ON o.id = g.id ORDER BY o.handle",
     )
-    .fetch_all(db.pool())
+    .fetch_all(db.read_pool())
     .await?;
     rows.iter()
         .map(|row| {

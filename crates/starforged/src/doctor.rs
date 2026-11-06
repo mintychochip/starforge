@@ -533,7 +533,7 @@ async fn check_stray_repos(
 /// writing (or backing up) that repository right now — a WARN, since
 /// doctor is read-only and a busy writer is not a fault.
 fn check_repository_locks(report: &mut Report, config: &Config) {
-    use starforged_core::repolock::{BlobGcLock, LockError, RepoLock};
+    use starforged_core::repolock::{BlobGcLock, RepoLock};
     let mut held: Vec<String> = Vec::new();
     let mut probed = 0_usize;
     let repos_dir = config.repos_dir();
@@ -550,18 +550,18 @@ fn check_repository_locks(report: &mut Report, config: &Config) {
                         continue;
                     }
                     probed += 1;
-                    match RepoLock::try_exclusive(&path) {
-                        Ok(_) => {}
-                        Err(LockError::WouldBlock { .. }) => held.push(path.display().to_string()),
+                    match RepoLock::probe_exclusive(&path) {
+                        Ok(true) => {}
+                        Ok(false) => held.push(path.display().to_string()),
                         Err(err) => held.push(format!("{} ({err})", path.display())),
                     }
                 }
             }
         }
     }
-    match BlobGcLock::try_exclusive(&config.blob_dir()) {
-        Ok(_) => {}
-        Err(LockError::WouldBlock { .. }) => held.push("the blob-GC lock".to_owned()),
+    match BlobGcLock::probe_exclusive(&config.blob_dir()) {
+        Ok(true) => {}
+        Ok(false) => held.push("the blob-GC lock".to_owned()),
         Err(err) => held.push(format!("the blob-GC lock ({err})")),
     }
     if held.is_empty() {

@@ -41,7 +41,7 @@ pub async fn permission(db: &Db, repo_id: i64, user_id: i64) -> DbResult<Option<
     )
     .bind(repo_id)
     .bind(user_id)
-    .fetch_optional(db.pool())
+    .fetch_optional(db.read_pool())
     .await?;
     Ok(value)
 }
@@ -52,7 +52,7 @@ pub async fn list(db: &Db, repo_id: i64) -> DbResult<Vec<CollaboratorRow>> {
          WHERE c.repo_id = $1 ORDER BY o.handle",
     )
     .bind(repo_id)
-    .fetch_all(db.pool())
+    .fetch_all(db.read_pool())
     .await?;
     rows.iter()
         .map(|row| {

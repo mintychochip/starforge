@@ -281,7 +281,7 @@ pub async fn session_by_ulid(db: &Db, repo_id: i64, ulid: &str) -> DbResult<Opti
     let row = sqlx::query(select_session!("WHERE repo_id = $1 AND ulid = $2"))
         .bind(repo_id)
         .bind(ulid)
-        .fetch_optional(db.pool())
+        .fetch_optional(db.read_pool())
         .await?;
     row.as_ref().map(session_from_row).transpose()
 }
@@ -368,7 +368,7 @@ pub async fn set_quarantine(
 pub async fn session_by_id(db: &Db, id: i64) -> DbResult<Option<SessionRow>> {
     let row = sqlx::query(select_session!("WHERE id = $1"))
         .bind(id)
-        .fetch_optional(db.pool())
+        .fetch_optional(db.read_pool())
         .await?;
     row.as_ref().map(session_from_row).transpose()
 }
@@ -389,7 +389,7 @@ pub async fn segment_by_n(db: &Db, session_id: i64, n: i64) -> DbResult<Option<S
     let row = sqlx::query(select_segment!("WHERE session_id = $1 AND n = $2"))
         .bind(session_id)
         .bind(n)
-        .fetch_optional(db.pool())
+        .fetch_optional(db.read_pool())
         .await?;
     row.as_ref().map(segment_from_row).transpose()
 }
@@ -430,7 +430,7 @@ pub async fn set_session_stats(
 pub async fn segment_count(db: &Db, session_id: i64) -> DbResult<i64> {
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM segments WHERE session_id = $1")
         .bind(session_id)
-        .fetch_one(db.pool())
+        .fetch_one(db.read_pool())
         .await?;
     Ok(count)
 }
@@ -463,7 +463,7 @@ pub async fn insert_segment(
 pub async fn segments_of(db: &Db, session_id: i64) -> DbResult<Vec<SegmentRow>> {
     let rows = sqlx::query(select_segment!("WHERE session_id = $1 ORDER BY n ASC"))
         .bind(session_id)
-        .fetch_all(db.pool())
+        .fetch_all(db.read_pool())
         .await?;
     rows.iter().map(segment_from_row).collect()
 }
@@ -639,7 +639,7 @@ async fn link_id_by_key(db: &Db, repo_id: i64, ulid: &str, sha: &str) -> DbResul
     .bind(repo_id)
     .bind(ulid)
     .bind(sha)
-    .fetch_one(db.pool())
+    .fetch_one(db.read_pool())
     .await?;
     Ok(id)
 }
@@ -664,7 +664,7 @@ async fn link_id_by_key_tx(
 pub async fn links_of_session(db: &Db, session_id: i64) -> DbResult<Vec<CommitLinkRow>> {
     let rows = sqlx::query(select_link!("WHERE session_id = $1 ORDER BY id ASC"))
         .bind(session_id)
-        .fetch_all(db.pool())
+        .fetch_all(db.read_pool())
         .await?;
     rows.iter().map(link_from_row).collect()
 }
@@ -672,7 +672,7 @@ pub async fn links_of_session(db: &Db, session_id: i64) -> DbResult<Vec<CommitLi
 pub async fn blob_by_hash(db: &Db, hash: &str) -> DbResult<Option<BlobRow>> {
     let row = sqlx::query("SELECT hash, size, refcount, backend_key FROM blobs WHERE hash = $1")
         .bind(hash)
-        .fetch_optional(db.pool())
+        .fetch_optional(db.read_pool())
         .await?;
     row.as_ref().map(blob_from_row).transpose()
 }
@@ -720,7 +720,7 @@ pub async fn zero_ref_blobs(db: &Db, limit: i64) -> DbResult<Vec<BlobRow>> {
          WHERE refcount <= 0 ORDER BY created_at ASC LIMIT $1",
     )
     .bind(limit)
-    .fetch_all(db.pool())
+    .fetch_all(db.read_pool())
     .await?;
     rows.iter().map(blob_from_row).collect()
 }
@@ -752,7 +752,7 @@ pub async fn repo_storage_bytes(db: &Db, repo_id: i64) -> DbResult<i64> {
          JOIN sessions s ON s.id = g.session_id WHERE s.repo_id = $1",
     )
     .bind(repo_id)
-    .fetch_one(db.pool())
+    .fetch_one(db.read_pool())
     .await?;
     Ok(bytes)
 }
@@ -764,7 +764,7 @@ pub async fn user_storage_bytes(db: &Db, user_id: i64) -> DbResult<i64> {
          JOIN sessions s ON s.id = g.session_id WHERE s.uploader_id = $1",
     )
     .bind(user_id)
-    .fetch_one(db.pool())
+    .fetch_one(db.read_pool())
     .await?;
     Ok(bytes)
 }
@@ -777,7 +777,7 @@ pub async fn user_volume_since(db: &Db, user_id: i64, since_unix: i64) -> DbResu
     )
     .bind(user_id)
     .bind(since_unix)
-    .fetch_one(db.pool())
+    .fetch_one(db.read_pool())
     .await?;
     Ok(bytes)
 }
@@ -788,7 +788,7 @@ pub async fn quarantined_of_repo(db: &Db, repo_id: i64) -> DbResult<Vec<SessionR
         "WHERE repo_id = $1 AND quarantine = 'quarantined' ORDER BY id ASC"
     ))
     .bind(repo_id)
-    .fetch_all(db.pool())
+    .fetch_all(db.read_pool())
     .await?;
     rows.iter().map(session_from_row).collect()
 }
@@ -810,7 +810,7 @@ pub async fn quarantined_all(db: &Db, limit: i64) -> DbResult<Vec<(SessionRow, S
          WHERE s.quarantine = 'quarantined' ORDER BY s.id ASC LIMIT $1",
     )
     .bind(limit)
-    .fetch_all(db.pool())
+    .fetch_all(db.read_pool())
     .await?;
     let mut out = Vec::with_capacity(rows.len());
     for row in &rows {
@@ -831,7 +831,7 @@ pub async fn links_for_sha(db: &Db, repo_id: i64, sha: &str) -> DbResult<Vec<Com
     ))
     .bind(repo_id)
     .bind(sha)
-    .fetch_all(db.pool())
+    .fetch_all(db.read_pool())
     .await?;
     rows.iter().map(link_from_row).collect()
 }
@@ -863,7 +863,7 @@ pub async fn links_for_shas(
     for sha in shas {
         query = query.bind(sha);
     }
-    let rows = query.fetch_all(db.pool()).await?;
+    let rows = query.fetch_all(db.read_pool()).await?;
     rows.iter().map(link_from_row).collect()
 }
 
@@ -880,7 +880,7 @@ pub async fn sessions_uploaded_by(
     ))
     .bind(uploader_id)
     .bind(limit)
-    .fetch_all(db.pool())
+    .fetch_all(db.read_pool())
     .await?;
     rows.iter().map(session_from_row).collect()
 }
@@ -892,7 +892,7 @@ pub async fn sessions_of_repo(db: &Db, repo_id: i64, limit: i64) -> DbResult<Vec
     ))
     .bind(repo_id)
     .bind(limit)
-    .fetch_all(db.pool())
+    .fetch_all(db.read_pool())
     .await?;
     rows.iter().map(session_from_row).collect()
 }

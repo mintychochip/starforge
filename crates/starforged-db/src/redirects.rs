@@ -11,7 +11,7 @@ pub async fn target(db: &Db, owner_handle: &str, lower_name: &str) -> DbResult<O
     )
     .bind(owner_handle)
     .bind(lower_name)
-    .fetch_optional(db.pool())
+    .fetch_optional(db.read_pool())
     .await?;
     Ok(id)
 }

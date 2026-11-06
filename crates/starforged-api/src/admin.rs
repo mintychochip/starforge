@@ -26,6 +26,28 @@ pub struct AuditParams {
 /// `GET /admin/audit`: newest first, keyset-paginated audit entries. Needs a site
 /// admin with the `admin` token scope; anyone else is answered as if the route
 /// did not exist (a non-admin token) or refused for the missing scope.
+#[utoipa::path(
+    get,
+    path = "/api/v1/admin/audit",
+    params(
+        ("actor" = Option<String>, Query, description = "Filter by actor"),
+        ("action" = Option<String>, Query, description = "Filter by action"),
+        ("target" = Option<String>, Query, description = "Filter by target"),
+        ("from" = Option<String>, Query, description = "Entries at or after this timestamp"),
+        ("to" = Option<String>, Query, description = "Entries at or before this timestamp"),
+        ("after" = Option<i64>, Query, description = "Keyset cursor"),
+        ("limit" = Option<i64>, Query, description = "Page size"),
+    ),
+    responses(
+        (status = 200, description = "Audit entries", body = serde_json::Value),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn audit(
     State(state): State<ApiState>,
     auth: ApiAuth,

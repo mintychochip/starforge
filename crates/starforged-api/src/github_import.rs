@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use starforged_core::github::status::GithubImportView;
 use starforged_core::tokens::Scope;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct StartGithubImportBody {
     /// The GitHub repository, `"owner/repo"` (`slug` is accepted as an alias).
     #[serde(default, alias = "slug")]
@@ -27,7 +27,7 @@ pub struct StartGithubImportBody {
     pub token: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct GithubImportJson {
     pub id: i64,
     pub repo_id: i64,
@@ -88,6 +88,24 @@ fn import_json(row: &GithubImportView) -> GithubImportJson {
 /// `NotFound` for non-readers); archived repositories and repositories
 /// that already have Trails answer `422`. The token is sealed at once
 /// and never appears in the response.
+#[utoipa::path(
+    post,
+    path = "/api/v1/repos/{owner}/{repo}/import/github",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+    ),
+    request_body = StartGithubImportBody,
+    responses(
+        (status = 201, description = "GitHub import started", body = GithubImportJson),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn start_github_import(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -106,6 +124,23 @@ pub async fn start_github_import(
 /// `GET /repos/{owner}/{repo}/import/github`: the import status for
 /// readers (mirroring `GET …/import`); `404` when no import exists or
 /// the caller cannot read the repository.
+#[utoipa::path(
+    get,
+    path = "/api/v1/repos/{owner}/{repo}/import/github",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+    ),
+    responses(
+        (status = 200, description = "GitHub import status", body = GithubImportJson),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn get_github_import(
     State(state): State<ApiState>,
     auth: ApiAuth,

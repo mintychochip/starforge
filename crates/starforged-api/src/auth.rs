@@ -29,8 +29,17 @@ impl FromRequestParts<ApiState> for ApiAuth {
         if !parts.headers.contains_key(header::AUTHORIZATION) {
             return Ok(ApiAuth(None, None));
         }
-        let token = bearer_token(&parts.headers).ok_or(ApiError::Unauthenticated)?;
-        let auth = state.core.authenticate_token(token).await?;
+        bearer_token(&parts.headers).ok_or(ApiError::Unauthenticated)?;
+        // The rate-limit middleware already authenticated the token and
+        // parked the result in the request extensions: reuse it instead of
+        // authenticating twice per request.
+        let auth = match parts.extensions.get::<TokenAuth>() {
+            Some(auth) => auth.clone(),
+            None => {
+                let token = bearer_token(&parts.headers).ok_or(ApiError::Unauthenticated)?;
+                state.core.authenticate_token(token).await?
+            }
+        };
         let decision = match parts.extensions.get::<RateDecision>() {
             Some(decision) => *decision,
             None => state.core.check_api_rate(auth.token_id),
@@ -70,6 +79,7 @@ pub async fn rate_limit(State(state): State<ApiState>, request: Request, next: N
         .into_response();
     }
     let mut request = request;
+    request.extensions_mut().insert(auth);
     request.extensions_mut().insert(decision);
     let mut response = next.run(request).await;
     insert_rate_headers(response.headers_mut(), 0, decision);

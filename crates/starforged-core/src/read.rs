@@ -625,7 +625,7 @@ mod tests {
     use crate::accounts::CreateUser;
     use crate::permission::Visibility;
     use crate::repos::CreateRepo;
-    use crate::testing::{test_core, user};
+    use crate::testing::{Fixture, test_core, user};
 
     pub(crate) fn repo(visibility: Visibility) -> Repo {
         Repo {
@@ -1057,6 +1057,7 @@ mod tests {
     }
 
     struct Seeded {
+        _fixture: Fixture,
         core: Core,
         alice: User,
         bob: User,
@@ -1105,7 +1106,7 @@ mod tests {
     }
 
     async fn seed() -> Seeded {
-        let (core, _f) = test_core().await;
+        let (core, fixture) = test_core().await;
         let alice = user(&core, "alice").await;
         let bob = user(&core, "bob").await;
         let carol = user(&core, "carol").await;
@@ -1130,6 +1131,7 @@ mod tests {
             .await
             .unwrap();
         Seeded {
+            _fixture: fixture,
             core,
             alice,
             bob,

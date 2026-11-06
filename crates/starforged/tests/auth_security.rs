@@ -475,6 +475,31 @@ async fn open_redirects_are_refused_on_every_login_next() {
     assert!(!page.contains("evil.example"), "next reflected: {page}");
     assert_eq!(extract_input(&page, "next"), "/");
 
+    // The OIDC begin route also sanitizes `next` for its signed-out
+    // redirect contract: an off-site next never becomes the Location of a
+    // signed-in redirect, and on the login page it can only ever render
+    // inside a same-site link.
+    let bad_oidc = anon
+        .get(s.url("/login/oidc?next=https%3A%2F%2Fevil.example"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad_oidc.status(), 401, "OIDC is disabled here");
+    assert!(!bad_oidc.text().await.unwrap().contains("evil.example"));
+
+    // A signed-in visitor asking for /login or /login/two-factor with an
+    // off-site next lands on "/" — safe_next applies there too.
+    let (signed_in, _) = s.login("alice").await;
+    for path in [
+        "/login?next=https%3A%2F%2Fevil.example",
+        "/login/two-factor?next=https%3A%2F%2Fevil.example",
+        "/login/oidc?next=https%3A%2F%2Fevil.example",
+    ] {
+        let response = signed_in.get(s.url(path)).send().await.unwrap();
+        assert_eq!(response.status(), 303, "{path}");
+        assert_eq!(location(&response), "/", "{path}");
+    }
+
     // Successful password logins land on "/" for off-site next values, and
     // keep same-site paths.
     for next in [
@@ -928,6 +953,23 @@ async fn suspended_users_cannot_log_in_on_any_path() {
     let bounced = eve.get(s.url("/settings/profile")).send().await.unwrap();
     assert_eq!(bounced.status(), 303);
     assert!(location(&bounced).starts_with("/login"));
+
+    // A challenge issued BEFORE suspension still refuses the correct code:
+    // `complete_second_factor` requires an active user, so no session.
+    let (_, _, dave_secret, _, _) = enroll(&s, "dave").await;
+    let (dave_browser, dave_csrf) = start_two_factor(&s, "dave").await;
+    let dave = s.core.user_by_handle("dave").await.unwrap().unwrap();
+    s.core.suspend_user(&admin, dave.id).await.unwrap();
+    let refused = second_factor(
+        &dave_browser,
+        &s,
+        &dave_csrf,
+        next_code(&dave_secret).as_str(),
+    )
+    .await;
+    assert_eq!(refused.status(), 303);
+    assert_eq!(location(&refused), "/login");
+    assert!(cookie_value(&refused, "sf_session").is_none());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -956,6 +998,39 @@ async fn suspended_linked_oidc_user_is_refused() {
     let body = response.text().await.unwrap();
     assert!(body.contains("Single sign-on failed"), "{body}");
     assert!(no_session);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn suspended_user_before_first_oidc_sign_in_links_nothing() {
+    let fake = FakeOidc::start_es256().await;
+    let s = oidc_server_ex(&fake, false, "open").await;
+    let alice = user_with_email(&s, "alice", "fake-user@example.com").await;
+    let admin = s
+        .core
+        .create_user(CreateUser {
+            handle: "root".into(),
+            password: Some(PASSWORD.into()),
+            is_admin: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    // Suspended before the identity was ever linked: the verified-email
+    // match must not insert an identity, and sign-in is refused.
+    s.core.suspend_user(&admin, alice.id).await.unwrap();
+    let (_, response) = browser_oidc_login(&s).await;
+    assert_eq!(response.status(), 401);
+    let no_session = cookie_value(&response, "sf_session").is_none();
+    let body = response.text().await.unwrap();
+    assert!(
+        body.contains("Single sign-on failed") || body.contains("No account for this sign-in"),
+        "{body}"
+    );
+    assert!(no_session);
+    assert!(
+        s.core.linked_identities(alice.id).await.unwrap().is_empty(),
+        "a suspended user's identity must not be linked"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -27,6 +27,12 @@ pub async fn redirect_renamed(
         .map(|o| o.0.clone())
         .unwrap_or_else(|| uri.clone());
     let token = bearer_token(request.headers()).map(str::to_owned);
+    // The rate-limit middleware parks the authenticated token in the
+    // extensions: reuse it instead of authenticating again here.
+    let parked = request
+        .extensions()
+        .get::<starforged_core::tokens::TokenAuth>()
+        .map(|auth| auth.user.clone());
     let response = next.run(request).await;
     if response.status() != StatusCode::NOT_FOUND {
         return response;
@@ -37,14 +43,17 @@ pub async fn redirect_renamed(
     let Some((owner, name, rest)) = split_repo_path(repo_path) else {
         return response;
     };
-    let viewer = match token {
-        Some(secret) => state
-            .core
-            .authenticate_token(&secret)
-            .await
-            .ok()
-            .map(|auth| auth.user),
-        None => None,
+    let viewer = match parked {
+        Some(user) => Some(user),
+        None => match token {
+            Some(secret) => state
+                .core
+                .authenticate_token(&secret)
+                .await
+                .ok()
+                .map(|auth| auth.user),
+            None => None,
+        },
     };
     let target = match state.core.moved_repo(viewer.as_ref(), owner, name).await {
         Ok(Some(repo)) => repo,

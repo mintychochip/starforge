@@ -151,7 +151,8 @@ pub async fn run(config_path: &Path, target: &Path, include_config: bool) -> any
     Ok(())
 }
 
-/// Refuses a non-empty target; creates an absent one `0700`.
+/// Refuses a non-empty target; creates an absent one. Either way the
+/// directory is `0700` (D3): the backup holds `secret_key`.
 fn prepare_target(target: &Path) -> anyhow::Result<()> {
     if target.exists() {
         if !target.is_dir() {
@@ -165,6 +166,7 @@ fn prepare_target(target: &Path) -> anyhow::Result<()> {
                 target.display()
             );
         }
+        set_mode(target, 0o700)?;
     } else {
         std::fs::create_dir_all(target)
             .with_context(|| format!("creating {}", target.display()))?;
@@ -207,7 +209,7 @@ fn repository_dirs(repos_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
 /// Recursively copies `src` to `dest` (creating `dest`), skipping the
 /// root-level `skip` entry when given. Returns the number of files copied.
 /// File contents and permissions, and symlinks, are preserved.
-fn copy_tree(src: &Path, dest: &Path, skip: Option<&str>) -> anyhow::Result<u64> {
+pub(crate) fn copy_tree(src: &Path, dest: &Path, skip: Option<&str>) -> anyhow::Result<u64> {
     std::fs::create_dir_all(dest).with_context(|| format!("creating {}", dest.display()))?;
     let mut files = 0_u64;
     let mut entries: Vec<PathBuf> = std::fs::read_dir(src)
@@ -251,21 +253,20 @@ fn make_dir(path: &Path) -> anyhow::Result<()> {
     set_mode(path, 0o700)
 }
 
-fn write_file(path: &Path, bytes: &[u8], mode: u32) -> anyhow::Result<()> {
+pub(crate) fn write_file(path: &Path, bytes: &[u8], mode: u32) -> anyhow::Result<()> {
     std::fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))?;
     set_mode(path, mode)
 }
 
 #[cfg(unix)]
-fn set_mode(path: &Path, mode: u32) -> anyhow::Result<()> {
+pub(crate) fn set_mode(path: &Path, mode: u32) -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
         .with_context(|| format!("setting permissions on {}", path.display()))
 }
 
 #[cfg(not(unix))]
-fn set_mode(path: &Path, _mode: u32) -> anyhow::Result<()> {
-    let _ = path;
+pub(crate) fn set_mode(path: &Path, _mode: u32) -> anyhow::Result<()> {
     Ok(())
 }
 
@@ -297,15 +298,69 @@ fn pg_dump(url: &str, dest: &Path) -> anyhow::Result<()> {
 
 /// Splits `postgres://user:password@host/db` into a password-less URL and
 /// the password, so the password never appears in argv.
-fn split_pg_password(url: &str) -> (String, Option<String>) {
+pub(crate) fn split_pg_password(url: &str) -> (String, Option<String>) {
     match url::Url::parse(url) {
         Ok(mut parsed) => {
-            let password = parsed.password().map(str::to_owned);
+            let password = parsed.password().map(percent_decode);
             if password.is_some() {
                 let _ = parsed.set_password(None);
             }
             (parsed.to_string(), password)
         }
         Err(_) => (url.to_owned(), None),
+    }
+}
+
+/// Decodes `%XX` escapes in a URL password (`Url::password()` is still
+/// percent-encoded). Malformed escapes pass through unchanged.
+fn percent_decode(encoded: &str) -> String {
+    let bytes = encoded.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (hex_value(bytes[i + 1]), hex_value(bytes[i + 2]))
+        {
+            out.push(hi * 16 + lo);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn password_split_decodes_escapes_and_strips_argv() {
+        let (url, password) =
+            split_pg_password("postgres://user:p%40ss%25word@127.0.0.1:55439/sf_test");
+        assert_eq!(password.as_deref(), Some("p@ss%word"));
+        assert!(
+            !url.contains("p%40ss"),
+            "the password must not reach argv: {url}"
+        );
+        assert_eq!(url, "postgres://user@127.0.0.1:55439/sf_test");
+    }
+
+    #[test]
+    fn password_split_without_password_is_unchanged() {
+        let (url, password) = split_pg_password("postgres://user@127.0.0.1:5432/db");
+        assert_eq!(url, "postgres://user@127.0.0.1:5432/db");
+        assert_eq!(password, None);
     }
 }

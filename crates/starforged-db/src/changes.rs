@@ -403,7 +403,7 @@ pub async fn change_by_trail_number(db: &Db, trail_id: i64, k: i64) -> DbResult<
     let row = sqlx::query(select_change!("WHERE trail_id = $1 AND number = $2"))
         .bind(trail_id)
         .bind(k)
-        .fetch_optional(db.pool())
+        .fetch_optional(db.read_pool())
         .await?;
     row.as_ref().map(change_from_row).transpose()
 }
@@ -412,7 +412,7 @@ pub async fn change_by_trail_number(db: &Db, trail_id: i64, k: i64) -> DbResult<
 pub async fn changes_of_trail(db: &Db, trail_id: i64) -> DbResult<Vec<ChangeRow>> {
     let rows = sqlx::query(select_change!("WHERE trail_id = $1 ORDER BY number ASC"))
         .bind(trail_id)
-        .fetch_all(db.pool())
+        .fetch_all(db.read_pool())
         .await?;
     rows.iter().map(change_from_row).collect()
 }
@@ -431,7 +431,7 @@ pub async fn changes_of_trail_filtered(
     .bind(trail_id)
     .bind(f.state.as_deref())
     .bind(f.kind.as_deref())
-    .fetch_all(db.pool())
+    .fetch_all(db.read_pool())
     .await?;
     rows.iter().map(change_from_row).collect()
 }
@@ -463,7 +463,7 @@ pub async fn open_agit_change(
     .bind(base)
     .bind(topic)
     .bind(trail_id)
-    .fetch_optional(db.pool())
+    .fetch_optional(db.read_pool())
     .await?;
     row.as_ref().map(change_from_row).transpose()
 }
@@ -477,7 +477,7 @@ pub async fn count_agit_changes_since(db: &Db, user_id: i64, since: i64) -> DbRe
     )
     .bind(user_id)
     .bind(since)
-    .fetch_one(db.pool())
+    .fetch_one(db.read_pool())
     .await?;
     Ok(count)
 }
@@ -498,7 +498,7 @@ pub async fn open_agit_topics_for_repo(
     )
     .bind(repo_id)
     .bind(user_id)
-    .fetch_all(db.pool())
+    .fetch_all(db.read_pool())
     .await?;
     rows.iter()
         .map(|row| {
@@ -513,7 +513,7 @@ pub async fn open_agit_topics_for_repo(
 pub async fn change_by_id(db: &Db, id: i64) -> DbResult<Option<ChangeRow>> {
     let row = sqlx::query(select_change!("WHERE id = $1"))
         .bind(id)
-        .fetch_optional(db.pool())
+        .fetch_optional(db.read_pool())
         .await?;
     row.as_ref().map(change_from_row).transpose()
 }
@@ -521,7 +521,7 @@ pub async fn change_by_id(db: &Db, id: i64) -> DbResult<Option<ChangeRow>> {
 pub async fn revision_by_id(db: &Db, id: i64) -> DbResult<Option<RevisionRow>> {
     let row = sqlx::query(select_revision!("WHERE id = $1"))
         .bind(id)
-        .fetch_optional(db.pool())
+        .fetch_optional(db.read_pool())
         .await?;
     row.as_ref().map(revision_from_row).transpose()
 }
@@ -542,7 +542,7 @@ pub async fn open_branch_changes(db: &Db, repo_id: i64, branch: &str) -> DbResul
     )
     .bind(repo_id)
     .bind(branch)
-    .fetch_all(db.pool())
+    .fetch_all(db.read_pool())
     .await?;
     rows.iter().map(change_from_row).collect()
 }
@@ -569,7 +569,7 @@ pub async fn changes_with_current_head(
     )
     .bind(repo_id)
     .bind(sha)
-    .fetch_all(db.pool())
+    .fetch_all(db.read_pool())
     .await?;
     rows.iter().map(change_from_row).collect()
 }
@@ -584,7 +584,7 @@ pub async fn open_change_ids_with_base(db: &Db, repo_id: i64, base: &str) -> DbR
     )
     .bind(repo_id)
     .bind(base)
-    .fetch_all(db.pool())
+    .fetch_all(db.read_pool())
     .await?;
     Ok(rows)
 }
@@ -892,7 +892,7 @@ pub async fn latest_revision_of_change(db: &Db, change_id: i64) -> DbResult<Opti
         "WHERE change_id = $1 ORDER BY number DESC LIMIT 1"
     ))
     .bind(change_id)
-    .fetch_optional(db.pool())
+    .fetch_optional(db.read_pool())
     .await?;
     row.as_ref().map(revision_from_row).transpose()
 }
@@ -901,7 +901,7 @@ pub async fn latest_revision_of_change(db: &Db, change_id: i64) -> DbResult<Opti
 pub async fn revisions_of_change(db: &Db, change_id: i64) -> DbResult<Vec<RevisionRow>> {
     let rows = sqlx::query(select_revision!("WHERE change_id = $1 ORDER BY number ASC"))
         .bind(change_id)
-        .fetch_all(db.pool())
+        .fetch_all(db.read_pool())
         .await?;
     rows.iter().map(revision_from_row).collect()
 }
@@ -969,7 +969,7 @@ pub async fn revision_commits_of(db: &Db, revision_id: i64) -> DbResult<Vec<Revi
          WHERE revision_id = $1 ORDER BY position ASC",
     )
     .bind(revision_id)
-    .fetch_all(db.pool())
+    .fetch_all(db.read_pool())
     .await?;
     rows.iter()
         .map(|row| {
@@ -1004,7 +1004,7 @@ pub async fn revision_commits_of_trail(db: &Db, trail_id: i64) -> DbResult<Vec<T
          JOIN changes c ON c.id = r.change_id WHERE c.trail_id = $1",
     )
     .bind(trail_id)
-    .fetch_all(db.pool())
+    .fetch_all(db.read_pool())
     .await?;
     rows.iter()
         .map(|row| {
@@ -1027,7 +1027,7 @@ pub async fn unrecorded_revision_ids(db: &Db, limit: i64) -> DbResult<Vec<i64>> 
         "SELECT id FROM revisions WHERE commits_recorded = 0 ORDER BY id ASC LIMIT $1",
     )
     .bind(limit)
-    .fetch_all(db.pool())
+    .fetch_all(db.read_pool())
     .await?;
     Ok(ids)
 }
@@ -1036,7 +1036,7 @@ pub async fn revision_by_number(db: &Db, change_id: i64, r: i64) -> DbResult<Opt
     let row = sqlx::query(select_revision!("WHERE change_id = $1 AND number = $2"))
         .bind(change_id)
         .bind(r)
-        .fetch_optional(db.pool())
+        .fetch_optional(db.read_pool())
         .await?;
     row.as_ref().map(revision_from_row).transpose()
 }
@@ -1143,7 +1143,7 @@ pub async fn insert_imported_review(
 pub async fn review_by_github_id(db: &Db, github_id: i64) -> DbResult<Option<ReviewRow>> {
     let row = sqlx::query(select_review!("WHERE github_id = $1"))
         .bind(github_id)
-        .fetch_optional(db.pool())
+        .fetch_optional(db.read_pool())
         .await?;
     row.as_ref().map(review_from_row).transpose()
 }
@@ -1297,7 +1297,7 @@ pub async fn insert_thread_with_imported_comment(
 pub async fn reviews_of_change(db: &Db, change_id: i64) -> DbResult<Vec<ReviewRow>> {
     let rows = sqlx::query(select_review!("WHERE change_id = $1 ORDER BY id ASC"))
         .bind(change_id)
-        .fetch_all(db.pool())
+        .fetch_all(db.read_pool())
         .await?;
     rows.iter().map(review_from_row).collect()
 }
@@ -1313,7 +1313,7 @@ pub async fn reviews_of_change_revision(
     ))
     .bind(change_id)
     .bind(revision_id)
-    .fetch_all(db.pool())
+    .fetch_all(db.read_pool())
     .await?;
     rows.iter().map(review_from_row).collect()
 }
@@ -1329,7 +1329,7 @@ pub async fn pending_review_of_author(
     ))
     .bind(change_id)
     .bind(author_id)
-    .fetch_optional(db.pool())
+    .fetch_optional(db.read_pool())
     .await?;
     row.as_ref().map(review_from_row).transpose()
 }
@@ -1445,7 +1445,7 @@ pub async fn insert_thread(
 pub async fn threads_of_change(db: &Db, change_id: i64) -> DbResult<Vec<ThreadRow>> {
     let rows = sqlx::query(select_thread!("WHERE change_id = $1 ORDER BY id ASC"))
         .bind(change_id)
-        .fetch_all(db.pool())
+        .fetch_all(db.read_pool())
         .await?;
     rows.iter().map(thread_from_row).collect()
 }
@@ -1518,7 +1518,7 @@ pub async fn thread_comment_by_github_id(
 ) -> DbResult<Option<ReviewCommentRow>> {
     let row = sqlx::query(select_comment!("WHERE github_id = $1"))
         .bind(github_id)
-        .fetch_optional(db.pool())
+        .fetch_optional(db.read_pool())
         .await?;
     row.as_ref().map(comment_from_row).transpose()
 }
@@ -1527,7 +1527,7 @@ pub async fn thread_comment_by_github_id(
 pub async fn comments_of_thread(db: &Db, thread_id: i64) -> DbResult<Vec<ReviewCommentRow>> {
     let rows = sqlx::query(select_comment!("WHERE thread_id = $1 ORDER BY id ASC"))
         .bind(thread_id)
-        .fetch_all(db.pool())
+        .fetch_all(db.read_pool())
         .await?;
     rows.iter().map(comment_from_row).collect()
 }
@@ -1546,7 +1546,7 @@ pub async fn set_comment_review(db: &Db, comment_id: i64, review_id: i64) -> DbR
 pub async fn comments_of_review(db: &Db, review_id: i64) -> DbResult<Vec<ReviewCommentRow>> {
     let rows = sqlx::query(select_comment!("WHERE review_id = $1 ORDER BY id ASC"))
         .bind(review_id)
-        .fetch_all(db.pool())
+        .fetch_all(db.read_pool())
         .await?;
     rows.iter().map(comment_from_row).collect()
 }
@@ -1592,7 +1592,7 @@ pub async fn file_views_of_change(
     )
     .bind(change_id)
     .bind(user_id)
-    .fetch_all(db.pool())
+    .fetch_all(db.read_pool())
     .await?;
     rows.iter().map(file_view_from_row).collect()
 }

@@ -90,17 +90,17 @@ fn request_class(path: &str) -> &'static str {
 /// Counts every request (except the ops endpoints themselves) and
 /// observes its duration, labelled only by class and status bucket.
 async fn record_metrics(State(core): State<Core>, request: Request, next: Next) -> Response {
-    let path = request.uri().path().to_owned();
-    if matches!(path.as_str(), "/healthz" | "/readyz" | "/metrics") {
+    let class = request_class(request.uri().path());
+    if matches!(request.uri().path(), "/healthz" | "/readyz" | "/metrics") {
         return next.run(request).await;
     }
-    let class = request_class(&path);
     let start = std::time::Instant::now();
     let response = next.run(request).await;
-    let status = response.status().as_u16();
-    core.metrics().inc_http(class, status);
-    core.metrics()
-        .observe_http(class, start.elapsed().as_secs_f64());
+    core.metrics().record_http(
+        class,
+        response.status().as_u16(),
+        start.elapsed().as_secs_f64(),
+    );
     response
 }
 
@@ -172,7 +172,9 @@ async fn metrics(State(state): State<OpsState>, headers: HeaderMap) -> Response 
     let Some(expected) = state.metrics_token.clone() else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    if bearer_token(&headers) != Some(expected.as_str()) {
+    use subtle::ConstantTimeEq;
+    let given = bearer_token(&headers).unwrap_or("");
+    if !bool::from(given.as_bytes().ct_eq(expected.as_bytes())) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     let mut gauges: Vec<Gauge> = Vec::new();

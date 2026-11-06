@@ -15,3 +15,4 @@ serde.workspace = true
 serde_json.workspace = true
 starforged-core = { path = "../starforged-core" }
 tracing.workspace = true
+utoipa.workspace = true

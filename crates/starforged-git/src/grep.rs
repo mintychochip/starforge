@@ -208,34 +208,40 @@ async fn run_grep(
         }),
     }
 }
-/// Parses `git grep -n -z` output: one record per line, each
-/// `<commit>:<path>\0<line>\0<text>`. The commit prefix is stripped exactly,
-/// and NUL delimiters keep paths containing `:` unambiguous. Applies the
-/// match, file, and line-length caps. `force_truncated` marks results cut
-/// short by the byte cap.
+/// Parses `git grep -n -z` output: each record is
+/// `<commit>:<path>\0<line>\0<text>\n`, read structurally (never by lines,
+/// since a path may itself contain a newline, which makes it
+/// unparseable by lines). The commit prefix is stripped exactly, and NUL
+/// delimiters keep paths containing `:` unambiguous. Applies the match,
+/// file, and line-length caps. `force_truncated` marks results cut short
+/// by the byte cap. A trailing `\r` stays part of the text: it is the
+/// file's actual line content.
 fn parse(text: &str, commit: &str, limits: &GrepLimits, force_truncated: bool) -> GrepResult {
     let mut matches: Vec<GrepMatch> = Vec::new();
     let mut files: HashSet<&str> = HashSet::new();
     let mut truncated = force_truncated;
-    for record in text.lines() {
-        let mut fields = record.split('\0');
-        let (Some(what), Some(line_field), Some(text_field)) =
-            (fields.next(), fields.next(), fields.next())
+    let mut rest = text;
+    while !rest.is_empty() {
+        let Some(rest_after_prefix) = rest.strip_prefix(commit).and_then(|r| r.strip_prefix(':'))
         else {
-            continue;
+            break;
         };
-        // Match text never contains a newline, but an embedded NUL would
-        // split it; re-join any further fields.
-        let body: String = std::iter::once(text_field)
-            .chain(fields)
-            .collect::<Vec<_>>()
-            .join("\0");
-        let Some(path) = what
-            .strip_prefix(commit)
-            .and_then(|rest| rest.strip_prefix(':'))
-        else {
-            continue;
+        let Some(path_end) = rest_after_prefix.find('\0') else {
+            break;
         };
+        let path = &rest_after_prefix[..path_end];
+        let after_path = &rest_after_prefix[path_end + 1..];
+        let Some(line_end) = after_path.find('\0') else {
+            break;
+        };
+        let line_field = &after_path[..line_end];
+        let after_line = &after_path[line_end + 1..];
+        // The text runs to the next newline; the final record may lack one.
+        let (body, next) = match after_line.find('\n') {
+            Some(at) => (&after_line[..at], &after_line[at + 1..]),
+            None => (after_line, ""),
+        };
+        rest = next;
         let Ok(line_no) = line_field.parse::<u32>() else {
             continue;
         };
@@ -245,7 +251,7 @@ fn parse(text: &str, commit: &str, limits: &GrepLimits, force_truncated: bool) -
             truncated = true;
             continue;
         }
-        let mut matched_text: &str = &body;
+        let mut matched_text = body;
         if matched_text.chars().count() > limits.max_line_chars {
             truncated = true;
             let at = matched_text
@@ -496,6 +502,42 @@ mod tests {
             grep(&gitdir, &commit, &too_long, false, &GrepLimits::default())
                 .await
                 .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn paths_with_newlines_are_found() {
+        let (dir, commit) = repo_with(&[("weird\nname.txt", b"needle here\n".to_vec())]);
+        let result = grep(
+            &git_dir(&dir),
+            &commit,
+            "needle",
+            false,
+            &GrepLimits::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.matches.len(), 1, "the weird-named file is found");
+        assert_eq!(result.matches[0].path, "weird\nname.txt");
+        assert_eq!(result.matches[0].line, 1);
+    }
+
+    #[tokio::test]
+    async fn crlf_line_endings_are_kept() {
+        let (dir, commit) = repo_with(&[("a.txt", b"needle here\r\nplain\r\n".to_vec())]);
+        let result = grep(
+            &git_dir(&dir),
+            &commit,
+            "needle",
+            false,
+            &GrepLimits::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.matches.len(), 1);
+        assert_eq!(
+            result.matches[0].text, "needle here\r",
+            "the file's actual line content is kept"
         );
     }
 }

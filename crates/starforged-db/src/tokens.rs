@@ -71,7 +71,7 @@ pub async fn insert(db: &Db, token: &NewToken<'_>) -> DbResult<i64> {
 pub async fn by_hash(db: &Db, token_hash: &str) -> DbResult<Option<TokenRow>> {
     let row = sqlx::query(select_token!("WHERE token_hash = $1"))
         .bind(token_hash)
-        .fetch_optional(db.pool())
+        .fetch_optional(db.read_pool())
         .await?;
     row.as_ref().map(from_row).transpose()
 }
@@ -79,7 +79,7 @@ pub async fn by_hash(db: &Db, token_hash: &str) -> DbResult<Option<TokenRow>> {
 pub async fn list_for_user(db: &Db, user_id: i64) -> DbResult<Vec<TokenRow>> {
     let rows = sqlx::query(select_token!("WHERE user_id = $1 ORDER BY id DESC"))
         .bind(user_id)
-        .fetch_all(db.pool())
+        .fetch_all(db.read_pool())
         .await?;
     rows.iter().map(from_row).collect()
 }

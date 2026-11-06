@@ -28,7 +28,7 @@ use crate::auth::ApiAuth;
 use crate::error::ApiError;
 use crate::time::rfc3339;
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct GateRuleJson {
     pub id: i64,
     pub pattern: Option<String>,
@@ -48,7 +48,7 @@ pub struct GateRuleJson {
     pub updated_at: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct PushAllowlistJson {
     pub users: Vec<String>,
     pub teams: Vec<String>,
@@ -80,6 +80,23 @@ fn gate_rule_json(view: &GateRuleDto) -> GateRuleJson {
 
 /// `GET /repos/{owner}/{repo}/gate-rules` (200): the repo's rules in
 /// insert order. Any reader may list.
+#[utoipa::path(
+    get,
+    path = "/api/v1/repos/{owner}/{repo}/gate-rules",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+    ),
+    responses(
+        (status = 200, description = "Gate rules", body = serde_json::Value),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn list_gate_rules(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -96,6 +113,24 @@ pub async fn list_gate_rules(
 
 /// `POST /repos/{owner}/{repo}/gate-rules` (201): creates a rule and
 /// returns it.
+#[utoipa::path(
+    post,
+    path = "/api/v1/repos/{owner}/{repo}/gate-rules",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+    ),
+    request_body = serde_json::Value,
+    responses(
+        (status = 201, description = "Created gate rule", body = GateRuleJson),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn create_gate_rule(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -113,6 +148,25 @@ pub async fn create_gate_rule(
 
 /// `PATCH /repos/{owner}/{repo}/gate-rules/{id}` (200): absent fields are
 /// unchanged; the merged result is validated as a whole.
+#[utoipa::path(
+    patch,
+    path = "/api/v1/repos/{owner}/{repo}/gate-rules/{id}",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("id" = i64, Path, description = "Gate rule id"),
+    ),
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, description = "Updated gate rule", body = GateRuleJson),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn patch_gate_rule(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -129,6 +183,24 @@ pub async fn patch_gate_rule(
 }
 
 /// `DELETE /repos/{owner}/{repo}/gate-rules/{id}` (204): removes the rule.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/repos/{owner}/{repo}/gate-rules/{id}",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("id" = i64, Path, description = "Gate rule id"),
+    ),
+    responses(
+        (status = 204, description = "Deleted"),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn delete_gate_rule(
     State(state): State<ApiState>,
     auth: ApiAuth,

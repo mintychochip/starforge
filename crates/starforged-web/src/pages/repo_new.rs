@@ -171,7 +171,7 @@ pub async fn submit(
                 form.name,
                 form.description,
                 readme,
-                form.import_url,
+                starforged_git::remote::scrub(&form.import_url, &form.import_url),
                 form.import_auth,
                 form.import_username,
                 Some(message),

@@ -65,7 +65,7 @@ pub async fn insert(db: &Db, invite: &NewInvite<'_>) -> DbResult<i64> {
 pub async fn by_code_hash(db: &Db, code_hash: &str) -> DbResult<Option<InviteRow>> {
     let row = sqlx::query(select_invite!("WHERE code_hash = $1"))
         .bind(code_hash)
-        .fetch_optional(db.pool())
+        .fetch_optional(db.read_pool())
         .await?;
     row.as_ref().map(from_row).transpose()
 }
@@ -106,7 +106,7 @@ pub async fn set_used_by(db: &Db, id: i64, user_id: i64) -> DbResult<()> {
 pub async fn list(db: &Db, limit: i64) -> DbResult<Vec<InviteRow>> {
     let rows = sqlx::query(select_invite!("ORDER BY id DESC LIMIT $1"))
         .bind(limit)
-        .fetch_all(db.pool())
+        .fetch_all(db.read_pool())
         .await?;
     rows.iter().map(from_row).collect()
 }

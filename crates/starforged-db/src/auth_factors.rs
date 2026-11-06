@@ -24,7 +24,7 @@ pub async fn totp_state(db: &Db, user_id: i64) -> DbResult<Option<TotpRow>> {
     let row =
         sqlx::query("SELECT totp_secret, totp_enabled, totp_last_step FROM users WHERE id = $1")
             .bind(user_id)
-            .fetch_optional(db.pool())
+            .fetch_optional(db.read_pool())
             .await?;
     row.as_ref().map(totp_from_row).transpose()
 }
@@ -154,7 +154,7 @@ pub async fn identity_by_issuer_subject(
     )
     .bind(issuer)
     .bind(subject)
-    .fetch_optional(db.pool())
+    .fetch_optional(db.read_pool())
     .await?;
     row.as_ref().map(identity_from_row).transpose()
 }
@@ -165,7 +165,7 @@ pub async fn identities_for_user(db: &Db, user_id: i64) -> DbResult<Vec<Identity
         "SELECT id, user_id, issuer, subject FROM user_identities WHERE user_id = $1 ORDER BY id ASC",
     )
     .bind(user_id)
-    .fetch_all(db.pool())
+    .fetch_all(db.read_pool())
     .await?;
     rows.iter().map(identity_from_row).collect()
 }
@@ -293,7 +293,7 @@ pub async fn challenge_by_token_hash(
         "SELECT id, kind, user_id, token_hash, state, nonce, code_verifier, attempts, expires_at FROM login_challenges WHERE token_hash = $1",
     )
     .bind(token_hash)
-    .fetch_optional(db.pool())
+    .fetch_optional(db.read_pool())
     .await?;
     row.as_ref().map(challenge_from_row).transpose()
 }

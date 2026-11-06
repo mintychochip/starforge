@@ -27,6 +27,16 @@ impl TestDb {
     }
 }
 
+/// Creates a fresh, EMPTY Postgres database (created but never
+/// migrated) and returns its URL: the restore target for
+/// `starforged restore` tests, which refuses a populated database.
+/// Panics when `STARFORGE_TEST_PG_URL` is not set.
+pub async fn create_empty_pg_database() -> String {
+    let admin_url =
+        std::env::var("STARFORGE_TEST_PG_URL").expect("STARFORGE_TEST_PG_URL must be set");
+    create_pg_database(&admin_url).await
+}
+
 async fn create_pg_database(admin_url: &str) -> String {
     let mut bytes = [0_u8; 6];
     getrandom::fill(&mut bytes).expect("OS randomness");

@@ -78,7 +78,7 @@ pub async fn device_code_by_hash(
 ) -> DbResult<Option<DeviceCodeRow>> {
     let row = sqlx::query(select_device_code!("WHERE device_code_hash = $1"))
         .bind(device_code_hash)
-        .fetch_optional(db.pool())
+        .fetch_optional(db.read_pool())
         .await?;
     row.map(|row| from_row(&row)).transpose()
 }
@@ -87,7 +87,7 @@ pub async fn device_code_by_hash(
 pub async fn device_code_by_user_code(db: &Db, user_code: &str) -> DbResult<Option<DeviceCodeRow>> {
     let row = sqlx::query(select_device_code!("WHERE user_code = $1"))
         .bind(user_code)
-        .fetch_optional(db.pool())
+        .fetch_optional(db.read_pool())
         .await?;
     row.map(|row| from_row(&row)).transpose()
 }

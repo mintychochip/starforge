@@ -115,15 +115,15 @@ pub fn check_url(
         if !allow_file_urls {
             return Err(invalid("file:// remote urls are not allowed"));
         }
-        // Like the scheme branch below: the stored URL carries no
-        // password, ever. Credentials arrive only via the explicit auth
-        // fields (sealed), so userinfo in a `file://` URL is stripped
-        // before the URL is stored, echoed, or audited.
+        // Credentials arrive only via the explicit auth fields (sealed):
+        // any userinfo in a `file://` URL is refused outright, so a secret
+        // can never be stored, echoed, or audited via the URL.
         let parsed = url::Url::parse(url).map_err(|_| invalid("remote url does not parse"))?;
-        let mut sanitized = parsed;
-        let _ = sanitized.set_password(None);
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            return Err(invalid("file:// remote urls must not carry credentials"));
+        }
         return Ok(PinnedRemote {
-            url: sanitized.to_string(),
+            url: parsed.to_string(),
             scheme: RemoteScheme::File,
             host: String::new(),
             port: 0,
@@ -536,11 +536,29 @@ fn now_plus(secs: i64) -> i64 {
 /// HTTPS carries a username and password/token; SSH asks the server to
 /// generate an ed25519 keypair whose private half is sealed and never
 /// displayed. Neither ever travels in the URL.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum ImportAuth {
     None,
     Https { username: String, password: String },
     Ssh,
+}
+
+impl std::fmt::Debug for ImportAuth {
+    /// Redacted: the HTTPS password/token never renders in any format, so a
+    /// `Debug` print of any input or view struct carrying this value cannot
+    /// disclose it (the derived `Debug` on the wrapper structs uses this).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ImportAuth::None => f.write_str("None"),
+            ImportAuth::Https { username, .. } => {
+                write!(
+                    f,
+                    "Https {{ username: {username:?}, password: <redacted> }}"
+                )
+            }
+            ImportAuth::Ssh => f.write_str("Ssh"),
+        }
+    }
 }
 
 /// The `import` body of a repository-creation request (M4b D3).
@@ -1044,6 +1062,11 @@ impl Core {
         let access = self
             .require_repo(Some(actor), owner, name, Permission::Maintain)
             .await?;
+        if access.repo.archived_at.is_some() {
+            return Err(CoreError::Invalid(
+                "repository is archived; mirror paused".into(),
+            ));
+        }
         if db_remotes::by_repo_role(self.db(), access.repo.id, "pull")
             .await?
             .is_none()
@@ -1068,6 +1091,22 @@ impl Core {
             return Ok(());
         };
         if row.enabled == 0 {
+            return Ok(());
+        }
+        // Archived repositories are read-only: never fetch into them. The
+        // pause is the remote's last error; rescheduling still runs, so
+        // unarchiving resumes syncing with no reconfiguration.
+        let archived = db_repos::by_id(self.db(), repo_id)
+            .await?
+            .is_some_and(|repo| repo.archived_at.is_some());
+        if archived {
+            db_remotes::record_attempt(
+                self.db(),
+                row.id,
+                false,
+                "repository is archived; mirror paused",
+            )
+            .await?;
             return Ok(());
         }
         let outcome = self.fetch_pull(repo_id, &row).await;

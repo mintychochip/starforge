@@ -13,7 +13,7 @@ use crate::auth::ApiAuth;
 use crate::error::ApiError;
 use crate::time::{opt_ts, rfc3339};
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct KeyJson {
     id: i64,
     title: String,
@@ -34,7 +34,7 @@ fn key_json(view: &SshKeyView) -> KeyJson {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct DeployKeyJson {
     id: i64,
     title: String,
@@ -57,13 +57,13 @@ fn deploy_key_json(view: &DeployKeyView) -> DeployKeyJson {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct CreateKeyBody {
     pub title: String,
     pub key: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct CreateDeployKeyBody {
     pub title: String,
     pub key: String,
@@ -72,6 +72,19 @@ pub struct CreateDeployKeyBody {
 }
 
 /// `GET /user/keys` (200).
+#[utoipa::path(
+    get,
+    path = "/api/v1/user/keys",
+    responses(
+        (status = 200, description = "User SSH keys", body = serde_json::Value),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn list_user_keys(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -84,6 +97,20 @@ pub async fn list_user_keys(
 }
 
 /// `POST /user/keys` (201).
+#[utoipa::path(
+    post,
+    path = "/api/v1/user/keys",
+    request_body = CreateKeyBody,
+    responses(
+        (status = 201, description = "Created key", body = KeyJson),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn create_user_key(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -99,6 +126,20 @@ pub async fn create_user_key(
 }
 
 /// `DELETE /user/keys/{id}` (204).
+#[utoipa::path(
+    delete,
+    path = "/api/v1/user/keys/{id}",
+    params(("id" = i64, Path, description = "Key id")),
+    responses(
+        (status = 204, description = "Deleted"),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn delete_user_key(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -110,6 +151,23 @@ pub async fn delete_user_key(
 }
 
 /// `GET /repos/{owner}/{repo}/keys` (200).
+#[utoipa::path(
+    get,
+    path = "/api/v1/repos/{owner}/{repo}/keys",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+    ),
+    responses(
+        (status = 200, description = "Deploy keys", body = serde_json::Value),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn list_deploy_keys(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -123,6 +181,24 @@ pub async fn list_deploy_keys(
 }
 
 /// `POST /repos/{owner}/{repo}/keys` (201).
+#[utoipa::path(
+    post,
+    path = "/api/v1/repos/{owner}/{repo}/keys",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+    ),
+    request_body = CreateDeployKeyBody,
+    responses(
+        (status = 201, description = "Created deploy key", body = DeployKeyJson),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn create_deploy_key(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -146,6 +222,24 @@ pub async fn create_deploy_key(
 }
 
 /// `DELETE /repos/{owner}/{repo}/keys/{id}` (204).
+#[utoipa::path(
+    delete,
+    path = "/api/v1/repos/{owner}/{repo}/keys/{id}",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("id" = i64, Path, description = "Key id"),
+    ),
+    responses(
+        (status = 204, description = "Deleted"),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn delete_deploy_key(
     State(state): State<ApiState>,
     auth: ApiAuth,

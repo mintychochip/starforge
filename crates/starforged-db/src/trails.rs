@@ -425,7 +425,7 @@ pub async fn insert_imported_comment_counted(
 pub async fn trail_by_github_id(db: &Db, github_id: i64) -> DbResult<Option<TrailRow>> {
     let row = sqlx::query(select_trail!("WHERE github_id = $1"))
         .bind(github_id)
-        .fetch_optional(db.pool())
+        .fetch_optional(db.read_pool())
         .await?;
     row.as_ref().map(trail_from_row).transpose()
 }
@@ -461,7 +461,7 @@ pub async fn insert_imported_comment(
 pub async fn comment_by_github_id(db: &Db, github_id: i64) -> DbResult<Option<TrailCommentRow>> {
     let row = sqlx::query(select_comment!("WHERE github_id = $1"))
         .bind(github_id)
-        .fetch_optional(db.pool())
+        .fetch_optional(db.read_pool())
         .await?;
     row.as_ref().map(comment_from_row).transpose()
 }
@@ -470,7 +470,7 @@ pub async fn trail_by_number(db: &Db, repo_id: i64, number: i64) -> DbResult<Opt
     let row = sqlx::query(select_trail!("WHERE repo_id = $1 AND number = $2"))
         .bind(repo_id)
         .bind(number)
-        .fetch_optional(db.pool())
+        .fetch_optional(db.read_pool())
         .await?;
     row.as_ref().map(trail_from_row).transpose()
 }
@@ -478,7 +478,7 @@ pub async fn trail_by_number(db: &Db, repo_id: i64, number: i64) -> DbResult<Opt
 pub async fn trail_by_id(db: &Db, id: i64) -> DbResult<Option<TrailRow>> {
     let row = sqlx::query(select_trail!("WHERE id = $1"))
         .bind(id)
-        .fetch_optional(db.pool())
+        .fetch_optional(db.read_pool())
         .await?;
     row.as_ref().map(trail_from_row).transpose()
 }
@@ -568,7 +568,7 @@ pub async fn trails_of_repo(db: &Db, repo_id: i64, f: &TrailFilter) -> DbResult<
         .bind(i64::from(facts.repo_public))
         .bind(i64::from(facts.repo_internal))
         .bind(f.limit)
-        .fetch_all(db.pool())
+        .fetch_all(db.read_pool())
         .await?;
     rows.iter().map(trail_from_row).collect()
 }
@@ -631,7 +631,7 @@ async fn dashboard_trails(
     let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
         .bind(user_id)
         .bind(limit)
-        .fetch_all(db.pool())
+        .fetch_all(db.read_pool())
         .await?;
     rows.iter().map(dashboard_trail_from_row).collect()
 }
@@ -738,7 +738,7 @@ pub async fn labels_of(db: &Db, trail_id: i64) -> DbResult<Vec<String>> {
     let names: Vec<String> =
         sqlx::query_scalar("SELECT name FROM trail_labels WHERE trail_id = $1 ORDER BY name ASC")
             .bind(trail_id)
-            .fetch_all(db.pool())
+            .fetch_all(db.read_pool())
             .await?;
     Ok(names)
 }
@@ -771,7 +771,7 @@ pub async fn assignees_of(db: &Db, trail_id: i64) -> DbResult<Vec<i64>> {
         "SELECT user_id FROM trail_assignees WHERE trail_id = $1 ORDER BY user_id ASC",
     )
     .bind(trail_id)
-    .fetch_all(db.pool())
+    .fetch_all(db.read_pool())
     .await?;
     Ok(ids)
 }
@@ -814,7 +814,7 @@ pub async fn review_requests_of(db: &Db, trail_id: i64) -> DbResult<Vec<i64>> {
         "SELECT user_id FROM trail_review_requests WHERE trail_id = $1 ORDER BY user_id ASC",
     )
     .bind(trail_id)
-    .fetch_all(db.pool())
+    .fetch_all(db.read_pool())
     .await?;
     Ok(ids)
 }
@@ -842,7 +842,7 @@ pub async fn insert_comment(
 pub async fn comment_by_id(db: &Db, id: i64) -> DbResult<Option<TrailCommentRow>> {
     let row = sqlx::query(select_comment!("WHERE id = $1"))
         .bind(id)
-        .fetch_optional(db.pool())
+        .fetch_optional(db.read_pool())
         .await?;
     row.as_ref().map(comment_from_row).transpose()
 }
@@ -860,7 +860,7 @@ pub async fn update_comment(db: &Db, id: i64, body: &str, now: i64) -> DbResult<
 pub async fn comments_of(db: &Db, trail_id: i64) -> DbResult<Vec<TrailCommentRow>> {
     let rows = sqlx::query(select_comment!("WHERE trail_id = $1 ORDER BY id ASC"))
         .bind(trail_id)
-        .fetch_all(db.pool())
+        .fetch_all(db.read_pool())
         .await?;
     rows.iter().map(comment_from_row).collect()
 }
@@ -893,7 +893,7 @@ pub async fn insert_timeline(
 pub async fn timeline_of_trail(db: &Db, trail_id: i64) -> DbResult<Vec<TimelineEventRow>> {
     let rows = sqlx::query(select_timeline!("WHERE trail_id = $1 ORDER BY id ASC"))
         .bind(trail_id)
-        .fetch_all(db.pool())
+        .fetch_all(db.read_pool())
         .await?;
     rows.iter().map(timeline_from_row).collect()
 }
@@ -955,7 +955,7 @@ pub async fn trail_session_links_of(db: &Db, trail_id: i64) -> DbResult<Vec<Trai
          WHERE trail_id = $1 ORDER BY created_at ASC, session_id ASC",
     )
     .bind(trail_id)
-    .fetch_all(db.pool())
+    .fetch_all(db.read_pool())
     .await?;
     rows.iter().map(session_link_from_row).collect()
 }
@@ -965,7 +965,7 @@ pub async fn trail_session_link_count(db: &Db, trail_id: i64) -> DbResult<i64> {
     let count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM trail_session_links WHERE trail_id = $1")
             .bind(trail_id)
-            .fetch_one(db.pool())
+            .fetch_one(db.read_pool())
             .await?;
     Ok(count)
 }

@@ -27,7 +27,7 @@ pub async fn push_allowlist_for_rule(db: &Db, rule_id: i64) -> DbResult<Vec<Push
          WHERE rule_id = $1 ORDER BY id ASC",
     )
     .bind(rule_id)
-    .fetch_all(db.pool())
+    .fetch_all(db.read_pool())
     .await?;
     rows.iter()
         .map(|row| {
@@ -77,7 +77,7 @@ pub async fn is_team_member(db: &Db, team_id: i64, user_id: i64) -> DbResult<boo
         sqlx::query_scalar("SELECT COUNT(*) FROM team_members WHERE team_id = $1 AND user_id = $2")
             .bind(team_id)
             .bind(user_id)
-            .fetch_one(db.pool())
+            .fetch_one(db.read_pool())
             .await?;
     Ok(count > 0)
 }
@@ -108,7 +108,7 @@ pub async fn tag_protections_for_repo(db: &Db, repo_id: i64) -> DbResult<Vec<Tag
          WHERE repo_id = $1 ORDER BY id ASC",
     )
     .bind(repo_id)
-    .fetch_all(db.pool())
+    .fetch_all(db.read_pool())
     .await?;
     rows.iter().map(tag_protection_from_row).collect()
 }
@@ -126,7 +126,7 @@ pub async fn tag_protection_by_id(
     )
     .bind(id)
     .bind(repo_id)
-    .fetch_optional(db.pool())
+    .fetch_optional(db.read_pool())
     .await?;
     row.map(|row| tag_protection_from_row(&row)).transpose()
 }

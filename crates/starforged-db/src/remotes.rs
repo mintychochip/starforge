@@ -97,7 +97,7 @@ pub async fn insert(db: &Db, remote: &NewRemote<'_>) -> DbResult<i64> {
 pub async fn by_id(db: &Db, id: i64) -> DbResult<Option<RemoteRow>> {
     let row = sqlx::query(select_remote!("WHERE id = $1"))
         .bind(id)
-        .fetch_optional(db.pool())
+        .fetch_optional(db.read_pool())
         .await?;
     row.as_ref().map(from_row).transpose()
 }
@@ -108,7 +108,7 @@ pub async fn by_repo_role(db: &Db, repo_id: i64, role: &str) -> DbResult<Option<
     let row = sqlx::query(select_remote!("WHERE repo_id = $1 AND role = $2"))
         .bind(repo_id)
         .bind(role)
-        .fetch_optional(db.pool())
+        .fetch_optional(db.read_pool())
         .await?;
     row.as_ref().map(from_row).transpose()
 }
@@ -117,7 +117,7 @@ pub async fn by_repo_role(db: &Db, repo_id: i64, role: &str) -> DbResult<Option<
 pub async fn list_by_repo(db: &Db, repo_id: i64) -> DbResult<Vec<RemoteRow>> {
     let rows = sqlx::query(select_remote!("WHERE repo_id = $1 ORDER BY id"))
         .bind(repo_id)
-        .fetch_all(db.pool())
+        .fetch_all(db.read_pool())
         .await?;
     rows.iter().map(from_row).collect()
 }
@@ -243,7 +243,7 @@ pub async fn set_enabled(db: &Db, id: i64, enabled: bool) -> DbResult<()> {
 pub async fn enabled_pull_repo_ids(db: &Db) -> DbResult<Vec<i64>> {
     let rows: Vec<i64> =
         sqlx::query_scalar("SELECT repo_id FROM repo_remotes WHERE role = 'pull' AND enabled = 1")
-            .fetch_all(db.pool())
+            .fetch_all(db.read_pool())
             .await?;
     Ok(rows)
 }
@@ -252,7 +252,7 @@ pub async fn enabled_pull_repo_ids(db: &Db) -> DbResult<Vec<i64>> {
 pub async fn enabled_push_remote_ids(db: &Db) -> DbResult<Vec<i64>> {
     let rows: Vec<i64> =
         sqlx::query_scalar("SELECT id FROM repo_remotes WHERE role = 'push' AND enabled = 1")
-            .fetch_all(db.pool())
+            .fetch_all(db.read_pool())
             .await?;
     Ok(rows)
 }

@@ -29,7 +29,7 @@ use crate::auth::ApiAuth;
 use crate::error::ApiError;
 use crate::time::{opt_ts, rfc3339};
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct TrailJson {
     pub number: i64,
     pub title: String,
@@ -66,7 +66,7 @@ fn trail_json(view: &TrailView) -> TrailJson {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct CommentJson {
     pub id: i64,
     pub author: String,
@@ -87,7 +87,7 @@ fn comment_json(view: &CommentView) -> CommentJson {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct TimelineJson {
     pub id: i64,
     pub kind: String,
@@ -97,7 +97,7 @@ pub struct TimelineJson {
 }
 
 /// The detail route: flat trail fields plus discussion.
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct TrailDetailJson {
     #[serde(flatten)]
     pub trail: TrailJson,
@@ -169,6 +169,23 @@ pub struct ListQuery {
 }
 
 /// `GET /repos/{owner}/{repo}/trails[?state=&label=&assignee=&author=&has_changes=&has_sessions=&review_requested=&after=&limit=]`.
+#[utoipa::path(
+    get,
+    path = "/api/v1/repos/{owner}/{repo}/trails",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+    ),
+    responses(
+        (status = 200, description = "Trails", body = serde_json::Value),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn list_trails(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -220,13 +237,31 @@ pub async fn list_trails(
     })))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct CreateTrailBody {
     pub title: String,
     pub intent: String,
 }
 
 /// `POST /repos/{owner}/{repo}/trails` (201).
+#[utoipa::path(
+    post,
+    path = "/api/v1/repos/{owner}/{repo}/trails",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+    ),
+    request_body = CreateTrailBody,
+    responses(
+        (status = 201, description = "Created trail", body = TrailJson),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn create_trail(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -243,6 +278,24 @@ pub async fn create_trail(
 }
 
 /// `GET /repos/{owner}/{repo}/trails/{n}`.
+#[utoipa::path(
+    get,
+    path = "/api/v1/repos/{owner}/{repo}/trails/{n}",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("n" = i64, Path, description = "Trail number"),
+    ),
+    responses(
+        (status = 200, description = "Trail detail", body = TrailDetailJson),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn get_trail(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -268,7 +321,7 @@ pub async fn get_trail(
     Ok(Json(detail_json(&state.core, &detail, &readable).await?))
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, utoipa::ToSchema)]
 pub struct PatchTrailBody {
     pub title: Option<String>,
     pub intent: Option<String>,
@@ -282,6 +335,25 @@ pub struct PatchTrailBody {
 ///
 /// Every supplied field is validated before anything is written: a rejected
 /// patch leaves the trail and its timeline untouched.
+#[utoipa::path(
+    patch,
+    path = "/api/v1/repos/{owner}/{repo}/trails/{n}",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("n" = i64, Path, description = "Trail number"),
+    ),
+    request_body = PatchTrailBody,
+    responses(
+        (status = 200, description = "Updated trail", body = TrailJson),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn patch_trail(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -332,6 +404,24 @@ pub async fn patch_trail(
 }
 
 /// `GET /repos/{owner}/{repo}/trails/{n}/comments`.
+#[utoipa::path(
+    get,
+    path = "/api/v1/repos/{owner}/{repo}/trails/{n}/comments",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("n" = i64, Path, description = "Trail number"),
+    ),
+    responses(
+        (status = 200, description = "Comments", body = serde_json::Value),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn list_comments(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -346,12 +436,31 @@ pub async fn list_comments(
     })))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct CreateCommentBody {
     pub body: String,
 }
 
 /// `POST /repos/{owner}/{repo}/trails/{n}/comments` (201).
+#[utoipa::path(
+    post,
+    path = "/api/v1/repos/{owner}/{repo}/trails/{n}/comments",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("n" = i64, Path, description = "Trail number"),
+    ),
+    request_body = CreateCommentBody,
+    responses(
+        (status = 201, description = "Created comment", body = CommentJson),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn post_comment(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -367,13 +476,33 @@ pub async fn post_comment(
     Ok((StatusCode::CREATED, Json(comment_json(&view))))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct EditCommentBody {
     pub body: String,
 }
 
 /// `PATCH /repos/{owner}/{repo}/trails/{n}/comments/{id}`: the comment author
 /// or a repo/site admin.
+#[utoipa::path(
+    patch,
+    path = "/api/v1/repos/{owner}/{repo}/trails/{n}/comments/{id}",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("n" = i64, Path, description = "Trail number"),
+        ("id" = i64, Path, description = "Comment id"),
+    ),
+    request_body = EditCommentBody,
+    responses(
+        (status = 200, description = "Updated comment", body = CommentJson),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn patch_comment(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -389,12 +518,31 @@ pub async fn patch_comment(
     Ok(Json(comment_json(&view)))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct LabelBody {
     pub name: String,
 }
 
 /// `POST /repos/{owner}/{repo}/trails/{n}/labels`: idempotent add.
+#[utoipa::path(
+    post,
+    path = "/api/v1/repos/{owner}/{repo}/trails/{n}/labels",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("n" = i64, Path, description = "Trail number"),
+    ),
+    request_body = LabelBody,
+    responses(
+        (status = 200, description = "Label added", body = TrailJson),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn add_label(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -412,6 +560,25 @@ pub async fn add_label(
 
 /// `DELETE /repos/{owner}/{repo}/trails/{n}/labels`: the name travels in the
 /// JSON body (symmetric with POST — no URL-encoding pitfalls). Idempotent.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/repos/{owner}/{repo}/trails/{n}/labels",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("n" = i64, Path, description = "Trail number"),
+    ),
+    request_body = LabelBody,
+    responses(
+        (status = 200, description = "Label removed", body = TrailJson),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn remove_label(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -427,7 +594,7 @@ pub async fn remove_label(
     Ok(Json(trail_json(&view)))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct AssigneeBody {
     pub user: String,
 }
@@ -435,6 +602,25 @@ pub struct AssigneeBody {
 /// `POST /repos/{owner}/{repo}/trails/{n}/assignees`: idempotent add. The
 /// handle must belong to a repository member; unknown handles and strangers
 /// answer `422`, never `404`.
+#[utoipa::path(
+    post,
+    path = "/api/v1/repos/{owner}/{repo}/trails/{n}/assignees",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("n" = i64, Path, description = "Trail number"),
+    ),
+    request_body = AssigneeBody,
+    responses(
+        (status = 200, description = "Assignee added", body = TrailJson),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn add_assignee(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -451,6 +637,25 @@ pub async fn add_assignee(
 }
 
 /// `DELETE /repos/{owner}/{repo}/trails/{n}/assignees`: symmetric with POST.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/repos/{owner}/{repo}/trails/{n}/assignees",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("n" = i64, Path, description = "Trail number"),
+    ),
+    request_body = AssigneeBody,
+    responses(
+        (status = 200, description = "Assignee removed", body = TrailJson),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn remove_assignee(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -466,7 +671,7 @@ pub async fn remove_assignee(
     Ok(Json(trail_json(&view)))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct ReviewRequestBody {
     pub user: String,
 }
@@ -474,6 +679,25 @@ pub struct ReviewRequestBody {
 /// `POST /repos/{owner}/{repo}/trails/{n}/review-requests`: idempotent add.
 /// The handle must belong to a repository member and not be the Trail author;
 /// unknown handles, strangers, and the author answer `422`, never `404`.
+#[utoipa::path(
+    post,
+    path = "/api/v1/repos/{owner}/{repo}/trails/{n}/review-requests",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("n" = i64, Path, description = "Trail number"),
+    ),
+    request_body = ReviewRequestBody,
+    responses(
+        (status = 200, description = "Review request added", body = TrailJson),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn add_review_request(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -490,6 +714,25 @@ pub async fn add_review_request(
 }
 
 /// `DELETE /repos/{owner}/{repo}/trails/{n}/review-requests`: symmetric with POST.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/repos/{owner}/{repo}/trails/{n}/review-requests",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("n" = i64, Path, description = "Trail number"),
+    ),
+    request_body = ReviewRequestBody,
+    responses(
+        (status = 200, description = "Review request removed", body = TrailJson),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn remove_review_request(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -550,6 +793,24 @@ fn trail_sessions_json(view: &starforged_core::trails::TrailSessions) -> Value {
 
 /// `GET /repos/{owner}/{repo}/trails/{n}/sessions`: the Trail's readable
 /// linked sessions (D5 JSON), applying §6.4 for the current viewer.
+#[utoipa::path(
+    get,
+    path = "/api/v1/repos/{owner}/{repo}/trails/{n}/sessions",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("n" = i64, Path, description = "Trail number"),
+    ),
+    responses(
+        (status = 200, description = "Trail sessions", body = serde_json::Value),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn get_trail_sessions(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -562,13 +823,32 @@ pub async fn get_trail_sessions(
     Ok(Json(trail_sessions_json(&view)))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct TrailSessionLinkBody {
     pub session: String,
 }
 
 /// `POST /repos/{owner}/{repo}/trails/{n}/sessions`: an explicit hand link
 /// (D3). Returns the Trail sessions JSON.
+#[utoipa::path(
+    post,
+    path = "/api/v1/repos/{owner}/{repo}/trails/{n}/sessions",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("n" = i64, Path, description = "Trail number"),
+    ),
+    request_body = TrailSessionLinkBody,
+    responses(
+        (status = 200, description = "Session linked", body = serde_json::Value),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn link_trail_session(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -590,6 +870,25 @@ pub async fn link_trail_session(
 
 /// `DELETE /repos/{owner}/{repo}/trails/{n}/sessions/{ulid}`: removes an
 /// explicit hand link (D3). Returns the Trail sessions JSON.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/repos/{owner}/{repo}/trails/{n}/sessions/{ulid}",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("n" = i64, Path, description = "Trail number"),
+        ("ulid" = String, Path, description = "Session ULID"),
+    ),
+    responses(
+        (status = 200, description = "Session unlinked", body = serde_json::Value),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn unlink_trail_session(
     State(state): State<ApiState>,
     auth: ApiAuth,

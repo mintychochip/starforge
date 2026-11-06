@@ -50,7 +50,7 @@ pub async fn active_by_hash(
     let row = sqlx::query("SELECT id, user_id, csrf_token, expires_at, last_seen_at FROM web_sessions WHERE session_hash = $1 AND expires_at > $2")
         .bind(session_hash)
         .bind(now_ts)
-        .fetch_optional(db.pool())
+        .fetch_optional(db.read_pool())
         .await?;
     row.map(|row| {
         Ok(WebSessionRow {
@@ -107,7 +107,7 @@ pub async fn list_for_user(db: &Db, user_id: i64, now_ts: i64) -> DbResult<Vec<S
     )
     .bind(user_id)
     .bind(now_ts)
-    .fetch_all(db.pool())
+    .fetch_all(db.read_pool())
     .await?;
     rows.iter()
         .map(|row| {

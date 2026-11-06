@@ -102,7 +102,7 @@ pub async fn expedite(db: &Db, dedupe_key: &str, run_at: i64) -> DbResult<()> {
 pub async fn by_id(db: &Db, id: i64) -> DbResult<Option<JobRow>> {
     let row = sqlx::query(select_job!("WHERE id = $1"))
         .bind(id)
-        .fetch_optional(db.pool())
+        .fetch_optional(db.read_pool())
         .await?;
     row.as_ref().map(from_row).transpose()
 }
@@ -223,7 +223,7 @@ pub async fn failed_of_kind_before(db: &Db, kind: &str, before: i64) -> DbResult
     ))
     .bind(kind)
     .bind(before)
-    .fetch_all(db.pool())
+    .fetch_all(db.read_pool())
     .await?;
     rows.iter().map(from_row).collect()
 }
@@ -232,7 +232,7 @@ pub async fn failed_of_kind_before(db: &Db, kind: &str, before: i64) -> DbResult
 pub async fn list_recent(db: &Db, limit: i64) -> DbResult<Vec<JobRow>> {
     let rows = sqlx::query(select_job!("ORDER BY run_at DESC, id DESC LIMIT $1"))
         .bind(limit)
-        .fetch_all(db.pool())
+        .fetch_all(db.read_pool())
         .await?;
     rows.iter().map(from_row).collect()
 }
@@ -264,14 +264,14 @@ pub async fn count_by_state(db: &Db, state: &str) -> DbResult<i64> {
     Ok(
         sqlx::query_scalar("SELECT COUNT(*) FROM jobs WHERE state = $1")
             .bind(state)
-            .fetch_one(db.pool())
+            .fetch_one(db.read_pool())
             .await?,
     )
 }
 /// Job counts grouped by kind and state, ordered by kind then state.
 pub async fn counts_by_kind_state(db: &Db) -> DbResult<Vec<(String, String, i64)>> {
     let rows = sqlx::query("SELECT kind, state, COUNT(*) AS n FROM jobs GROUP BY kind, state ORDER BY kind ASC, state ASC")
-        .fetch_all(db.pool())
+        .fetch_all(db.read_pool())
         .await?;
     let mut out = Vec::with_capacity(rows.len());
     for row in &rows {
@@ -288,7 +288,7 @@ pub async fn counts_by_kind_state(db: &Db) -> DbResult<Vec<(String, String, i64)
 pub async fn oldest_pending_created(db: &Db) -> DbResult<Option<i64>> {
     Ok(
         sqlx::query_scalar("SELECT MIN(created_at) FROM jobs WHERE state = 'queued'")
-            .fetch_one(db.pool())
+            .fetch_one(db.read_pool())
             .await?,
     )
 }

@@ -7,14 +7,12 @@ use starforged::config::Config;
 #[derive(Parser)]
 #[command(name = "starforged", version, about = "Starforge server")]
 struct Cli {
-    /// Path to starforged.toml.
-    #[arg(
-        long,
-        env = "STARFORGE_CONFIG",
-        default_value = "starforged.toml",
-        global = true
-    )]
-    config: PathBuf,
+    /// Path to starforged.toml. Optional so that `restore` can run
+    /// without one (it then uses the backup's config); every other
+    /// subcommand defaults to `starforged.toml` in the working
+    /// directory, exactly as before.
+    #[arg(long, env = "STARFORGE_CONFIG", global = true)]
+    config: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -60,6 +58,17 @@ enum Command {
         /// Omit the config copy (which contains `secret_key`).
         #[arg(long)]
         no_config: bool,
+    },
+    /// Restore a backup snapshot into the target config's data
+    /// directory and database, which must be empty. Without
+    /// `--config`, the backup's config copy is used with
+    /// `storage.data_dir` taken from `--data-dir`.
+    Restore {
+        /// The backup snapshot directory to restore from.
+        dir: PathBuf,
+        /// The target data directory (required when `--config` is absent).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
     },
     /// Entry points for git hooks in hosted repositories.
     #[command(hide = true)]
@@ -148,6 +157,12 @@ enum HookCommand {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    // `restore` may run without `--config` (it then uses the backup's
+    // config); every other subcommand defaults to `starforged.toml`.
+    let config_path = cli
+        .config
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("starforged.toml"));
     match cli.command {
         Command::Init {
             data_dir,
@@ -155,28 +170,28 @@ async fn main() -> anyhow::Result<()> {
             http_addr,
         } => {
             let config = starforged::init::run(&starforged::init::InitOptions {
-                config_path: &cli.config,
+                config_path: &config_path,
                 data_dir: &data_dir,
                 base_url: &base_url,
                 http_addr: &http_addr,
             })?;
             println!(
                 "wrote {} (data directory {})",
-                cli.config.display(),
+                config_path.display(),
                 config.storage.data_dir.display()
             );
         }
         Command::Migrate => {
-            admin::migrate(&Config::load(&cli.config)?).await?;
+            admin::migrate(&Config::load(&config_path)?).await?;
             println!("database schema is up to date");
         }
         Command::Serve => {
-            let config = Config::load(&cli.config)?;
+            let config = Config::load(&config_path)?;
             init_tracing(&config);
             starforged::serve::run(config).await?;
         }
         Command::Admin { command } => {
-            let config = Config::load(&cli.config)?;
+            let config = Config::load(&config_path)?;
             match command {
                 AdminCommand::User {
                     command:
@@ -223,13 +238,16 @@ async fn main() -> anyhow::Result<()> {
         Command::Index {
             command: IndexCommand::Rebuild,
         } => {
-            starforged::index_cmd::rebuild(&Config::load(&cli.config)?).await?;
+            starforged::index_cmd::rebuild(&Config::load(&config_path)?).await?;
         }
         Command::Doctor { fix } => {
-            std::process::exit(starforged::doctor::run(&cli.config, fix).await?);
+            std::process::exit(starforged::doctor::run(&config_path, fix).await?);
         }
         Command::Backup { dir, no_config } => {
-            starforged::backup::run(&cli.config, &dir, !no_config).await?;
+            starforged::backup::run(&config_path, &dir, !no_config).await?;
+        }
+        Command::Restore { dir, data_dir } => {
+            starforged::restore::run(&dir, cli.config.as_deref(), data_dir.as_deref()).await?;
         }
         Command::Hook {
             hook: HookCommand::PreReceive,

@@ -655,7 +655,7 @@ mod tests {
     use super::*;
     use crate::permission::Visibility;
     use crate::repos::CreateRepo;
-    use crate::testing::test_core;
+    use crate::testing::{Fixture, test_core};
 
     const PASSWORD: &str = "correct horse battery staple extra";
 
@@ -680,16 +680,16 @@ mod tests {
         .unwrap()
     }
 
-    async fn two_admins() -> (Core, User, User) {
-        let (core, _f) = test_core().await;
+    async fn two_admins() -> (Core, User, User, Fixture) {
+        let (core, fixture) = test_core().await;
         let root = admin_user(&core, "root").await;
         let vice = admin_user(&core, "vice").await;
-        (core, root, vice)
+        (core, root, vice, fixture)
     }
 
     #[tokio::test]
     async fn suspend_ends_sessions_and_last_admin_is_protected() {
-        let (core, root, vice) = two_admins().await;
+        let (core, root, vice, _f) = two_admins().await;
         // Non-admin cannot suspend.
         let bob = plain_user(&core, "bob").await;
         assert!(matches!(
@@ -730,7 +730,7 @@ mod tests {
 
     #[tokio::test]
     async fn unsuspend_reactivates_and_refuses_active_accounts() {
-        let (core, root, _) = two_admins().await;
+        let (core, root, _, _f) = two_admins().await;
         let bob = plain_user(&core, "bob").await;
         assert!(matches!(
             core.unsuspend_user(&bob, bob.id).await,
@@ -747,7 +747,7 @@ mod tests {
 
     #[tokio::test]
     async fn grant_and_revoke_admin_guard_the_last_admin() {
-        let (core, root, vice) = two_admins().await;
+        let (core, root, vice, _f) = two_admins().await;
         let bob = plain_user(&core, "bob").await;
         assert!(matches!(
             core.grant_admin(&bob, bob.id).await,
@@ -803,7 +803,7 @@ mod tests {
 
     #[tokio::test]
     async fn admin_list_and_get_users() {
-        let (core, root, _) = two_admins().await;
+        let (core, root, _, _f) = two_admins().await;
         let bob = plain_user(&core, "bob").await;
         assert!(matches!(
             core.admin_list_users(&bob, "", 200).await,
@@ -840,7 +840,7 @@ mod tests {
 
     #[tokio::test]
     async fn admin_create_user_verifies_the_address() {
-        let (core, root, _) = two_admins().await;
+        let (core, root, _, _f) = two_admins().await;
         let bob = plain_user(&core, "bob").await;
         assert!(matches!(
             core.admin_create_user(
@@ -871,7 +871,7 @@ mod tests {
 
     #[tokio::test]
     async fn admin_delete_user_guards_and_purges() {
-        let (core, root, vice) = two_admins().await;
+        let (core, root, vice, _f) = two_admins().await;
         let bob = plain_user(&core, "bob").await;
         // Non-admin cannot delete.
         assert!(matches!(
@@ -928,7 +928,7 @@ mod tests {
     async fn failed_jobs_retry_and_delete() {
         use crate::jobs::Job;
         use starforged_db::{audit, jobs as db_jobs};
-        let (core, root, _) = two_admins().await;
+        let (core, root, _, _f) = two_admins().await;
         let bob = plain_user(&core, "bob").await;
         assert!(matches!(
             core.admin_list_jobs(&bob).await,
@@ -1085,7 +1085,7 @@ mod tests {
     async fn overview_counts_everything() {
         use crate::jobs::Job;
         use starforged_db::jobs as db_jobs;
-        let (core, root, _vice) = two_admins().await;
+        let (core, root, _vice, _f) = two_admins().await;
         core.create_repo(
             &root,
             &root.handle,

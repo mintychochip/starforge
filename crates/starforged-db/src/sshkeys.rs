@@ -219,7 +219,7 @@ pub async fn ssh_key_by_fingerprint(db: &Db, fingerprint: &str) -> DbResult<Opti
         "FROM ssh_keys WHERE fingerprint = $1"
     ))
     .bind(fingerprint)
-    .fetch_optional(db.pool())
+    .fetch_optional(db.read_pool())
     .await?;
     row.as_ref().map(ssh_from_row).transpose()
 }
@@ -233,7 +233,7 @@ pub async fn deploy_key_by_fingerprint(
         "FROM deploy_keys WHERE fingerprint = $1"
     ))
     .bind(fingerprint)
-    .fetch_optional(db.pool())
+    .fetch_optional(db.read_pool())
     .await?;
     row.as_ref().map(deploy_from_row).transpose()
 }
@@ -244,7 +244,7 @@ pub async fn list_ssh_keys(db: &Db, user_id: i64) -> DbResult<Vec<SshKeyRow>> {
         "FROM ssh_keys WHERE user_id = $1 ORDER BY id"
     ))
     .bind(user_id)
-    .fetch_all(db.pool())
+    .fetch_all(db.read_pool())
     .await?;
     rows.iter().map(ssh_from_row).collect()
 }
@@ -255,7 +255,7 @@ pub async fn list_deploy_keys(db: &Db, repo_id: i64) -> DbResult<Vec<DeployKeyRo
         "FROM deploy_keys WHERE repo_id = $1 ORDER BY id"
     ))
     .bind(repo_id)
-    .fetch_all(db.pool())
+        .fetch_all(db.read_pool())
     .await?;
     rows.iter().map(deploy_from_row).collect()
 }
@@ -263,7 +263,7 @@ pub async fn list_deploy_keys(db: &Db, repo_id: i64) -> DbResult<Vec<DeployKeyRo
 pub async fn count_ssh_keys(db: &Db, user_id: i64) -> DbResult<i64> {
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ssh_keys WHERE user_id = $1")
         .bind(user_id)
-        .fetch_one(db.pool())
+        .fetch_one(db.read_pool())
         .await?;
     Ok(count)
 }
@@ -271,7 +271,7 @@ pub async fn count_ssh_keys(db: &Db, user_id: i64) -> DbResult<i64> {
 pub async fn count_deploy_keys(db: &Db, repo_id: i64) -> DbResult<i64> {
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM deploy_keys WHERE repo_id = $1")
         .bind(repo_id)
-        .fetch_one(db.pool())
+        .fetch_one(db.read_pool())
         .await?;
     Ok(count)
 }

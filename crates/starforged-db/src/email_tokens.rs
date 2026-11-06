@@ -54,7 +54,7 @@ pub async fn newest_created_at(db: &Db, user_id: i64, purpose: &str) -> DbResult
     )
     .bind(user_id)
     .bind(purpose)
-    .fetch_one(db.pool())
+    .fetch_one(db.read_pool())
     .await?;
     Ok(newest)
 }
@@ -100,7 +100,7 @@ pub async fn peek(
     .bind(token_hash)
     .bind(purpose)
     .bind(now_ts)
-    .fetch_optional(db.pool())
+    .fetch_optional(db.read_pool())
     .await?;
     row.as_ref().map(from_row).transpose()
 }

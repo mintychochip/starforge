@@ -7,4 +7,5 @@ pub mod doctor;
 pub mod hook;
 pub mod index_cmd;
 pub mod init;
+pub mod restore;
 pub mod serve;

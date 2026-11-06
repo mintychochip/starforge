@@ -28,7 +28,7 @@ use crate::auth::ApiAuth;
 use crate::error::ApiError;
 use crate::time::rfc3339;
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct StatusJson {
     pub sha: String,
     pub context: String,
@@ -62,7 +62,7 @@ fn combined_json(view: &CombinedDto) -> Value {
     })
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct SubmitStatusBody {
     pub state: String,
     pub context: String,
@@ -72,6 +72,25 @@ pub struct SubmitStatusBody {
 
 /// `POST /repos/{owner}/{repo}/statuses/{sha}` (201): upserts the caller's
 /// status for `(sha, context)` and returns the current row.
+#[utoipa::path(
+    post,
+    path = "/api/v1/repos/{owner}/{repo}/statuses/{sha}",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("sha" = String, Path, description = "Commit SHA"),
+    ),
+    request_body = SubmitStatusBody,
+    responses(
+        (status = 201, description = "Submitted status", body = StatusJson),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn submit_status(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -98,6 +117,24 @@ pub async fn submit_status(
 
 /// `GET /repos/{owner}/{repo}/statuses/{sha}` (200): the latest status per
 /// context for `sha`, in context order.
+#[utoipa::path(
+    get,
+    path = "/api/v1/repos/{owner}/{repo}/statuses/{sha}",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("sha" = String, Path, description = "Commit SHA"),
+    ),
+    responses(
+        (status = 200, description = "Statuses for sha", body = serde_json::Value),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn list_statuses(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -117,6 +154,24 @@ pub async fn list_statuses(
 /// then peeled `refs/tags`; a branch shadows a same-named tag; anything
 /// else is `404`). The latest-per-context rows fold with error > failure >
 /// pending > success precedence; an unknown sha is `pending` with zero rows.
+#[utoipa::path(
+    get,
+    path = "/api/v1/repos/{owner}/{repo}/commits/{reference}/status",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("reference" = String, Path, description = "Commit SHA, branch, or tag"),
+    ),
+    responses(
+        (status = 200, description = "Combined status", body = serde_json::Value),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn combined_status(
     State(state): State<ApiState>,
     auth: ApiAuth,

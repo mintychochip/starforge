@@ -57,6 +57,14 @@ git push http://me:<token>@127.0.0.1:3000/me/<repository>.git main
 | `ssh.idle_timeout_secs` | Idle timeout per SSH connection (default `300`) |
 | `ssh.max_connection_secs` | Total timeout per SSH connection (default `3600`) |
 | `ssh.max_connections_per_user` | Concurrent SSH connections per user (per deploy key) (default `10`) |
+| `log.format` | Log output: `text` (default) or `json` (one JSON object per line) |
+| `log.level` | `EnvFilter` string for log verbosity (default `info`) |
+| `metrics.token` | Bearer token protecting `GET /metrics`; unset disables the endpoint (404) |
+| `limits.login_per_ip_per_minute` | Sign-in attempts per client IP per minute (default `10`; `0` disables) |
+| `limits.login_per_account_per_hour` | Failed sign-ins per normalized login name per hour (default `20`; `0` disables) |
+| `limits.api_per_token_per_hour` | API requests per token per hour (default `5000`; `0` disables) |
+| `limits.refs_for_new_changes_per_hour` | New `refs/for` changes per user per hour (default `30`; `0` disables) |
+| `remotes.allow_file_urls` | Test-only: admit `file://`/local-path remotes and loopback hosts for the import/mirror URL policy (default `false`; never set in production) |
 
 Any key can be overridden with an environment variable such as `STARFORGE__SERVER__HTTP_ADDR` or
 `STARFORGE__DATABASE__URL`. `STARFORGE_CONFIG` sets the config file path.
@@ -86,10 +94,10 @@ can delete their account there once they own no repositories.
 
 Any account can turn on TOTP two-factor authentication under **Settings → Two-factor** (`/settings/two-factor`):
 
-1. **Enroll.** The page shows an `otpauth://` URI (issuer is the site name, one 20-byte secret, 6 digits, 30 s step) and the base32 secret. The secret is stored sealed with the server key, never in clear, and is never logged.
+1. **Enroll.** The page shows an `otpauth://` URI (issuer `Starforge`, one 20-byte secret, 6 digits, 30 s step) and the base32 secret. The secret is stored sealed with the server key, never in clear, and is never logged.
 2. **Confirm** with a current code. Only then is 2FA enabled, and 10 recovery codes (`xxxxx-xxxxx`) are shown **once** — save them. Signing in then asks for the password and a current code (or one recovery code) at `/login/two-factor`; no web session exists before the second factor.
 3. A code is accepted within one step either way, and a step is never reused. Each recovery code is shown once, five failed codes void the challenge and sign-in starts again, and challenges expire after five minutes. All of these write audit rows (`account.2fa_enabled`, `account.2fa_disabled`, `account.recovery_codes_regenerated`).
-4. Disable needs the password plus a code; regenerate needs a code and invalidates the old ones.
+4. Disable needs the password plus a code — for a password-less SSO-only account the password is waived but a current code is still required; regenerate needs a code and invalidates the old ones.
 
 Personal access tokens and OAuth device tokens are not affected by 2FA. A site admin can disable a user's 2FA from the admin user page (`/admin/users/{handle}`, audited as `user.2fa_reset`).
 
@@ -189,6 +197,121 @@ the status for readers: `state` (`pending`, `running`, `rate_limited`,
 `review_comments_count`), `dropped_assignees`, `has_token`, and the last
 scrubbed `error`.
 
+## Import and mirroring
+
+Repositories can be created from an existing git repository, and any
+repository can continuously sync with external remotes (spec §8.6). All of it
+goes through one outbound URL policy and one sealed-credential store.
+
+**One-time import.** `POST /api/v1/user/repos` and `POST /api/v1/orgs/{org}/repos`
+accept an `"import": {"url", "auth": {"kind": ...}}` body, and the web
+**New repository** form has an "Import from URL" section. The repository is
+created empty in the `pending` state and the `ImportRepo` job runs
+`git fetch --prune <url> +refs/heads/*:refs/heads/* +refs/tags/*:refs/tags/*`
+(only branches and tags; `refs/notes/*`, `refs/pull/*`, and friends never
+arrive), then points `HEAD` at the remote's default branch (`git ls-remote
+--symref`, falling back to `main`). State moves `pending → running →
+done|failed`; pushes are refused while `pending` or `running`. A failed
+import shows the scrubbed error with **Retry import** and **Delete import**
+(the repository returns to a normal empty one).
+
+- **HTTPS** imports carry a username and password/token in the `auth` object.
+- **SSH** imports (`ssh://…` or scp-like `user@host:path`) are generated an
+  ed25519 deploy keypair server-side: the public key is shown (response
+  field `ssh_public_key`, and beside the import banner) for installing
+  upstream, the repository waits in `pending`, and **Start import** (or
+  `POST …/import/start`) runs the fetch once the key is installed.
+
+**Pull mirrors.** `PUT /api/v1/repos/{owner}/{repo}/mirror/pull`
+`{"url", "auth", "interval_secs"}` (≥ 300, default 3600, at most 30 days)
+configures one pull mirror per repository (web: **Settings → Mirrors**).
+The `PullMirror` job fetches with the import refspecs and `--prune`, runs the
+same branch-move ingest as post-receive (revisions and mergeability), and
+dispatches `push` webhooks with `sender: null`; it re-enqueues itself at the
+interval (after a failure, at a 300 s backoff). `POST …/mirror/pull/sync` is
+"sync now" (deduplicated per repository). While enabled,
+`repos.mirror` is true: direct branch/tag pushes are refused and Trail
+merges are refused with "this repository is a pull mirror", while `refs/for`,
+comments, and reviews keep working. `POST …/mirror/pull/enabled`
+`{"enabled": bool}` toggles without forgetting the configuration, and
+`DELETE` removes the mirror; both restore pushes.
+
+**Push mirrors.** `POST /api/v1/repos/{owner}/{repo}/mirror/push`
+`{"url", "auth"}` adds one (at most 10, **Settings → Mirrors** lists them
+with their last result and error). After every accepted push, the post-receive
+scan enqueues one `PushMirror` job per remote at now + 30 s, deduplicated per
+remote, so pushes inside the window coalesce. The job runs
+`git push --prune <url> +refs/heads/*:refs/heads/* +refs/tags/*:refs/tags/*` —
+a true mirror of branches and tags (`refs/trails/*` and `refs/for/*` never
+leave). Each run updates `last_attempt_at`, `last_success_at`, and the scrubbed
+`last_error`; a failure backs off 300 s, a success does not reschedule until
+the next push. `POST …/mirror/push/{id}/sync` runs immediately (deduplicated
+per remote) and `DELETE …/mirror/push/{id}` removes one. Mirrors never block
+the repository's own pushes.
+
+**Credential storage.** HTTPS credentials and SSH private keys are stored only
+sealed at rest: XChaCha20-Poly1305 under an HKDF-SHA256 key derived from
+`security.secret_key` (salt `"starforge"`, info `"mirror-credentials-v1"`).
+They are never displayed after saving — every view carries only
+`has_credentials: bool` and, for SSH, the public key — and they never travel
+in argv, URLs, logs, or error messages (HTTPS credentials become an
+`http.extraHeader` via `GIT_CONFIG_*` environment entries; SSH private keys
+are written to a `0600` temporary file for one command and removed, including
+on failure; git stderr is scrubbed of URL userinfo before it is stored as
+`last_error` or rendered). `Debug` output of credential values is redacted
+likewise.
+
+**A `secret_key` warning.** The seal is derived from `security.secret_key`.
+Changing or losing it makes every stored remote credential unreadable: jobs
+fail (the import goes `failed`) with the clear error
+"credentials unreadable; re-enter them", never a panic. Re-enter the
+credentials on the settings page or the update/start endpoints to recover.
+
+**URL policy.** Every import/pull/push URL — API and web, at save time and
+again before every fetch or push — passes
+`Core::check_remote_url`:
+
+- Allowed schemes: `https`, and `ssh` (`ssh://` and scp-like `user@host:path`),
+  plus `http` only when the resolved host is loopback **and**
+  `remotes.allow_file_urls` is set. Refused (422): `file://`, local paths,
+  `ext::`, `fd::`, and every other transport (git runs under
+  `-c protocol.allow=never` with the allowed schemes explicitly allowed),
+  unless `remotes.allow_file_urls` is set (default false; documented as
+  test-only — it also admits loopback hosts).
+- Hosts are resolved and refused by the webhook SSRF rules — private,
+  loopback (unless flagged), link-local including the `169.254.169.254`
+  metadata endpoint, unique-local, multicast, and other non-global ranges;
+  IPv4-mapped IPv6 (`::ffff:a.b.c.d`) is unwrapped and classified as its inner
+  IPv4 address — unless the test flag admits loopback.
+- The first allowed resolved address is pinned (`http.curloptResolve` for
+  HTTPS, `HostName` with `HostKeyAlias` for SSH), and git refuses redirects
+  (`http.followRedirects=false`), so a DNS change between the check and git's
+  own lookup cannot redirect the connection; the run-time re-check fails
+  closed if the host has rebound to a private address.
+- Dash-prefixed URLs, users, and hosts are refused outright (SSH
+  `-oProxyCommand=` injection), as are whitespace/control characters. A
+  password pasted into a URL's userinfo is stripped: the stored and returned
+  URL never carries it, for every scheme.
+
+**Access and audit.** Mirror configuration is maintain+ (the `mirrors`
+capability); below-threshold readers get `403`, non-readers `404`, and readers
+can `GET` the configuration. Import mirrors the same matrix (readers see the
+state via `GET …/import`; start/delete need maintain+). Archived repositories
+refuse new configuration, imports, and mirror additions with `422` while
+staying readable. Every configuration change writes one audit row
+(`repo.import`, `mirror.create`, `mirror.update`, `mirror.delete`, plus
+`mirror.credentials_changed` when credentials are set or replaced). Web forms
+are CSRF-gated like every other state-changing form.
+
+**API.** `GET`/`DELETE /repos/{owner}/{repo}/import` and
+`POST …/import/start` (optional body replaces credentials); `PUT`/`GET`/`DELETE
+/repos/{owner}/{repo}/mirror/pull`, `POST …/mirror/pull/sync`,
+`POST …/mirror/pull/enabled`; `POST`/`GET …/mirror/push`,
+`DELETE …/mirror/push/{id}`, `POST …/mirror/push/{id}/sync`. The create-repo
+bodies carry `"import"` as above. Responses carry `url`, `auth`,
+`has_credentials`, `ssh_public_key` (SSH), the interval and enabled flag (pull),
+and the last attempt/success times and scrubbed `last_error` — never a secret.
+
 ## Organizations and teams
 
 Organizations share the handle namespace with users and own repositories at `/{org}/{repo}`. Any active
@@ -249,6 +372,65 @@ good; failed background jobs are retried or dropped.
 Every `/admin` page and action answers 404 to anyone who is not a site admin, so the area is
 indistinguishable from a missing page. Guards refuse to suspend or delete yourself, and the last active
 admin cannot be suspended, demoted, or deleted. Each admin action is recorded in the audit log.
+
+## Abuse controls
+
+Abuse controls (spec §11.6) are all configurable under `[limits]`; every key is
+also overridable as `STARFORGE__LIMITS__*`. Setting any limit to `0` disables it.
+The session-upload volume and storage quotas keep their own `[sessions]` keys
+(500 MiB/hour upload volume, 5 GiB per user, 20 GiB per repository, 16 MiB per
+segment) and their existing errors.
+
+| Limit | Config key | Default | What it counts |
+|---|---|---|---|
+| Sign-in attempts | `limits.login_per_ip_per_minute` | `10` | Attempts from one client IP per fixed 1-minute window (in-memory) |
+| Failed sign-ins | `limits.login_per_account_per_hour` | `20` | `auth.login_failed` rows for the normalized login name in the last hour (database) |
+| API requests | `limits.api_per_token_per_hour` | `5000` | Requests per token per fixed 1-hour window (in-memory) |
+| New `refs/for` changes | `limits.refs_for_new_changes_per_hour` | `30` | `agit` changes created by the user in all repositories in the last hour (database) |
+
+**Client IP.** The login limiter, the login page, and the audit writer all use
+the same address: the TCP peer (`ConnectInfo`) of the HTTP connection. An
+`X-Forwarded-For` header is never trusted, so a client cannot spoof its
+address; only a reverse proxy in front of a single server can see the proxied
+address, and behind one the limiter and the audit log see the proxy, not the
+client. The per-account limit counts failures for existing and non-existing
+login names identically (by the normalized name), so probing unknown names is
+limited the same way.
+
+**Response shapes.** Over the API limit: `429` with the error envelope
+`{"error": {"code": "rate_limited", "message": "rate limit exceeded"}}`,
+`Retry-After`, and on every token-authenticated API response (when the limit is
+enabled) `X-RateLimit-Limit`, `X-RateLimit-Remaining`, and `X-RateLimit-Reset`
+(unix seconds). When the limit is disabled no `X-RateLimit-*` headers are sent.
+Over a sign-in limit: the sign-in page re-renders with `429` and a generic
+message; failed attempts while limited are still audited
+(`auth.login_rate_limited`). Over the `refs/for` budget: the push of that ref
+is refused with a `remote: starforge: …` message naming the limit; updating
+an existing topic is still accepted. API `429`s are never audited (too noisy)
+and are logged at `info` with the token id, never the token. The in-memory
+windows reset on restart, which a single-process deployment accepts.
+
+## Audit log
+
+Every state-changing action writes exactly one append-only audit row
+(`crates/starforged-db/src/audit.rs`): the actor, the action (for example
+`auth.login`, `repo.visibility`, `session.publish`, `user.suspend`), the
+target (`user:alice`, `repo:alice/proj`, `token:12`, `session:<ULID>`,
+`job:7`, `org:acme`, `team:acme/core`), a detail string, the client IP and
+user agent where the caller supplies them (sign-ins carry both; most other
+actions record empty values), and the timestamp. Refused actions write no
+row, except failed sign-ins (`auth.login_failed` with the normalized login
+name as the target, including unknown names) and refused sign-ins over a
+limit (`auth.login_rate_limited`). Audit rows never contain session
+transcript content, tokens, or other secrets.
+
+Site admins read the log at `/admin/audit` (newest first, 50 per page with a
+keyset cursor; filters for actor handle, action exact or prefix like
+`session.`, target substring, and from/to dates) and through
+`GET /api/v1/admin/audit?actor=&action=&target=&from=&to=&after=&limit=`
+with an `admin`-scoped token. Non-admins get 404 on the page, and the API
+requires a site admin. Columns (time, actor, action, target, IP, user agent)
+are escaped.
 
 ## Git over SSH
 
@@ -548,6 +730,100 @@ may still read, newest first, at most 10). Every row is re-checked against
 your current permission, so losing access hides it immediately; anonymous
 visitors see the marketing page with no sections.
 
+## Search
+
+The search page (`/search`, with a search box in the site header) has
+Trails and Sessions tabs, and each repository has its own code search
+(`/{owner}/{repo}/search`, with a search field on every repository
+page). Every search page and every session search response sends
+`X-Robots-Tag: noindex` (spec §11.1).
+
+**What is indexed.** One Tantivy index (the only crate that depends on
+it is `starforged-index`) holds Trail documents — one per Trail, keyed
+`trail_id`, with the title and the intent plus all comment bodies — and
+session event documents — one per searchable event, keyed
+`session_id` + `seq`, with user and assistant message text, tool names,
+and file paths. Reasoning, system and compaction events, tool call
+inputs and outputs, and review comments are deliberately **not**
+indexed: they are large and secret-prone, and the document content
+comes from the same reader the session viewer uses (with redaction
+applied), so the index never holds text the viewer would redact. Only
+`complete` sessions are indexed — a receiving session becomes
+searchable when it completes. The index lives under
+`storage.index_dir` (default `index` inside `storage.data_dir`,
+`STARFORGE__STORAGE__INDEX_DIR` to override), is rebuildable from the
+database and blobs, and is skipped by backups; a missing or corrupt
+index is recreated empty at startup and a full rebuild job is
+enqueued — the server never refuses to start because of the index.
+Indexing never blocks or fails a mutation: mutations only enqueue
+index jobs (de-duplicated by kind and id), and purging or deleting a
+session drops its documents.
+
+**Filters.** Trail and session search share `q`, `repo` (`owner/name`),
+`author` (a handle), `from`/`to` (RFC 3339 date or date-time,
+inclusive), `page` (1-based), and `per_page` (at most 50, default
+20); session search adds `agent`, `model` (a term of the session's
+models), and `commit` (a full or ≥7-character SHA prefix, matched
+against the session's linked commits). A Trail's date is its
+`updated_at`; an event's is its own timestamp. Session results group
+events by session — each result shows the session and its
+best-matching events (at most three snippets) and links to the viewer
+at `#turn-<seq>`. An invalid date, SHA, `page`, `per_page`, or
+malformed `repo` answers `422`; an unknown `repo` or `author` filter
+answers an empty page, so existence stays undiscoverable.
+
+**Permissions.** The index is never the source of truth. The query
+carries a permission filter (public repositories, internal ones for
+signed-in viewers, and the private/internal repositories the viewer
+can read through grants, org and team grants, or site administration),
+and every hit is re-read from the database and re-checked before it is
+returned — Trail hits need repository read, session hits must still
+pass the §6.4 session read rule (unpublished sessions on public
+repositories need membership; quarantined sessions are uploader or
+repo-admin only; site admins read everything). A stale document can
+only ever hide a result, never leak one: a repository that became
+private, a revoked grant, a deleted repository, a session quarantined
+or unpublished after indexing — all hide the hit immediately, with no
+index job run needed. Quarantined sessions **are** indexed (with
+their quarantine state) so the uploader and admins can find them; the
+filter and re-check hide them from everyone else. Archived
+repositories stay searchable (only pushes refuse them). A
+repository the viewer cannot read answers `404` on code search, never
+`403`.
+
+**Code search** runs `git grep` over the default branch's tip commit
+only — a match that exists on another branch is absent. The query is
+a fixed string (regex metacharacters are literal, and a query starting
+with `-` is searched literally, never treated as an option) with an
+optional case-insensitive switch (`case=insensitive`), refuses an
+empty query or one longer than 256 characters, times out after 10 s,
+skips binary files, and returns at most 200 matches over at most 50
+files with lines truncated to 500 characters (`truncated: true` when
+either cap bites). Each match links to the file and line
+(`/{owner}/{repo}/blob/{ref}/{path}#L{line}`). An empty repository
+answers an empty result.
+
+**Rebuilding the index.** `starforged index rebuild` (server stopped)
+wipes and rebuilds the index from the database and blobs and prints
+the counts (`index rebuild complete: N trail(s), M event(s)`); while
+the server runs it refuses with a "stop the server or use the admin
+rebuild" message. While the server runs, site admins can instead use
+the **Rebuild search index** action on the admin jobs page
+(`/admin/jobs`, CSRF-protected, site-admin only, audited as
+`index.rebuild`), which enqueues the same rebuild as a background job.
+
+**API.** `GET /api/v1/search/trails?q=&repo=&author=&from=&to=&page=&per_page=`
+returns `{"results": [{"repo", "number", "title", "state",
+"updated_at", "snippet": {"text", "highlights": [[start, end]…]}}],
+"page", "per_page", "has_more"}`; `GET /api/v1/search/sessions` with
+the session filters returns the grouped sessions with their matched
+events (`seq`, `kind`, `snippet`); and
+`GET /api/v1/repos/{owner}/{repo}/search/code?q=&case=sensitive|insensitive`
+returns `{"ref", "commit", "matches": [{"path", "line", "text"}],
+"truncated"}`. Anonymous callers are allowed; a token must carry
+`repo:read` (a token without it answers `403`).
+
+
 ## Changes and reviews
 
 Push to `refs/for/<branch>` to propose work without moving the branch — the `refs/for`
@@ -804,6 +1080,96 @@ ranges are refused, nothing is redirected, bodies cap at 64 KiB under a
 is marked failed.
 
 Not yet: per-context soft gates, check retries, deployments, and mirrors.
+
+## Operations
+
+Backups, restores, health checks, and the knobs that keep a running instance
+observable. Everything below that takes a config file reads `starforged.toml`
+(or `--config` / `STARFORGE_CONFIG`).
+
+### Backup and restore
+
+```bash
+./target/release/starforged backup <dir>            # see below; --no-config omits the config copy
+./target/release/starforged restore <backup-dir> --data-dir <fresh-dir>
+./target/release/starforged restore <backup-dir> --config <target-config>
+```
+
+`backup` writes a consistent snapshot into an empty or absent directory:
+`manifest.json` (format version 1, Starforge version, creation time, engine,
+latest migration, repository and blob counts), `database/`, `repos/` (the
+same sharded layout), `blobs/`, and `config/starforged.toml` (a copy of the
+running config, unless `--no-config`). The search index is not backed up; it
+is rebuilt from the database on demand. The database snapshot is
+transactionally consistent (`VACUUM INTO` on SQLite, `pg_dump` — which must be
+on `PATH` — on Postgres), each repository is copied under its exclusive
+lock, and blob garbage collection is paused for the duration, so every blob
+the snapshot references is present.
+
+**The backup contains secrets.** The config copy holds `security.secret_key`,
+so the backup directory is created `0700` and the config and manifest files
+`0600`. Keep backups like secrets: encrypted at rest, access-limited, and
+never committed or uploaded anywhere public.
+
+`restore` refuses a non-empty data directory (or, on Postgres, a database that
+already has tables) and a manifest from a newer schema than the binary knows;
+it runs migrations after restoring an older schema. Without `--config` it
+uses the backup's config with `storage.data_dir` taken from `--data-dir`.
+Stop the server before restoring, and start it again afterwards.
+
+### Doctor
+
+```bash
+./target/release/starforged doctor [--fix]
+```
+
+Checks the git version, repository hooks, data-directory permissions,
+orphaned blob files, and search-index health against the database, printing
+one line per check. It exits `0` when every check passes, `1` on any
+failure, and `2` when only warnings occur. `--fix` reinstalls missing
+repository hooks and removes orphaned blob files older than one hour; it
+never deletes database rows.
+
+### Readiness and metrics
+
+`GET /healthz` answers `ok` unconditionally (liveness). `GET /readyz` answers
+`200` only while the database answers `SELECT 1` within 2 s, migrations are
+up to date, job workers have heartbeated within 30 s, the search index is
+open, and the data directory is present; otherwise it answers `503` with a
+JSON list of the failing items (for example `{"status": "unavailable",
+"failing": ["jobs"]}`).
+
+`GET /metrics` serves Prometheus text exposition when `metrics.token` is
+set (`Authorization: Bearer <token>`): it answers `404` when no token is
+configured and `401` on a wrong token. The counters, gauges, and the request
+duration histogram carry no user, repository, or token labels.
+
+### Logs
+
+`log.format` selects `text` (default) or `json` (one JSON object per line,
+for log aggregation), and `log.level` is an `EnvFilter` string (default
+`info`). Both are overridable as `STARFORGE__LOG__FORMAT` /
+`STARFORGE__LOG__LEVEL`. Secrets are never logged.
+
+### Upgrades and migrations
+
+Database migrations run automatically at startup when `database.auto_migrate`
+is true (the default); `starforged migrate` applies them by hand. Migrations
+are embedded and engine-specific (SQLite and Postgres schema files ship
+side by side), so an upgrade is just a new binary — back up first, then
+restart. `starforged doctor` reports whether migrations are up to date, and
+`restore` refuses a backup whose schema is newer than the binary's.
+
+### Reader pool
+
+On SQLite the database layer keeps one writer connection and a separate pool
+of read-only (`PRAGMA query_only = ON`) reader connections, with the
+database in WAL mode: a long read never blocks a write, and a write routed
+to a reader fails loudly instead of landing. On Postgres both share one pool.
+Functions that only `SELECT` outside a transaction use the reader pool;
+writes, transactions, and read-then-write functions use the writer. Committed
+writes are visible to readers immediately, so a sequential "write, then
+read" in one request is safe either way.
 
 ## Development
 

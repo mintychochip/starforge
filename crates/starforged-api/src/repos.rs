@@ -11,7 +11,7 @@ use crate::ApiState;
 use crate::auth::ApiAuth;
 use crate::error::ApiError;
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub(crate) struct RepoJson {
     pub(crate) id: i64,
     pub(crate) owner: String,
@@ -49,7 +49,7 @@ pub(crate) fn repo_json(state: &ApiState, access: RepoAccess) -> RepoJson {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub(crate) struct CreateRepoBody {
     pub(crate) name: String,
     #[serde(default)]
@@ -69,7 +69,7 @@ fn private() -> String {
 
 /// The `import` half of a repository-creation body (M4b D3):
 /// `{"url": ..., "auth": {"kind": "none|https|ssh", "username": ..., "password"|"token": ...}}`.
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub(crate) struct ImportBody {
     pub(crate) url: String,
     #[serde(default)]
@@ -79,7 +79,7 @@ pub(crate) struct ImportBody {
 /// The `auth` half of an import body. For `https` the username and
 /// password/token travel here and are sealed server-side; for `ssh` the
 /// server generates the keypair.
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub(crate) struct ImportAuthBody {
     #[serde(default)]
     pub(crate) kind: String,
@@ -140,6 +140,20 @@ pub(crate) fn parse_import(
     }))
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/v1/user/repos",
+    request_body = CreateRepoBody,
+    responses(
+        (status = 201, description = "Created repository", body = RepoJson),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn create(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -178,6 +192,23 @@ pub async fn create(
     Ok((StatusCode::CREATED, Json(json)))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/v1/repos/{owner}/{repo}",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+    ),
+    responses(
+        (status = 200, description = "Repository", body = RepoJson),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn show(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -187,11 +218,28 @@ pub async fn show(
     Ok(Json(repo_json(&state, access)))
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct CollaboratorJson {
     handle: String,
     permission: &'static str,
 }
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/repos/{owner}/{repo}/collaborators",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+    ),
+    responses(
+        (status = 200, description = "Collaborators", body = Vec<CollaboratorJson>),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
 
 pub async fn list_collaborators(
     State(state): State<ApiState>,
@@ -211,10 +259,29 @@ pub async fn list_collaborators(
     ))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct SetCollaboratorBody {
     permission: String,
 }
+
+#[utoipa::path(
+    put,
+    path = "/api/v1/repos/{owner}/{repo}/collaborators/{handle}",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("handle" = String, Path, description = "User handle"),
+    ),
+    request_body = SetCollaboratorBody,
+    responses(
+        (status = 204, description = "Collaborator set"),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
 
 pub async fn set_collaborator(
     State(state): State<ApiState>,
@@ -234,6 +301,24 @@ pub async fn set_collaborator(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[utoipa::path(
+    delete,
+    path = "/api/v1/repos/{owner}/{repo}/collaborators/{handle}",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("handle" = String, Path, description = "User handle"),
+    ),
+    responses(
+        (status = 204, description = "Collaborator removed"),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn remove_collaborator(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -246,7 +331,7 @@ pub async fn remove_collaborator(
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct PatchRepoBody {
     pub refs_for_access: Option<String>,
 }
@@ -254,6 +339,24 @@ pub struct PatchRepoBody {
 /// `PATCH /repos/{owner}/{repo}` (`{"refs_for_access": …}`): flips the
 /// `refs/for` push policy between `anyone_with_read` and `members`.
 /// Maintain+ via the repo-settings power; anything else in the body is 422.
+#[utoipa::path(
+    patch,
+    path = "/api/v1/repos/{owner}/{repo}",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+    ),
+    request_body = PatchRepoBody,
+    responses(
+        (status = 200, description = "Updated repository settings", body = serde_json::Value),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn patch(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -272,7 +375,7 @@ pub async fn patch(
     Ok(Json(serde_json::json!({ "refs_for_access": value })))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct TransferRepoBody {
     new_owner: String,
 }
@@ -280,6 +383,24 @@ pub struct TransferRepoBody {
 /// `POST /repos/{owner}/{repo}/transfer` (`{"new_owner": "<handle>"}`):
 /// moves the repository to the actor or to an org the actor owns (D6).
 /// Anything else in the body is 422.
+#[utoipa::path(
+    post,
+    path = "/api/v1/repos/{owner}/{repo}/transfer",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+    ),
+    request_body = TransferRepoBody,
+    responses(
+        (status = 200, description = "Repository transferred", body = RepoJson),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn transfer(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -306,7 +427,7 @@ pub async fn transfer(
 
 /// What the API shows for a repository's import source: never a secret,
 /// only `has_credentials` and, for SSH, the public key.
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct ImportJson {
     repo_id: i64,
     state: String,
@@ -331,6 +452,23 @@ fn import_json(view: starforged_core::remotes::ImportView) -> ImportJson {
 
 /// `GET /repos/{owner}/{repo}/import`: readers see the import state;
 /// anyone who cannot read gets 404 (via `repo_for`).
+#[utoipa::path(
+    get,
+    path = "/api/v1/repos/{owner}/{repo}/import",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+    ),
+    responses(
+        (status = 200, description = "Import status", body = ImportJson),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn get_import(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -343,7 +481,7 @@ pub async fn get_import(
     Ok(Json(import_json(view)))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct StartImportBody {
     #[serde(default)]
     pub auth: Option<ImportAuthBody>,
@@ -352,6 +490,24 @@ pub struct StartImportBody {
 /// `POST /repos/{owner}/{repo}/import/start`: "start import" and retry.
 /// The optional body replaces the stored credentials (the "fix
 /// credentials" retry); without it they run unchanged.
+#[utoipa::path(
+    post,
+    path = "/api/v1/repos/{owner}/{repo}/import/start",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+    ),
+    request_body = StartImportBody,
+    responses(
+        (status = 200, description = "Import started", body = ImportJson),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn start_import(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -375,6 +531,23 @@ pub async fn start_import(
 
 /// `DELETE /repos/{owner}/{repo}/import`: deletes the import source,
 /// returning the repository to a normal empty one.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/repos/{owner}/{repo}/import",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+    ),
+    responses(
+        (status = 204, description = "Import deleted"),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn delete_import(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -387,7 +560,7 @@ pub async fn delete_import(
 
 /// What the API shows for a pull mirror: never a secret, only
 /// and, for SSH, the public key (mirroring the import shape).
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct PullMirrorJson {
     repo_id: i64,
     url: String,
@@ -416,7 +589,7 @@ fn pull_mirror_json(view: starforged_core::remotes::PullMirrorView) -> PullMirro
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct PullMirrorBody {
     pub url: String,
     #[serde(default)]
@@ -433,6 +606,24 @@ fn default_interval() -> i64 {
 /// the pull mirror. Maintain+ (enforced in core); the URL policy runs at
 /// save time and again before every fetch. 422 for a policy refusal or an
 /// interval below 300 seconds.
+#[utoipa::path(
+    put,
+    path = "/api/v1/repos/{owner}/{repo}/mirror/pull",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+    ),
+    request_body = PullMirrorBody,
+    responses(
+        (status = 200, description = "Pull mirror configured", body = PullMirrorJson),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn put_pull_mirror(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -461,6 +652,23 @@ pub async fn put_pull_mirror(
 }
 
 /// `GET /repos/{owner}/{repo}/mirror/pull`: readers see the configuration.
+#[utoipa::path(
+    get,
+    path = "/api/v1/repos/{owner}/{repo}/mirror/pull",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+    ),
+    responses(
+        (status = 200, description = "Pull mirror", body = PullMirrorJson),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn get_pull_mirror(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -475,6 +683,23 @@ pub async fn get_pull_mirror(
 
 /// `DELETE /repos/{owner}/{repo}/mirror/pull`: deletes the mirror;
 /// pushes are restored.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/repos/{owner}/{repo}/mirror/pull",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+    ),
+    responses(
+        (status = 204, description = "Pull mirror deleted"),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn delete_pull_mirror(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -490,6 +715,23 @@ pub async fn delete_pull_mirror(
 
 /// `POST /repos/{owner}/{repo}/mirror/pull/sync`: queues an immediate
 /// sync (deduplicated per repository).
+#[utoipa::path(
+    post,
+    path = "/api/v1/repos/{owner}/{repo}/mirror/pull/sync",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+    ),
+    responses(
+        (status = 200, description = "Pull mirror sync queued", body = PullMirrorJson),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn sync_pull_mirror(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -505,6 +747,24 @@ pub async fn sync_pull_mirror(
 
 /// `POST /repos/{owner}/{repo}/mirror/pull/enabled` (`{"enabled": bool}`):
 /// toggles the mirror without forgetting its configuration.
+#[utoipa::path(
+    post,
+    path = "/api/v1/repos/{owner}/{repo}/mirror/pull/enabled",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+    ),
+    request_body = EnableBody,
+    responses(
+        (status = 200, description = "Pull mirror updated", body = PullMirrorJson),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn set_pull_mirror_enabled(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -522,7 +782,7 @@ pub async fn set_pull_mirror_enabled(
 
 /// What the API shows for one push mirror: never a secret, only
 /// `has_credentials` and, for SSH, the public key (mirroring the pull shape).
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct PushMirrorJson {
     id: i64,
     repo_id: i64,
@@ -551,7 +811,7 @@ fn push_mirror_json(view: starforged_core::remotes::PushMirrorView) -> PushMirro
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct PushMirrorBody {
     pub url: String,
     #[serde(default)]
@@ -562,6 +822,24 @@ pub struct PushMirrorBody {
 /// (at most 10 per repository). Maintain+ (enforced in core); the URL
 /// policy runs at save time and again before every push. 422 for a policy
 /// refusal or a full mirror list.
+#[utoipa::path(
+    post,
+    path = "/api/v1/repos/{owner}/{repo}/mirror/push",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+    ),
+    request_body = PushMirrorBody,
+    responses(
+        (status = 201, description = "Push mirror added", body = PushMirrorJson),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn add_push_mirror(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -590,6 +868,23 @@ pub async fn add_push_mirror(
 
 /// `GET /repos/{owner}/{repo}/mirror/push`: readers see the push mirrors
 /// with their last result and (scrubbed) error.
+#[utoipa::path(
+    get,
+    path = "/api/v1/repos/{owner}/{repo}/mirror/push",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+    ),
+    responses(
+        (status = 200, description = "Push mirrors", body = Vec<PushMirrorJson>),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn list_push_mirrors(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -604,6 +899,24 @@ pub async fn list_push_mirrors(
 
 /// `DELETE /repos/{owner}/{repo}/mirror/push/{id}`: deletes one push
 /// mirror. Maintain+ (enforced in core).
+#[utoipa::path(
+    delete,
+    path = "/api/v1/repos/{owner}/{repo}/mirror/push/{id}",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("id" = i64, Path, description = "Push mirror id"),
+    ),
+    responses(
+        (status = 204, description = "Push mirror deleted"),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn delete_push_mirror(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -619,6 +932,24 @@ pub async fn delete_push_mirror(
 
 /// `POST /repos/{owner}/{repo}/mirror/push/{id}/sync`: queues an immediate
 /// run (deduplicated per remote).
+#[utoipa::path(
+    post,
+    path = "/api/v1/repos/{owner}/{repo}/mirror/push/{id}/sync",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("id" = i64, Path, description = "Push mirror id"),
+    ),
+    responses(
+        (status = 200, description = "Push mirror sync queued", body = PushMirrorJson),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn sync_push_mirror(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -632,7 +963,7 @@ pub async fn sync_push_mirror(
     Ok(Json(push_mirror_json(view)))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct EnableBody {
     enabled: bool,
 }

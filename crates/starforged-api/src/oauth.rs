@@ -16,13 +16,13 @@ use starforged_core::oauth::PollOutcome;
 
 use crate::ApiState;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct DeviceCodeForm {
     client_id: String,
     scope: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct TokenForm {
     grant_type: String,
     device_code: String,
@@ -30,6 +30,16 @@ pub struct TokenForm {
 }
 
 /// `POST /api/v1/oauth/device/code`: starts a device flow for `starforge-cli`.
+#[utoipa::path(
+    post,
+    path = "/api/v1/oauth/device/code",
+    request_body(content = DeviceCodeForm, content_type = "application/x-www-form-urlencoded"),
+    responses(
+        (status = 200, description = "Device authorization response", body = serde_json::Value),
+        (status = 400, description = "Bad request", body = serde_json::Value),
+    ),
+)]
+
 pub async fn device_code(
     State(state): State<ApiState>,
     Form(form): Form<DeviceCodeForm>,
@@ -61,6 +71,16 @@ pub async fn device_code(
 }
 
 /// `POST /api/v1/oauth/token`: polls a device flow for its token pair.
+#[utoipa::path(
+    post,
+    path = "/api/v1/oauth/token",
+    request_body(content = TokenForm, content_type = "application/x-www-form-urlencoded"),
+    responses(
+        (status = 200, description = "Token response or RFC 8628 pending body", body = serde_json::Value),
+        (status = 400, description = "Bad request", body = serde_json::Value),
+    ),
+)]
+
 pub async fn token(State(state): State<ApiState>, Form(form): Form<TokenForm>) -> Response {
     if form.grant_type != "urn:ietf:params:oauth:grant-type:device_code" {
         return oauth_error("unsupported_grant_type");

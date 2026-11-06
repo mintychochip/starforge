@@ -96,7 +96,7 @@ pub async fn get_or_create(db: &Db, repo_id: i64, source: &str) -> DbResult<Gith
 pub async fn import_of_repo(db: &Db, repo_id: i64) -> DbResult<Option<GithubImportRow>> {
     let row = sqlx::query(select_import!("WHERE repo_id = $1"))
         .bind(repo_id)
-        .fetch_optional(db.pool())
+        .fetch_optional(db.read_pool())
         .await?;
     row.map(|r| from_row(&r)).transpose()
 }

@@ -59,6 +59,14 @@ impl DbError {
     pub fn is_unique_violation(&self) -> bool {
         matches!(self, DbError::Sqlx(e) if e.as_database_error().is_some_and(|d| d.is_unique_violation()))
     }
+
+    /// A foreign-key violation: a referencing row whose parent
+    /// (`owners`, `users`, `repos`, …) vanished, e.g. a repo-scoped write
+    /// racing an org or account deletion. Callers map this to `NotFound`
+    /// (the parent is gone) instead of surfacing a 500.
+    pub fn is_foreign_key_violation(&self) -> bool {
+        matches!(self, DbError::Sqlx(e) if e.as_database_error().is_some_and(|d| d.is_foreign_key_violation()))
+    }
 }
 
 pub type DbResult<T> = Result<T, DbError>;
@@ -66,6 +74,7 @@ pub type DbResult<T> = Result<T, DbError>;
 #[derive(Debug, Clone)]
 pub struct Db {
     pool: AnyPool,
+    read_pool: AnyPool,
     backend: Backend,
 }
 
@@ -80,8 +89,8 @@ impl Db {
             return Err(DbError::UnsupportedUrl(url.to_owned()));
         };
         let pool = match backend {
-            // One connection: SQLite serializes writes anyway, and a single connection avoids SQLITE_BUSY.
-            // The reader-pool split from spec §12 lands in M5.
+            // One writer connection: SQLite serializes writes anyway, and a
+            // single connection avoids SQLITE_BUSY among writers.
             Backend::Sqlite => {
                 AnyPoolOptions::new()
                     .max_connections(1)
@@ -103,7 +112,32 @@ impl Db {
                     .await?
             }
         };
-        Ok(Db { pool, backend })
+        let read_pool = match backend {
+            Backend::Sqlite => {
+                AnyPoolOptions::new()
+                    .max_connections(4)
+                    .after_connect(|conn, _meta| {
+                        Box::pin(async move {
+                            conn.execute("PRAGMA foreign_keys = ON").await?;
+                            conn.execute("PRAGMA journal_mode = WAL").await?;
+                            conn.execute("PRAGMA busy_timeout = 5000").await?;
+                            // Last: every reader connection refuses writes, so a
+                            // write accidentally routed here fails loudly instead
+                            // of contending with the single writer.
+                            conn.execute("PRAGMA query_only = ON").await?;
+                            Ok(())
+                        })
+                    })
+                    .connect(url)
+                    .await?
+            }
+            Backend::Postgres => pool.clone(),
+        };
+        Ok(Db {
+            pool,
+            read_pool,
+            backend,
+        })
     }
 
     pub async fn migrate(&self) -> DbResult<()> {
@@ -114,14 +148,31 @@ impl Db {
         Ok(())
     }
 
+    /// The writer pool: every write, every transaction (`pool().begin()`),
+    /// and every read-then-write function.
+    ///
+    /// Read-your-writes rule: a function that must observe a write it just
+    /// made in the same request stays on this pool. Committed writes are
+    /// visible to the reader pool (WAL on SQLite, READ COMMITTED on
+    /// Postgres), so a sequential "write, then read" across two functions is
+    /// safe on either pool — but a read inside an open write transaction
+    /// (which sees the transaction's uncommitted rows) must use this pool.
     pub fn pool(&self) -> &AnyPool {
         &self.pool
+    }
+
+    /// The read-only pool: functions that only `SELECT` outside a transaction.
+    /// On Postgres this is the same pool as [`Db::pool`]; on SQLite it is a
+    /// separate pool of `query_only` connections, so a long read never blocks
+    /// the single writer and a stray write fails instead of landing.
+    pub fn read_pool(&self) -> &AnyPool {
+        &self.read_pool
     }
 
     /// Answers `SELECT 1` (the `/readyz` database check, plan M5b D5).
     pub async fn ping(&self) -> DbResult<()> {
         sqlx::query_scalar::<_, i64>("SELECT 1")
-            .fetch_one(self.pool())
+            .fetch_one(self.read_pool())
             .await?;
         Ok(())
     }
@@ -135,7 +186,7 @@ impl Db {
     pub async fn latest_migration(&self) -> DbResult<Option<i64>> {
         Ok(
             sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
-                .fetch_one(self.pool())
+                .fetch_one(self.read_pool())
                 .await?,
         )
     }

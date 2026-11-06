@@ -157,6 +157,21 @@ fn acquire(
     }
 }
 
+/// Non-mutating probe (doctor): `Ok(true)` when the lock is free — or the
+/// lock file does not exist yet — without creating anything.
+fn probe(path: &Path) -> Result<bool, LockError> {
+    let file = match OpenOptions::new().read(true).write(true).open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(err) => return Err(LockError::Io(err)),
+    };
+    match file.try_lock() {
+        Ok(()) => Ok(true),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(false),
+        Err(std::fs::TryLockError::Error(err)) => Err(LockError::Io(err)),
+    }
+}
+
 /// Runs a blocking lock acquisition on a blocking thread so async callers
 /// never stall the runtime.
 async fn acquire_async(
@@ -224,6 +239,12 @@ impl RepoLock {
         )
     }
 
+    /// Non-mutating probe: `Ok(true)` when no process holds the exclusive
+    /// lock (a missing lock file counts as free). For doctor.
+    pub fn probe_exclusive(repo_dir: &Path) -> Result<bool, LockError> {
+        probe(&Self::lock_path(repo_dir))
+    }
+
     pub async fn shared_async(repo_dir: &Path) -> Result<LockGuard, LockError> {
         acquire_async(Self::lock_path(repo_dir), LockMode::Shared, LOCK_TIMEOUT).await
     }
@@ -284,6 +305,12 @@ impl BlobGcLock {
             Duration::ZERO,
             false,
         )
+    }
+
+    /// Non-mutating probe: `Ok(true)` when no process holds the exclusive
+    /// lock (a missing lock file counts as free). For doctor.
+    pub fn probe_exclusive(blob_dir: &Path) -> Result<bool, LockError> {
+        probe(&Self::lock_path(blob_dir))
     }
 
     pub async fn shared_async(blob_dir: &Path) -> Result<LockGuard, LockError> {
@@ -383,6 +410,22 @@ mod tests {
             RepoLock::try_exclusive(&repo),
             Err(LockError::WouldBlock { .. })
         ));
+    }
+
+    #[test]
+    fn probe_is_non_mutating_and_sees_held_locks() {
+        let dir = repo_dir();
+        let repo = dir.path().join("repo.git");
+        // No lock file yet: free, and the probe must not create one.
+        assert!(RepoLock::probe_exclusive(&repo).unwrap());
+        assert!(!RepoLock::lock_path(&repo).exists());
+        let _held = RepoLock::exclusive(&repo).unwrap();
+        assert!(!RepoLock::probe_exclusive(&repo).unwrap());
+        drop(_held);
+        assert!(RepoLock::probe_exclusive(&repo).unwrap());
+        let blobs = dir.path().join("blobs");
+        assert!(BlobGcLock::probe_exclusive(&blobs).unwrap());
+        assert!(!BlobGcLock::lock_path(&blobs).exists());
     }
 
     #[test]

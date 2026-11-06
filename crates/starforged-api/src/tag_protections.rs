@@ -26,7 +26,7 @@ use crate::auth::ApiAuth;
 use crate::error::ApiError;
 use crate::time::rfc3339;
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct TagProtectionJson {
     pub id: i64,
     pub pattern: String,
@@ -43,6 +43,23 @@ fn tag_protection_json(view: &TagProtectionDto) -> TagProtectionJson {
 
 /// `GET /repos/{owner}/{repo}/tag-protections` (200): the repo's tag
 /// protections in insert order. Any repository reader.
+#[utoipa::path(
+    get,
+    path = "/api/v1/repos/{owner}/{repo}/tag-protections",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+    ),
+    responses(
+        (status = 200, description = "Tag protections", body = serde_json::Value),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn list_tag_protections(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -59,6 +76,24 @@ pub async fn list_tag_protections(
 
 /// `POST /repos/{owner}/{repo}/tag-protections` (201): creates a tag
 /// protection and returns it.
+#[utoipa::path(
+    post,
+    path = "/api/v1/repos/{owner}/{repo}/tag-protections",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+    ),
+    request_body = serde_json::Value,
+    responses(
+        (status = 201, description = "Created tag protection", body = TagProtectionJson),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn create_tag_protection(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -76,6 +111,24 @@ pub async fn create_tag_protection(
 
 /// `DELETE /repos/{owner}/{repo}/tag-protections/{id}` (204): removes the
 /// tag protection.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/repos/{owner}/{repo}/tag-protections/{id}",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("id" = i64, Path, description = "Tag protection id"),
+    ),
+    responses(
+        (status = 204, description = "Deleted"),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn delete_tag_protection(
     State(state): State<ApiState>,
     auth: ApiAuth,

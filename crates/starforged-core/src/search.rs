@@ -539,7 +539,13 @@ impl Core {
             if permission.is_some() {
                 scope.readable.push(repo.id);
             }
-            if is_member(&grants) {
+            // Site admins read everything (§6.4 row 12), including
+            // unpublished sessions on public repositories, but
+            // `is_member` excludes them by definition. The query filter
+            // must stay a superset of the re-check, so bucket every live
+            // repository as a member for a site admin here (and only here
+            // — `is_member` itself is unchanged).
+            if is_member(&grants) || active.is_some_and(|u| u.is_admin) {
                 scope.member.push(repo.id);
             }
             if permission.is_some_and(|p| p >= Permission::Admin) {

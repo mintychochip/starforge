@@ -8,6 +8,7 @@ mod gate_rules;
 mod github_import;
 mod moved;
 mod oauth;
+pub mod openapi;
 mod orgs;
 mod repos;
 mod search;
@@ -54,6 +55,7 @@ pub fn router(core: Core, base_url: String) -> Router {
         base_url: Arc::from(base_url),
     };
     Router::new()
+        .route("/openapi.json", get(openapi::openapi_json))
         .route("/admin/audit", get(admin::audit))
         .route("/user", get(user::show))
         .route("/user/repos", post(repos::create))

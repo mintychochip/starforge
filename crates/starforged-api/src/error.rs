@@ -106,12 +106,16 @@ impl IntoResponse for ApiError {
 }
 
 /// Writes the rate-limit headers (plan M5a): `X-RateLimit-Limit`,
-/// `-Remaining`, `-Reset`, and `Retry-After` on 429s.
+/// `-Remaining`, `-Reset`, and `Retry-After` on 429s. A disabled limit
+/// (`limit == 0`) emits nothing: clients must not be told a budget of 0.
 pub fn insert_rate_headers(
     headers: &mut axum::http::HeaderMap,
     retry_after: i64,
     decision: starforged_core::limits::RateDecision,
 ) {
+    if decision.limit == 0 {
+        return;
+    }
     let mut set = |name: &'static str, value: i64| {
         if let Ok(value) = value.to_string().parse::<HeaderValue>() {
             headers.insert(axum::http::HeaderName::from_static(name), value);

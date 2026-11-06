@@ -41,6 +41,25 @@ pub struct SessionListQuery {
 
 /// `PUT /repos/{owner}/{repo}/sessions/{ulid}`: creates the session row from
 /// `SessionMeta` JSON (201), or refreshes it on re-PUT (200).
+#[utoipa::path(
+    put,
+    path = "/api/v1/repos/{owner}/{repo}/sessions/{ulid}",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("ulid" = String, Path, description = "Session ULID"),
+    ),
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, description = "Session metadata", body = serde_json::Value),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn put_meta(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -83,6 +102,25 @@ pub async fn put_meta(
 /// answer `409 {"hash": "<stored hex>"}` — exactly that shape, not the error
 /// envelope, so the CLI can tell the cases apart. Bodies over the configured
 /// cap answer `413`.
+#[utoipa::path(
+    put,
+    path = "/api/v1/repos/{owner}/{repo}/sessions/{ulid}/segments/{n}",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("ulid" = String, Path, description = "Session ULID"),
+        ("n" = i64, Path, description = "Segment number"),
+    ),
+    responses(
+        (status = 200, description = "Segment stored", body = serde_json::Value),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn put_segment(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -139,6 +177,25 @@ pub async fn put_segment(
 /// `POST /repos/{owner}/{repo}/sessions/{ulid}/complete`: flips the session to
 /// `complete`. The body must be an empty JSON object (`{}`); anything else is
 /// `422`. The server never auto-completes (the CLI owns the idle rule).
+#[utoipa::path(
+    post,
+    path = "/api/v1/repos/{owner}/{repo}/sessions/{ulid}/complete",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("ulid" = String, Path, description = "Session ULID"),
+    ),
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, description = "Session completed", body = serde_json::Value),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn post_complete(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -166,6 +223,25 @@ pub async fn post_complete(
 /// `POST /repos/{owner}/{repo}/sessions/{ulid}/links`: records the CLI's
 /// commit claims (`{"links": [...]}`). Re-posts merge idempotently through
 /// `upsert_claim_links` (one transaction); answers `{"accepted": k}`.
+#[utoipa::path(
+    post,
+    path = "/api/v1/repos/{owner}/{repo}/sessions/{ulid}/links",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("ulid" = String, Path, description = "Session ULID"),
+    ),
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, description = "Links recorded", body = serde_json::Value),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn post_links(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -191,6 +267,23 @@ pub async fn post_links(
 /// queue (repo `admin` only; visible-but-insufficient answers `403`,
 /// invisible repositories `404`). `?quarantined=false` answers `422`
 /// (after authentication, like every other validation here).
+#[utoipa::path(
+    get,
+    path = "/api/v1/repos/{owner}/{repo}/sessions",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+    ),
+    responses(
+        (status = 200, description = "Sessions", body = serde_json::Value),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn list_sessions(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -248,6 +341,24 @@ pub async fn list_sessions(
 /// back to `released` (the evidence columns stay for forensics) and audits
 /// `session.quarantine.released`. A session that is not quarantined answers
 /// `422`.
+#[utoipa::path(
+    post,
+    path = "/api/v1/repos/{owner}/{repo}/sessions/{ulid}/release",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("ulid" = String, Path, description = "Session ULID"),
+    ),
+    responses(
+        (status = 200, description = "Quarantine released", body = serde_json::Value),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn release_session(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -268,6 +379,24 @@ pub async fn release_session(
 /// `POST /repos/{owner}/{repo}/sessions/{ulid}/purge`: deletes the session
 /// row, its segment rows (blob refcounts decremented), and its commit links,
 /// then audits `session.purged`. Answers `204`; an unknown session is `404`.
+#[utoipa::path(
+    post,
+    path = "/api/v1/repos/{owner}/{repo}/sessions/{ulid}/purge",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("ulid" = String, Path, description = "Session ULID"),
+    ),
+    responses(
+        (status = 204, description = "Purged"),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn purge_session(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -290,6 +419,24 @@ pub async fn purge_session(
 /// publishing would have no effect) and audits `session.publish`. Repo
 /// `maintain` or above; visible-but-insufficient answers `403`, invisible
 /// repositories `404`.
+#[utoipa::path(
+    post,
+    path = "/api/v1/repos/{owner}/{repo}/sessions/{ulid}/publish",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("ulid" = String, Path, description = "Session ULID"),
+    ),
+    responses(
+        (status = 200, description = "Published", body = serde_json::Value),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn publish_session(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -313,6 +460,24 @@ pub async fn publish_session(
 /// `POST /repos/{owner}/{repo}/sessions/{ulid}/unpublish`: the mirror of
 /// [`publish_session`], back to `inherit` (an `Ok` no-op when the session was
 /// never published). Same auth; audits `session.unpublish`.
+#[utoipa::path(
+    post,
+    path = "/api/v1/repos/{owner}/{repo}/sessions/{ulid}/unpublish",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("ulid" = String, Path, description = "Session ULID"),
+    ),
+    responses(
+        (status = 200, description = "Unpublished", body = serde_json::Value),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn unpublish_session(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -338,6 +503,24 @@ pub async fn unpublish_session(
 /// its segments (blob refcounts decremented), and its commit links, auditing
 /// `session.deleted`. Answers `204`; anyone else (and unknown ULIDs) answer
 /// `404`, so session ULIDs stay undiscoverable.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/repos/{owner}/{repo}/sessions/{ulid}",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("ulid" = String, Path, description = "Session ULID"),
+    ),
+    responses(
+        (status = 204, description = "Deleted"),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn delete_session(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -359,6 +542,24 @@ pub async fn delete_session(
 /// scan over the stored segments (filling the M1d gap — `Core::rescan_session`
 /// had no HTTP route) and answers the new quarantine verdict. Repo `admin`
 /// only; audits `session.rescan`; idempotent.
+#[utoipa::path(
+    post,
+    path = "/api/v1/repos/{owner}/{repo}/sessions/{ulid}/rescan",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("ulid" = String, Path, description = "Session ULID"),
+    ),
+    responses(
+        (status = 200, description = "Rescan verdict", body = serde_json::Value),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn rescan_session(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -395,6 +596,24 @@ fn json_column(raw: &str) -> Value {
 /// `GET /repos/{owner}/{repo}/sessions/{ulid}`: session metadata plus its
 /// commit links. One [`Core::authorize_session_read_by_ulid`] check —
 /// non-readers get `404`, never `403`.
+#[utoipa::path(
+    get,
+    path = "/api/v1/repos/{owner}/{repo}/sessions/{ulid}",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("ulid" = String, Path, description = "Session ULID"),
+    ),
+    responses(
+        (status = 200, description = "Session metadata and links", body = serde_json::Value),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn get_session(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -452,6 +671,24 @@ pub async fn get_session(
 /// `GET /repos/{owner}/{repo}/sessions/{ulid}/events?page=N`: the same
 /// 200-event page the viewer renders, as JSON. Undecodable segments appear
 /// as `{"kind": "unreadable_segment", "n": N}` placeholders.
+#[utoipa::path(
+    get,
+    path = "/api/v1/repos/{owner}/{repo}/sessions/{ulid}/events",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("ulid" = String, Path, description = "Session ULID"),
+    ),
+    responses(
+        (status = 200, description = "Session events", body = serde_json::Value),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn get_events(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -492,6 +729,24 @@ pub async fn get_events(
 /// links (the `links` array of [`get_session`], standalone for export).
 /// One [`Core::authorize_session_read_by_ulid`] check — non-readers get
 /// `404`, never `403`.
+#[utoipa::path(
+    get,
+    path = "/api/v1/repos/{owner}/{repo}/sessions/{ulid}/links",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("ulid" = String, Path, description = "Session ULID"),
+    ),
+    responses(
+        (status = 200, description = "Session links", body = serde_json::Value),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn get_links(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -525,6 +780,25 @@ pub async fn get_links(
 /// as-uploaded and never re-redacted, while every other read path renders
 /// server-redacted content (§11.2), so weaker readers answer `404` here
 /// even for sessions they could read through `/events`.
+#[utoipa::path(
+    get,
+    path = "/api/v1/repos/{owner}/{repo}/sessions/{ulid}/segments/{n}",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("ulid" = String, Path, description = "Session ULID"),
+        ("n" = i64, Path, description = "Segment number"),
+    ),
+    responses(
+        (status = 200, description = "Raw segment bytes", body = Vec<u8>),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn get_segment(
     State(state): State<ApiState>,
     auth: ApiAuth,

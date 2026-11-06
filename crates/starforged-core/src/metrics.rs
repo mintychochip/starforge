@@ -50,6 +50,20 @@ fn format_labels(labels: &Labels) -> String {
     format!("{{{}}}", parts.join(","))
 }
 
+fn help(name: &str) -> &'static str {
+    match name {
+        "starforged_http_requests_total" => "HTTP requests by class and status bucket.",
+        "starforged_git_rpc_total" => "Git RPCs by service and transport.",
+        "starforged_jobs_processed_total" => "Background jobs by kind and outcome.",
+        "starforged_session_upload_bytes_total" => "Session segment bytes accepted.",
+        "starforged_rate_limited_total" => "Requests refused by a rate limit.",
+        "starforged_http_request_duration_seconds" => "HTTP request duration in seconds.",
+        "starforged_jobs_pending" => "Queued background jobs by kind.",
+        "starforged_index_documents" => "Search index documents by kind.",
+        "starforged_ssh_connections" => "Live SSH connections.",
+        _ => "",
+    }
+}
 impl Metrics {
     pub fn new() -> Metrics {
         Metrics::default()
@@ -88,13 +102,19 @@ impl Metrics {
                 count: 0,
                 sum: 0.0,
             });
-        for (i, bucket) in DURATION_BUCKETS.iter().enumerate() {
-            if secs <= *bucket {
-                hist.buckets[i] += 1;
-            }
+        // Only the first bucket >= the observation counts; `render`
+        // prefix-sums into the cumulative `le` exposition.
+        if let Some(i) = DURATION_BUCKETS.iter().position(|bucket| secs <= *bucket) {
+            hist.buckets[i] += 1;
         }
         hist.count += 1;
         hist.sum += secs;
+    }
+
+    /// Records one request: counter bump and duration observation.
+    pub fn record_http(&self, class: &str, status: u16, secs: f64) {
+        self.inc_http(class, status);
+        self.observe_http(class, secs);
     }
 
     /// `starforged_git_rpc_total{service, transport}`.
@@ -148,6 +168,7 @@ impl Metrics {
         let mut last_name = "";
         for ((name, labels), value) in &entries {
             if name != last_name {
+                out.push_str(&format!("# HELP {name} {}\n", help(name)));
                 out.push_str(&format!("# TYPE {name} counter\n"));
                 last_name = name;
             }
@@ -157,6 +178,7 @@ impl Metrics {
 
         // Histogram.
         if !self.histograms.lock().unwrap().is_empty() {
+            out.push_str("# HELP starforged_http_request_duration_seconds HTTP request duration in seconds.\n");
             out.push_str("# TYPE starforged_http_request_duration_seconds histogram\n");
             let histograms = self.histograms.lock().unwrap();
             let mut classes: Vec<_> = histograms.iter().collect();
@@ -199,6 +221,7 @@ impl Metrics {
             let mut last_name = "";
             for (name, labels, value) in sorted {
                 if name != last_name {
+                    out.push_str(&format!("# HELP {name} {}\n", help(name)));
                     out.push_str(&format!("# TYPE {name} gauge\n"));
                     last_name = name;
                 }
@@ -218,7 +241,11 @@ mod tests {
         let m = Metrics::new();
         m.inc_http("web", 200);
         m.inc_http("web", 404);
-        m.observe_http("web", 0.03);
+        // One observation per bucket boundary: 0.003 lands in 0.005,
+        // 0.03 in 0.05, 0.4 in 0.5, 3.0 in 5.0, 20.0 beyond 10.0.
+        for secs in [0.003, 0.03, 0.4, 3.0, 20.0] {
+            m.observe_http("web", secs);
+        }
         m.inc_git_rpc("upload-pack", "http");
         m.inc_job("hourly_cleanup", "ok");
         m.add_session_upload_bytes(42);
@@ -236,13 +263,36 @@ mod tests {
         ));
         assert!(text.contains("starforged_session_upload_bytes_total 42\n"));
         assert!(text.contains("starforged_rate_limited_total{limit=\"api\"} 1\n"));
-        assert!(text.contains(
-            "starforged_http_request_duration_seconds_bucket{class=\"web\",le=\"0.05\"} 1\n"
-        ));
-        assert!(text.contains(
-            "starforged_http_request_duration_seconds_bucket{class=\"web\",le=\"+Inf\"} 1\n"
-        ));
-        assert!(text.contains("starforged_http_request_duration_seconds_count{class=\"web\"} 1\n"));
+        // Cumulative `le` expectations (single accumulation + prefix sum):
+        // every finite bucket tops out at 4 (the 20 s observation is only
+        // in +Inf), so no bucket exceeds the observation count of 5.
+        let expected = [
+            ("0.005", 1),
+            ("0.01", 1),
+            ("0.025", 1),
+            ("0.05", 2),
+            ("0.1", 2),
+            ("0.25", 2),
+            ("0.5", 3),
+            ("1", 3),
+            ("2.5", 3),
+            ("5", 4),
+            ("10", 4),
+            ("+Inf", 5),
+        ];
+        for (le, cumulative) in expected {
+            let line = format!(
+                "starforged_http_request_duration_seconds_bucket{{class=\"web\",le=\"{le}\"}} {cumulative}\n"
+            );
+            assert!(text.contains(&line), "missing bucket line: {line}");
+        }
+        assert!(text.contains("starforged_http_request_duration_seconds_count{class=\"web\"} 5\n"));
+        assert!(
+            text.contains("starforged_http_request_duration_seconds_sum{class=\"web\"} 23.433\n")
+        );
+        assert!(text.contains("# HELP starforged_http_requests_total "));
+        assert!(text.contains("# HELP starforged_http_request_duration_seconds "));
+        assert!(text.contains("# HELP starforged_ssh_connections "));
         assert!(text.contains("starforged_ssh_connections 3\n"));
     }
 }

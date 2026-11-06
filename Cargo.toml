@@ -54,6 +54,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 two-face = { version = "0.5.2", default-features = false, features = ["syntect-default-fancy"] }
 ulid = { version = "1", features = ["serde"] }
 url = "2.5.8"
+utoipa = "6.0.0"
 zstd = "0.13"
 [workspace.lints.rust]
 unsafe_code = "forbid"

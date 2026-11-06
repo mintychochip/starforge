@@ -32,7 +32,7 @@ use crate::auth::ApiAuth;
 use crate::error::ApiError;
 use crate::time::rfc3339;
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct ChangeJson {
     pub trail: i64,
     pub k: i64,
@@ -79,7 +79,7 @@ async fn change_json_full(
     })
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct RevisionJson {
     pub r: i64,
     pub head_sha: String,
@@ -104,7 +104,7 @@ fn revision_json(view: &RevisionView) -> RevisionJson {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct ReviewJson {
     pub id: i64,
     pub revision: i64,
@@ -129,7 +129,7 @@ fn review_json(view: &ReviewView) -> ReviewJson {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct ThreadCommentJson {
     pub id: i64,
     pub review_id: Option<i64>,
@@ -148,7 +148,7 @@ fn thread_comment_json(view: &ThreadCommentView) -> ThreadCommentJson {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct ThreadJson {
     pub id: i64,
     pub revision: i64,
@@ -229,6 +229,24 @@ fn diff_range(query: &RevQuery) -> Result<(Option<i64>, Option<(i64, i64)>), Api
 }
 
 /// `GET /repos/{owner}/{repo}/trails/{n}/changes[?limit=]`.
+#[utoipa::path(
+    get,
+    path = "/api/v1/repos/{owner}/{repo}/trails/{n}/changes",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("n" = i64, Path, description = "Trail number"),
+    ),
+    responses(
+        (status = 200, description = "Changes", body = serde_json::Value),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn list_changes(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -247,7 +265,7 @@ pub async fn list_changes(
     Ok(Json(json!({ "changes": out })))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct CreateChangeBody {
     pub kind: String,
     pub head_branch: Option<String>,
@@ -256,6 +274,25 @@ pub struct CreateChangeBody {
 
 /// `POST /repos/{owner}/{repo}/trails/{n}/changes` (201): only `branch`
 /// changes exist in M2b; the body names its head and base branches.
+#[utoipa::path(
+    post,
+    path = "/api/v1/repos/{owner}/{repo}/trails/{n}/changes",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("n" = i64, Path, description = "Trail number"),
+    ),
+    request_body = CreateChangeBody,
+    responses(
+        (status = 201, description = "Created change", body = ChangeJson),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn create_change(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -287,6 +324,25 @@ pub async fn create_change(
 /// the change with its revisions, the selected diff, discussion, and
 /// capabilities. With `from`/`to` the diff is the tree diff between those
 /// revisions' heads (D8).
+#[utoipa::path(
+    get,
+    path = "/api/v1/repos/{owner}/{repo}/trails/{n}/changes/{k}",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("n" = i64, Path, description = "Trail number"),
+        ("k" = i64, Path, description = "Change number"),
+    ),
+    responses(
+        (status = 200, description = "Change detail", body = serde_json::Value),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn get_change(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -313,6 +369,25 @@ pub async fn get_change(
 
 /// `GET /repos/{owner}/{repo}/trails/{n}/changes/{k}/gates`: the merge-gate
 /// report for the change (informational; merging re-evaluates server-side).
+#[utoipa::path(
+    get,
+    path = "/api/v1/repos/{owner}/{repo}/trails/{n}/changes/{k}/gates",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("n" = i64, Path, description = "Trail number"),
+        ("k" = i64, Path, description = "Change number"),
+    ),
+    responses(
+        (status = 200, description = "Gate report", body = serde_json::Value),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn get_gates(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -331,6 +406,26 @@ pub async fn get_gates(
 /// permission (enforced by [`Core::merge_change`], which re-resolves the
 /// base tip and re-evaluates gates at merge time). Unknown or disallowed
 /// methods and failing gates answer `422`; conflicts and CAS races `409`.
+#[utoipa::path(
+    post,
+    path = "/api/v1/repos/{owner}/{repo}/trails/{n}/changes/{k}/merge",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("n" = i64, Path, description = "Trail number"),
+        ("k" = i64, Path, description = "Change number"),
+    ),
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, description = "Merged", body = serde_json::Value),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn merge_change(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -346,7 +441,7 @@ pub async fn merge_change(
     Ok(Json(json!({"sha": outcome.sha, "method": outcome.method})))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct ChangeStateBody {
     pub state: String,
 }
@@ -370,6 +465,26 @@ async fn set_state(
 
 /// `PATCH /repos/{owner}/{repo}/trails/{n}/changes/{k}` (`{"state": …}`):
 /// closes or reopens. `merged` answers 422 — the merge path owns it.
+#[utoipa::path(
+    patch,
+    path = "/api/v1/repos/{owner}/{repo}/trails/{n}/changes/{k}",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("n" = i64, Path, description = "Trail number"),
+        ("k" = i64, Path, description = "Change number"),
+    ),
+    request_body = ChangeStateBody,
+    responses(
+        (status = 200, description = "Updated change", body = ChangeJson),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn patch_change(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -384,6 +499,26 @@ pub async fn patch_change(
 
 /// `POST /repos/{owner}/{repo}/trails/{n}/changes/{k}/state`: the same
 /// transition as `PATCH …/changes/{k}`.
+#[utoipa::path(
+    post,
+    path = "/api/v1/repos/{owner}/{repo}/trails/{n}/changes/{k}/state",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("n" = i64, Path, description = "Trail number"),
+        ("k" = i64, Path, description = "Change number"),
+    ),
+    request_body = ChangeStateBody,
+    responses(
+        (status = 200, description = "Updated change", body = ChangeJson),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn post_state(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -397,6 +532,25 @@ pub async fn post_state(
 }
 
 /// `GET /repos/{owner}/{repo}/trails/{n}/changes/{k}/revisions[?limit=]`.
+#[utoipa::path(
+    get,
+    path = "/api/v1/repos/{owner}/{repo}/trails/{n}/changes/{k}/revisions",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("n" = i64, Path, description = "Trail number"),
+        ("k" = i64, Path, description = "Change number"),
+    ),
+    responses(
+        (status = 200, description = "Revisions", body = serde_json::Value),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn list_revisions(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -415,6 +569,26 @@ pub async fn list_revisions(
 /// `GET …/changes/{k}/revisions/{r}`: the revision with its diff summary —
 /// changed files with add/modify/delete status and per-file unified hunks
 /// (binary files carry metadata with empty hunks), capped at 256 KiB total.
+#[utoipa::path(
+    get,
+    path = "/api/v1/repos/{owner}/{repo}/trails/{n}/changes/{k}/revisions/{r}",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("n" = i64, Path, description = "Trail number"),
+        ("k" = i64, Path, description = "Change number"),
+        ("r" = i64, Path, description = "Revision number"),
+    ),
+    responses(
+        (status = 200, description = "Revision with diff summary", body = serde_json::Value),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn get_revision(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -442,6 +616,25 @@ pub async fn get_revision(
 /// `GET …/changes/{k}/diff[?rev=][?from=&to=]`: the selected revision's
 /// diff alone, or with `from`/`to` the tree diff between those revisions'
 /// heads (D8). Unknown revisions are 404; `from == to` is 422.
+#[utoipa::path(
+    get,
+    path = "/api/v1/repos/{owner}/{repo}/trails/{n}/changes/{k}/diff",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("n" = i64, Path, description = "Trail number"),
+        ("k" = i64, Path, description = "Change number"),
+    ),
+    responses(
+        (status = 200, description = "Diff", body = serde_json::Value),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn get_diff(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -457,7 +650,7 @@ pub async fn get_diff(
     ))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SubmitReviewBody {
     pub revision: Option<i64>,
@@ -468,7 +661,7 @@ pub struct SubmitReviewBody {
     pub comments: Vec<InlineCommentBody>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct InlineCommentBody {
     pub path: String,
@@ -485,6 +678,26 @@ pub struct InlineCommentBody {
 /// with its first comment linked to the new review. Unknown fields at either
 /// level are 422. The response is the review JSON plus a `threads` array
 /// (empty when no comments were sent).
+#[utoipa::path(
+    post,
+    path = "/api/v1/repos/{owner}/{repo}/trails/{n}/changes/{k}/reviews",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("n" = i64, Path, description = "Trail number"),
+        ("k" = i64, Path, description = "Change number"),
+    ),
+    request_body = SubmitReviewBody,
+    responses(
+        (status = 201, description = "Submitted review", body = serde_json::Value),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn submit_review(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -534,6 +747,23 @@ pub struct HeadShaQuery {
 /// (any state) whose current revision's head is `sha`, ascending by (trail
 /// number, k). Reader auth like the other change GETs; a missing or invalid
 /// `head_sha` is 422.
+#[utoipa::path(
+    get,
+    path = "/api/v1/repos/{owner}/{repo}/changes",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+    ),
+    responses(
+        (status = 200, description = "Changes with head", body = serde_json::Value),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn list_changes_by_head(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -556,6 +786,25 @@ pub async fn list_changes_by_head(
 }
 
 /// `GET …/changes/{k}/reviews[?limit=]`.
+#[utoipa::path(
+    get,
+    path = "/api/v1/repos/{owner}/{repo}/trails/{n}/changes/{k}/reviews",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("n" = i64, Path, description = "Trail number"),
+        ("k" = i64, Path, description = "Change number"),
+    ),
+    responses(
+        (status = 200, description = "Reviews", body = serde_json::Value),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn list_reviews(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -572,6 +821,26 @@ pub async fn list_reviews(
 }
 
 /// `POST …/changes/{k}/reviews/{id}/dismiss`: triage+ only.
+#[utoipa::path(
+    post,
+    path = "/api/v1/repos/{owner}/{repo}/trails/{n}/changes/{k}/reviews/{id}/dismiss",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("n" = i64, Path, description = "Trail number"),
+        ("k" = i64, Path, description = "Change number"),
+        ("id" = i64, Path, description = "Review id"),
+    ),
+    responses(
+        (status = 200, description = "Dismissed review", body = ReviewJson),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn dismiss_review(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -586,7 +855,7 @@ pub async fn dismiss_review(
     )))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct CreateThreadBody {
     pub revision: Option<i64>,
     pub path: String,
@@ -603,6 +872,26 @@ pub struct CreateThreadBody {
 /// `POST …/changes/{k}/threads` (201): any reader may open a thread; the
 /// body becomes its first comment. With `"pending": true` the comment
 /// attaches to the actor's draft review and stays invisible to others.
+#[utoipa::path(
+    post,
+    path = "/api/v1/repos/{owner}/{repo}/trails/{n}/changes/{k}/threads",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("n" = i64, Path, description = "Trail number"),
+        ("k" = i64, Path, description = "Change number"),
+    ),
+    request_body = CreateThreadBody,
+    responses(
+        (status = 201, description = "Created thread", body = ThreadJson),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn create_thread(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -632,6 +921,25 @@ pub async fn create_thread(
 }
 
 /// `GET …/changes/{k}/threads[?limit=]`.
+#[utoipa::path(
+    get,
+    path = "/api/v1/repos/{owner}/{repo}/trails/{n}/changes/{k}/threads",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("n" = i64, Path, description = "Trail number"),
+        ("k" = i64, Path, description = "Change number"),
+    ),
+    responses(
+        (status = 200, description = "Threads", body = serde_json::Value),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn list_threads(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -647,13 +955,34 @@ pub async fn list_threads(
     })))
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Default, utoipa::ToSchema)]
 pub struct ResolveBody {
     pub resolved: Option<bool>,
 }
 
 /// `POST …/threads/{t}/resolve`: the thread author or triage+. A missing
 /// body resolves.
+#[utoipa::path(
+    post,
+    path = "/api/v1/repos/{owner}/{repo}/trails/{n}/changes/{k}/threads/{t}/resolve",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("n" = i64, Path, description = "Trail number"),
+        ("k" = i64, Path, description = "Change number"),
+        ("t" = i64, Path, description = "Thread id"),
+    ),
+    request_body = ResolveBody,
+    responses(
+        (status = 200, description = "Resolved thread", body = ThreadJson),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn resolve_thread(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -670,7 +999,7 @@ pub async fn resolve_thread(
     )))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct CommentBody {
     pub body: String,
     pub review_id: Option<i64>,
@@ -684,6 +1013,27 @@ pub struct CommentBody {
 /// when given, must name a review on the same change. With `"pending": true`
 /// the comment attaches to the actor's draft review and stays invisible to
 /// others.
+#[utoipa::path(
+    post,
+    path = "/api/v1/repos/{owner}/{repo}/trails/{n}/changes/{k}/threads/{t}/comments",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("n" = i64, Path, description = "Trail number"),
+        ("k" = i64, Path, description = "Change number"),
+        ("t" = i64, Path, description = "Thread id"),
+    ),
+    request_body = CommentBody,
+    responses(
+        (status = 201, description = "Created comment", body = ThreadCommentJson),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn add_comment(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -709,7 +1059,7 @@ pub async fn add_comment(
     Ok((StatusCode::CREATED, Json(thread_comment_json(&view))))
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct PendingCommentJson {
     pub id: i64,
     pub thread_id: i64,
@@ -717,7 +1067,7 @@ pub struct PendingCommentJson {
     pub created_at: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct PendingReviewJson {
     pub id: i64,
     pub revision: i64,
@@ -745,6 +1095,25 @@ fn pending_review_json(view: &PendingReviewView) -> PendingReviewJson {
 
 /// `GET …/changes/{k}/reviews/pending`: the caller's draft review, or 404
 /// when they hold none.
+#[utoipa::path(
+    get,
+    path = "/api/v1/repos/{owner}/{repo}/trails/{n}/changes/{k}/reviews/pending",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("n" = i64, Path, description = "Trail number"),
+        ("k" = i64, Path, description = "Change number"),
+    ),
+    responses(
+        (status = 200, description = "Pending draft review", body = PendingReviewJson),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn get_pending_review(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -763,6 +1132,25 @@ pub async fn get_pending_review(
 /// `DELETE …/changes/{k}/reviews/pending`: discards the caller's draft —
 /// its comments plus the threads left without comments. No draft is 404;
 /// nothing is audited or dispatched.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/repos/{owner}/{repo}/trails/{n}/changes/{k}/reviews/pending",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("n" = i64, Path, description = "Trail number"),
+        ("k" = i64, Path, description = "Change number"),
+    ),
+    responses(
+        (status = 200, description = "Draft discarded", body = serde_json::Value),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn discard_pending_review(
     State(state): State<ApiState>,
     auth: ApiAuth,

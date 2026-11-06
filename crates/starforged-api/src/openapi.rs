@@ -1,0 +1,257 @@
+//! OpenAPI 3.1 document generated from the API code (spec §10.4, M5c D1).
+//!
+//! Served unauthenticated at `GET /api/v1/openapi.json` (registered in
+//! [`crate::router`]): the document reveals no data, only the API shape.
+//! It is generated at startup and cached.
+
+use axum::Json;
+use serde::Serialize;
+use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
+use utoipa::{Modify, OpenApi, ToSchema};
+
+/// Shared error envelope: `{"error": {"code", "message", "details"}}`.
+/// Mirrors [`crate::error::ApiError`]'s JSON shape; `details` is `null`
+/// or a JSON object depending on the error kind.
+#[derive(Clone, Serialize, ToSchema)]
+pub struct ApiErrorBody {
+    pub error: ApiErrorDetail,
+}
+
+#[derive(Clone, Serialize, ToSchema)]
+pub struct ApiErrorDetail {
+    pub code: String,
+    pub message: String,
+    pub details: serde_json::Value,
+}
+
+/// Declares the `bearer_auth` security scheme (HTTP bearer token) used by
+/// every operation except the OAuth device-flow endpoints.
+struct SecurityAddon;
+
+impl Modify for SecurityAddon {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        openapi
+            .components
+            .get_or_insert_with(utoipa::openapi::Components::new)
+            .add_security_scheme(
+                "bearer_auth",
+                SecurityScheme::Http(HttpBuilder::new().scheme(HttpAuthScheme::Bearer).build()),
+            );
+    }
+}
+
+#[derive(OpenApi)]
+#[openapi(
+    info(title = "Starforge API", version = "0.1.0", description = "Starforge JSON REST API (spec \u{00a7}10.4)."),
+    paths(
+        crate::admin::audit,
+        crate::user::show,
+        crate::repos::create,
+        crate::sshkeys::list_user_keys,
+        crate::sshkeys::create_user_key,
+        crate::sshkeys::delete_user_key,
+        crate::orgs::create,
+        crate::orgs::show,
+        crate::orgs::patch,
+        crate::orgs::delete,
+        crate::orgs::list_repos,
+        crate::orgs::create_repo,
+        crate::orgs::list_teams,
+        crate::orgs::create_team,
+        crate::orgs::show_team,
+        crate::orgs::patch_team,
+        crate::orgs::delete_team,
+        crate::orgs::list_team_members,
+        crate::orgs::set_team_member,
+        crate::orgs::remove_team_member,
+        crate::orgs::list_team_repos,
+        crate::orgs::add_team_repo,
+        crate::orgs::remove_team_repo,
+        crate::orgs::list_members,
+        crate::orgs::set_member,
+        crate::orgs::remove_member,
+        crate::search::search_trails,
+        crate::search::search_sessions,
+        crate::search::search_code,
+        crate::oauth::device_code,
+        crate::oauth::token,
+        crate::repos::show,
+        crate::repos::patch,
+        crate::repos::list_collaborators,
+        crate::repos::set_collaborator,
+        crate::repos::remove_collaborator,
+        crate::sshkeys::list_deploy_keys,
+        crate::sshkeys::create_deploy_key,
+        crate::sshkeys::delete_deploy_key,
+        crate::repos::transfer,
+        crate::repos::get_import,
+        crate::repos::delete_import,
+        crate::repos::start_import,
+        crate::github_import::start_github_import,
+        crate::github_import::get_github_import,
+        crate::repos::put_pull_mirror,
+        crate::repos::get_pull_mirror,
+        crate::repos::delete_pull_mirror,
+        crate::repos::sync_pull_mirror,
+        crate::repos::add_push_mirror,
+        crate::repos::list_push_mirrors,
+        crate::repos::delete_push_mirror,
+        crate::repos::sync_push_mirror,
+        crate::repos::set_pull_mirror_enabled,
+        crate::sessions::put_meta,
+        crate::sessions::get_session,
+        crate::sessions::delete_session,
+        crate::sessions::list_sessions,
+        crate::sessions::put_segment,
+        crate::sessions::get_segment,
+        crate::sessions::post_complete,
+        crate::sessions::get_events,
+        crate::sessions::post_links,
+        crate::sessions::get_links,
+        crate::sessions::release_session,
+        crate::sessions::purge_session,
+        crate::sessions::publish_session,
+        crate::sessions::unpublish_session,
+        crate::sessions::rescan_session,
+        crate::trails::list_trails,
+        crate::trails::create_trail,
+        crate::trails::get_trail,
+        crate::trails::patch_trail,
+        crate::trails::list_comments,
+        crate::trails::post_comment,
+        crate::trails::patch_comment,
+        crate::trails::add_label,
+        crate::trails::remove_label,
+        crate::trails::add_assignee,
+        crate::trails::remove_assignee,
+        crate::trails::add_review_request,
+        crate::trails::remove_review_request,
+        crate::trails::get_trail_sessions,
+        crate::trails::link_trail_session,
+        crate::trails::unlink_trail_session,
+        crate::changes::list_changes_by_head,
+        crate::changes::list_changes,
+        crate::changes::create_change,
+        crate::changes::get_change,
+        crate::changes::patch_change,
+        crate::changes::post_state,
+        crate::changes::list_revisions,
+        crate::changes::get_revision,
+        crate::changes::get_diff,
+        crate::changes::list_reviews,
+        crate::changes::submit_review,
+        crate::changes::get_pending_review,
+        crate::changes::discard_pending_review,
+        crate::changes::dismiss_review,
+        crate::changes::list_threads,
+        crate::changes::create_thread,
+        crate::changes::resolve_thread,
+        crate::changes::add_comment,
+        crate::changes::get_gates,
+        crate::changes::merge_change,
+        crate::statuses::submit_status,
+        crate::statuses::list_statuses,
+        crate::statuses::combined_status,
+        crate::webhooks::list_hooks,
+        crate::webhooks::create_hook,
+        crate::webhooks::patch_hook,
+        crate::webhooks::delete_hook,
+        crate::webhooks::list_deliveries,
+        crate::webhooks::get_delivery,
+        crate::webhooks::redeliver,
+        crate::gate_rules::list_gate_rules,
+        crate::gate_rules::create_gate_rule,
+        crate::gate_rules::patch_gate_rule,
+        crate::gate_rules::delete_gate_rule,
+        crate::tag_protections::list_tag_protections,
+        crate::tag_protections::create_tag_protection,
+        crate::tag_protections::delete_tag_protection,
+        crate::openapi::openapi_json,
+    ),
+    components(schemas(
+        ApiErrorBody,
+        ApiErrorDetail,
+        crate::user::UserJson,
+        crate::changes::ChangeJson,
+        crate::changes::RevisionJson,
+        crate::changes::ReviewJson,
+        crate::changes::ThreadCommentJson,
+        crate::changes::ThreadJson,
+        crate::changes::PendingCommentJson,
+        crate::changes::PendingReviewJson,
+        crate::changes::CreateChangeBody,
+        crate::changes::ChangeStateBody,
+        crate::changes::SubmitReviewBody,
+        crate::changes::InlineCommentBody,
+        crate::changes::CreateThreadBody,
+        crate::changes::ResolveBody,
+        crate::changes::CommentBody,
+        crate::gate_rules::GateRuleJson,
+        crate::gate_rules::PushAllowlistJson,
+        crate::github_import::StartGithubImportBody,
+        crate::github_import::GithubImportJson,
+        crate::oauth::DeviceCodeForm,
+        crate::oauth::TokenForm,
+        crate::orgs::OrgJson,
+        crate::orgs::OrgMemberJson,
+        crate::orgs::CreateOrgBody,
+        crate::orgs::PatchOrgBody,
+        crate::orgs::SetMemberBody,
+        crate::orgs::TeamJson,
+        crate::orgs::TeamMemberJson,
+        crate::orgs::TeamRepoJson,
+        crate::orgs::CreateTeamBody,
+        crate::orgs::PatchTeamBody,
+        crate::repos::RepoJson,
+        crate::repos::CreateRepoBody,
+        crate::repos::ImportBody,
+        crate::repos::ImportAuthBody,
+        crate::repos::CollaboratorJson,
+        crate::repos::SetCollaboratorBody,
+        crate::repos::PatchRepoBody,
+        crate::repos::TransferRepoBody,
+        crate::repos::ImportJson,
+        crate::repos::StartImportBody,
+        crate::repos::PullMirrorJson,
+        crate::repos::PullMirrorBody,
+        crate::repos::PushMirrorJson,
+        crate::repos::PushMirrorBody,
+        crate::repos::EnableBody,
+        crate::sshkeys::KeyJson,
+        crate::sshkeys::DeployKeyJson,
+        crate::sshkeys::CreateKeyBody,
+        crate::sshkeys::CreateDeployKeyBody,
+        crate::statuses::StatusJson,
+        crate::statuses::SubmitStatusBody,
+        crate::tag_protections::TagProtectionJson,
+        crate::trails::TrailJson,
+        crate::trails::CommentJson,
+        crate::trails::TimelineJson,
+        crate::trails::TrailDetailJson,
+        crate::trails::CreateTrailBody,
+        crate::trails::PatchTrailBody,
+        crate::trails::CreateCommentBody,
+        crate::trails::EditCommentBody,
+        crate::trails::LabelBody,
+        crate::trails::AssigneeBody,
+        crate::trails::ReviewRequestBody,
+        crate::trails::TrailSessionLinkBody,
+        crate::webhooks::WebhookJson,
+        crate::webhooks::CreateHookBody,
+        crate::webhooks::PatchHookBody,
+    )),
+    modifiers(&SecurityAddon),
+)]
+pub struct ApiDoc;
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/openapi.json",
+    responses((status = 200, description = "OpenAPI 3.1 document", body = serde_json::Value)),
+)]
+pub async fn openapi_json() -> Json<serde_json::Value> {
+    static SPEC: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+    let spec = SPEC
+        .get_or_init(|| serde_json::to_value(ApiDoc::openapi()).unwrap_or(serde_json::Value::Null));
+    Json(spec.clone())
+}

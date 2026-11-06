@@ -57,6 +57,19 @@ pub struct SessionsQuery {
 }
 
 /// `GET /api/v1/search/trails?q=&repo=&author=&from=&to=&page=&per_page=`.
+#[utoipa::path(
+    get,
+    path = "/api/v1/search/trails",
+    responses(
+        (status = 200, description = "Trail search results", body = serde_json::Value),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn search_trails(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -102,6 +115,19 @@ pub async fn search_trails(
 }
 
 /// `GET /api/v1/search/sessions?q=&repo=&agent=&model=&author=&from=&to=&commit=&page=&per_page=`.
+#[utoipa::path(
+    get,
+    path = "/api/v1/search/sessions",
+    responses(
+        (status = 200, description = "Session search results", body = serde_json::Value),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn search_sessions(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -169,6 +195,23 @@ pub struct CodeQuery {
 
 /// `GET /api/v1/repos/{owner}/{repo}/search/code?q=&case=sensitive|insensitive`.
 /// A repository the caller cannot read is `NotFound`, never `Forbidden`.
+#[utoipa::path(
+    get,
+    path = "/api/v1/repos/{owner}/{repo}/search/code",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+    ),
+    responses(
+        (status = 200, description = "Code search results", body = serde_json::Value),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+
 pub async fn search_code(
     State(state): State<ApiState>,
     auth: ApiAuth,

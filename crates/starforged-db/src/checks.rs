@@ -340,7 +340,7 @@ pub async fn latest_checks_for_sha(db: &Db, repo_id: i64, sha: &str) -> DbResult
     ))
     .bind(repo_id)
     .bind(sha)
-    .fetch_all(db.pool())
+    .fetch_all(db.read_pool())
     .await?;
     rows.iter().map(check_from_row).collect()
 }
@@ -372,7 +372,7 @@ pub async fn latest_checks_for_shas(
     for sha in shas {
         query = query.bind(sha);
     }
-    let rows = query.fetch_all(db.pool()).await?;
+    let rows = query.fetch_all(db.read_pool()).await?;
     rows.iter().map(check_from_row).collect()
 }
 
@@ -475,7 +475,7 @@ async fn insert_gate_rule_row(db: &Db, n: &NewGateRule<'_>) -> DbResult<GateRule
 pub async fn gate_rules_for_repo(db: &Db, repo_id: i64) -> DbResult<Vec<GateRuleRow>> {
     let rows = sqlx::query(select_gate_rule!("WHERE repo_id = $1 ORDER BY id ASC"))
         .bind(repo_id)
-        .fetch_all(db.pool())
+        .fetch_all(db.read_pool())
         .await?;
     rows.iter().map(gate_rule_from_row).collect()
 }
@@ -491,7 +491,7 @@ pub async fn gate_rule_by_id(db: &Db, id: i64, repo_id: i64) -> DbResult<Option<
     let row = sqlx::query(select_gate_rule!("WHERE id = $1 AND repo_id = $2"))
         .bind(id)
         .bind(repo_id)
-        .fetch_optional(db.pool())
+        .fetch_optional(db.read_pool())
         .await?;
     row.map(|row| gate_rule_from_row(&row)).transpose()
 }
@@ -628,7 +628,7 @@ async fn insert_webhook_row(db: &Db, n: &NewWebhook<'_>) -> DbResult<WebhookRow>
 pub async fn webhooks_for_repo(db: &Db, repo_id: i64) -> DbResult<Vec<WebhookRow>> {
     let rows = sqlx::query(select_webhook!("WHERE repo_id = $1 ORDER BY id ASC"))
         .bind(repo_id)
-        .fetch_all(db.pool())
+        .fetch_all(db.read_pool())
         .await?;
     rows.iter().map(webhook_from_row).collect()
 }
@@ -642,7 +642,7 @@ pub async fn webhooks_of_repo(db: &Db, repo_id: i64) -> DbResult<Vec<WebhookRow>
 pub async fn webhook_by_id(db: &Db, id: i64) -> DbResult<Option<WebhookRow>> {
     let row = sqlx::query(select_webhook!("WHERE id = $1"))
         .bind(id)
-        .fetch_optional(db.pool())
+        .fetch_optional(db.read_pool())
         .await?;
     row.as_ref().map(webhook_from_row).transpose()
 }
@@ -718,7 +718,7 @@ pub async fn insert_delivery(
 pub async fn delivery_by_id(db: &Db, id: i64) -> DbResult<Option<WebhookDeliveryRow>> {
     let row = sqlx::query(select_delivery!("WHERE id = $1"))
         .bind(id)
-        .fetch_optional(db.pool())
+        .fetch_optional(db.read_pool())
         .await?;
     row.as_ref().map(delivery_from_row).transpose()
 }
@@ -744,7 +744,7 @@ pub async fn recent_deliveries(
     ))
     .bind(webhook_id)
     .bind(limit)
-    .fetch_all(db.pool())
+    .fetch_all(db.read_pool())
     .await?;
     rows.iter().map(delivery_from_row).collect()
 }

@@ -11,7 +11,7 @@ use crate::{Db, DbResult};
 /// Every `repo_remotes.url`, for doctor's SSH-client check.
 pub async fn remote_urls(db: &Db) -> DbResult<Vec<String>> {
     let rows = sqlx::query("SELECT url FROM repo_remotes")
-        .fetch_all(db.pool())
+        .fetch_all(db.read_pool())
         .await?;
     let urls = rows
         .iter()
@@ -24,7 +24,7 @@ pub async fn remote_urls(db: &Db) -> DbResult<Vec<String>> {
 /// repository-directory check.
 pub async fn repo_ids(db: &Db) -> DbResult<Vec<i64>> {
     let rows = sqlx::query("SELECT id FROM repos")
-        .fetch_all(db.pool())
+        .fetch_all(db.read_pool())
         .await?;
     let ids = rows
         .iter()
@@ -36,7 +36,7 @@ pub async fn repo_ids(db: &Db) -> DbResult<Vec<i64>> {
 /// Every `blobs.hash`, for doctor's orphaned-blob-file check.
 pub async fn blob_hashes(db: &Db) -> DbResult<Vec<String>> {
     let rows = sqlx::query("SELECT hash FROM blobs")
-        .fetch_all(db.pool())
+        .fetch_all(db.read_pool())
         .await?;
     let hashes = rows
         .iter()
@@ -51,7 +51,7 @@ pub async fn stale_zero_ref_blobs(db: &Db, cutoff: i64) -> DbResult<i64> {
     Ok(
         sqlx::query_scalar("SELECT COUNT(*) FROM blobs WHERE refcount <= 0 AND created_at < $1")
             .bind(cutoff)
-            .fetch_one(db.pool())
+            .fetch_one(db.read_pool())
             .await?,
     )
 }
@@ -62,6 +62,25 @@ pub async fn live_trail_count(db: &Db) -> DbResult<i64> {
     Ok(sqlx::query_scalar(
         "SELECT COUNT(*) FROM trails t JOIN repos r ON r.id = t.repo_id WHERE r.deleted_at IS NULL",
     )
-    .fetch_one(db.pool())
+    .fetch_one(db.read_pool())
     .await?)
+}
+
+/// The number of user tables in the database, on either engine: the
+/// restore emptiness probe (`starforged restore` refuses a Postgres
+/// database that already has tables). Counts the `public` schema on
+/// Postgres and `sqlite_master` (minus internals) on SQLite.
+pub async fn table_count(db: &Db) -> DbResult<i64> {
+    match db.backend() {
+        crate::Backend::Postgres => Ok(sqlx::query_scalar(
+            "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'public'",
+        )
+        .fetch_one(db.read_pool())
+        .await?),
+        crate::Backend::Sqlite => Ok(sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+        )
+        .fetch_one(db.read_pool())
+        .await?),
+    }
 }

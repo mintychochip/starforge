@@ -625,6 +625,13 @@ impl Core {
         revision: &db_changes::RevisionRow,
         trail_number: i64,
     ) -> Result<(), Fail> {
+        // The trail ref writes mutate the repository: hold the shared lock
+        // for them (plan M5b O1). Callers may already hold it — shared
+        // locks are mutually compatible, so nesting is safe.
+        let _repo_lock = self
+            .repo_lock_shared(repo_id)
+            .await
+            .map_err(|e| Fail::Fatal(e.to_string()))?;
         db_changes::set_current_revision(self.db(), change_id, revision.id, now())
             .await
             .map_err(|e| Fail::Fatal(e.to_string()))?;

@@ -84,7 +84,7 @@ pub async fn insert(db: &Db, new: &NewUser<'_>) -> DbResult<i64> {
 pub async fn by_id(db: &Db, id: i64) -> DbResult<Option<UserRow>> {
     let row = sqlx::query(select_user!("WHERE u.id = $1"))
         .bind(id)
-        .fetch_optional(db.pool())
+        .fetch_optional(db.read_pool())
         .await?;
     row.as_ref().map(from_row).transpose()
 }
@@ -93,7 +93,7 @@ pub async fn by_id(db: &Db, id: i64) -> DbResult<Option<UserRow>> {
 pub async fn by_handle(db: &Db, handle: &str) -> DbResult<Option<UserRow>> {
     let row = sqlx::query(select_user!("WHERE o.handle = $1"))
         .bind(handle)
-        .fetch_optional(db.pool())
+        .fetch_optional(db.read_pool())
         .await?;
     row.as_ref().map(from_row).transpose()
 }
@@ -102,7 +102,7 @@ pub async fn by_handle(db: &Db, handle: &str) -> DbResult<Option<UserRow>> {
 pub async fn by_email(db: &Db, email: &str) -> DbResult<Option<UserRow>> {
     let row = sqlx::query(select_user!("WHERE u.email = $1"))
         .bind(email)
-        .fetch_optional(db.pool())
+        .fetch_optional(db.read_pool())
         .await?;
     row.as_ref().map(from_row).transpose()
 }
@@ -124,7 +124,7 @@ pub async fn list_users(db: &Db, query: &str, limit: i64) -> DbResult<Vec<UserRo
     ))
     .bind(query)
     .bind(limit)
-    .fetch_all(db.pool())
+    .fetch_all(db.read_pool())
     .await?;
     rows.iter().map(from_row).collect()
 }
@@ -142,7 +142,7 @@ pub async fn set_is_admin(db: &Db, id: i64, is_admin: bool) -> DbResult<()> {
 /// Total user count, for the admin overview.
 pub async fn count(db: &Db) -> DbResult<i64> {
     Ok(sqlx::query_scalar("SELECT COUNT(*) FROM users")
-        .fetch_one(db.pool())
+        .fetch_one(db.read_pool())
         .await?)
 }
 pub async fn set_email_verified(db: &Db, id: i64, verified: bool) -> DbResult<()> {
@@ -188,7 +188,7 @@ pub async fn count_active_admins_except(db: &Db, id: i64) -> DbResult<i64> {
         "SELECT COUNT(*) FROM users WHERE is_admin = 1 AND state = 'active' AND id <> $1",
     )
     .bind(id)
-    .fetch_one(db.pool())
+    .fetch_one(db.read_pool())
     .await?;
     Ok(count)
 }
