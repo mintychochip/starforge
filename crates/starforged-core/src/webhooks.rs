@@ -1535,6 +1535,7 @@ mod tests {
         let repo = core
             .create_repo(
                 &user,
+                &user.handle,
                 crate::repos::CreateRepo {
                     name: "proj".into(),
                     description: String::new(),

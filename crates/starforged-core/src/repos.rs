@@ -10,7 +10,7 @@ use starforged_db::repos::{self as db_repos, NewRepo, RepoRow};
 use starforged_git::write::Identity;
 
 use crate::accounts::User;
-use crate::orgs::base_grant;
+use crate::orgs::{OrgRole, base_grant};
 use crate::permission::{self, CollectedGrants, Permission, Viewer, Visibility};
 use crate::{Core, CoreError, CoreResult, validate};
 
@@ -136,22 +136,49 @@ pub fn split_repo_path(path: &str) -> Option<(&str, &str, &str)> {
 }
 
 impl Core {
-    /// Creates a repository owned by `actor` (organizations arrive in M3) and its bare git directory, with a
-    /// README commit when `input.readme` is set (forge-basics design §5.1).
-    pub async fn create_repo(&self, actor: &User, input: CreateRepo) -> CoreResult<Repo> {
+    /// Creates a repository owned by `owner` (the actor, or an org the actor
+    /// owns) and its bare git directory, with a README commit when
+    /// `input.readme` is set (forge-basics design §5.1). Creating under
+    /// another user is 403; creating in an org needs the owner role (D5).
+    pub async fn create_repo(
+        &self,
+        actor: &User,
+        owner: &str,
+        input: CreateRepo,
+    ) -> CoreResult<Repo> {
         let name = validate::repo_name(&input.name)?;
         let description = checked_description(&input.description)?;
+        let owner_row = db_orgs::owner_by_handle(self.db(), &owner.trim().to_ascii_lowercase())
+            .await?
+            .ok_or(CoreError::NotFound)?;
+        let (owner_id, in_org) = if owner_row.kind == "org" {
+            if !actor.active || self.org_role(owner_row.id, actor.id).await? != Some(OrgRole::Owner)
+            {
+                return Err(CoreError::Forbidden);
+            }
+            (owner_row.id, true)
+        } else {
+            if owner_row.id != actor.id {
+                return Err(CoreError::Forbidden);
+            }
+            (actor.id, false)
+        };
         let new = NewRepo {
-            owner_id: actor.id,
+            owner_id,
             name: &name,
             description: &description,
             visibility: input.visibility.as_str(),
             default_branch: "main",
         };
-        let id = match db_repos::insert(self.db(), &new).await {
+        let insert = if in_org {
+            db_repos::insert_org_repo(self.db(), owner_id, &new).await
+        } else {
+            db_repos::insert(self.db(), &new).await
+        };
+        let id = match insert {
             Ok(id) => id,
             Err(e) if e.is_unique_violation() => {
-                return Err(self.name_taken(actor.id, &actor.handle, &name).await);
+                return Err(self.name_taken(owner_id, owner.trim(), &name).await);
             }
             Err(e) => return Err(e.into()),
         };
@@ -349,14 +376,21 @@ impl Core {
         Ok(visible)
     }
 
-    /// The user's own repositories, then the ones they collaborate on.
+    /// Every repository where the user is a member (D4): the user's own,
+    /// the ones they collaborate on, and the org ones their ownership, base
+    /// permission, or team grants cover.
     pub async fn dashboard_repos(&self, user: &User) -> CoreResult<Vec<Repo>> {
+        let mut seen = std::collections::HashSet::new();
         let mut repos = Vec::new();
-        for row in db_repos::list_by_owner(self.db(), user.id).await? {
-            repos.push(to_repo(row)?);
-        }
-        for row in db_repos::list_collaborating(self.db(), user.id).await? {
-            repos.push(to_repo(row)?);
+        for row in db_repos::list_by_owner(self.db(), user.id)
+            .await?
+            .into_iter()
+            .chain(db_repos::list_collaborating(self.db(), user.id).await?)
+            .chain(db_repos::list_org_member_repos(self.db(), user.id).await?)
+        {
+            if seen.insert(row.id) {
+                repos.push(to_repo(row)?);
+            }
         }
         Ok(repos)
     }
@@ -561,6 +595,70 @@ impl Core {
         Ok(repo)
     }
 
+    /// Admins: moves the repository to another owner (D6, §8.5). Allowed when
+    /// the actor is a repo admin and may create repositories under the new
+    /// owner: the actor, or an org the actor owns (site admins may move
+    /// anywhere). The old `<owner>/<repo>` path redirects to the new one,
+    /// the old org's team links drop, collaborators stay, and one
+    /// `repo.transfer` audit row records the move. Archived repositories
+    /// may be transferred; the name must be free at the target (422).
+    pub async fn transfer_repo(
+        &self,
+        actor: &User,
+        owner: &str,
+        name: &str,
+        new_owner: &str,
+    ) -> CoreResult<Repo> {
+        let access = self
+            .require_repo(Some(actor), owner, name, Permission::Admin)
+            .await?;
+        let old = access.repo;
+        let target = db_orgs::owner_by_handle(self.db(), &new_owner.trim().to_ascii_lowercase())
+            .await?
+            .ok_or(CoreError::NotFound)?;
+        let newcomer = if target.kind == "org" {
+            if !actor.active {
+                return Err(CoreError::Forbidden);
+            }
+            self.org_role(target.id, actor.id).await? == Some(OrgRole::Owner) || actor.is_admin
+        } else {
+            target.id == actor.id || actor.is_admin
+        };
+        if !newcomer {
+            return Err(CoreError::Forbidden);
+        }
+        if target.id == old.owner_id {
+            return Ok(old);
+        }
+        let old_full = old.full_name();
+        match db_repos::transfer(self.db(), old.id, target.id).await {
+            Ok(db_repos::TransferOutcome::Done { .. }) => {}
+            Ok(db_repos::TransferOutcome::Clash) => {
+                return Err(CoreError::Invalid(format!(
+                    "{}/{} already exists",
+                    new_owner.trim(),
+                    old.name
+                )));
+            }
+            Ok(db_repos::TransferOutcome::Gone) => return Err(CoreError::NotFound),
+            Err(e) if e.is_unique_violation() => {
+                return Err(self
+                    .name_taken(target.id, new_owner.trim(), &old.name)
+                    .await);
+            }
+            Err(e) => return Err(e.into()),
+        }
+        let repo = self.reload_repo(old.id).await?;
+        self.audit(
+            Some(actor.id),
+            "repo.transfer",
+            &format!("repo:{}", repo.full_name()),
+            &format!("{old_full} -> {}", repo.full_name()),
+        )
+        .await?;
+        Ok(repo)
+    }
+
     /// Admins: archives the repository; it stays readable and refuses pushes until it is unarchived.
     pub async fn archive_repo(&self, actor: &User, owner: &str, name: &str) -> CoreResult<Repo> {
         self.set_archived(actor, owner, name, true).await
@@ -701,17 +799,22 @@ impl Core {
         Ok(deleted)
     }
 
-    /// Restores a deleted repository within [`RESTORE_SECS`]; its owner or a site admin may. Anyone else, and a
-    /// repository that is not deleted or is past the window, gets `NotFound`.
+    /// Restores a deleted repository within [`RESTORE_SECS`]; anyone with
+    /// `Admin` on it may (owners, org owners, and admin collaborators alike,
+    /// plus site admins). Anyone else, and a repository that is not deleted
+    /// or is past the window, gets `NotFound`.
     pub async fn restore_repo(&self, actor: &User, repo_id: i64) -> CoreResult<Repo> {
         let repo = to_repo(
             db_repos::by_id(self.db(), repo_id)
                 .await?
                 .ok_or(CoreError::NotFound)?,
         )?;
-        let allowed = actor.active && (actor.id == repo.owner_id || actor.is_admin);
         let restorable = repo.deleted_at.is_some_and(|at| restorable(at, now()));
-        if !allowed || !restorable {
+        let admin = self
+            .permission_on(&repo, Some(actor))
+            .await?
+            .is_some_and(|p| p >= Permission::Admin);
+        if !restorable || !admin {
             return Err(CoreError::NotFound);
         }
         db_repos::set_deleted(self.db(), repo.id, None).await?;
@@ -830,6 +933,7 @@ mod tests {
         let repo = core
             .create_repo(
                 &alice,
+                "alice",
                 CreateRepo {
                     name: "Proj".into(),
                     description: " demo ".into(),
@@ -853,12 +957,12 @@ mod tests {
         assert!(path.join("HEAD").is_file());
         assert!(path.join("hooks/pre-receive").is_file());
         assert!(matches!(
-            core.create_repo(&alice, new("proj", Visibility::Public))
+            core.create_repo(&alice, "alice", new("proj", Visibility::Public))
                 .await,
             Err(CoreError::Conflict(_))
         ));
         assert!(matches!(
-            core.create_repo(&alice, new("x.git", Visibility::Public))
+            core.create_repo(&alice, "alice", new("x.git", Visibility::Public))
                 .await,
             Err(CoreError::Invalid(_))
         ));
@@ -877,6 +981,7 @@ mod tests {
         let alice = user(&core, "alice").await;
         core.create_repo(
             &alice,
+            "alice",
             CreateRepo {
                 name: "proj".into(),
                 description: "A demo".into(),
@@ -916,6 +1021,7 @@ mod tests {
                 .unwrap();
             core.create_repo(
                 &owner,
+                &owner.handle,
                 CreateRepo {
                     name: "notes".into(),
                     description: String::new(),
@@ -949,7 +1055,7 @@ mod tests {
         let (core, _f) = test_core().await;
         let alice = user(&core, "alice").await;
         let bob = user(&core, "bob").await;
-        core.create_repo(&alice, new("secret", Visibility::Private))
+        core.create_repo(&alice, "alice", new("secret", Visibility::Private))
             .await
             .unwrap();
 
@@ -1020,7 +1126,7 @@ mod tests {
             Err(CoreError::NotFound)
         ));
 
-        core.create_repo(&alice, new("open", Visibility::Public))
+        core.create_repo(&alice, "alice", new("open", Visibility::Public))
             .await
             .unwrap();
         assert_eq!(
@@ -1057,7 +1163,7 @@ mod tests {
         let mia = user(&core, "mia").await;
         let walt = user(&core, "walt").await;
         let bob = user(&core, "bob").await;
-        core.create_repo(&alice, new("proj", Visibility::Private))
+        core.create_repo(&alice, "alice", new("proj", Visibility::Private))
             .await
             .unwrap();
         core.set_collaborator(&alice, "alice", "proj", "mia", Permission::Maintain)
@@ -1120,7 +1226,7 @@ mod tests {
         let (core, _f) = test_core().await;
         let alice = user(&core, "alice").await;
         let repo = core
-            .create_repo(&alice, new("proj", Visibility::Public))
+            .create_repo(&alice, "alice", new("proj", Visibility::Public))
             .await
             .unwrap();
         assert!(matches!(
@@ -1172,10 +1278,10 @@ mod tests {
         let alice = user(&core, "alice").await;
         let mia = user(&core, "mia").await;
         let bob = user(&core, "bob").await;
-        core.create_repo(&alice, new("proj", Visibility::Private))
+        core.create_repo(&alice, "alice", new("proj", Visibility::Private))
             .await
             .unwrap();
-        core.create_repo(&alice, new("other", Visibility::Private))
+        core.create_repo(&alice, "alice", new("other", Visibility::Private))
             .await
             .unwrap();
         core.set_collaborator(&alice, "alice", "proj", "mia", Permission::Maintain)
@@ -1258,7 +1364,7 @@ mod tests {
         let (core, _f) = test_core().await;
         let alice = user(&core, "alice").await;
         let mia = user(&core, "mia").await;
-        core.create_repo(&alice, new("proj", Visibility::Public))
+        core.create_repo(&alice, "alice", new("proj", Visibility::Public))
             .await
             .unwrap();
         core.set_collaborator(&alice, "alice", "proj", "mia", Permission::Maintain)
@@ -1298,7 +1404,7 @@ mod tests {
         let alice = user(&core, "alice").await;
         let bob = user(&core, "bob").await;
         let repo = core
-            .create_repo(&alice, new("proj", Visibility::Public))
+            .create_repo(&alice, "alice", new("proj", Visibility::Public))
             .await
             .unwrap();
         core.set_collaborator(&alice, "alice", "proj", "bob", Permission::Admin)
@@ -1335,7 +1441,7 @@ mod tests {
             "the data stays until the purge"
         );
         let taken = core
-            .create_repo(&alice, new("PROJ", Visibility::Public))
+            .create_repo(&alice, "alice", new("PROJ", Visibility::Public))
             .await;
         assert!(
             matches!(&taken, Err(CoreError::Conflict(m)) if m.contains("deleted")),
@@ -1353,15 +1459,11 @@ mod tests {
             core.deleted_repos(&bob).await.unwrap().is_empty(),
             "the list shows the user's own repositories"
         );
-        assert!(
-            matches!(
-                core.restore_repo(&bob, repo.id).await,
-                Err(CoreError::NotFound)
-            ),
-            "only the owner or a site admin restores"
+        let restored = core.restore_repo(&bob, repo.id).await.unwrap();
+        assert_eq!(
+            restored.deleted_at, None,
+            "an admin collaborator restores too (delete already allows them)"
         );
-        let restored = core.restore_repo(&alice, repo.id).await.unwrap();
-        assert_eq!(restored.deleted_at, None);
         assert_eq!(
             core.repo_for(Some(&bob), "alice", "proj")
                 .await
@@ -1385,11 +1487,11 @@ mod tests {
         let (core, _f) = test_core().await;
         let alice = user(&core, "alice").await;
         let old = core
-            .create_repo(&alice, new("old", Visibility::Public))
+            .create_repo(&alice, "alice", new("old", Visibility::Public))
             .await
             .unwrap();
         let recent = core
-            .create_repo(&alice, new("recent", Visibility::Public))
+            .create_repo(&alice, "alice", new("recent", Visibility::Public))
             .await
             .unwrap();
         core.delete_repo(&alice, "alice", "old", "alice/old")
@@ -1452,7 +1554,7 @@ mod tests {
             (purged.target.as_str(), purged.actor_id),
             ("repo:alice/old", None)
         );
-        core.create_repo(&alice, new("old", Visibility::Public))
+        core.create_repo(&alice, "alice", new("old", Visibility::Public))
             .await
             .unwrap();
     }
@@ -1462,7 +1564,7 @@ mod tests {
         let (core, _f) = test_core().await;
         let alice = user(&core, "alice").await;
         let repo = core
-            .create_repo(&alice, new("proj", Visibility::Public))
+            .create_repo(&alice, "alice", new("proj", Visibility::Public))
             .await
             .unwrap();
         core.delete_repo(&alice, "alice", "proj", "alice/proj")
@@ -1491,7 +1593,7 @@ mod tests {
     async fn a_purge_leaves_a_repository_restored_since_it_was_listed() {
         let (core, _f) = test_core().await;
         let alice = user(&core, "alice").await;
-        core.create_repo(&alice, new("proj", Visibility::Public))
+        core.create_repo(&alice, "alice", new("proj", Visibility::Public))
             .await
             .unwrap();
         let listed = core
@@ -1508,7 +1610,7 @@ mod tests {
     async fn old_names_of_deleted_repositories_lead_nowhere() {
         let (core, _f) = test_core().await;
         let alice = user(&core, "alice").await;
-        core.create_repo(&alice, new("proj", Visibility::Public))
+        core.create_repo(&alice, "alice", new("proj", Visibility::Public))
             .await
             .unwrap();
         core.rename_repo(&alice, "alice", "proj", "renamed")

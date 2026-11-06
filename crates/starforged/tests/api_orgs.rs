@@ -1040,3 +1040,297 @@ async fn concurrent_member_adds_are_idempotent() {
     assert!(first.is_ok() && second.is_ok(), "{first:?} / {second:?}");
     assert_eq!(audit_count(&c.s, "org.member_add", "org:acme").await, 1);
 }
+
+// --- A3: org repositories, transfer support, org deletion, team races. -----
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn org_owner_creates_repo_and_member_is_refused() {
+    let c = Ctx::start().await;
+    let client = reqwest::Client::new();
+    let res = client
+        .post(c.orgs())
+        .bearer_auth(&c.alice)
+        .json(&json!({"handle": "acme"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 201);
+
+    // A plain member cannot create repositories in the org.
+    let res = client
+        .put(c.member("acme", "bob"))
+        .bearer_auth(&c.alice)
+        .json(&json!({"role": "member"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let denied = client
+        .post(c.s.url("/api/v1/orgs/acme/repos"))
+        .bearer_auth(&c.bob)
+        .json(&json!({"name": "nope", "visibility": "private"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), 403, "plain member cannot create org repos");
+
+    // An org owner creates `acme/proj` through the API.
+    let created = client
+        .post(c.s.url("/api/v1/orgs/acme/repos"))
+        .bearer_auth(&c.alice)
+        .json(&json!({"name": "proj", "visibility": "private"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201, "owner creates org repo");
+    let body: Value = created.json().await.unwrap();
+    assert_eq!(body["full_name"], "acme/proj");
+    assert_eq!(body["permission"], "admin");
+
+    // A team member with `read` can clone it over HTTP.
+    let res = client
+        .post(c.s.url("/api/v1/orgs/acme/teams"))
+        .bearer_auth(&c.alice)
+        .json(&json!({"name": "devs", "permission": "read", "all_repos": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 201);
+    let res = client
+        .put(c.member("acme", "carol"))
+        .bearer_auth(&c.alice)
+        .json(&json!({"role": "member"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let res = client
+        .put(c.s.url("/api/v1/orgs/acme/teams/devs/members/carol"))
+        .bearer_auth(&c.alice)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let tmp = tempfile::tempdir().unwrap();
+    let work = work_repo(tmp.path(), "work", &[("README.md", "# proj\n")]).await;
+    git_ok(
+        &work,
+        &[
+            "push",
+            "-q",
+            &c.s.git_url("acme", "proj", Some(&c.alice)),
+            "main",
+        ],
+    )
+    .await;
+    git_ok(
+        tmp.path(),
+        &[
+            "clone",
+            "-q",
+            &c.s.git_url("acme", "proj", Some(&c.carol)),
+            "carol-clone",
+        ],
+    )
+    .await;
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("carol-clone").join("README.md")).unwrap(),
+        "# proj\n"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn org_deletion_needs_an_empty_namespace() {
+    let c = Ctx::start().await;
+    let client = reqwest::Client::new();
+    let res = client
+        .post(c.orgs())
+        .bearer_auth(&c.alice)
+        .json(&json!({"handle": "acme"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 201);
+    let created = client
+        .post(c.s.url("/api/v1/orgs/acme/repos"))
+        .bearer_auth(&c.alice)
+        .json(&json!({"name": "proj", "visibility": "private"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201);
+
+    let blocked = client
+        .delete(c.org("acme"))
+        .bearer_auth(&c.alice)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        blocked.status(),
+        422,
+        "an org with a repo cannot be deleted"
+    );
+
+    // A soft-deleted repository inside the grace period still blocks.
+    c.s.core
+        .delete_repo(
+            &c.s.core.user_by_handle("alice").await.unwrap().unwrap(),
+            "acme",
+            "proj",
+            "acme/proj",
+        )
+        .await
+        .unwrap();
+    let blocked = client
+        .delete(c.org("acme"))
+        .bearer_auth(&c.alice)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(blocked.status(), 422, "a soft-deleted repo still blocks");
+
+    // Restoring, then transferring the repository out, frees the org.
+    let alice_user = c.s.core.user_by_handle("alice").await.unwrap().unwrap();
+    let repo_id: i64 = sqlx::query_scalar(
+        "SELECT r.id FROM repos r JOIN owners o ON o.id = r.owner_id WHERE o.handle = 'acme' AND r.lower_name = 'proj'",
+    )
+    .fetch_one(c.s.core.db().pool())
+    .await
+    .unwrap();
+    c.s.core.restore_repo(&alice_user, repo_id).await.unwrap();
+    let moved = client
+        .post(c.s.url("/api/v1/repos/acme/proj/transfer"))
+        .bearer_auth(&c.alice)
+        .json(&json!({"new_owner": "alice"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(moved.status(), 200, "transfer the last repo out");
+    let deleted = client
+        .delete(c.org("acme"))
+        .bearer_auth(&c.alice)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), 204, "empty org deletes");
+    assert_eq!(audit_count(&c.s, "org.delete", "org:acme").await, 1);
+    assert_eq!(
+        client
+            .get(c.org("acme"))
+            .bearer_auth(&c.alice)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+    let recreated = client
+        .post(c.orgs())
+        .bearer_auth(&c.alice)
+        .json(&json!({"handle": "acme"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(recreated.status(), 201, "deletion frees the handle");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn racing_team_creates_share_one_url() {
+    let c = Ctx::start().await;
+    let client = reqwest::Client::new();
+    let res = client
+        .post(c.orgs())
+        .bearer_auth(&c.alice)
+        .json(&json!({"handle": "acme"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 201);
+    let alice = c.s.core.user_by_handle("alice").await.unwrap().unwrap();
+    // `a-b` and `a b` slug to the same URL but differ as lower names: the
+    // UNIQUE constraint alone would admit both, so the per-org lock must
+    // serialize them.
+    let new_team = |name: &str| starforged_core::orgs::NewTeamInput {
+        name: name.into(),
+        description: String::new(),
+        permission: "read".into(),
+        all_repos: true,
+    };
+    let (first, second) = tokio::join!(
+        c.s.core.create_team(&alice, "acme", new_team("a-b")),
+        c.s.core.create_team(&alice, "acme", new_team("a b")),
+    );
+    assert!(
+        first.is_ok() ^ second.is_ok(),
+        "exactly one wins: {first:?} / {second:?}"
+    );
+    for r in [&first, &second] {
+        if let Err(e) = r {
+            assert!(
+                matches!(e, starforged_core::CoreError::Invalid(_)),
+                "loser gets 422, not {e:?}"
+            );
+        }
+    }
+    let teams = c.s.core.teams(&alice, "acme").await.unwrap();
+    assert_eq!(teams.len(), 1, "one URL per team: {teams:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn racing_team_renames_conflict_as_422() {
+    let c = Ctx::start().await;
+    let client = reqwest::Client::new();
+    let res = client
+        .post(c.orgs())
+        .bearer_auth(&c.alice)
+        .json(&json!({"handle": "acme"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 201);
+    let alice = c.s.core.user_by_handle("alice").await.unwrap().unwrap();
+    let new_team = |name: &str| starforged_core::orgs::NewTeamInput {
+        name: name.into(),
+        description: String::new(),
+        permission: "read".into(),
+        all_repos: true,
+    };
+    c.s.core
+        .create_team(&alice, "acme", new_team("alpha"))
+        .await
+        .unwrap();
+    c.s.core
+        .create_team(&alice, "acme", new_team("beta"))
+        .await
+        .unwrap();
+    let patch = || starforged_core::orgs::TeamPatch {
+        name: Some("gamma".into()),
+        description: None,
+        permission: None,
+        all_repos: None,
+    };
+    let (first, second) = tokio::join!(
+        c.s.core.update_team(&alice, "acme", "alpha", patch()),
+        c.s.core.update_team(&alice, "acme", "beta", patch()),
+    );
+    assert!(
+        first.is_ok() ^ second.is_ok(),
+        "exactly one wins: {first:?} / {second:?}"
+    );
+    for r in [&first, &second] {
+        if let Err(e) = r {
+            assert!(
+                matches!(e, starforged_core::CoreError::Invalid(_)),
+                "loser gets 422, not {e:?}"
+            );
+        }
+    }
+    let teams = c.s.core.teams(&alice, "acme").await.unwrap();
+    assert_eq!(teams.len(), 2);
+    assert_eq!(
+        teams.iter().filter(|t| t.slug == "gamma").count(),
+        1,
+        "one team owns the slug: {teams:?}"
+    );
+}

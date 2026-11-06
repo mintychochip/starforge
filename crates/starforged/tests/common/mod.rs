@@ -142,6 +142,7 @@ impl TestServer {
         self.core
             .create_repo(
                 owner,
+                &owner.handle,
                 CreateRepo {
                     name: name.into(),
                     description: String::new(),

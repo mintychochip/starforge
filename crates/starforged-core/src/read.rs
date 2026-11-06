@@ -850,6 +850,7 @@ mod tests {
     async fn mk_repo(core: &Core, owner: &User, name: &str, visibility: Visibility) -> Repo {
         core.create_repo(
             owner,
+            &owner.handle,
             CreateRepo {
                 name: name.into(),
                 description: String::new(),

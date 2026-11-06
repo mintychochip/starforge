@@ -496,9 +496,15 @@ mod tests {
             visibility: Visibility::Public,
             readme: false,
         };
-        let kept = core.create_repo(&alice, repo("kept")).await.unwrap();
-        let gone = core.create_repo(&alice, repo("gone")).await.unwrap();
-        core.create_repo(&bob, repo("theirs")).await.unwrap();
+        let kept = core
+            .create_repo(&alice, "alice", repo("kept"))
+            .await
+            .unwrap();
+        let gone = core
+            .create_repo(&alice, "alice", repo("gone"))
+            .await
+            .unwrap();
+        core.create_repo(&bob, "bob", repo("theirs")).await.unwrap();
         core.set_collaborator(&bob, "bob", "theirs", "alice", Permission::Write)
             .await
             .unwrap();

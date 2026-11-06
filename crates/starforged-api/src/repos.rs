@@ -44,15 +44,15 @@ pub(crate) fn repo_json(state: &ApiState, access: RepoAccess) -> RepoJson {
 }
 
 #[derive(Deserialize)]
-pub struct CreateRepoBody {
-    name: String,
+pub(crate) struct CreateRepoBody {
+    pub(crate) name: String,
     #[serde(default)]
-    description: String,
+    pub(crate) description: String,
     #[serde(default = "private")]
-    visibility: String,
+    pub(crate) visibility: String,
     /// Commit a README as the first commit.
     #[serde(default)]
-    readme: bool,
+    pub(crate) readme: bool,
 }
 
 fn private() -> String {
@@ -73,6 +73,7 @@ pub async fn create(
         .core
         .create_repo(
             &auth.user,
+            &auth.user.handle,
             CreateRepo {
                 name: body.name,
                 description: body.description,
@@ -185,4 +186,36 @@ pub async fn patch(
         .set_refs_for_access(&auth.user, &owner, &repo, &value)
         .await?;
     Ok(Json(serde_json::json!({ "refs_for_access": value })))
+}
+
+#[derive(Deserialize)]
+pub struct TransferRepoBody {
+    new_owner: String,
+}
+
+/// `POST /repos/{owner}/{repo}/transfer` (`{"new_owner": "<handle>"}`):
+/// moves the repository to the actor or to an org the actor owns (D6).
+/// Anything else in the body is 422.
+pub async fn transfer(
+    State(state): State<ApiState>,
+    auth: ApiAuth,
+    Path((owner, repo)): Path<(String, String)>,
+    body: Result<Json<TransferRepoBody>, JsonRejection>,
+) -> Result<Json<RepoJson>, ApiError> {
+    let auth = auth.require(Scope::RepoWrite)?;
+    let Json(body) = body.map_err(|e| ApiError::Invalid(e.body_text()))?;
+    if body.new_owner.trim().is_empty() {
+        return Err(ApiError::Invalid("new_owner is required".into()));
+    }
+    let moved = state
+        .core
+        .transfer_repo(&auth.user, &owner, &repo, &body.new_owner)
+        .await?;
+    Ok(Json(repo_json(
+        &state,
+        RepoAccess {
+            repo: moved,
+            permission: Permission::Admin,
+        },
+    )))
 }

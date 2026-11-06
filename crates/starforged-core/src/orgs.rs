@@ -4,7 +4,7 @@
 //! its id. Any active signed-in user may create one and becomes its first
 //! owner; owners add existing active users directly and manage teams.
 
-use starforged_db::{orgs as db_orgs, repos as db_repos};
+use starforged_db::{now, orgs as db_orgs, repos as db_repos};
 
 use crate::repos::{Repo, to_repo};
 use crate::{Core, CoreError, CoreResult, accounts::User, permission::Permission, validate};
@@ -228,8 +228,10 @@ impl Core {
         self.org(Some(user), &row.handle).await
     }
 
-    /// Deletes an org (D7): owners only, and only when it owns no
-    /// repositories, including soft-deleted ones inside the grace period.
+    /// Deletes an org (D7): owners only, and only when it owns no live
+    /// repositories and none soft-deleted inside the grace period. The
+    /// count and the delete run in one per-org-locked transaction, so a
+    /// racing creation or transfer cannot slip a repository in between.
     /// Teams and memberships cascade; the handle is freed. One `org.delete`
     /// audit row.
     pub async fn delete_org(&self, user: &User, handle: &str) -> CoreResult<()> {
@@ -240,11 +242,9 @@ impl Core {
         if self.org_role(row.id, user.id).await? != Some(OrgRole::Owner) {
             return Err(CoreError::Forbidden);
         }
-        let live = db_repos::list_by_owner(self.db(), row.id).await?.len();
-        let deleted = db_repos::list_deleted_by_owner(self.db(), row.id)
-            .await?
-            .len();
-        let total = live + deleted;
+        let total =
+            db_orgs::delete_serialized(self.db(), row.id, now() - crate::repos::RESTORE_SECS)
+                .await?;
         if total > 0 {
             return Err(CoreError::Invalid(format!(
                 "organization still owns {total} {}",
@@ -255,7 +255,6 @@ impl Core {
                 }
             )));
         }
-        db_orgs::delete(self.db(), row.id).await?;
         self.audit(
             Some(user.id),
             "org.delete",
@@ -583,15 +582,10 @@ impl Core {
         let description = checked_description(&input.description)?;
         let permission = checked_team_permission(&input.permission)?;
         let lower = name.to_ascii_lowercase();
-        if db_orgs::team_clash(self.db(), org.id, &lower, &team_slug(&lower))
-            .await?
-            .is_some()
-        {
-            return Err(CoreError::Invalid(format!("team '{name}' already exists")));
-        }
-        // A racing duplicate insert hits the UNIQUE constraint: report the
-        // clash as 422, like the check above, instead of failing 500.
-        let id = db_orgs::create_team(
+        // Serialized behind the per-org lock (the UNIQUE constraint covers
+        // only `lower_name`, so slug collisions need the check plus the
+        // insert in one transaction); the loser reports 422, never 500.
+        let id = match db_orgs::create_team(
             self.db(),
             org.id,
             &name,
@@ -601,13 +595,16 @@ impl Core {
             input.all_repos,
         )
         .await
-        .map_err(|e| {
-            if e.is_unique_violation() {
-                CoreError::Invalid(format!("team '{name}' already exists"))
-            } else {
-                e.into()
+        {
+            Ok(db_orgs::TeamCreate::Created(id)) => id,
+            Ok(db_orgs::TeamCreate::Clash) => {
+                return Err(CoreError::Invalid(format!("team '{name}' already exists")));
             }
-        })?;
+            Err(e) if e.is_unique_violation() => {
+                return Err(CoreError::Invalid(format!("team '{name}' already exists")));
+            }
+            Err(e) => return Err(e.into()),
+        };
         let slug = team_slug(&lower);
         self.audit(
             Some(user.id),
@@ -683,22 +680,33 @@ impl Core {
             return Ok(current);
         }
         let lower = name.to_ascii_lowercase();
-        if let Some(clash) =
-            db_orgs::team_clash(self.db(), org.id, &lower, &team_slug(&lower)).await?
-            && clash.id != row.id
-        {
-            return Err(CoreError::Invalid(format!("team '{name}' already exists")));
-        }
-        db_orgs::set_team(
+        // Serialized behind the per-org lock (finding 1): the clash check
+        // and the update run in one transaction, so a racing conflicting
+        // rename reports 422 instead of failing 500 on the UNIQUE constraint.
+        match db_orgs::set_team(
             self.db(),
+            org.id,
             row.id,
-            &name,
-            &lower,
-            &description,
-            permission.as_str(),
-            all_repos,
+            &db_orgs::TeamFields {
+                name: &name,
+                lower_name: &lower,
+                description: &description,
+                permission: permission.as_str(),
+                all_repos,
+            },
         )
-        .await?;
+        .await
+        {
+            Ok(db_orgs::TeamUpdate::Done) => {}
+            Ok(db_orgs::TeamUpdate::Clash) => {
+                return Err(CoreError::Invalid(format!("team '{name}' already exists")));
+            }
+            Ok(db_orgs::TeamUpdate::Gone) => return Err(CoreError::NotFound),
+            Err(e) if e.is_unique_violation() => {
+                return Err(CoreError::Invalid(format!("team '{name}' already exists")));
+            }
+            Err(e) => return Err(e.into()),
+        }
         let updated = team_view(
             &org.handle,
             db_orgs::TeamRow {

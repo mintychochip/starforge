@@ -77,7 +77,11 @@ pub async fn submit(
         visibility,
         readme,
     };
-    match state.core.create_repo(&session.user, input).await {
+    match state
+        .core
+        .create_repo(&session.user, &session.user.handle, input)
+        .await
+    {
         Ok(repo) => Ok(Redirect::to(&format!("/{}/{}", repo.owner, repo.name)).into_response()),
         Err(CoreError::Invalid(message) | CoreError::Conflict(message)) => {
             let page = page(&session, form.name, form.description, readme, Some(message));

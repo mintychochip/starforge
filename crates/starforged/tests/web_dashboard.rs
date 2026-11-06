@@ -324,3 +324,82 @@ async fn anonymous_dashboard_is_unchanged() {
         assert!(!page.contains(section), "anonymous sees no {section}");
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dashboard_lists_org_repositories() {
+    let s = TestServer::start().await;
+    let alice = s.user("alice").await;
+    s.user("bob").await;
+    let alice_t = s.token(&alice, &[Scope::RepoWrite]).await;
+    let client = reqwest::Client::new();
+    let api = |path: &str| s.url(&format!("/api/v1{path}"));
+    let res = client
+        .post(api("/orgs"))
+        .bearer_auth(&alice_t)
+        .json(&json!({"handle": "acme"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 201);
+    let res = client
+        .put(api("/orgs/acme/members/bob"))
+        .bearer_auth(&alice_t)
+        .json(&json!({"role": "member"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let res = client
+        .post(api("/orgs/acme/repos"))
+        .bearer_auth(&alice_t)
+        .json(&json!({"name": "proj", "visibility": "private"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 201);
+
+    // The org base permission makes bob a member: the repo is on his dashboard.
+    let res = client
+        .patch(api("/orgs/acme"))
+        .bearer_auth(&alice_t)
+        .json(&json!({"base_permission": "read"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let (bob_browser, _) = s.login("bob").await;
+    let page = get_text(&bob_browser, &s.url("/")).await;
+    assert!(
+        page.contains("/acme/proj"),
+        "base-permission repo is listed"
+    );
+
+    // With no base permission, a team grant still lists it.
+    let res = client
+        .patch(api("/orgs/acme"))
+        .bearer_auth(&alice_t)
+        .json(&json!({"base_permission": "none"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let page = get_text(&bob_browser, &s.url("/")).await;
+    assert!(!page.contains("/acme/proj"), "no grant, no listing");
+    let res = client
+        .post(api("/orgs/acme/teams"))
+        .bearer_auth(&alice_t)
+        .json(&json!({"name": "devs", "permission": "read", "all_repos": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 201);
+    let res = client
+        .put(api("/orgs/acme/teams/devs/members/bob"))
+        .bearer_auth(&alice_t)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let page = get_text(&bob_browser, &s.url("/")).await;
+    assert!(page.contains("/acme/proj"), "team-grant repo is listed");
+}

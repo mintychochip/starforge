@@ -56,7 +56,10 @@ pub fn router(core: Core, base_url: String) -> Router {
             "/orgs/{org}",
             get(orgs::show).patch(orgs::patch).delete(orgs::delete),
         )
-        .route("/orgs/{org}/repos", get(orgs::list_repos))
+        .route(
+            "/orgs/{org}/repos",
+            get(orgs::list_repos).post(orgs::create_repo),
+        )
         .route(
             "/orgs/{org}/teams",
             get(orgs::list_teams).post(orgs::create_team),
@@ -99,6 +102,7 @@ pub fn router(core: Core, base_url: String) -> Router {
             "/repos/{owner}/{repo}/collaborators/{handle}",
             put(repos::set_collaborator).delete(repos::remove_collaborator),
         )
+        .route("/repos/{owner}/{repo}/transfer", post(repos::transfer))
         .route(
             "/repos/{owner}/{repo}/sessions/{ulid}",
             put(sessions::put_meta)

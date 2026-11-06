@@ -467,6 +467,7 @@ mod tests {
             let created = core
                 .create_repo(
                     &alice,
+                    "alice",
                     CreateRepo {
                         name: "proj-gates".into(),
                         description: String::new(),

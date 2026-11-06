@@ -132,13 +132,36 @@ pub async fn set(
     Ok(())
 }
 
-/// Deletes the owner row; the org row, memberships, and teams cascade. Frees the handle.
-pub async fn delete(db: &Db, id: i64) -> DbResult<()> {
+/// Deletes the org only when it owns no live repositories and no deleted
+/// ones newer than `deleted_cutoff` (the grace window): the count check and
+/// the delete run in one transaction behind the per-org lock, so a racing
+/// repository creation or transfer cannot slip a repository in between.
+/// Returns the blocking repository count; nonzero rolls back and deletes
+/// nothing.
+pub async fn delete_serialized(db: &Db, org_id: i64, deleted_cutoff: i64) -> DbResult<i64> {
+    let mut tx = db.pool().begin().await?;
+    lock_org(&mut tx, org_id).await?;
+    let live: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM repos WHERE owner_id = $1 AND deleted_at IS NULL")
+            .bind(org_id)
+            .fetch_one(tx.as_mut())
+            .await?;
+    let grace: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM repos WHERE owner_id = $1 AND deleted_at IS NOT NULL AND deleted_at > $2",
+    )
+    .bind(org_id)
+    .bind(deleted_cutoff)
+    .fetch_one(tx.as_mut())
+    .await?;
+    if live + grace > 0 {
+        return Ok(live + grace);
+    }
     sqlx::query("DELETE FROM owners WHERE id = $1")
-        .bind(id)
-        .execute(db.pool())
+        .bind(org_id)
+        .execute(tx.as_mut())
         .await?;
-    Ok(())
+    tx.commit().await?;
+    Ok(0)
 }
 
 /// The base permission and the viewer's membership role for an org-owned
@@ -237,7 +260,10 @@ pub async fn set_role(db: &Db, org_id: i64, user_id: i64, role: &str) -> DbResul
 /// lock on SQLite. Conditional single statements are NOT enough — under
 /// READ COMMITTED two of them can each count 2 owners and change different
 /// rows (write skew), orphaning the org.
-async fn lock_org(tx: &mut sqlx::Transaction<'_, sqlx::Any>, org_id: i64) -> DbResult<()> {
+pub(crate) async fn lock_org(
+    tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    org_id: i64,
+) -> DbResult<()> {
     sqlx::query("UPDATE orgs SET updated_at = updated_at WHERE id = $1")
         .bind(org_id)
         .execute(tx.as_mut())
@@ -414,6 +440,16 @@ fn from_team(row: &AnyRow) -> DbResult<TeamRow> {
     })
 }
 
+/// The outcome of a serialized team creation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TeamCreate {
+    Created(i64),
+    Clash,
+}
+
+/// Creates the team behind the per-org lock: the clash check (lower name or
+/// slug, so `a-b` and `a b` cannot share one URL) and the insert run in one
+/// transaction, since the UNIQUE constraint covers only `lower_name`.
 pub async fn create_team(
     db: &Db,
     org_id: i64,
@@ -422,7 +458,12 @@ pub async fn create_team(
     description: &str,
     permission: &str,
     all_repos: bool,
-) -> DbResult<i64> {
+) -> DbResult<TeamCreate> {
+    let mut tx = db.pool().begin().await?;
+    lock_org(&mut tx, org_id).await?;
+    if clash_in(&mut tx, org_id, None, lower_name).await?.is_some() {
+        return Ok(TeamCreate::Clash);
+    }
     let ts = now();
     let id: i64 = sqlx::query_scalar(
         "INSERT INTO teams (org_id, name, lower_name, description, permission, all_repos, created_at, updated_at) \
@@ -436,7 +477,30 @@ pub async fn create_team(
     .bind(i64::from(all_repos))
     .bind(ts)
     .bind(ts)
-    .fetch_one(db.pool())
+    .fetch_one(tx.as_mut())
+    .await?;
+    tx.commit().await?;
+    Ok(TeamCreate::Created(id))
+}
+
+/// The id of a team whose lower name or slug collides with `lower_name`,
+/// ignoring `ignore_id` (a rename keeps its own name). `None` when free.
+async fn clash_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    org_id: i64,
+    ignore_id: Option<i64>,
+    lower_name: &str,
+) -> DbResult<Option<i64>> {
+    let slug = lower_name.replace(' ', "-");
+    let id: Option<i64> = sqlx::query_scalar(
+        "SELECT id FROM teams WHERE org_id = $1 AND (id <> $2 OR $2 IS NULL) \
+         AND (lower_name = $3 OR REPLACE(lower_name, ' ', '-') = $4) ORDER BY id LIMIT 1",
+    )
+    .bind(org_id)
+    .bind(ignore_id)
+    .bind(lower_name)
+    .bind(slug.as_str())
+    .fetch_optional(tx.as_mut())
     .await?;
     Ok(id)
 }
@@ -455,27 +519,6 @@ pub async fn team_by_slug(db: &Db, org_id: i64, slug: &str) -> DbResult<Option<T
     row.as_ref().map(from_team).transpose()
 }
 
-/// A team whose lower name or slug collides with the candidate (for the
-/// case-insensitive uniqueness check, including the `-`/space ambiguity).
-pub async fn team_clash(
-    db: &Db,
-    org_id: i64,
-    lower_name: &str,
-    slug: &str,
-) -> DbResult<Option<TeamRow>> {
-    let row = sqlx::query(
-        "SELECT id, org_id, name, lower_name, description, permission, all_repos, created_at, updated_at \
-         FROM teams WHERE org_id = $1 AND (lower_name = $2 OR REPLACE(lower_name, ' ', '-') = $3) \
-         ORDER BY id LIMIT 1",
-    )
-    .bind(org_id)
-    .bind(lower_name)
-    .bind(slug)
-    .fetch_optional(db.pool())
-    .await?;
-    row.as_ref().map(from_team).transpose()
-}
-
 pub async fn list_teams(db: &Db, org_id: i64) -> DbResult<Vec<TeamRow>> {
     let rows = sqlx::query(
         "SELECT id, org_id, name, lower_name, description, permission, all_repos, created_at, updated_at \
@@ -487,29 +530,64 @@ pub async fn list_teams(db: &Db, org_id: i64) -> DbResult<Vec<TeamRow>> {
     rows.iter().map(from_team).collect()
 }
 
+/// The mutable team fields for [`set_team`].
+pub struct TeamFields<'a> {
+    pub name: &'a str,
+    pub lower_name: &'a str,
+    pub description: &'a str,
+    pub permission: &'a str,
+    pub all_repos: bool,
+}
+
+/// The outcome of a serialized team update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TeamUpdate {
+    Done,
+    Clash,
+    Gone,
+}
+
+/// Renames (slugs follow), re-describes, re-permissions, or flips
+/// `all_repos` behind the per-org lock: the clash check and the update run
+/// in one transaction, so racing conflicting renames cannot both commit.
 pub async fn set_team(
     db: &Db,
+    org_id: i64,
     id: i64,
-    name: &str,
-    lower_name: &str,
-    description: &str,
-    permission: &str,
-    all_repos: bool,
-) -> DbResult<()> {
+    fields: &TeamFields<'_>,
+) -> DbResult<TeamUpdate> {
+    let mut tx = db.pool().begin().await?;
+    lock_org(&mut tx, org_id).await?;
+    let kept: Option<i64> =
+        sqlx::query_scalar("SELECT id FROM teams WHERE id = $1 AND org_id = $2")
+            .bind(id)
+            .bind(org_id)
+            .fetch_optional(tx.as_mut())
+            .await?;
+    if kept.is_none() {
+        return Ok(TeamUpdate::Gone);
+    }
+    if clash_in(&mut tx, org_id, Some(id), fields.lower_name)
+        .await?
+        .is_some()
+    {
+        return Ok(TeamUpdate::Clash);
+    }
     sqlx::query(
         "UPDATE teams SET name = $1, lower_name = $2, description = $3, permission = $4, all_repos = $5, \
          updated_at = $6 WHERE id = $7",
     )
-    .bind(name)
-    .bind(lower_name)
-    .bind(description)
-    .bind(permission)
-    .bind(i64::from(all_repos))
+    .bind(fields.name)
+    .bind(fields.lower_name)
+    .bind(fields.description)
+    .bind(fields.permission)
+    .bind(i64::from(fields.all_repos))
     .bind(now())
     .bind(id)
-    .execute(db.pool())
+    .execute(tx.as_mut())
     .await?;
-    Ok(())
+    tx.commit().await?;
+    Ok(TeamUpdate::Done)
 }
 
 /// Deletes the team; memberships and repo links cascade.

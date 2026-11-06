@@ -56,9 +56,25 @@ fn from_row(row: &AnyRow) -> DbResult<RepoRow> {
 
 /// Inserts the repository. A redirect that held its name stops (forge-basics design §5.3).
 pub async fn insert(db: &Db, repo: &NewRepo<'_>) -> DbResult<i64> {
+    let mut tx = db.pool().begin().await?;
+    let id = insert_in(&mut tx, repo).await?;
+    tx.commit().await?;
+    Ok(id)
+}
+
+/// Inserts a repository owned by an org behind the per-org lock, so a racing
+/// org deletion cannot slip it into a namespace being removed.
+pub async fn insert_org_repo(db: &Db, org_id: i64, repo: &NewRepo<'_>) -> DbResult<i64> {
+    let mut tx = db.pool().begin().await?;
+    crate::orgs::lock_org(&mut tx, org_id).await?;
+    let id = insert_in(&mut tx, repo).await?;
+    tx.commit().await?;
+    Ok(id)
+}
+
+async fn insert_in(tx: &mut sqlx::Transaction<'_, sqlx::Any>, repo: &NewRepo<'_>) -> DbResult<i64> {
     let ts = now();
     let lower_name = repo.name.to_ascii_lowercase();
-    let mut tx = db.pool().begin().await?;
     let id: i64 = sqlx::query_scalar(
         "INSERT INTO repos (owner_id, name, lower_name, description, visibility, default_branch, created_at, updated_at) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id",
@@ -71,14 +87,13 @@ pub async fn insert(db: &Db, repo: &NewRepo<'_>) -> DbResult<i64> {
     .bind(repo.default_branch)
     .bind(ts)
     .bind(ts)
-    .fetch_one(&mut *tx)
+    .fetch_one(tx.as_mut())
     .await?;
     sqlx::query("DELETE FROM repo_redirects WHERE owner_id = $1 AND lower_name = $2")
         .bind(repo.owner_id)
         .bind(lower_name.as_str())
-        .execute(&mut *tx)
+        .execute(tx.as_mut())
         .await?;
-    tx.commit().await?;
     Ok(id)
 }
 
@@ -134,6 +149,34 @@ pub async fn list_collaborating(db: &Db, user_id: i64) -> DbResult<Vec<RepoRow>>
         "JOIN collaborators c ON c.repo_id = r.id WHERE c.user_id = $1 AND r.deleted_at IS NULL \
          ORDER BY o.handle, r.lower_name"
     ))
+    .bind(user_id)
+    .fetch_all(db.pool())
+    .await?;
+    rows.iter().map(from_row).collect()
+}
+
+/// Live repositories where `user_id` is a member through an org: every
+/// repository of an org the user owns or belongs to with a non-`none` base
+/// permission, plus every repository covered by one of the user's teams
+/// (an `all_repos` team covers the whole org, otherwise the link must name
+/// the repository). (Owned and collaborator repositories come from
+/// [`list_by_owner`] and [`list_collaborating`].)
+pub async fn list_org_member_repos(db: &Db, user_id: i64) -> DbResult<Vec<RepoRow>> {
+    let rows = sqlx::query(
+        "SELECT r.id, r.owner_id, o.handle AS owner_handle, r.name, r.description, r.visibility, \
+         r.default_branch, r.archived_at, r.deleted_at, r.created_at, r.updated_at \
+         FROM repos r JOIN owners o ON o.id = r.owner_id \
+         JOIN orgs g ON g.id = r.owner_id JOIN org_members m ON m.org_id = g.id \
+         WHERE m.user_id = $1 AND (m.role = 'owner' OR g.base_permission <> 'none') AND r.deleted_at IS NULL \
+         UNION \
+         SELECT r.id, r.owner_id, o.handle AS owner_handle, r.name, r.description, r.visibility, \
+         r.default_branch, r.archived_at, r.deleted_at, r.created_at, r.updated_at \
+         FROM repos r JOIN owners o ON o.id = r.owner_id \
+         JOIN teams t ON t.org_id = r.owner_id JOIN team_members tm ON tm.team_id = t.id \
+         LEFT JOIN team_repos tr ON tr.team_id = t.id AND tr.repo_id = r.id \
+         WHERE tm.user_id = $1 AND (t.all_repos <> 0 OR tr.repo_id IS NOT NULL) AND r.deleted_at IS NULL \
+         ORDER BY owner_handle, name",
+    )
     .bind(user_id)
     .fetch_all(db.pool())
     .await?;
@@ -216,6 +259,93 @@ pub async fn rename(db: &Db, id: i64, new_name: &str) -> DbResult<()> {
     }
     tx.commit().await?;
     Ok(())
+}
+
+/// The outcome of a repository transfer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferOutcome {
+    Done {
+        old_owner_id: i64,
+    },
+    /// The new owner already has a live repository with this name.
+    Clash,
+    /// The repository is gone.
+    Gone,
+}
+
+/// Moves repository `id` to `new_owner_id` in one transaction: the repo row
+/// and both org rows (in id order, a no-op for users) are locked first, so
+/// racing transfers and org deletions serialize. The old `<owner>/<name>`
+/// path is recorded in `repo_redirects` (reusing the rename redirect), a
+/// redirect holding the new path stops, the old org's team links drop, and
+/// collaborators are kept. A deleted name at the target stays a unique
+/// violation for the caller to report.
+pub async fn transfer(db: &Db, id: i64, new_owner_id: i64) -> DbResult<TransferOutcome> {
+    let ts = now();
+    let mut tx = db.pool().begin().await?;
+    let held = sqlx::query("UPDATE repos SET updated_at = updated_at WHERE id = $1")
+        .bind(id)
+        .execute(tx.as_mut())
+        .await?
+        .rows_affected();
+    if held == 0 {
+        return Ok(TransferOutcome::Gone);
+    }
+    let (old_owner_id, lower_name): (i64, String) =
+        sqlx::query_as("SELECT owner_id, lower_name FROM repos WHERE id = $1")
+            .bind(id)
+            .fetch_one(tx.as_mut())
+            .await?;
+    if old_owner_id == new_owner_id {
+        return Ok(TransferOutcome::Done { old_owner_id });
+    }
+    for org_id in [
+        old_owner_id.min(new_owner_id),
+        old_owner_id.max(new_owner_id),
+    ] {
+        crate::orgs::lock_org(&mut tx, org_id).await?;
+    }
+    let clash: Option<i64> = sqlx::query_scalar(
+        "SELECT id FROM repos WHERE owner_id = $1 AND lower_name = $2 AND deleted_at IS NULL AND id <> $3",
+    )
+    .bind(new_owner_id)
+    .bind(lower_name.as_str())
+    .bind(id)
+    .fetch_optional(tx.as_mut())
+    .await?;
+    if clash.is_some() {
+        return Ok(TransferOutcome::Clash);
+    }
+    sqlx::query("UPDATE repos SET owner_id = $1, updated_at = $2 WHERE id = $3")
+        .bind(new_owner_id)
+        .bind(ts)
+        .bind(id)
+        .execute(tx.as_mut())
+        .await?;
+    sqlx::query("DELETE FROM repo_redirects WHERE owner_id = $1 AND lower_name = $2")
+        .bind(new_owner_id)
+        .bind(lower_name.as_str())
+        .execute(tx.as_mut())
+        .await?;
+    sqlx::query(
+        "INSERT INTO repo_redirects (owner_id, lower_name, repo_id, created_at) VALUES ($1, $2, $3, $4) \
+         ON CONFLICT (owner_id, lower_name) DO UPDATE SET repo_id = excluded.repo_id, created_at = excluded.created_at",
+    )
+    .bind(old_owner_id)
+    .bind(lower_name.as_str())
+    .bind(id)
+    .bind(ts)
+    .execute(tx.as_mut())
+    .await?;
+    sqlx::query(
+        "DELETE FROM team_repos WHERE repo_id = $1 AND team_id IN (SELECT id FROM teams WHERE org_id = $2)",
+    )
+    .bind(id)
+    .bind(old_owner_id)
+    .execute(tx.as_mut())
+    .await?;
+    tx.commit().await?;
+    Ok(TransferOutcome::Done { old_owner_id })
 }
 
 /// Archives the repository (`Some(time)`) or lifts the archive (`None`).

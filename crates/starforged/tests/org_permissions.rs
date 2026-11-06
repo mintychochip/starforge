@@ -62,6 +62,7 @@ impl Ctx {
             .core
             .create_repo(
                 &self.alice,
+                "alice",
                 CreateRepo {
                     name: name.into(),
                     description: String::new(),

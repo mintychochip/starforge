@@ -586,8 +586,8 @@ mod tests {
             visibility: Visibility::Public,
             readme: true,
         };
-        let a = core.create_repo(&alice, repo("a")).await.unwrap();
-        let b = core.create_repo(&alice, repo("b")).await.unwrap();
+        let a = core.create_repo(&alice, "alice", repo("a")).await.unwrap();
+        let b = core.create_repo(&alice, "alice", repo("b")).await.unwrap();
         for repo_id in [a.id, a.id, b.id] {
             core.enqueue(&Job::GitMaintenance { repo_id })
                 .await
@@ -624,6 +624,7 @@ mod tests {
         let alice = user(&core, "alice").await;
         core.create_repo(
             &alice,
+            "alice",
             CreateRepo {
                 name: "proj".into(),
                 description: String::new(),

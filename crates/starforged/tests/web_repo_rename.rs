@@ -199,3 +199,99 @@ async fn redirects_need_read_access_and_yield_to_new_repositories() {
         "the new repository answers, not a redirect"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transferred_paths_redirect_pages_git_and_the_api() {
+    let s = TestServer::start().await;
+    let alice = s.user("alice").await;
+    s.repo(&alice, "proj", Visibility::Public).await;
+    let token = s.token(&alice, &[Scope::RepoWrite]).await;
+    let client = reqwest::Client::new();
+    let api = |path: &str| s.url(&format!("/api/v1{path}"));
+    let res = client
+        .post(api("/orgs"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"handle": "acme"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 201);
+    let tmp = tempfile::tempdir().unwrap();
+    let work = work_repo(tmp.path(), "work", &[("src/main.rs", "fn main() {}\n")]).await;
+    git_ok(
+        &work,
+        &[
+            "push",
+            "-q",
+            &s.git_url("alice", "proj", Some(&token)),
+            "main",
+        ],
+    )
+    .await;
+
+    let moved = client
+        .post(api("/repos/alice/proj/transfer"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"new_owner": "acme"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(moved.status(), 200);
+    assert_eq!(
+        moved.json::<Value>().await.unwrap()["full_name"],
+        "acme/proj"
+    );
+
+    let browser = s.browser();
+    let page = browser.get(s.url("/alice/proj")).send().await.unwrap();
+    assert_eq!(page.status(), 301);
+    assert_eq!(page.headers()["location"], "/acme/proj");
+    let page = browser
+        .get(s.url("/alice/proj/tree/main/src?x=1"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(page.status(), 301);
+    assert_eq!(page.headers()["location"], "/acme/proj/tree/main/src?x=1");
+
+    let api_res = browser
+        .get(s.url("/api/v1/repos/alice/proj"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(api_res.status(), 301);
+    assert_eq!(api_res.headers()["location"], "/api/v1/repos/acme/proj");
+
+    git_ok(
+        tmp.path(),
+        &[
+            "clone",
+            "-q",
+            &s.git_url("alice", "proj", None),
+            "anonymous",
+        ],
+    )
+    .await;
+    assert!(tmp.path().join("anonymous/src/main.rs").is_file());
+    commit_files(
+        &work,
+        &[("more.txt", b"more\n")],
+        "pushed through the old name",
+    )
+    .await;
+    git_ok(
+        &work,
+        &[
+            "push",
+            "-q",
+            &s.git_url("alice", "proj", Some(&token)),
+            "main",
+        ],
+    )
+    .await;
+    assert!(
+        get_text(&browser, &s.url("/acme/proj/commits/main"))
+            .await
+            .contains("pushed through the old name")
+    );
+}

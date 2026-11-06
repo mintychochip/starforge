@@ -1598,6 +1598,7 @@ mod tests {
     async fn proj(core: &Core, owner: &User, visibility: Visibility) -> String {
         core.create_repo(
             owner,
+            &owner.handle,
             CreateRepo {
                 name: "proj".into(),
                 description: String::new(),

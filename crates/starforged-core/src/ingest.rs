@@ -1045,6 +1045,7 @@ mod tests {
         let alice = user(&core, "alice").await;
         core.create_repo(
             &alice,
+            "alice",
             CreateRepo {
                 name: "proj".into(),
                 description: String::new(),

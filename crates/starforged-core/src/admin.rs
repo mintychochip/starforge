@@ -602,6 +602,7 @@ mod tests {
         let owner = plain_user(&core, "owner").await;
         core.create_repo(
             &owner,
+            &owner.handle,
             CreateRepo {
                 name: "proj".into(),
                 description: String::new(),
@@ -714,6 +715,7 @@ mod tests {
         for (owner, name) in [(&alice, "aproj"), (&bob, "bproj"), (&alice, "live")] {
             core.create_repo(
                 owner,
+                &owner.handle,
                 CreateRepo {
                     name: (*name).into(),
                     description: String::new(),
@@ -791,6 +793,7 @@ mod tests {
         let (core, root, _vice) = two_admins().await;
         core.create_repo(
             &root,
+            &root.handle,
             CreateRepo {
                 name: "proj".into(),
                 description: String::new(),

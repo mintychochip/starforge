@@ -165,6 +165,46 @@ pub async fn list_repos(
     Ok(Json(out))
 }
 
+/// `POST /orgs/{org}/repos` (D5): org owners create repositories in the org.
+/// The body matches user repository creation; anything else is 422.
+pub async fn create_repo(
+    State(state): State<ApiState>,
+    auth: ApiAuth,
+    Path(org): Path<String>,
+    body: Result<Json<crate::repos::CreateRepoBody>, JsonRejection>,
+) -> Result<(StatusCode, Json<RepoJson>), ApiError> {
+    use starforged_core::permission::{Permission, Visibility};
+    use starforged_core::repos::{CreateRepo, RepoAccess};
+    let auth = auth.require(Scope::RepoWrite)?;
+    let Json(body) = body.map_err(|e| ApiError::Invalid(e.body_text()))?;
+    let visibility = Visibility::parse(&body.visibility).ok_or_else(|| {
+        ApiError::Invalid("visibility must be public, internal, or private".into())
+    })?;
+    let repo = state
+        .core
+        .create_repo(
+            &auth.user,
+            &org,
+            CreateRepo {
+                name: body.name,
+                description: body.description,
+                visibility,
+                readme: body.readme,
+            },
+        )
+        .await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(repo_json(
+            &state,
+            RepoAccess {
+                repo,
+                permission: Permission::Admin,
+            },
+        )),
+    ))
+}
+
 /// `GET /orgs/{org}/members`: members and site admins only, 404 otherwise.
 pub async fn list_members(
     State(state): State<ApiState>,
