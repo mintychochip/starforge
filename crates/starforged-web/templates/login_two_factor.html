@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block title %}Two-factor sign-in · Starforge{% endblock %}
+{% block content %}
+<h1>Two-factor authentication</h1>
+{% if let Some(e) = error %}<p class="error">{{ e }}</p>{% endif %}
+<p>Enter the 6-digit code from your authenticator app, or one of your recovery codes.</p>
+<form method="post" action="/login/two-factor" class="stack">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <input type="hidden" name="next" value="{{ next }}">
+  <label>Code <input name="code" autocomplete="one-time-code" required></label>
+  <button type="submit">Verify</button>
+</form>
+{% endblock %}

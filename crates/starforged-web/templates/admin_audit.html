@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block title %}Audit log · Site administration{% endblock %}
+{% block content %}
+<h1>Site administration</h1>
+{% include "admin_nav.html" %}
+<section>
+  <h2>Audit log</h2>
+  <form method="get" action="/admin/audit" class="stack">
+    <label>Actor <input name="actor" type="search" value="{{ actor }}" autocomplete="off"></label>
+    <label>Action <input name="action" type="search" value="{{ action }}" autocomplete="off" placeholder="exact, or prefix like session."></label>
+    <label>Target <input name="target" type="search" value="{{ target }}" autocomplete="off"></label>
+    <label>From <input name="from" type="date" value="{{ from }}"></label>
+    <label>To <input name="to" type="date" value="{{ to }}"></label>
+    <button type="submit">Filter</button>
+  </form>
+  {% if entries.is_empty() %}
+  <p>No audit entries match.</p>
+  {% else %}
+  <table>
+    <thead>
+      <tr><th>Time</th><th>Actor</th><th>Action</th><th>Target</th><th>IP</th><th>User agent</th></tr>
+    </thead>
+    <tbody>
+      {% for entry in entries %}
+      <tr>
+        <td>{{ entry.time }}</td>
+        <td>{{ entry.actor }}</td>
+        <td>{{ entry.action }}</td>
+        <td>{{ entry.target }}</td>
+        <td>{{ entry.ip }}</td>
+        <td>{{ entry.user_agent }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% if let Some(after) = next_after %}
+  <p><a href="/admin/audit?actor={{ actor }}&amp;action={{ action }}&amp;target={{ target }}&amp;from={{ from }}&amp;to={{ to }}&amp;after={{ after }}">Older entries</a></p>
+  {% endif %}
+  {% endif %}
+</section>
+{% endblock %}

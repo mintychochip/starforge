@@ -25,6 +25,7 @@ pub async fn open_core(config: &Config, hook_exe: PathBuf) -> anyhow::Result<Cor
             repos_dir: config.repos_dir(),
             tmp_dir: config.tmp_dir(),
             blob_dir: config.blob_dir(),
+            index_dir: config.index_dir(),
             max_segment_bytes: config.sessions.max_segment_bytes,
             max_repo_bytes: config.sessions.max_repo_bytes,
             max_user_bytes: config.sessions.max_user_bytes,
@@ -37,6 +38,13 @@ pub async fn open_core(config: &Config, hook_exe: PathBuf) -> anyhow::Result<Cor
             mailer: config.mailer()?,
             registration: config.registration_settings()?,
             webhook_key: WebhookKey(webhook_key(&config.security.secret_key)?),
+            credential_box: starforged_core::crypto::CredentialBox::new(&webhook_key(
+                &config.security.secret_key,
+            )?),
+            // Test-only escape hatch for the outbound remote URL policy
+            // (`STARFORGE__REMOTES__ALLOW_FILE_URLS=1` or
+            // `[remotes] allow_file_urls = true`). Production never sets it.
+            allow_file_urls: config.remotes.allow_file_urls,
             // Test-only escape hatch for the integration suite's in-process
             // receiver (`STARFORGE__WEBHOOKS__ALLOW_LOOPBACK=1` or
             // `[webhooks] allow_loopback = true`). Production never sets it.

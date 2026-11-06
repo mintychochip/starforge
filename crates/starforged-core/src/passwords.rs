@@ -181,7 +181,8 @@ mod tests {
         let (_, session) = core
             .login("alice", PASSWORD, "ua", "127.0.0.1")
             .await
-            .unwrap();
+            .unwrap()
+            .into_session();
         core.request_password_reset("alice@example.com")
             .await
             .unwrap();

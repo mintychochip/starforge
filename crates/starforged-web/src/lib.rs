@@ -53,6 +53,10 @@ fn page_routes() -> Router<AppState> {
     Router::new()
         .route("/", get(pages::dashboard::show))
         .route("/login", get(pages::login::form).post(pages::login::submit))
+        .route(
+            "/login/two-factor",
+            get(pages::login::two_factor_form).post(pages::login::two_factor_submit),
+        )
         .route("/join", get(pages::join::form).post(pages::join::submit))
         .route("/logout", post(pages::login::logout))
         .route("/oauth/device", get(pages::device::show))
@@ -105,6 +109,14 @@ fn page_routes() -> Router<AppState> {
             get(pages::tokens::list).post(pages::tokens::create),
         )
         .route("/settings/tokens/{id}/revoke", post(pages::tokens::revoke))
+        .route(
+            "/settings/keys",
+            get(pages::sshkeys::user_list).post(pages::sshkeys::user_add),
+        )
+        .route(
+            "/settings/keys/{id}/remove",
+            post(pages::sshkeys::user_remove),
+        )
         .route("/settings/repositories", get(pages::settings::repositories))
         .route(
             "/settings/repositories/{id}/restore",
@@ -113,6 +125,10 @@ fn page_routes() -> Router<AppState> {
         .route(
             "/settings/delete",
             get(pages::settings::delete_account_form).post(pages::settings::delete_account),
+        )
+        .route(
+            "/settings/two-factor",
+            get(pages::settings_2fa::index).post(pages::settings_2fa::submit),
         )
         .route("/admin", get(pages::admin::overview))
         .route(
@@ -142,6 +158,10 @@ fn page_routes() -> Router<AppState> {
             post(pages::admin::reset_password),
         )
         .route(
+            "/admin/users/{handle}/reset-2fa",
+            post(pages::admin::reset_2fa),
+        )
+        .route(
             "/admin/invites",
             get(pages::admin::invites).post(pages::admin::create_invite),
         )
@@ -160,6 +180,7 @@ fn page_routes() -> Router<AppState> {
             post(pages::admin::purge_repo),
         )
         .route("/admin/jobs", get(pages::admin::jobs))
+        .route("/admin/audit", get(pages::admin::audit_page))
         .route("/admin/jobs/{id}/retry", post(pages::admin::retry_job))
         .route("/admin/jobs/{id}/delete", post(pages::admin::delete_job))
         .route(
@@ -301,6 +322,14 @@ fn page_routes() -> Router<AppState> {
         .route(
             "/{owner}/{repo}/settings/collaborators/{handle}/remove",
             post(pages::collaborators::remove),
+        )
+        .route(
+            "/{owner}/{repo}/settings/keys",
+            get(pages::sshkeys::deploy_list).post(pages::sshkeys::deploy_add),
+        )
+        .route(
+            "/{owner}/{repo}/settings/keys/{id}/remove",
+            post(pages::sshkeys::deploy_remove),
         )
         .route("/{owner}/{repo}", get(pages::code::repo_home))
         .route("/{owner}/{repo}/tree/{*rest}", get(pages::code::tree))

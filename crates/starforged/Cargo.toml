@@ -21,6 +21,7 @@ starforged-blob = { path = "../starforged-blob" }
 starforged-core = { path = "../starforged-core" }
 starforged-db = { path = "../starforged-db" }
 starforged-git = { path = "../starforged-git" }
+starforged-index = { path = "../starforged-index" }
 starforged-web = { path = "../starforged-web" }
 tokio.workspace = true
 toml.workspace = true
@@ -39,3 +40,4 @@ starforged-core = { path = "../starforged-core", features = ["testing"] }
 starforged-db = { path = "../starforged-db", features = ["testing"] }
 tempfile.workspace = true
 time.workspace = true
+starforged-index = { path = "../starforged-index" }

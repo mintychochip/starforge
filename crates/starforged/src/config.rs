@@ -28,6 +28,10 @@ pub struct Config {
     /// Push policy tuning. Missing section defaults cleanly (no extra namespaces).
     #[serde(default)]
     pub git: GitConfig,
+    /// Import/mirror tuning. Missing section defaults cleanly (test-only
+    /// file-URL flag off).
+    #[serde(default)]
+    pub remotes: RemotesConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,9 +64,18 @@ fn default_true() -> bool {
     true
 }
 
+fn default_index_dir() -> PathBuf {
+    PathBuf::from("index")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StorageConfig {
     pub data_dir: PathBuf,
+    /// Search index directory (spec §5.3). An absolute `index_dir` is used
+    /// verbatim; a relative one resolves against `storage.data_dir` (like
+    /// `sessions.blob_dir` does, see [`Config::index_dir`]).
+    #[serde(default = "default_index_dir")]
+    pub index_dir: PathBuf,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -214,6 +227,16 @@ pub struct GitConfig {
     pub allowed_ref_namespaces: Vec<String>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemotesConfig {
+    /// Test-only escape hatch for the outbound remote URL policy (M4b):
+    /// when true, `file://`/local-path remotes and loopback hosts are
+    /// admitted (the import/mirror integration suite). Always false in
+    /// production.
+    #[serde(default)]
+    pub allow_file_urls: bool,
+}
+
 impl Config {
     /// Reads `path`, applies environment overrides, and validates.
     pub fn load(path: &Path) -> anyhow::Result<Config> {
@@ -241,6 +264,7 @@ impl Config {
                 "database__url" => self.database.url = value,
                 "database__auto_migrate" => self.database.auto_migrate = parse_bool(&key, &value)?,
                 "storage__data_dir" => self.storage.data_dir = PathBuf::from(value),
+                "storage__index_dir" => self.storage.index_dir = PathBuf::from(value),
                 "security__secret_key" => self.security.secret_key = value,
                 "mail__url" => self.mail.url = value,
                 "mail__from" => self.mail.from = value,
@@ -288,6 +312,9 @@ impl Config {
                 }
                 "webhooks__allow_loopback" => {
                     self.webhooks.allow_loopback = parse_bool(&key, &value)?;
+                }
+                "remotes__allow_file_urls" => {
+                    self.remotes.allow_file_urls = parse_bool(&key, &value)?;
                 }
                 "git__allowed_ref_namespaces" => {
                     self.git.allowed_ref_namespaces = value
@@ -380,6 +407,17 @@ impl Config {
         }
     }
 
+    /// Resolved search index directory: an absolute `storage.index_dir` is
+    /// used verbatim, a relative one resolves against `storage.data_dir`
+    /// (the same rule as [`Config::blob_dir`]). Defaults to `index`.
+    pub fn index_dir(&self) -> PathBuf {
+        if self.storage.index_dir.is_absolute() {
+            self.storage.index_dir.clone()
+        } else {
+            self.storage.data_dir.join(&self.storage.index_dir)
+        }
+    }
+
     /// Cookies carry `Secure` when the public URL is HTTPS.
     pub fn secure_cookies(&self) -> bool {
         self.server.base_url.starts_with("https://")
@@ -412,6 +450,7 @@ mod tests {
             database: DatabaseConfig::default(),
             storage: StorageConfig {
                 data_dir: PathBuf::from("/srv/starforge"),
+                index_dir: PathBuf::from("index"),
             },
             security: SecurityConfig {
                 secret_key: "ab".repeat(32),
@@ -421,6 +460,7 @@ mod tests {
             sessions: SessionsConfig::default(),
             webhooks: WebhooksConfig::default(),
             git: GitConfig::default(),
+            remotes: RemotesConfig::default(),
         }
     }
 
@@ -451,6 +491,19 @@ mod tests {
         assert_eq!(config.server.http_addr, "0.0.0.0:80");
         assert_eq!(config.database.url, "postgres://db/starforge");
         assert!(!config.database.auto_migrate);
+    }
+
+    #[test]
+    fn index_dir_defaults_under_the_data_dir_and_overrides() {
+        assert_eq!(sample().index_dir(), PathBuf::from("/srv/starforge/index"));
+        let mut config = sample();
+        config
+            .apply_env([(
+                "STARFORGE__STORAGE__INDEX_DIR".to_owned(),
+                "/elsewhere/idx".to_owned(),
+            )])
+            .unwrap();
+        assert_eq!(config.index_dir(), PathBuf::from("/elsewhere/idx"));
     }
 
     #[test]

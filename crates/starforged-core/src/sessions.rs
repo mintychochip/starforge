@@ -1,11 +1,17 @@
 //! Browser sessions (spec §9): random cookie value stored as SHA-256, 30-day lifetime, per-session CSRF token.
 
+use starforged_db::auth_factors;
 use starforged_db::web_sessions::{self, NewWebSession};
 
 use crate::accounts::User;
 use crate::{Core, CoreError, CoreResult, crypto};
 
 pub const WEB_SESSION_TTL_SECS: i64 = 30 * 86_400;
+
+/// How long a `totp` login challenge stays usable (spec §9 D2).
+pub const SECOND_FACTOR_TTL_SECS: i64 = 5 * 60;
+/// Failed codes after which a challenge is voided.
+pub const MAX_SECOND_FACTOR_ATTEMPTS: i64 = 5;
 
 /// A session's last-activity time is written at most this often.
 const TOUCH_INTERVAL_SECS: i64 = 300;
@@ -26,15 +32,43 @@ pub struct NewSession {
     pub max_age_secs: i64,
 }
 
+/// What a password check produced. A user with TOTP enabled gets no web
+/// session until the second factor passes: the browser carries the
+/// challenge token (in an `HttpOnly` cookie) to complete the login.
+#[derive(Debug, Clone)]
+pub enum LoginOutcome {
+    /// The web session was opened.
+    Session(User, NewSession),
+    /// The password was right; the second factor must complete the login.
+    /// The inner string is the random challenge token for the browser cookie.
+    NeedsSecondFactor(String),
+}
+
+impl LoginOutcome {
+    /// The session, for callers (mostly tests) whose user has no 2FA.
+    /// Panics when the login instead needs a second factor.
+    pub fn into_session(self) -> (User, NewSession) {
+        match self {
+            LoginOutcome::Session(user, session) => (user, session),
+            LoginOutcome::NeedsSecondFactor(_) => {
+                panic!("login needs a second factor; complete the challenge first")
+            }
+        }
+    }
+}
+
 impl Core {
-    /// Checks the password and opens a session. Successes and failures are audited with the client address.
+    /// Checks the password. Without 2FA it opens a session at once; with
+    /// TOTP enabled it starts a login challenge (5-minute expiry) and
+    /// returns [`LoginOutcome::NeedsSecondFactor`] instead. Successes and
+    /// failures are audited with the client address.
     pub async fn login(
         &self,
         login: &str,
         password: &str,
         user_agent: &str,
         ip: &str,
-    ) -> CoreResult<(User, NewSession)> {
+    ) -> CoreResult<LoginOutcome> {
         let user_agent: String = user_agent.chars().take(256).collect();
         let user = match self.authenticate_password(login, password).await {
             Ok(user) => user,
@@ -58,20 +92,19 @@ impl Core {
             .await?;
             return Err(CoreError::EmailUnverified);
         }
-        let cookie_value = crypto::random_hex(32);
-        let csrf_token = crypto::random_hex(32);
-        web_sessions::insert(
-            self.db(),
-            &NewWebSession {
-                session_hash: &crypto::sha256_hex(&cookie_value),
-                user_id: user.id,
-                csrf_token: &csrf_token,
-                expires_at: starforged_db::now() + WEB_SESSION_TTL_SECS,
-                user_agent: &user_agent,
-                ip,
-            },
-        )
-        .await?;
+        if self.totp_enabled(user.id).await? {
+            let token = crypto::random_hex(32);
+            auth_factors::insert_challenge(
+                self.db(),
+                "totp",
+                Some(user.id),
+                &crypto::sha256_hex(&token),
+                starforged_db::now() + SECOND_FACTOR_TTL_SECS,
+            )
+            .await?;
+            return Ok(LoginOutcome::NeedsSecondFactor(token));
+        }
+        let session = self.open_session(&user, &user_agent, ip).await?;
         self.audit_client(
             Some(user.id),
             "auth.login",
@@ -81,14 +114,110 @@ impl Core {
             &user_agent,
         )
         .await?;
-        Ok((
-            user,
-            NewSession {
-                cookie_value,
-                csrf_token,
-                max_age_secs: WEB_SESSION_TTL_SECS,
+        Ok(LoginOutcome::Session(user, session))
+    }
+
+    /// Opens a web session for an already-authenticated user.
+    async fn open_session(
+        &self,
+        user: &User,
+        user_agent: &str,
+        ip: &str,
+    ) -> CoreResult<NewSession> {
+        let cookie_value = crypto::random_hex(32);
+        let csrf_token = crypto::random_hex(32);
+        web_sessions::insert(
+            self.db(),
+            &NewWebSession {
+                session_hash: &crypto::sha256_hex(&cookie_value),
+                user_id: user.id,
+                csrf_token: &csrf_token,
+                expires_at: starforged_db::now() + WEB_SESSION_TTL_SECS,
+                user_agent,
+                ip,
             },
-        ))
+        )
+        .await?;
+        Ok(NewSession {
+            cookie_value,
+            csrf_token,
+            max_age_secs: WEB_SESSION_TTL_SECS,
+        })
+    }
+
+    /// Completes a `totp` login challenge with a TOTP code or a recovery
+    /// code. Every failed code writes `login.2fa_failure`; five failures
+    /// void the challenge. Success opens the web session and writes
+    /// `auth.login`. An unknown or expired challenge is `Unauthenticated`
+    /// (start again); a wrong code on a live challenge is `Invalid`.
+    pub async fn complete_second_factor(
+        &self,
+        challenge_token: &str,
+        code: &str,
+        user_agent: &str,
+        ip: &str,
+    ) -> CoreResult<(User, NewSession)> {
+        let user_agent: String = user_agent.chars().take(256).collect();
+        let hash = crypto::sha256_hex(challenge_token.trim());
+        let challenge = auth_factors::challenge_by_token_hash(self.db(), &hash)
+            .await?
+            .ok_or(CoreError::Unauthenticated)?;
+        let user_id = challenge.user_id.ok_or(CoreError::Unauthenticated)?;
+        let user = self
+            .user_by_id(user_id)
+            .await?
+            .filter(|u| u.active)
+            .ok_or(CoreError::Unauthenticated)?;
+        if starforged_db::now() > challenge.expires_at {
+            auth_factors::delete_challenge(self.db(), challenge.id).await?;
+            self.audit_client(
+                Some(user.id),
+                "login.2fa_failure",
+                &format!("user:{}", user.handle),
+                "challenge expired",
+                ip,
+                &user_agent,
+            )
+            .await?;
+            return Err(CoreError::Unauthenticated);
+        }
+        let code = code.trim();
+        let totp_ok = self.check_totp_code(&user, code).await.is_ok();
+        let recovery_ok = !totp_ok
+            && auth_factors::consume_recovery_code(
+                self.db(),
+                user.id,
+                &crypto::sha256_hex(&crate::totp::normalize_recovery_code(code)),
+            )
+            .await?;
+        if !totp_ok && !recovery_ok {
+            let attempts = auth_factors::bump_challenge_attempts(self.db(), challenge.id).await?;
+            self.audit_client(
+                Some(user.id),
+                "login.2fa_failure",
+                &format!("user:{}", user.handle),
+                "bad code",
+                ip,
+                &user_agent,
+            )
+            .await?;
+            if attempts >= MAX_SECOND_FACTOR_ATTEMPTS {
+                auth_factors::delete_challenge(self.db(), challenge.id).await?;
+            }
+            return Err(CoreError::Invalid("That code is not valid.".into()));
+        }
+        auth_factors::delete_challenge(self.db(), challenge.id).await?;
+        let session = self.open_session(&user, &user_agent, ip).await?;
+        self.audit_client(
+            Some(user.id),
+            "auth.login",
+            &format!("user:{}", user.handle),
+            "",
+            ip,
+            &user_agent,
+        )
+        .await?;
+        Ok((user, session))
     }
 
     /// The user behind a session cookie, if the session is unexpired and the user is active.
@@ -147,7 +276,8 @@ mod tests {
         let (user, session) = core
             .login("alice", PASSWORD, "ua", "127.0.0.1")
             .await
-            .unwrap();
+            .unwrap()
+            .into_session();
         assert_eq!(user.id, alice.id);
         assert_eq!(session.max_age_secs, WEB_SESSION_TTL_SECS);
         let found = core
@@ -198,7 +328,8 @@ mod tests {
         let (_, session) = core
             .login("alice", PASSWORD, "ua", "127.0.0.1")
             .await
-            .unwrap();
+            .unwrap()
+            .into_session();
         sqlx::query("UPDATE web_sessions SET expires_at = $1")
             .bind(0_i64)
             .execute(core.db().pool())

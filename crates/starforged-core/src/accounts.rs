@@ -120,7 +120,7 @@ pub(crate) async fn hash_password(password: String) -> CoreResult<String> {
     .map_err(|e| CoreError::Internal(e.to_string()))
 }
 
-async fn verify_password(stored: Option<String>, password: String) -> CoreResult<bool> {
+pub(crate) async fn verify_password(stored: Option<String>, password: String) -> CoreResult<bool> {
     tokio::task::spawn_blocking(move || {
         let hash = stored.unwrap_or_else(|| dummy_hash().to_owned());
         PasswordHash::new(&hash)

@@ -21,6 +21,8 @@ pub mod repo_new;
 pub mod repo_settings;
 pub mod session;
 pub mod settings;
+pub mod settings_2fa;
+pub mod sshkeys;
 pub mod tokens;
 pub mod trails;
 pub mod verify;

@@ -559,6 +559,7 @@ async fn invalid_namespace_entry_fails_startup() {
         },
         storage: StorageConfig {
             data_dir: data.path().to_path_buf(),
+            index_dir: PathBuf::from("index"),
         },
         security: SecurityConfig {
             secret_key: "0".repeat(64),
@@ -570,6 +571,7 @@ async fn invalid_namespace_entry_fails_startup() {
         git: GitConfig {
             allowed_ref_namespaces: vec!["refs/heads/evil/".into()],
         },
+        remotes: starforged::config::RemotesConfig::default(),
     };
     let err =
         match starforged::serve::build(&config, PathBuf::from(env!("CARGO_BIN_EXE_starforged")))

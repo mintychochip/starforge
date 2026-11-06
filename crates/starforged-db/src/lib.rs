@@ -14,6 +14,7 @@ use sqlx::Executor;
 use sqlx::any::AnyPoolOptions;
 
 pub mod audit;
+pub mod auth_factors;
 pub mod changes;
 pub mod checks;
 pub mod collaborators;
@@ -26,6 +27,7 @@ pub mod protection;
 pub mod redirects;
 pub mod repos;
 pub mod sessions;
+pub mod sshkeys;
 pub mod tokens;
 pub mod trails;
 pub mod users;

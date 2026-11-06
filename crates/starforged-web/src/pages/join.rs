@@ -135,7 +135,8 @@ pub async fn submit(
                     user_agent,
                     &addr.ip().to_string(),
                 )
-                .await?;
+                .await?
+                .into_session();
             let cookie = session_cookie(
                 session.cookie_value,
                 state.settings.secure_cookies,

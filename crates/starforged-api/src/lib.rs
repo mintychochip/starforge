@@ -1,5 +1,6 @@
 //! starforged-api: the JSON REST API under `/api/v1` (spec §10.4). A thin layer over `starforged-core`.
 
+mod admin;
 pub mod auth;
 mod changes;
 pub mod error;
@@ -9,6 +10,7 @@ mod oauth;
 mod orgs;
 mod repos;
 mod sessions;
+mod sshkeys;
 mod statuses;
 mod tag_protections;
 mod time;
@@ -50,8 +52,14 @@ pub fn router(core: Core, base_url: String) -> Router {
         base_url: Arc::from(base_url),
     };
     Router::new()
+        .route("/admin/audit", get(admin::audit))
         .route("/user", get(user::show))
         .route("/user/repos", post(repos::create))
+        .route(
+            "/user/keys",
+            get(sshkeys::list_user_keys).post(sshkeys::create_user_key),
+        )
+        .route("/user/keys/{id}", delete(sshkeys::delete_user_key))
         .route("/orgs", post(orgs::create))
         .route(
             "/orgs/{org}",
@@ -102,6 +110,14 @@ pub fn router(core: Core, base_url: String) -> Router {
         .route(
             "/repos/{owner}/{repo}/collaborators/{handle}",
             put(repos::set_collaborator).delete(repos::remove_collaborator),
+        )
+        .route(
+            "/repos/{owner}/{repo}/keys",
+            get(sshkeys::list_deploy_keys).post(sshkeys::create_deploy_key),
+        )
+        .route(
+            "/repos/{owner}/{repo}/keys/{id}",
+            delete(sshkeys::delete_deploy_key),
         )
         .route("/repos/{owner}/{repo}/transfer", post(repos::transfer))
         .route(

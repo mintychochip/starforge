@@ -1,6 +1,6 @@
 //! `starforged init`: writes a fresh `starforged.toml` and data directory.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
 
@@ -36,7 +36,10 @@ pub fn run(opts: &InitOptions<'_>) -> anyhow::Result<Config> {
             base_url: opts.base_url.trim_end_matches('/').to_owned(),
         },
         database: DatabaseConfig::default(),
-        storage: StorageConfig { data_dir },
+        storage: StorageConfig {
+            data_dir,
+            index_dir: PathBuf::from("index"),
+        },
         security: SecurityConfig {
             secret_key: hex::encode(key),
         },
@@ -45,6 +48,7 @@ pub fn run(opts: &InitOptions<'_>) -> anyhow::Result<Config> {
         sessions: SessionsConfig::default(),
         webhooks: WebhooksConfig::default(),
         git: GitConfig::default(),
+        remotes: crate::config::RemotesConfig::default(),
     };
     config.validate()?;
     // Document the blob_dir resolution rule in the generated file so operators

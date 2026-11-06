@@ -1,6 +1,7 @@
 <nav class="tabs" aria-label="Repository settings">
 <a href="/{{ head.owner }}/{{ head.name }}/settings"{% if settings_page == "general" %} aria-current="page"{% endif %}>General</a>
 {% if head.can_admin %}<a href="/{{ head.owner }}/{{ head.name }}/settings/collaborators"{% if settings_page == "collaborators" %} aria-current="page"{% endif %}>Collaborators</a>{% endif %}
+{% if head.can_admin %}<a href="/{{ head.owner }}/{{ head.name }}/settings/keys"{% if settings_page == "keys" %} aria-current="page"{% endif %}>Deploy keys</a>{% endif %}
 {% if head.can_maintain %}<a href="/{{ head.owner }}/{{ head.name }}/settings/hooks"{% if settings_page == "hooks" %} aria-current="page"{% endif %}>Hooks</a>{% endif %}
 {% if head.can_maintain %}<a href="/{{ head.owner }}/{{ head.name }}/settings/protection"{% if settings_page == "protection" %} aria-current="page"{% endif %}>Protection</a>{% endif %}
 </nav>

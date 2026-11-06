@@ -11,5 +11,6 @@ pub mod merge;
 pub mod pushsidecar;
 pub mod read;
 pub mod refpolicy;
+pub mod remote;
 pub mod write;
 pub use command::GitError;

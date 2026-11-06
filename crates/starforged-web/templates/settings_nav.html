@@ -2,8 +2,10 @@
   <a href="/settings/profile"{% if settings_tab == "profile" %} aria-current="page"{% endif %}>Profile</a>
   <a href="/settings/email"{% if settings_tab == "email" %} aria-current="page"{% endif %}>Email</a>
   <a href="/settings/password"{% if settings_tab == "password" %} aria-current="page"{% endif %}>Password</a>
+  <a href="/settings/two-factor"{% if settings_tab == "two-factor" %} aria-current="page"{% endif %}>Two-factor</a>
   <a href="/settings/sessions"{% if settings_tab == "sessions" %} aria-current="page"{% endif %}>Sessions</a>
   <a href="/settings/tokens"{% if settings_tab == "tokens" %} aria-current="page"{% endif %}>Tokens</a>
+  <a href="/settings/keys"{% if settings_tab == "keys" %} aria-current="page"{% endif %}>SSH keys</a>
   <a href="/settings/repositories"{% if settings_tab == "repositories" %} aria-current="page"{% endif %}>Repositories</a>
   <a href="/settings/delete"{% if settings_tab == "delete" %} aria-current="page"{% endif %}>Delete account</a>
 </nav>

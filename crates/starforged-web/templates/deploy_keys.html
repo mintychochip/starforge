@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% block title %}Deploy keys · {{ head.owner }}/{{ head.name }}{% endblock %}
+{% block content %}
+{% include "repo_head.html" %}
+{% include "repo_settings_nav.html" %}
+{% if let Some(e) = error %}<p class="error">{{ e }}</p>{% endif %}
+<h2>Deploy keys</h2>
+{% if keys.is_empty() %}
+<p class="muted">No deploy keys yet.</p>
+{% else %}
+<table class="list">
+<thead><tr><th>Title</th><th>Fingerprint</th><th>Access</th><th>Added</th><th>Last used</th><th></th></tr></thead>
+<tbody>
+{% for k in keys %}
+<tr>
+<td>{{ k.title }}</td><td><code>{{ k.fingerprint }}</code></td><td>{{ k.access }}</td><td>{{ k.created }}</td><td>{{ k.last_used }}</td>
+<td><form method="post" action="/{{ head.owner }}/{{ head.name }}/settings/keys/{{ k.id }}/remove" class="inline"><input type="hidden" name="_csrf" value="{{ csrf }}"><button type="submit">Remove</button></form></td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+{% endif %}
+<h2>Add a deploy key</h2>
+<form method="post" action="/{{ head.owner }}/{{ head.name }}/settings/keys" class="stack">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <label>Title <input name="title" required maxlength="128"></label>
+  <label>Public key <textarea name="key" required rows="4"></textarea></label>
+  <label class="check"><input type="checkbox" name="read_write" value="1"> Read-write access</label>
+  <button type="submit">Add key</button>
+</form>
+{% endblock %}

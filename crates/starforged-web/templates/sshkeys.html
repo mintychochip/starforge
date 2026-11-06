@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% block title %}SSH keys · Starforge{% endblock %}
+{% block content %}
+{% include "settings_nav.html" %}
+<h1>SSH keys</h1>
+{% if let Some(e) = error %}<p class="error">{{ e }}</p>{% endif %}
+<form method="post" action="/settings/keys" class="stack">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <label>Title <input name="title" required maxlength="128"></label>
+  <label>Public key <textarea name="key" required rows="4"></textarea></label>
+  <button type="submit">Add key</button>
+</form>
+<h2>Existing keys</h2>
+{% if keys.is_empty() %}
+<p class="muted">No SSH keys yet.</p>
+{% else %}
+<table class="list">
+<thead><tr><th>Title</th><th>Fingerprint</th><th>Added</th><th>Last used</th><th></th></tr></thead>
+<tbody>
+{% for k in keys %}
+<tr>
+<td>{{ k.title }}</td><td><code>{{ k.fingerprint }}</code></td><td>{{ k.created }}</td><td>{{ k.last_used }}</td>
+<td><form method="post" action="/settings/keys/{{ k.id }}/remove" class="inline"><input type="hidden" name="_csrf" value="{{ csrf }}"><button type="submit">Remove</button></form></td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+{% endif %}
+{% endblock %}

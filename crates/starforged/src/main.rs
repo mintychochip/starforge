@@ -39,12 +39,24 @@ enum Command {
         #[command(subcommand)]
         command: AdminCommand,
     },
+    /// Search index administration.
+    Index {
+        #[command(subcommand)]
+        command: IndexCommand,
+    },
     /// Entry points for git hooks in hosted repositories.
     #[command(hide = true)]
     Hook {
         #[command(subcommand)]
         hook: HookCommand,
     },
+}
+
+#[derive(Subcommand)]
+enum IndexCommand {
+    /// Wipe and rebuild the search index from the database and blobs. The
+    /// server must be stopped (or use the site-admin rebuild action).
+    Rebuild,
 }
 
 #[derive(Subcommand)]
@@ -191,6 +203,11 @@ async fn main() -> anyhow::Result<()> {
                     println!("sent a test email to {to}");
                 }
             }
+        }
+        Command::Index {
+            command: IndexCommand::Rebuild,
+        } => {
+            starforged::index_cmd::rebuild(&Config::load(&cli.config)?).await?;
         }
         Command::Hook {
             hook: HookCommand::PreReceive,

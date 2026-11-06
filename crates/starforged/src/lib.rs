@@ -3,5 +3,6 @@
 pub mod admin;
 pub mod config;
 pub mod hook;
+pub mod index_cmd;
 pub mod init;
 pub mod serve;

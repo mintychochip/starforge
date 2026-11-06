@@ -179,7 +179,10 @@ impl Core {
     /// segment bytes (missing blob, failed decompression, non-UTF-8) become
     /// [`SessionPageItem::UnreadableSegment`]; unparseable lines are skipped
     /// with a warning, never failing the page.
-    async fn load_session_items(&self, session_id: i64) -> CoreResult<Vec<SessionPageItem>> {
+    pub(crate) async fn load_session_items(
+        &self,
+        session_id: i64,
+    ) -> CoreResult<Vec<SessionPageItem>> {
         let session = db_sessions::session_by_id(self.db(), session_id)
             .await?
             .ok_or(CoreError::NotFound)?;

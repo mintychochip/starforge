@@ -41,6 +41,7 @@ impl TestServer {
             },
             storage: StorageConfig {
                 data_dir: data.path().to_path_buf(),
+                index_dir: PathBuf::from("index"),
             },
             security: SecurityConfig {
                 secret_key: "0".repeat(64),
@@ -50,6 +51,7 @@ impl TestServer {
             sessions: SessionsConfig::default(),
             webhooks: WebhooksConfig::default(),
             git: GitConfig::default(),
+            remotes: starforged::config::RemotesConfig::default(),
         };
         configure(&mut config);
         let app =

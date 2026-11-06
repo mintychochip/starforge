@@ -231,11 +231,13 @@ mod tests {
         let (_, first) = core
             .login("alice", PASSWORD, "ua", "127.0.0.1")
             .await
-            .unwrap();
+            .unwrap()
+            .into_session();
         let (_, second) = core
             .login("alice", PASSWORD, "ua", "127.0.0.1")
             .await
-            .unwrap();
+            .unwrap()
+            .into_session();
         let current = core
             .web_session(&first.cookie_value)
             .await
@@ -309,7 +311,8 @@ mod tests {
         let (_, session) = core
             .login("alice", PASSWORD, "ua", "127.0.0.1")
             .await
-            .unwrap();
+            .unwrap()
+            .into_session();
         let last_seen = || async {
             let ts: i64 = sqlx::query_scalar("SELECT last_seen_at FROM web_sessions")
                 .fetch_one(core.db().pool())

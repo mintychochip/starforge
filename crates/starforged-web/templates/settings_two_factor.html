@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+{% block title %}Two-factor authentication · Settings · Starforge{% endblock %}
+{% block content %}
+{% include "settings_nav.html" %}
+<h1>Two-factor authentication</h1>
+{% if let Some(n) = notice %}<p class="notice">{{ n }}</p>{% endif %}
+{% if let Some(e) = error %}<p class="error">{{ e }}</p>{% endif %}
+{% if let Some(codes) = codes %}
+<section>
+  <h2>Recovery codes</h2>
+  <p>Each code works once. Store them somewhere safe.</p>
+  <pre class="recovery-codes">{% for code in codes %}{{ code }}
+{% endfor %}</pre>
+</section>
+{% endif %}
+{% if enabled %}
+<p>Two-factor authentication is <strong>enabled</strong>. Signing in needs your password and a current code (or a recovery code).</p>
+<form method="post" action="/settings/two-factor" class="stack">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <input type="hidden" name="action" value="regenerate">
+  <label>Code <input name="code" autocomplete="one-time-code" required></label>
+  <button type="submit">Regenerate recovery codes</button>
+</form>
+<form method="post" action="/settings/two-factor" class="stack">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <input type="hidden" name="action" value="disable">
+  <label>Password <input name="password" type="password" autocomplete="current-password" required></label>
+  <label>Code <input name="code" autocomplete="one-time-code" required></label>
+  <button type="submit">Disable two-factor authentication</button>
+</form>
+{% else if let Some(pending) = pending %}
+<p>Add this secret to your authenticator app, then confirm with a code:</p>
+<p>Secret: <code class="totp-secret">{{ pending.secret_base32 }}</code></p>
+<p>URI: <code class="totp-uri">{{ pending.otpauth_uri }}</code></p>
+<form method="post" action="/settings/two-factor" class="stack">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <input type="hidden" name="action" value="confirm">
+  <label>Code <input name="code" autocomplete="one-time-code" required></label>
+  <button type="submit">Confirm and enable</button>
+</form>
+{% else %}
+<p>Two-factor authentication is <strong>disabled</strong>. Signing in then needs only your password.</p>
+<form method="post" action="/settings/two-factor" class="stack">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <input type="hidden" name="action" value="enroll">
+  <button type="submit">Set up two-factor authentication</button>
+</form>
+{% endif %}
+{% endblock %}

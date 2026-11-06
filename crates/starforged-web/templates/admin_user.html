@@ -14,6 +14,7 @@
     <dt>Admin</dt><dd>{% if summary.user.is_admin %}yes{% else %}no{% endif %}</dd>
     <dt>State</dt><dd>{% if summary.user.active %}active{% else %}suspended{% endif %}</dd>
     <dt>Repositories</dt><dd>{{ summary.repo_count }}</dd>
+    <dt>Two-factor</dt><dd>{% if summary.totp_enabled %}enabled{% else %}disabled{% endif %}</dd>
   </dl>
   {% if summary.user.active %}
   <form method="post" action="/admin/users/{{ summary.user.handle }}/suspend" class="stack">
@@ -46,5 +47,11 @@
     <input type="hidden" name="_csrf" value="{{ csrf }}">
     <button type="submit">Send password reset</button>
   </form>
+  {% if summary.totp_enabled %}
+  <form method="post" action="/admin/users/{{ summary.user.handle }}/reset-2fa" class="stack">
+    <input type="hidden" name="_csrf" value="{{ csrf }}">
+    <button type="submit">Reset two-factor authentication</button>
+  </form>
+  {% endif %}
 </section>
 {% endblock %}

@@ -5,17 +5,20 @@
 //! left without an administrator.
 
 use crate::accounts::{CreateUser, User};
+use crate::audit::{AuditEntryView, AuditQuery, day_start};
 use crate::permission::Visibility;
 use crate::repos::{RESTORE_SECS, Repo};
 use crate::{Core, CoreError, CoreResult};
+use starforged_db::audit as db_audit;
 use starforged_db::orgs as db_orgs;
-use starforged_db::{jobs as db_jobs, now, repos as db_repos, users, web_sessions};
+use starforged_db::{auth_factors, jobs as db_jobs, now, repos as db_repos, users, web_sessions};
 
 /// A user plus how many live repositories they own, for the admin detail page.
 #[derive(Debug, Clone)]
 pub struct UserSummary {
     pub user: User,
     pub repo_count: i64,
+    pub totp_enabled: bool,
 }
 
 /// A deleted repository of any owner, for the site admin's deleted-repositories page.
@@ -115,9 +118,13 @@ impl Core {
             .await?
             .ok_or(CoreError::NotFound)?;
         let repo_count = db_repos::list_by_owner(self.db(), row.id).await?.len() as i64;
+        let totp_enabled = auth_factors::totp_state(self.db(), row.id)
+            .await?
+            .is_some_and(|s| s.enabled);
         Ok(UserSummary {
             user: User::from(row),
             repo_count,
+            totp_enabled,
         })
     }
 
@@ -256,6 +263,44 @@ impl Core {
                 attempts: row.attempts,
                 last_error: row.last_error,
                 run_at: row.run_at,
+                created_at: row.created_at,
+            })
+            .collect())
+    }
+
+    /// Audit log entries newest first, with optional filters and keyset pagination (D3).
+    /// `to` covers the whole named day; callers pass a sane `limit` (which may include
+    /// one extra probe row to detect a following page).
+    pub async fn admin_audit(
+        &self,
+        admin: &User,
+        query: &AuditQuery,
+    ) -> CoreResult<Vec<AuditEntryView>> {
+        forbidden_unless_admin(admin)?;
+        let filter = db_audit::AuditFilter {
+            actor: query.actor.clone(),
+            action: query.action.clone(),
+            target: query.target.clone(),
+            from: query.from.as_deref().map(day_start).transpose()?,
+            to: query
+                .to
+                .as_deref()
+                .map(|date| day_start(date).map(|start| start + 86_400))
+                .transpose()?,
+            after: query.after,
+            limit: query.limit.max(1),
+        };
+        Ok(db_audit::search(self.db(), &filter)
+            .await?
+            .into_iter()
+            .map(|row| AuditEntryView {
+                id: row.id,
+                actor: row.actor_handle,
+                action: row.action,
+                target: row.target,
+                detail: row.detail,
+                ip: row.ip,
+                user_agent: row.user_agent,
                 created_at: row.created_at,
             })
             .collect())
@@ -437,7 +482,8 @@ mod tests {
         let (_, session) = core
             .login("bob", PASSWORD, "ua", "127.0.0.1")
             .await
-            .unwrap();
+            .unwrap()
+            .into_session();
         let suspended = core.suspend_user(&root, bob.id).await.unwrap();
         assert!(!suspended.active);
         assert!(

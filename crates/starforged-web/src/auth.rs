@@ -14,6 +14,7 @@ use crate::error::WebError;
 
 pub const SESSION_COOKIE: &str = "sf_session";
 pub const LOGIN_CSRF_COOKIE: &str = "sf_login_csrf";
+pub const CHALLENGE_COOKIE: &str = "sf_login_challenge";
 
 /// The signed-in user, if any.
 pub struct MaybeUser(pub Option<WebSession>);
@@ -111,6 +112,21 @@ pub fn session_cookie(value: String, secure: bool, max_age_secs: i64) -> Cookie<
     cookie.set_path("/");
     cookie.set_secure(secure);
     cookie.set_max_age(time::Duration::seconds(max_age_secs));
+    cookie
+}
+
+/// The second-factor challenge cookie: the random token naming the pending
+/// `login_challenges` row. `HttpOnly` + `SameSite=Lax`, `Secure` on https,
+/// expiring with the challenge.
+pub fn challenge_cookie(value: String, secure: bool) -> Cookie<'static> {
+    let mut cookie = Cookie::new(CHALLENGE_COOKIE, value);
+    cookie.set_http_only(true);
+    cookie.set_same_site(SameSite::Lax);
+    cookie.set_path("/");
+    cookie.set_secure(secure);
+    cookie.set_max_age(time::Duration::seconds(
+        starforged_core::sessions::SECOND_FACTOR_TTL_SECS,
+    ));
     cookie
 }
 

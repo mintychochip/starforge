@@ -243,7 +243,7 @@ fn unbound(key: &[u8; 32]) -> Result<UnboundKey, CoreError> {
 }
 
 /// `v1:<base64(nonce‖ciphertext)>` with a fresh 12-byte nonce per seal.
-fn seal_secret(key: &[u8; 32], plaintext: &str) -> CoreResult<String> {
+pub(crate) fn seal_secret(key: &[u8; 32], plaintext: &str) -> CoreResult<String> {
     let mut nonce = [0u8; 12];
     getrandom::fill(&mut nonce)
         .map_err(|e| CoreError::Internal(format!("randomness failed: {e}")))?;
@@ -260,7 +260,7 @@ fn seal_secret(key: &[u8; 32], plaintext: &str) -> CoreResult<String> {
     ))
 }
 
-fn open_secret(key: &[u8; 32], sealed: &str) -> CoreResult<String> {
+pub(crate) fn open_secret(key: &[u8; 32], sealed: &str) -> CoreResult<String> {
     let b64 = sealed
         .strip_prefix("v1:")
         .ok_or_else(|| CoreError::Invalid("unknown webhook secret format".into()))?;
@@ -1203,7 +1203,7 @@ fn request_headers_json(event: &str, delivery_id: &str, signature: Option<&str>)
 /// reserved ranges, in either address family — IPv4-mapped IPv6 forms
 /// (`::ffff:a.b.c.d`) unwrap to their inner IPv4 address first. The coarser
 /// checks use stable predicates, the rest explicit prefix matches.
-fn host_allowed(ip: std::net::IpAddr, allow_loopback: bool) -> bool {
+pub(crate) fn host_allowed(ip: std::net::IpAddr, allow_loopback: bool) -> bool {
     if ip.is_loopback() {
         return allow_loopback;
     }

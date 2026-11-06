@@ -27,10 +27,14 @@ pub mod protection;
 pub mod quota;
 pub mod read;
 pub mod registration;
+pub mod remotes;
 pub mod repos;
 pub mod rescan;
+pub mod search;
 pub mod sessions;
+pub mod sshkeys;
 pub mod tokens;
+pub mod totp;
 pub mod trails;
 pub mod validate;
 pub mod verification;
@@ -63,6 +67,10 @@ pub struct CoreConfig {
     pub tmp_dir: PathBuf,
     /// Content-addressed blob root (`<blob_dir>/<hash[0..2]>/<hash>`, spec §5.3).
     pub blob_dir: PathBuf,
+    /// The tantivy search index (`<data_dir>/index`, spec §5.3). Rebuildable
+    /// and never the source of truth; the server never refuses to start
+    /// because of it.
+    pub index_dir: PathBuf,
     /// Rejects segment bodies larger than this (spec §6.3).
     pub max_segment_bytes: u64,
     /// Rejects segment uploads past this per-repository stored total (spec §7.7).
@@ -91,6 +99,15 @@ pub struct CoreConfig {
     /// `Debug` is redacted like `SecurityConfig::secret_key`: the bytes
     /// never render, in any format.
     pub webhook_key: WebhookKey,
+    /// Box sealing git remote credentials at rest: XChaCha20-Poly1305
+    /// under an HKDF key derived from `security.secret_key` (M4b D1),
+    /// independent of the webhook key. `Debug` is redacted.
+    pub credential_box: crypto::CredentialBox,
+    /// Test-only escape hatch for the outbound remote URL policy
+    /// (`remotes.allow_file_urls`): when true, `file://`/local-path
+    /// remotes and loopback hosts are admitted. Always false in
+    /// production.
+    pub allow_file_urls: bool,
     /// Test-only escape hatch for the webhook SSRF gate: when true, delivery
     /// may target loopback addresses (the integration suite's in-process
     /// receiver). Always false in production; everything else non-global is
@@ -122,6 +139,9 @@ pub struct Core {
 struct Inner {
     db: Db,
     config: CoreConfig,
+    /// The search index, opened at `config.index_dir` (startup recreates a
+    /// missing or corrupt index empty; see `open_search_index`).
+    search_index: std::sync::Arc<starforged_index::SearchIndex>,
     /// Wakes one idle job worker when a job is queued.
     job_wakeup: tokio::sync::Notify,
     /// Test seam for the merge CAS race (see [`merge::PreCasHook`]): `None`
@@ -138,10 +158,12 @@ struct Inner {
 
 impl Core {
     pub fn new(db: Db, config: CoreConfig) -> Core {
+        let search_index = open_search_index(&config);
         Core {
             inner: Arc::new(Inner {
                 db,
                 config,
+                search_index,
                 job_wakeup: tokio::sync::Notify::new(),
                 merge_cas_hook: std::sync::Mutex::new(None),
                 ingest_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -155,6 +177,36 @@ impl Core {
 
     pub fn config(&self) -> &CoreConfig {
         &self.inner.config
+    }
+
+    /// The search index. Mutations never go through it directly; they
+    /// enqueue jobs and the jobs feed the index.
+    pub fn search_index(&self) -> &starforged_index::SearchIndex {
+        &self.inner.search_index
+    }
+}
+
+/// Opens the search index at `config.index_dir`, recreating a missing or
+/// corrupt directory empty. The server never refuses to start because of the
+/// index (plan D5): if anything else goes wrong — the writer is held by
+/// another process, the disk is unwritable — this process serves with a
+/// throwaway index under the temp directory (writes still succeed; search
+/// just sees nothing until the next start with the real index).
+fn open_search_index(config: &CoreConfig) -> std::sync::Arc<starforged_index::SearchIndex> {
+    match starforged_index::SearchIndex::open_or_create(&config.index_dir) {
+        Ok(index) => std::sync::Arc::new(index),
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                index_dir = %config.index_dir.display(),
+                "search index unavailable; serving with a throwaway index"
+            );
+            let dir = std::env::temp_dir().join(format!("starforged-index-{}", std::process::id()));
+            std::sync::Arc::new(
+                starforged_index::SearchIndex::open_or_create(&dir)
+                    .expect("a fresh index in the temp directory must open"),
+            )
+        }
     }
 }
 
@@ -228,6 +280,7 @@ pub(crate) mod testing {
             tmp_dir: dir.path().join("tmp"),
             blob_store: std::sync::Arc::new(starforged_blob::FsBlobStore::new(blob_dir.clone())),
             blob_dir,
+            index_dir: dir.path().join("index"),
             max_segment_bytes: DEFAULT_MAX_SEGMENT_BYTES,
             max_repo_bytes: DEFAULT_MAX_REPO_BYTES,
             max_user_bytes: DEFAULT_MAX_USER_BYTES,
@@ -239,6 +292,8 @@ pub(crate) mod testing {
             mailer: None,
             registration: registration::Registration::default(),
             webhook_key: WebhookKey([7u8; 32]),
+            credential_box: crypto::CredentialBox::new(&[7_u8; 32]),
+            allow_file_urls: false,
             allow_loopback_webhooks: false,
             allowed_ref_namespaces: Vec::new(),
         };

@@ -12,6 +12,7 @@ use starforged_core::CoreResult;
 use starforged_core::accounts::CreateUser;
 use starforged_core::accounts::User;
 use starforged_core::admin::{AdminOverview, JobInfo, UserSummary};
+use starforged_core::audit::AuditQuery;
 use starforged_core::passwords::AdminReset;
 use starforged_core::sessions::WebSession;
 
@@ -225,6 +226,34 @@ pub async fn suspend(
         format!("/admin/users/{handle}"),
     )
     .await
+}
+
+/// Resets a user's two-factor authentication (site admin, CSRF, audited as
+/// `user.2fa_reset`): the secret and recovery codes are deleted.
+pub async fn reset_2fa(
+    State(state): State<AppState>,
+    RequireAdmin(session): RequireAdmin,
+    Path(handle): Path<String>,
+    Form(form): Form<CsrfForm>,
+) -> Result<Response, WebError> {
+    verify_csrf(&session.csrf_token, &form.csrf)?;
+    let handle = handle.to_lowercase();
+    let id = target_id(&state, &session, &handle).await?;
+    let result = state.core.admin_reset_2fa(&session.user, id).await;
+    match result {
+        Ok(()) => {
+            let page = detail_page(
+                &state,
+                &session,
+                &handle,
+                None,
+                Some("Two-factor authentication was reset.".to_owned()),
+            )
+            .await?;
+            Ok(page.into_response())
+        }
+        Err(other) => Err(other.into()),
+    }
 }
 
 pub async fn unsuspend(
@@ -683,4 +712,100 @@ pub async fn delete_job(
         Err(CoreError::NotFound) => Err(WebError::NotFound),
         Err(other) => Err(other.into()),
     }
+}
+
+/// One audit row for the page: every column is rendered escaped by the template.
+pub struct AuditRowView {
+    id: i64,
+    time: String,
+    actor: String,
+    action: String,
+    target: String,
+    ip: String,
+    user_agent: String,
+}
+
+#[derive(Template, WebTemplate)]
+#[template(path = "admin_audit.html")]
+pub struct AuditPage {
+    nav_user: Option<NavUser>,
+    #[allow(dead_code)]
+    csrf: String,
+    admin_tab: &'static str,
+    actor: String,
+    action: String,
+    target: String,
+    from: String,
+    to: String,
+    entries: Vec<AuditRowView>,
+    next_after: Option<i64>,
+}
+
+#[derive(Deserialize)]
+pub struct AuditParams {
+    actor: Option<String>,
+    action: Option<String>,
+    target: Option<String>,
+    from: Option<String>,
+    to: Option<String>,
+    after: Option<i64>,
+}
+
+/// `/admin/audit`: newest first, 50 per page with a keyset cursor (D3).
+pub async fn audit_page(
+    State(state): State<AppState>,
+    RequireAdmin(session): RequireAdmin,
+    Query(params): Query<AuditParams>,
+) -> Result<AuditPage, WebError> {
+    let non_empty = |value: Option<String>| value.filter(|v| !v.is_empty());
+    let actor = non_empty(params.actor.clone()).unwrap_or_default();
+    let action = non_empty(params.action.clone()).unwrap_or_default();
+    let target = non_empty(params.target.clone()).unwrap_or_default();
+    let from = non_empty(params.from.clone()).unwrap_or_default();
+    let to = non_empty(params.to.clone()).unwrap_or_default();
+    // Fetch one extra row: its presence means another page follows.
+    let mut entries = state
+        .core
+        .admin_audit(
+            &session.user,
+            &AuditQuery {
+                actor: non_empty(params.actor),
+                action: non_empty(params.action),
+                target: non_empty(params.target),
+                from: non_empty(params.from),
+                to: non_empty(params.to),
+                after: params.after,
+                limit: 51,
+            },
+        )
+        .await?
+        .into_iter()
+        .map(|entry| AuditRowView {
+            id: entry.id,
+            time: crate::views::format_time(entry.created_at),
+            actor: entry.actor.unwrap_or_else(|| "—".to_owned()),
+            action: entry.action,
+            target: entry.target,
+            ip: entry.ip,
+            user_agent: entry.user_agent,
+        })
+        .collect::<Vec<_>>();
+    let next_after = if entries.len() > 50 {
+        entries.truncate(50);
+        entries.last().map(|row| row.id)
+    } else {
+        None
+    };
+    Ok(AuditPage {
+        nav_user: Some(NavUser::from_session(&session)),
+        csrf: session.csrf_token.clone(),
+        admin_tab: "audit",
+        actor,
+        action,
+        target,
+        from,
+        to,
+        entries,
+        next_after,
+    })
 }
