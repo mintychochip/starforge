@@ -57,3 +57,9 @@ unsafe_code = "forbid"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
+
+# Third-party crates build without debug info in dev and test builds: ~90
+# integration-test binaries otherwise carry hundreds of MB of dependency
+# debug info each. Workspace crates keep full debug info.
+[profile.dev.package."*"]
+debug = false
