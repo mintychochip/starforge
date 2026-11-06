@@ -938,11 +938,17 @@ async fn deploy_write_push_webhook_sender_null() {
     let mut sender: Option<serde_json::Value> = None;
     for _ in 0..100 {
         s.core.run_due_jobs().await.unwrap();
+        // Match the deploy-key push itself: the earlier HTTP push of `main`
+        // by alice is processed asynchronously and may also reach the hook
+        // if its fan-out runs after the hook is registered.
         let found = hits
             .lock()
             .unwrap()
             .iter()
-            .find(|b| b.get("event").is_some_and(|v| v == "push"))
+            .find(|b| {
+                b.get("event").is_some_and(|v| v == "push")
+                    && b["push"]["ref"] == "refs/heads/deployed"
+            })
             .cloned();
         if let Some(body) = found {
             sender = body.get("sender").cloned();
