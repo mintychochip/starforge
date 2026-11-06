@@ -673,3 +673,28 @@ async fn token_host_key_equals_pinned_origin() {
         Some(expected)
     );
 }
+
+// IPv6: the anchor built from an IPv6-literal remote and the `api_url`
+// origin must compare equal (both bracketed), so pinning does not refuse
+// loopback IPv6 servers.
+#[test]
+fn ipv6_anchor_and_api_url_origins_match() {
+    use starforge_cli::discovery::{pin_api_url, probe_base_for_remote};
+    let anchor =
+        probe_base_for_remote("http://[::1]:3000/o/r.git").expect("IPv6 remote must probe");
+    assert_eq!(anchor, "http://[::1]:3000");
+    assert_eq!(
+        pin_api_url("http://[::1]:3000", &anchor).expect("same IPv6 origin must pin"),
+        "http://[::1]:3000"
+    );
+    assert_eq!(
+        pin_api_url("http://[::1]:3000/", &anchor).expect("trailing slash must pin"),
+        "http://[::1]:3000"
+    );
+    assert!(pin_api_url("http://[::1]:3001", &anchor).is_err());
+    assert!(pin_api_url("http://127.0.0.1:3000", &anchor).is_err());
+    assert_eq!(
+        starforge_cli::cli::sync_host_key(&anchor),
+        Some("[::1]:3000".to_string())
+    );
+}

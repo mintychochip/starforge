@@ -64,13 +64,21 @@ fn queue_path(spool: &Spool) -> std::path::PathBuf {
     spool.root.join("queue.jsonl")
 }
 
-/// Append one entry to `queue.jsonl`.
+/// Append one entry to `queue.jsonl`. The file is created `0600` on unix
+/// (like every other spool file) and tightened best-effort on open, so a
+/// `queue.jsonl` deleted and recreated by an append never lands
+/// world-readable.
 pub fn enqueue(spool: &Spool, entry: QueueEntry) -> Result<(), QueueError> {
     use std::io::Write as _;
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(queue_path(spool))?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(queue_path(spool))?;
+    crate::spool::tighten_file(&queue_path(spool));
     writeln!(
         file,
         "{}",

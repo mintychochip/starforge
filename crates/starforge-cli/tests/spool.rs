@@ -175,6 +175,82 @@ fn spool_layout_is_private_on_unix() {
     );
 }
 
+/// Older per-session contents (written before the permissions fix) are
+/// tightened recursively by `ensure_layout`: a `0755` session dir and a
+/// `0644` segment file become `0700`/`0600`.
+#[cfg(unix)]
+#[test]
+fn ensure_layout_tightens_legacy_session_contents() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = TempDir::new().unwrap();
+    let spool = Spool::open(dir.path());
+    let ulid = ulid::Ulid::new().to_string();
+    let session = spool.root.join("sessions").join(&ulid);
+    let segments = session.join("segments");
+    std::fs::create_dir_all(&segments).unwrap();
+    let seg = segments.join("0.jsonl.zst");
+    std::fs::write(&seg, b"legacy").unwrap();
+    std::fs::write(session.join("meta.json"), b"{}").unwrap();
+    std::fs::set_permissions(&session, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::set_permissions(&segments, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::set_permissions(&seg, std::fs::Permissions::from_mode(0o644)).unwrap();
+    std::fs::set_permissions(
+        session.join("meta.json"),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+
+    spool.ensure_layout().unwrap();
+    assert_eq!(
+        std::fs::metadata(&session).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(
+        std::fs::metadata(&segments).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(
+        std::fs::metadata(&seg).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(
+        std::fs::metadata(session.join("meta.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+}
+
+/// A `queue.jsonl` that was deleted and is recreated by `enqueue` is
+/// created `0600` on unix.
+#[cfg(unix)]
+#[test]
+fn enqueue_recreates_queue_private_on_unix() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let (_dir, spool) = open_spool();
+    std::fs::remove_file(spool.root.join("queue.jsonl")).unwrap();
+    enqueue(
+        &spool,
+        queue_entry(
+            QueueOp::Meta,
+            "01J9KQXF1T3NP2R8A5B6C7D9E0",
+            None,
+            "2026-01-01T00:00:00Z",
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        std::fs::metadata(spool.root.join("queue.jsonl"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+}
+
 #[test]
 fn planted_token_absent_from_segments_and_raw_with_counts_and_fingerprint() {
     let (repo_tmp, spool) = open_spool();

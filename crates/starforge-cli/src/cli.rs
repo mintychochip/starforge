@@ -994,6 +994,11 @@ fn body_source(body: Option<&str>, body_file: Option<&std::path::Path>) -> Resul
 pub fn sync_host_key(api_url: &str) -> Option<String> {
     let url = url::Url::parse(api_url).ok()?;
     let host = url.host_str()?.to_lowercase();
+    let host = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host
+    };
     Some(match url.port() {
         Some(port) => format!("{host}:{port}"),
         None => host,

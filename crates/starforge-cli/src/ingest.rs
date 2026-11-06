@@ -278,6 +278,8 @@ pub fn ingest(
                 if let Some(title) = meta.title.clone() {
                     meta.title = Some(redact_str(&compiled, &title, &mut meta_counts));
                 }
+                let version = meta.agent.version.clone();
+                meta.agent.version = redact_str(&compiled, &version, &mut meta_counts);
                 let remotes = crate::git::remotes(repo_root).unwrap_or_default();
                 meta.repo = starforge_format::RepoInfo {
                     // Strip credential userinfo: secrets must never reach the spool.
@@ -380,10 +382,25 @@ pub fn ingest(
             for (k, v) in &raw_counts {
                 *meta.redaction.counts.entry(k.clone()).or_insert(0) += v;
             }
+            let mut models_counts: BTreeMap<String, u64> = BTreeMap::new();
+            let mut models = std::collections::HashSet::new();
+            for model in &meta.models {
+                models.insert(redact_str(&compiled, model, &mut models_counts));
+            }
             for model in &out.header.models {
-                if !meta.models.contains(model) {
-                    meta.models.push(model.clone());
-                }
+                models.insert(redact_str(&compiled, model, &mut models_counts));
+            }
+            let mut models: Vec<String> = models.into_iter().collect();
+            models.sort();
+            meta.models = models;
+            let version = if meta.agent.version.is_empty() {
+                out.header.agent.version.clone()
+            } else {
+                meta.agent.version.clone()
+            };
+            meta.agent.version = redact_str(&compiled, &version, &mut models_counts);
+            for (k, v) in &models_counts {
+                *meta.redaction.counts.entry(k.clone()).or_insert(0) += v;
             }
             let usage = out.header.usage;
             meta.usage.input = meta.usage.input.max(usage.input);

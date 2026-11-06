@@ -179,7 +179,7 @@ fn tighten_dir(path: &Path) {
 }
 
 /// Narrow `path` to `0600` (unix, best-effort: never fails the caller).
-fn tighten_file(path: &Path) {
+pub(crate) fn tighten_file(path: &Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -187,6 +187,43 @@ fn tighten_file(path: &Path) {
     }
     #[cfg(not(unix))]
     let _ = path;
+}
+
+/// Best-effort recursive tighten under `root` (unix only): dirs to `0700`,
+/// regular files to `0600`, so per-session spool contents written before
+/// the permissions fix get narrowed too. Symlinks are never followed
+/// (skipped via `symlink_metadata`), errors are ignored, and entries
+/// already at the target mode are left alone (no needless chmods — this
+/// runs on every hook).
+fn tighten_tree(root: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fn tighten(path: &Path) {
+            let Ok(md) = std::fs::symlink_metadata(path) else {
+                return;
+            };
+            let ty = md.file_type();
+            if ty.is_symlink() {
+                return; // never follow links
+            }
+            if ty.is_dir() {
+                if md.permissions().mode() & 0o777 != 0o700 {
+                    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
+                }
+                if let Ok(entries) = std::fs::read_dir(path) {
+                    for entry in entries.flatten() {
+                        tighten(&entry.path());
+                    }
+                }
+            } else if ty.is_file() && md.permissions().mode() & 0o777 != 0o600 {
+                let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+            }
+        }
+        tighten(root);
+    }
+    #[cfg(not(unix))]
+    let _ = root;
 }
 
 /// Write `bytes` to `path` atomically: temp file in the same directory,
@@ -247,7 +284,9 @@ impl Spool {
 
     /// Create the spool directory layout (§7.3). Idempotent: existing files
     /// are never truncated or rewritten. Dirs are `0700`, files `0600`
-    /// (unix); pre-existing root/dirs/files are tightened best-effort.
+    /// (unix); pre-existing root/dirs/files (including older per-session
+    /// contents) are tightened best-effort, recursively, without following
+    /// symlinks.
     pub fn ensure_layout(&self) -> io::Result<()> {
         create_dir_private(&self.root.join("sessions"))?;
         tighten_dir(&self.root);
@@ -269,6 +308,7 @@ impl Spool {
             }
             tighten_file(&path);
         }
+        tighten_tree(&self.root);
         Ok(())
     }
 

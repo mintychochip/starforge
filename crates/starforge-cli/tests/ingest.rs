@@ -237,12 +237,12 @@ fn unreadable_native_file_does_not_starve_later_adapters() {
     );
 }
 
-// Finding 2: a detector hit that appears only in the raw native slice (the
-// `model` field passes `redact_event` through untouched but `redact_text`
-// scrubs it) increments the session counts.
+// Finding 2: a detector hit in the `model` field (which `redact_event`
+// passes through untouched) is still scrubbed and counted: once where
+// `meta.models` is redacted and once in the raw native slice.
 
 #[test]
-fn raw_only_detector_hit_increments_counts() {
+fn model_field_detector_hit_is_redacted_and_counted() {
     let (_repo_dir, repo) = init_repo();
     let home = TempDir::new().unwrap();
     let cwd = repo.to_string_lossy();
@@ -282,8 +282,8 @@ fn raw_only_detector_hit_increments_counts() {
             .get("known-token")
             .copied()
             .unwrap_or(0),
-        1,
-        "raw-only model hit counted: {:?}",
+        2,
+        "model hit counted in meta.models and the raw slice: {:?}",
         meta.redaction.counts
     );
     let raw = String::from_utf8(
@@ -294,6 +294,11 @@ fn raw_only_detector_hit_increments_counts() {
     assert!(
         raw.contains("[redacted:known-token]"),
         "raw slice carries the marker: {raw:?}"
+    );
+    assert!(
+        !meta.models.iter().any(|m| m.contains("sk-ant-")),
+        "meta.models redacted: {:?}",
+        meta.models
     );
 }
 
@@ -462,7 +467,14 @@ const OPENCODE_TOKEN: &str = "ghp_0123456789abcdef0123456789abcdef0123";
 
 /// Build a minimal OpenCode v2 store (same schema as the capture fixtures)
 /// with bound parameters (JSON payloads are never formatted into the SQL).
-fn build_opencode_db(db: &Path, repo: &Path, title: &str, tool_file: &str) {
+fn build_opencode_db(
+    db: &Path,
+    repo: &Path,
+    title: &str,
+    tool_file: &str,
+    model: &str,
+    version: &str,
+) {
     std::fs::create_dir_all(db.parent().expect("db has parent")).unwrap();
     let conn = rusqlite::Connection::open(db).unwrap();
     conn.execute_batch(
@@ -479,8 +491,8 @@ fn build_opencode_db(db: &Path, repo: &Path, title: &str, tool_file: &str) {
     )
     .unwrap();
     conn.execute(
-        "INSERT INTO session_v2(id, project_id, directory, version, title, time_created, time_updated) VALUES('sess1', 'p1', ?1, '2.0.29', ?2, 1793793600000, 1793793615000)",
-        rusqlite::params![repo_str, title],
+        "INSERT INTO session_v2(id, project_id, directory, version, title, time_created, time_updated) VALUES('sess1', 'p1', ?1, ?2, ?3, 1793793600000, 1793793615000)",
+        rusqlite::params![repo_str, version, title],
     )
     .unwrap();
     let user_data = serde_json::json!({"text": "hello"}).to_string();
@@ -491,7 +503,7 @@ fn build_opencode_db(db: &Path, repo: &Path, title: &str, tool_file: &str) {
     .unwrap();
     let asst_data = serde_json::json!({
         "agent": "build",
-        "model": {"id": "m", "providerID": "anthropic"},
+        "model": {"id": model, "providerID": "anthropic"},
         "tokens": {"input": 1, "output": 1, "reasoning": 0, "cache": {"read": 0, "write": 0}},
     })
     .to_string();
@@ -555,6 +567,8 @@ fn opencode_title_and_file_path_are_redacted_in_meta() {
         &repo,
         &format!("deploy key {OPENCODE_TOKEN}"),
         &tool_file,
+        &format!("model-{OPENCODE_TOKEN}"),
+        &format!("2.0.29-{OPENCODE_TOKEN}"),
     );
     evaluate_roots(&roots, &repo, &spool);
     let ulid = spool_ulid(&spool);
@@ -575,6 +589,16 @@ fn opencode_title_and_file_path_are_redacted_in_meta() {
         "file path carries the redaction marker: {:?}",
         meta.files_touched
     );
+    assert!(
+        meta.models.iter().any(|m| m.contains("[redacted:")),
+        "model carries the redaction marker: {:?}",
+        meta.models
+    );
+    assert!(
+        meta.agent.version.contains("[redacted:"),
+        "agent version carries the redaction marker: {}",
+        meta.agent.version
+    );
 }
 
 #[test]
@@ -587,6 +611,8 @@ fn opencode_ingest_writes_no_raw_slices() {
         &repo,
         "plain title",
         &tool_file,
+        "m",
+        "2.0.29",
     );
     evaluate_roots(&roots, &repo, &spool);
     let ulid = spool_ulid(&spool);

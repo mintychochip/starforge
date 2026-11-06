@@ -67,10 +67,10 @@ pub fn anchor_transport_allowed(anchor: &str) -> bool {
     }
 }
 
-/// Origin (`scheme://host[:port]`, no trailing slash, IPv6 bracketed) of an
-/// absolute http(s) URL, or `None` when it has no http(s) origin.
-fn origin_of(url_str: &str) -> Option<String> {
-    let parsed = url::Url::parse(url_str.trim()).ok()?;
+/// Format a parsed URL's origin (`scheme://host[:port]`, no trailing slash)
+/// with IPv6 hosts bracketed. The single origin formatter: every anchor /
+/// `api_url` / host-key string is built through here so they compare equal.
+pub(crate) fn format_origin(parsed: &url::Url) -> Option<String> {
     if !matches!(parsed.scheme(), "http" | "https") {
         return None;
     }
@@ -84,6 +84,11 @@ fn origin_of(url_str: &str) -> Option<String> {
         Some(port) => format!("{}://{host}:{port}", parsed.scheme()),
         None => format!("{}://{host}", parsed.scheme()),
     })
+}
+
+/// Origin of an absolute http(s) URL, or `None` when it has no http(s) origin.
+fn origin_of(url_str: &str) -> Option<String> {
+    format_origin(&url::Url::parse(url_str.trim()).ok()?)
 }
 
 /// Validate `api_url` against the discovery `anchor` origin and return the
@@ -230,15 +235,7 @@ pub fn probe_base_for_remote(remote_url: &str) -> Option<String> {
             return None;
         }
         let parsed = url::Url::parse(remote_url).ok()?;
-        if !matches!(parsed.scheme(), "http" | "https") {
-            return None;
-        }
-        let host = parsed.host_str()?;
-        let authority = match parsed.port() {
-            Some(port) => format!("{host}:{port}"),
-            None => host.to_string(),
-        };
-        return Some(format!("{}://{authority}", parsed.scheme()));
+        return format_origin(&parsed);
     }
     // Possible scp-style `user@host:path` / `host:path`. A `/` before the
     // first `:` means it is a local path, not a remote.
@@ -423,13 +420,9 @@ pub fn sanitize_remote_url(url: &str) -> String {
 /// still uses the full configured URL.
 fn sanitized_base(server: &str) -> String {
     if let Ok(parsed) = url::Url::parse(server)
-        && let Some(host) = parsed.host_str()
+        && let Some(origin) = format_origin(&parsed)
     {
-        let authority = match parsed.port() {
-            Some(port) => format!("{host}:{port}"),
-            None => host.to_string(),
-        };
-        return format!("{}://{authority}", parsed.scheme());
+        return origin;
     }
     // Unparseable input: hide any leading userinfo rather than echoing it.
     match server.rsplit_once('@') {
