@@ -15,6 +15,7 @@ pub mod message;
 pub mod orgs;
 pub mod owner;
 pub mod password;
+pub mod protection;
 pub mod refs;
 pub mod repo_new;
 pub mod repo_settings;

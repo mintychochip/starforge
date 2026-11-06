@@ -1,0 +1,80 @@
+{% extends "base.html" %}
+{% block title %}Branch protection · {{ head.owner }}/{{ head.name }}{% endblock %}
+{% block content %}
+{% include "repo_head.html" %}
+{% include "repo_settings_nav.html" %}
+{% if let Some(e) = error %}<p class="error">{{ e }}</p>{% endif %}
+<h2>Branch protection</h2>
+<p class="muted">Each rule guards one branch pattern: every rule matching a branch must pass before it can merge, and the push restrictions block direct pushes, force pushes, and deletion. Allow-listed users — directly or through a team — may still push directly.</p>
+{% if gate_rules.is_empty() %}
+<p class="muted">No branch rules yet. Every branch accepts direct pushes until a rule guards it.</p>
+{% else %}
+<table class="list">
+<thead><tr><th>Pattern</th><th>Approvals</th><th>Checks</th><th>Methods</th><th>Pushes</th><th>Allow-list</th><th></th></tr></thead>
+<tbody>
+{% for r in gate_rules %}
+<tr><td><code>{% if let Some(p) = r.pattern %}{{ p }}{% else %}all branches{% endif %}</code></td><td>{{ r.required_approvals }}</td><td>{% if r.required_contexts.is_empty() %}—{% else %}{{ r.required_contexts|join(", ") }}{% endif %}</td><td>{% if r.allowed_methods.is_empty() %}all{% else %}{{ r.allowed_methods|join(", ") }}{% endif %}</td><td>{% if r.block_direct_push %}no-direct {% endif %}{% if r.block_force_push %}no-force {% endif %}{% if r.block_deletion %}no-delete{% endif %}{% if !r.block_direct_push && !r.block_force_push && !r.block_deletion %}—{% endif %}</td><td>{% if r.push_allowlist.users.is_empty() && r.push_allowlist.teams.is_empty() %}—{% else %}{{ r.push_allowlist.users|join(", ") }}{% if !r.push_allowlist.users.is_empty() && !r.push_allowlist.teams.is_empty() %}, {% endif %}{{ r.push_allowlist.teams|join(", ") }}{% endif %}</td>
+<td><form method="post" action="/{{ head.owner }}/{{ head.name }}/settings/protection/rules/{{ r.id }}/delete" class="inline"><input type="hidden" name="_csrf" value="{{ csrf }}"><button type="submit">Delete</button></form></td></tr>
+<tr><td colspan="7"><form method="post" action="/{{ head.owner }}/{{ head.name }}/settings/protection/rules/{{ r.id }}" class="stack">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <label>Branch pattern <input name="pattern" value="{% if let Some(p) = r.pattern %}{{ p }}{% endif %}" placeholder="all branches"></label>
+  <label>Required approvals <input name="required_approvals" value="{{ r.required_approvals }}"></label>
+  <label class="check"><input type="checkbox" name="dismiss_on_push" value="true"{% if r.dismiss_on_push %} checked{% endif %}> Dismiss approvals on push</label>
+  <label class="check"><input type="checkbox" name="block_on_request_changes" value="true"{% if r.block_on_request_changes %} checked{% endif %}> Block on request changes</label>
+  <label>Required contexts (comma-separated) <input name="required_contexts" value="{{ r.required_contexts|join(", ") }}"></label>
+  <label class="check"><input type="checkbox" name="require_up_to_date" value="true"{% if r.require_up_to_date %} checked{% endif %}> Require up to date</label>
+  <label class="check"><input type="checkbox" name="require_threads_resolved" value="true"{% if r.require_threads_resolved %} checked{% endif %}> Require threads resolved</label>
+  <label class="check"><input type="checkbox" name="require_session_evidence" value="true"{% if r.require_session_evidence %} checked{% endif %}> Require session evidence</label>
+  <label>Allowed methods (comma-separated, blank means all) <input name="allowed_methods" value="{{ r.allowed_methods|join(", ") }}"></label>
+  <label class="check"><input type="checkbox" name="block_direct_push" value="true"{% if r.block_direct_push %} checked{% endif %}> Block direct pushes (changes must go through a Trail)</label>
+  <label class="check"><input type="checkbox" name="block_force_push" value="true"{% if r.block_force_push %} checked{% endif %}> Block force pushes</label>
+  <label class="check"><input type="checkbox" name="block_deletion" value="true"{% if r.block_deletion %} checked{% endif %}> Block deletion</label>
+  <label>Push allow-list users (comma-separated handles) <input name="push_users" value="{{ r.push_allowlist.users|join(", ") }}"></label>
+  <label>Push allow-list teams (comma-separated slugs) <input name="push_teams" value="{{ r.push_allowlist.teams|join(", ") }}"></label>
+  <button type="submit">Save rule</button>
+</form></td></tr>
+{% endfor %}
+</tbody>
+</table>
+{% endif %}
+<h3>Add a rule</h3>
+<form method="post" action="/{{ head.owner }}/{{ head.name }}/settings/protection" class="stack">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <label>Branch pattern <input name="pattern" placeholder="all branches"></label>
+  <label>Required approvals <input name="required_approvals" value="0"></label>
+  <label class="check"><input type="checkbox" name="dismiss_on_push" value="true"> Dismiss approvals on push</label>
+  <label class="check"><input type="checkbox" name="block_on_request_changes" value="true" checked> Block on request changes</label>
+  <label>Required contexts (comma-separated) <input name="required_contexts"></label>
+  <label class="check"><input type="checkbox" name="require_up_to_date" value="true"> Require up to date</label>
+  <label class="check"><input type="checkbox" name="require_threads_resolved" value="true"> Require threads resolved</label>
+  <label class="check"><input type="checkbox" name="require_session_evidence" value="true"> Require session evidence</label>
+  <label>Allowed methods (comma-separated, blank means all) <input name="allowed_methods"></label>
+  <label class="check"><input type="checkbox" name="block_direct_push" value="true"> Block direct pushes (changes must go through a Trail)</label>
+  <label class="check"><input type="checkbox" name="block_force_push" value="true"> Block force pushes</label>
+  <label class="check"><input type="checkbox" name="block_deletion" value="true"> Block deletion</label>
+  <label>Push allow-list users (comma-separated handles) <input name="push_users"></label>
+  <label>Push allow-list teams (comma-separated slugs) <input name="push_teams"></label>
+  <button type="submit">Add rule</button>
+</form>
+<h2>Tag protection</h2>
+<p class="muted">Creating, moving, or deleting a tag matching a pattern below needs maintain or above; other tags need write, as today.</p>
+{% if tag_protections.is_empty() %}
+<p class="muted">No tag protections yet.</p>
+{% else %}
+<table class="list">
+<thead><tr><th>Pattern</th><th></th></tr></thead>
+<tbody>
+{% for t in tag_protections %}
+<tr><td><code>{{ t.pattern }}</code></td>
+<td><form method="post" action="/{{ head.owner }}/{{ head.name }}/settings/protection/tags/{{ t.id }}/delete" class="inline"><input type="hidden" name="_csrf" value="{{ csrf }}"><button type="submit">Delete</button></form></td></tr>
+{% endfor %}
+</tbody>
+</table>
+{% endif %}
+<h3>Protect tags</h3>
+<form method="post" action="/{{ head.owner }}/{{ head.name }}/settings/protection/tags" class="stack">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <label>Tag pattern <input name="pattern" placeholder="v*" required></label>
+  <button type="submit">Protect tags</button>
+</form>
+{% endblock %}

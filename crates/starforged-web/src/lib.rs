@@ -255,6 +255,26 @@ fn page_routes() -> Router<AppState> {
             post(pages::repo_settings::delete_gate_rule),
         )
         .route(
+            "/{owner}/{repo}/settings/protection",
+            get(pages::protection::show).post(pages::protection::create_rule),
+        )
+        .route(
+            "/{owner}/{repo}/settings/protection/rules/{id}",
+            post(pages::protection::update_rule),
+        )
+        .route(
+            "/{owner}/{repo}/settings/protection/rules/{id}/delete",
+            post(pages::protection::delete_rule),
+        )
+        .route(
+            "/{owner}/{repo}/settings/protection/tags",
+            post(pages::protection::create_tag),
+        )
+        .route(
+            "/{owner}/{repo}/settings/protection/tags/{id}/delete",
+            post(pages::protection::delete_tag),
+        )
+        .route(
             "/{owner}/{repo}/settings/rename",
             post(pages::repo_settings::rename),
         )
