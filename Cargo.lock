@@ -5534,6 +5534,7 @@ dependencies = [
  "axum",
  "clap",
  "reqwest",
+ "rusqlite",
  "serde",
  "serde_json",
  "starforge-capture",

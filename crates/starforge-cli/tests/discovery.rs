@@ -39,10 +39,7 @@ fn init_repo() -> TempDir {
 }
 
 fn client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap()
+    starforge_cli::discovery::forge_client(Duration::from_secs(5)).unwrap()
 }
 
 /// A port on localhost that is (almost surely) closed: bind `:0`, read the
@@ -56,10 +53,24 @@ fn closed_port() -> u16 {
 #[derive(Clone)]
 enum WellKnownMode {
     /// Serve the §7.6 shape; `api_url` is derived from the Host header so the
-    /// test can bind `:0` and still assert the exact URL.
+    /// test can bind `:0` and still assert the exact URL. Origin-only.
     Good {
         version: &'static str,
     },
+    /// Serve the §7.6 shape with `api_url` = `{host}/` (trailing slash).
+    GoodTrailingSlash,
+    /// Serve the §7.6 shape with `api_url` = `{host}/api` (non-origin path).
+    WithPath,
+    /// Serve the §7.6 shape with an explicit `api_url` (cross-origin tests).
+    CrossOrigin {
+        api_url: String,
+    },
+    /// Respond 302 to `location` (must not be followed).
+    RedirectTo {
+        location: String,
+    },
+    /// Respond with an oversize (>64 KiB) body.
+    Oversize,
     Malformed,
     MissingKey,
     NotFound,
@@ -90,9 +101,47 @@ async fn well_known_stub(mode: WellKnownMode) -> Stub {
                         axum::http::StatusCode::OK,
                         axum::Json(serde_json::json!({
                             "starforge": version,
+                            "api_url": format!("http://{host}"),
+                            "ssh_url": "ssh://git@example.com:2222",
+                        })),
+                    )
+                        .into_response(),
+                    WellKnownMode::GoodTrailingSlash => (
+                        axum::http::StatusCode::OK,
+                        axum::Json(serde_json::json!({
+                            "starforge": "0.1.0",
+                            "api_url": format!("http://{host}/"),
+                            "ssh_url": "ssh://git@example.com:2222",
+                        })),
+                    )
+                        .into_response(),
+                    WellKnownMode::WithPath => (
+                        axum::http::StatusCode::OK,
+                        axum::Json(serde_json::json!({
+                            "starforge": "0.1.0",
                             "api_url": format!("http://{host}/api"),
                             "ssh_url": "ssh://git@example.com:2222",
                         })),
+                    )
+                        .into_response(),
+                    WellKnownMode::CrossOrigin { api_url } => (
+                        axum::http::StatusCode::OK,
+                        axum::Json(serde_json::json!({
+                            "starforge": "0.1.0",
+                            "api_url": api_url,
+                            "ssh_url": "ssh://git@example.com:2222",
+                        })),
+                    )
+                        .into_response(),
+                    WellKnownMode::RedirectTo { location } => (
+                        axum::http::StatusCode::FOUND,
+                        [(axum::http::header::LOCATION, location)],
+                    )
+                        .into_response(),
+                    WellKnownMode::Oversize => (
+                        axum::http::StatusCode::OK,
+                        [("content-type", "application/json")],
+                        "x".repeat(70 * 1024),
                     )
                         .into_response(),
                     WellKnownMode::Malformed => (
@@ -259,7 +308,7 @@ async fn resolve_picks_origin_stub_over_dead_backup() {
         ],
     );
     let (server, owner_repo, chosen) = resolve_server(&client(), repo.path()).await.unwrap();
-    assert_eq!(server.api_url, format!("{}/api", stub.base_url));
+    assert_eq!(server.api_url, stub.base_url);
     assert_eq!(server.version, "0.1.0");
     assert_eq!(owner_repo, "owner/repo");
     assert!(chosen.contains("127.0.0.1"), "chosen remote: {chosen}");
@@ -292,7 +341,7 @@ async fn resolve_prefers_origin_over_upstream() {
     );
     let (server, _, _) = resolve_server(&client(), repo.path()).await.unwrap();
     assert_eq!(server.version, "1");
-    assert_eq!(server.api_url, format!("{}/api", a.base_url));
+    assert_eq!(server.api_url, a.base_url);
 }
 
 // (c) no config/preferred name: first well-known hit wins (dead first).
@@ -314,7 +363,7 @@ async fn resolve_first_well_known_hit_wins() {
         &["remote", "add", "beta", &format!("{}/b.git", stub.base_url)],
     );
     let (server, _, chosen) = resolve_server(&client(), repo.path()).await.unwrap();
-    assert_eq!(server.api_url, format!("{}/api", stub.base_url));
+    assert_eq!(server.api_url, stub.base_url);
     assert!(chosen.contains("/b.git"), "chosen: {chosen}");
 }
 
@@ -340,7 +389,7 @@ async fn config_server_wins_without_http() {
     git(repo.path(), &["config", "starforge.repo", "acme/app"]);
     let (server, owner_repo, _) = resolve_server(&client(), repo.path()).await.unwrap();
     assert_eq!(server.version, "9.9.9");
-    assert_eq!(server.api_url, format!("{}/api", cfg_stub.base_url));
+    assert_eq!(server.api_url, cfg_stub.base_url);
     assert_eq!(owner_repo, "acme/app");
     assert_eq!(
         remote_stub.hits.load(Ordering::SeqCst),
@@ -444,5 +493,183 @@ fn sanitize_remote_url_strips_pathless_and_pat_usernames() {
     assert_eq!(
         sanitize_remote_url("git@github.com:o/r.git"),
         "git@github.com:o/r.git"
+    );
+}
+
+// C1: `api_url` on another origin is refused and no request reaches it.
+#[tokio::test]
+async fn cross_origin_api_url_is_refused_and_other_host_not_contacted() {
+    let attacker = well_known_stub(WellKnownMode::Good { version: "0.1.0" }).await;
+    let victim = well_known_stub(WellKnownMode::CrossOrigin {
+        api_url: attacker.base_url.clone(),
+    })
+    .await;
+    let repo = init_repo();
+    git(
+        repo.path(),
+        &[
+            "remote",
+            "add",
+            "origin",
+            &format!("{}/o/r.git", victim.base_url),
+        ],
+    );
+    let err = resolve_server(&client(), repo.path()).await.unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains(&format!(
+            "server at {} advertises api_url {} on another origin; refusing (set git config starforge.server {} to trust it explicitly)",
+            victim.base_url, attacker.base_url, attacker.base_url
+        )),
+        "message: {msg}"
+    );
+    assert_eq!(
+        attacker.hits.load(Ordering::SeqCst),
+        0,
+        "no further request may reach the advertised host"
+    );
+    assert_eq!(victim.hits.load(Ordering::SeqCst), 1);
+}
+
+// C1: same origin with a trailing slash is accepted and normalized.
+#[tokio::test]
+async fn same_origin_trailing_slash_is_accepted_and_normalized() {
+    let stub = well_known_stub(WellKnownMode::GoodTrailingSlash).await;
+    let repo = init_repo();
+    git(
+        repo.path(),
+        &[
+            "remote",
+            "add",
+            "origin",
+            &format!("{}/o/r.git", stub.base_url),
+        ],
+    );
+    let (server, _, _) = resolve_server(&client(), repo.path()).await.unwrap();
+    assert_eq!(server.api_url, stub.base_url);
+}
+
+// C1: `api_url` with a non-origin path is refused.
+#[tokio::test]
+async fn api_url_with_path_is_refused() {
+    let stub = well_known_stub(WellKnownMode::WithPath).await;
+    let repo = init_repo();
+    git(
+        repo.path(),
+        &[
+            "remote",
+            "add",
+            "origin",
+            &format!("{}/o/r.git", stub.base_url),
+        ],
+    );
+    let err = resolve_server(&client(), repo.path()).await.unwrap_err();
+    assert!(
+        err.to_string().contains("non-origin path"),
+        "message: {err}"
+    );
+}
+
+// I7: a redirect from the well-known endpoint is not followed.
+#[tokio::test]
+async fn well_known_redirect_is_not_followed() {
+    let target = well_known_stub(WellKnownMode::Good { version: "0.1.0" }).await;
+    let redirector = well_known_stub(WellKnownMode::RedirectTo {
+        location: format!("{}/.well-known/starforge.json", target.base_url),
+    })
+    .await;
+    let repo = init_repo();
+    git(
+        repo.path(),
+        &[
+            "remote",
+            "add",
+            "origin",
+            &format!("{}/o/r.git", redirector.base_url),
+        ],
+    );
+    let err = resolve_server(&client(), repo.path()).await.unwrap_err();
+    assert!(
+        matches!(err, DiscoveryError::Unreachable(_)),
+        "expected Unreachable, got {err:?}"
+    );
+    assert_eq!(
+        target.hits.load(Ordering::SeqCst),
+        0,
+        "redirect target must not be contacted"
+    );
+}
+
+// I7: an oversize well-known body is refused.
+#[tokio::test]
+async fn oversize_well_known_body_is_refused() {
+    let stub = well_known_stub(WellKnownMode::Oversize).await;
+    let repo = init_repo();
+    git(
+        repo.path(),
+        &[
+            "remote",
+            "add",
+            "origin",
+            &format!("{}/o/r.git", stub.base_url),
+        ],
+    );
+    let err = resolve_server(&client(), repo.path()).await.unwrap_err();
+    assert!(err.to_string().contains("exceeds"), "message: {err}");
+}
+
+// I7: `http` is allowed only for loopback anchors (pure check fn).
+#[test]
+fn http_non_loopback_anchor_is_refused() {
+    use starforge_cli::discovery::anchor_transport_allowed;
+    assert!(anchor_transport_allowed("https://example.com"));
+    assert!(anchor_transport_allowed("https://127.0.0.1:1234"));
+    assert!(anchor_transport_allowed("http://127.0.0.1:1234"));
+    assert!(anchor_transport_allowed("http://127.0.0.5:1234"));
+    assert!(anchor_transport_allowed("http://localhost:1234"));
+    assert!(anchor_transport_allowed("http://[::1]:1234"));
+    assert!(!anchor_transport_allowed("http://example.com"));
+    assert!(!anchor_transport_allowed("http://192.168.1.1"));
+    assert!(!anchor_transport_allowed("http://10.0.0.1"));
+    assert!(!anchor_transport_allowed("ftp://127.0.0.1"));
+}
+
+// C1: explicit `starforge.server` with matching origins works (anchor is
+// the configured origin).
+#[tokio::test]
+async fn config_server_explicit_matching_origin_works() {
+    let cfg_stub = well_known_stub(WellKnownMode::Good { version: "9.9.9" }).await;
+    let repo = init_repo();
+    git(
+        repo.path(),
+        &["config", "starforge.server", &cfg_stub.base_url],
+    );
+    git(repo.path(), &["config", "starforge.repo", "acme/app"]);
+    let (server, owner_repo, chosen) = resolve_server(&client(), repo.path()).await.unwrap();
+    assert_eq!(server.api_url, cfg_stub.base_url);
+    assert_eq!(owner_repo, "acme/app");
+    assert_eq!(chosen, cfg_stub.base_url);
+}
+
+// C1: the credential host key equals the pinned origin host.
+#[tokio::test]
+async fn token_host_key_equals_pinned_origin() {
+    let stub = well_known_stub(WellKnownMode::Good { version: "0.1.0" }).await;
+    let repo = init_repo();
+    git(
+        repo.path(),
+        &[
+            "remote",
+            "add",
+            "origin",
+            &format!("{}/o/r.git", stub.base_url),
+        ],
+    );
+    let (server, _, _) = resolve_server(&client(), repo.path()).await.unwrap();
+    assert_eq!(server.api_url, stub.base_url);
+    let expected = stub.base_url.trim_start_matches("http://").to_string();
+    assert_eq!(
+        starforge_cli::cli::sync_host_key(&server.api_url),
+        Some(expected)
     );
 }

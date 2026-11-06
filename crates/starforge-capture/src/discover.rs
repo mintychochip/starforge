@@ -1,18 +1,49 @@
 use std::path::{Component, Path};
 
-/// True when `workdir` lies inside `worktree` (prefix match on path components).
+/// True when `workdir` lies inside `worktree`.
 ///
-/// Comparison is component-wise: `/repo` contains `/repo/sub` but not
-/// `/repo2`. `.` segments are dropped and `..` segments pop the previous
-/// normal component lexically; no filesystem access is performed so neither
-/// path needs to exist.
+/// When both paths exist on disk they are compared on their canonicalized
+/// (symlink-resolved) forms, so a symlink inside the worktree that points
+/// outside never counts as inside. Paths that do not exist fall back to
+/// lexical component-wise comparison (`/repo` contains `/repo/sub` but not
+/// `/repo2`; `.` segments are dropped and `..` segments pop the previous
+/// normal component lexically).
 pub fn workdir_inside(worktree: &Path, workdir: &Path) -> bool {
-    let base = normalize(worktree);
-    let dir = normalize(workdir);
+    let base = canonical_or_lexical(worktree);
+    let dir = canonical_or_lexical(workdir);
     if dir.len() < base.len() {
         return false;
     }
     dir[..base.len()] == base[..]
+}
+
+/// Owned path components when `path` exists (canonicalized) or lexically
+/// otherwise: symlink targets are resolved before comparison.
+fn canonical_or_lexical(path: &Path) -> Vec<String> {
+    let resolved;
+    let effective = match std::fs::canonicalize(path) {
+        Ok(r) => {
+            resolved = r;
+            &resolved
+        }
+        Err(_) => path,
+    };
+    let mut out: Vec<(String, bool)> = Vec::new();
+    for c in effective.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(out.last(), Some((_, true))) {
+                    out.pop();
+                }
+            }
+            Component::Normal(_) => {
+                out.push((c.as_os_str().to_string_lossy().into_owned(), true));
+            }
+            _ => out.push((c.as_os_str().to_string_lossy().into_owned(), false)),
+        }
+    }
+    out.into_iter().map(|(s, _)| s).collect()
 }
 
 /// Lexically normalise path components: drop `.`, resolve `..` by popping
@@ -141,5 +172,22 @@ mod tests {
         // The workdir itself is a directory, not a file inside it.
         assert_eq!(repo_relative(Path::new("/repo"), "/repo"), None);
         assert_eq!(repo_relative(Path::new("/repo"), "/repo/."), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workdir_inside_symlink_outside_is_not_inside() {
+        let tmp = tempfile::tempdir().unwrap();
+        let worktree = tmp.path().join("repo");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let link = worktree.join("link");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        assert!(
+            !workdir_inside(&worktree, &link),
+            "symlink inside the tree pointing outside must not count as inside"
+        );
+        assert!(workdir_inside(&worktree, &worktree));
     }
 }

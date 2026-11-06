@@ -407,3 +407,101 @@ fn claude_unknown_record_and_block_emit_system() {
     );
     assert_eq!(texts[1], lines[2], "record raw JSON preserved exactly");
 }
+
+/// A symlinked `settings.json` (dotfile manager) stays a symlink after
+/// install and remove, and its target carries the updated content.
+#[cfg(unix)]
+#[test]
+fn claude_symlinked_settings_preserved() {
+    let tmp = tempfile::tempdir().unwrap();
+    let roots = Roots {
+        config_dir: tmp.path().join("cfg"),
+        data_dir: tmp.path().join("data"),
+        worktree: PathBuf::from("/repo"),
+    };
+    let a = ClaudeAdapter;
+    let target = tmp.path().join("dotfiles/settings.json");
+    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+    std::fs::write(&target, r#"{"theme":"dark"}"#).unwrap();
+    let path = roots.config_dir.join("settings.json");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&target, &path).unwrap();
+
+    let written = a.install_hooks(&roots).unwrap();
+    assert_eq!(written, vec![path.clone()]);
+    assert!(
+        std::fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "link preserved after install"
+    );
+    let merged: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&target).unwrap()).unwrap();
+    assert_eq!(merged.get("theme").and_then(|v| v.as_str()), Some("dark"));
+    assert_eq!(
+        merged
+            .pointer("/hooks/SessionEnd/0/hooks/0/command")
+            .and_then(|v| v.as_str()),
+        Some("starforge hook session-end")
+    );
+
+    let removed = a.remove_hooks(&roots).unwrap();
+    assert_eq!(removed, vec![path.clone()]);
+    assert!(
+        std::fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "link preserved after remove"
+    );
+    let after: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&target).unwrap()).unwrap();
+    assert_eq!(after, serde_json::json!({"theme": "dark"}));
+}
+
+/// An existing restrictive mode on `settings.json` survives install.
+#[cfg(unix)]
+#[test]
+fn claude_install_preserves_existing_mode() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let tmp = tempfile::tempdir().unwrap();
+    let roots = Roots {
+        config_dir: tmp.path().join("cfg"),
+        data_dir: tmp.path().join("data"),
+        worktree: PathBuf::from("/repo"),
+    };
+    let a = ClaudeAdapter;
+    let path = roots.config_dir.join("settings.json");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, r#"{"theme":"dark"}"#).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    a.install_hooks(&roots).unwrap();
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+}
+
+/// A dangling symlink is an error and the link is left untouched.
+#[cfg(unix)]
+#[test]
+fn claude_dangling_symlink_is_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let roots = Roots {
+        config_dir: tmp.path().join("cfg"),
+        data_dir: tmp.path().join("data"),
+        worktree: PathBuf::from("/repo"),
+    };
+    let a = ClaudeAdapter;
+    let path = roots.config_dir.join("settings.json");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(tmp.path().join("missing.json"), &path).unwrap();
+    assert!(a.install_hooks(&roots).is_err());
+    assert!(
+        std::fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}

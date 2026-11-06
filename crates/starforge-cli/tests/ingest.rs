@@ -457,3 +457,149 @@ fn spool_failure_leaves_cursor_and_replays_without_loss_or_dupes() {
         );
     }
 }
+
+const OPENCODE_TOKEN: &str = "ghp_0123456789abcdef0123456789abcdef0123";
+
+/// Build a minimal OpenCode v2 store (same schema as the capture fixtures)
+/// with bound parameters (JSON payloads are never formatted into the SQL).
+fn build_opencode_db(db: &Path, repo: &Path, title: &str, tool_file: &str) {
+    std::fs::create_dir_all(db.parent().expect("db has parent")).unwrap();
+    let conn = rusqlite::Connection::open(db).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE project(id TEXT PRIMARY KEY, worktree TEXT NOT NULL, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL);\
+         CREATE TABLE session_v2(id TEXT PRIMARY KEY, project_id TEXT NOT NULL, directory TEXT NOT NULL DEFAULT '', version TEXT NOT NULL DEFAULT '', parent_id TEXT, title TEXT, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, time_archived INTEGER);\
+         CREATE TABLE session_message(id TEXT PRIMARY KEY, session_id TEXT NOT NULL, type TEXT NOT NULL, seq INTEGER NOT NULL, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL);\
+         CREATE TABLE session_part(message_id TEXT NOT NULL, session_id TEXT NOT NULL, ordinal INTEGER NOT NULL, type TEXT NOT NULL, call_id TEXT, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL);",
+    )
+    .unwrap();
+    let repo_str = repo.to_string_lossy().into_owned();
+    conn.execute(
+        "INSERT INTO project VALUES('p1', ?1, 1, 1)",
+        rusqlite::params![repo_str],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO session_v2(id, project_id, directory, version, title, time_created, time_updated) VALUES('sess1', 'p1', ?1, '2.0.29', ?2, 1793793600000, 1793793615000)",
+        rusqlite::params![repo_str, title],
+    )
+    .unwrap();
+    let user_data = serde_json::json!({"text": "hello"}).to_string();
+    conn.execute(
+        "INSERT INTO session_message VALUES('m1', 'sess1', 'user', 0, 1793793600000, 1793793600000, ?1)",
+        rusqlite::params![user_data],
+    )
+    .unwrap();
+    let asst_data = serde_json::json!({
+        "agent": "build",
+        "model": {"id": "m", "providerID": "anthropic"},
+        "tokens": {"input": 1, "output": 1, "reasoning": 0, "cache": {"read": 0, "write": 0}},
+    })
+    .to_string();
+    conn.execute(
+        "INSERT INTO session_message VALUES('m2', 'sess1', 'assistant', 1, 1793793605000, 1793793610000, ?1)",
+        rusqlite::params![asst_data],
+    )
+    .unwrap();
+    let part_data = serde_json::json!({
+        "type": "tool",
+        "id": "c1",
+        "name": "edit",
+        "state": {
+            "status": "completed",
+            "input": {"file_path": tool_file},
+            "content": [{"type": "text", "text": "done"}],
+        },
+    })
+    .to_string();
+    conn.execute(
+        "INSERT INTO session_part VALUES('m2', 'sess1', 0, 'tool', 'c1', 1793793605000, 1793793610000, ?1)",
+        rusqlite::params![part_data],
+    )
+    .unwrap();
+}
+
+fn opencode_spool_root(repo: &Path) -> (TempDir, BTreeMap<String, Roots>, Spool) {
+    let home = TempDir::new().unwrap();
+    let _paths = CliPaths::from_home(home.path().to_path_buf());
+    let common = common_dir(repo).unwrap();
+    let spool = Spool::open(&common);
+    spool.ensure_layout().unwrap();
+    let roots = BTreeMap::from([(
+        "opencode".to_string(),
+        Roots {
+            config_dir: home.path().join(".config"),
+            data_dir: home.path().join("data"),
+            worktree: repo.to_path_buf(),
+        },
+    )]);
+    (home, roots, spool)
+}
+
+fn spool_ulid(spool: &Spool) -> String {
+    for entry in std::fs::read_dir(spool.root.join("sessions")).unwrap() {
+        let entry = entry.unwrap();
+        if entry.path().is_dir() {
+            return entry.file_name().to_string_lossy().into_owned();
+        }
+    }
+    panic!("one spool session");
+}
+
+#[test]
+fn opencode_title_and_file_path_are_redacted_in_meta() {
+    let (_repo_dir, repo) = init_repo();
+    let tool_file = format!("{}/src/{}.rs", repo.to_string_lossy(), OPENCODE_TOKEN);
+    let (_home, roots, spool) = opencode_spool_root(&repo);
+    build_opencode_db(
+        &roots["opencode"].data_dir.join("opencode.db"),
+        &repo,
+        &format!("deploy key {OPENCODE_TOKEN}"),
+        &tool_file,
+    );
+    evaluate_roots(&roots, &repo, &spool);
+    let ulid = spool_ulid(&spool);
+    let meta_text =
+        std::fs::read_to_string(spool.root.join("sessions").join(&ulid).join("meta.json")).unwrap();
+    assert!(
+        !meta_text.contains(OPENCODE_TOKEN),
+        "meta.json must not contain the secret: {meta_text}"
+    );
+    let meta = spool.read_meta(&ulid).unwrap();
+    let title = meta.title.expect("title present");
+    assert!(title.contains("[redacted:"), "title redacted: {title}");
+    for f in &meta.files_touched {
+        assert!(!f.contains(OPENCODE_TOKEN), "files_touched redacted: {f}");
+    }
+    assert!(
+        meta.files_touched.iter().any(|f| f.contains("[redacted:")),
+        "file path carries the redaction marker: {:?}",
+        meta.files_touched
+    );
+}
+
+#[test]
+fn opencode_ingest_writes_no_raw_slices() {
+    let (_repo_dir, repo) = init_repo();
+    let tool_file = format!("{}/src/lib.rs", repo.to_string_lossy());
+    let (_home, roots, spool) = opencode_spool_root(&repo);
+    build_opencode_db(
+        &roots["opencode"].data_dir.join("opencode.db"),
+        &repo,
+        "plain title",
+        &tool_file,
+    );
+    evaluate_roots(&roots, &repo, &spool);
+    let ulid = spool_ulid(&spool);
+    let raw_dir = spool.root.join("sessions").join(&ulid).join("raw");
+    assert!(
+        !raw_dir.exists() || std::fs::read_dir(&raw_dir).unwrap().count() == 0,
+        "OpenCode writes no raw slices: {}",
+        raw_dir.display()
+    );
+}
+
+fn evaluate_roots(roots: &BTreeMap<String, Roots>, repo: &Path, spool: &Spool) {
+    let now = parse_now("2026-11-04T00:00:00Z");
+    let stats = ingest(spool, roots, repo, now).unwrap();
+    assert_eq!(stats.sessions, 1, "one opencode session: {stats:?}");
+}

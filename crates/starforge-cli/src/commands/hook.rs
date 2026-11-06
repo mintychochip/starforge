@@ -11,6 +11,7 @@
 //! exit code.
 
 use std::io::Read as _;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use time::format_description::well_known::Rfc3339;
@@ -27,6 +28,12 @@ struct SessionEndPayload {
     transcript_path: Option<String>,
     #[serde(default)]
     cwd: Option<String>,
+}
+
+/// One-line stderr warning that never panics on a closed stderr
+/// (the hook must always exit `0`).
+fn warn(msg: &str) {
+    let _ = writeln!(std::io::stderr(), "{msg}");
 }
 
 /// The repo top level enclosing `dir`, or `None` when it is not in a repo.
@@ -104,7 +111,9 @@ fn mark_ended(spool: &crate::spool::Spool, session_id: &str, now_rfc3339: &str) 
     let records = match spool.cursor_records() {
         Ok(records) => records,
         Err(err) => {
-            eprintln!("warning: starforge session-end: cannot read cursors: {err}");
+            warn(&format!(
+                "warning: starforge session-end: cannot read cursors: {err}"
+            ));
             return;
         }
     };
@@ -121,7 +130,9 @@ fn mark_ended(spool: &crate::spool::Spool, session_id: &str, now_rfc3339: &str) 
     let mut meta = match spool.read_meta(&ulid) {
         Ok(meta) => meta,
         Err(err) => {
-            eprintln!("warning: starforge session-end: cannot read session: {err}");
+            warn(&format!(
+                "warning: starforge session-end: cannot read session: {err}"
+            ));
             return;
         }
     };
@@ -129,7 +140,9 @@ fn mark_ended(spool: &crate::spool::Spool, session_id: &str, now_rfc3339: &str) 
         meta.ended_at =
             Some(last_event_ts(spool, &ulid).unwrap_or_else(|| now_rfc3339.to_string()));
         if let Err(err) = spool.put_session(&meta) {
-            eprintln!("warning: starforge session-end: cannot end session: {err}");
+            warn(&format!(
+                "warning: starforge session-end: cannot end session: {err}"
+            ));
             return;
         }
     }
@@ -158,7 +171,9 @@ fn mark_ended(spool: &crate::spool::Spool, session_id: &str, now_rfc3339: &str) 
             not_before: now_rfc3339.to_string(),
         },
     ) {
-        eprintln!("warning: starforge session-end: cannot queue complete: {err}");
+        warn(&format!(
+            "warning: starforge session-end: cannot queue complete: {err}"
+        ));
     }
 }
 
@@ -168,7 +183,7 @@ async fn best_effort_upload(repo: &Path, paths: &crate::config::CliPaths) {
     let common = match crate::git::common_dir(repo) {
         Ok(common) => common,
         Err(err) => {
-            eprintln!("warning: starforge session-end: {err}");
+            warn(&format!("warning: starforge session-end: {err}"));
             return;
         }
     };
@@ -177,18 +192,18 @@ async fn best_effort_upload(repo: &Path, paths: &crate::config::CliPaths) {
         match crate::commands::status::resolve_server(repo, paths).await {
             Ok(resolved) => resolved,
             Err(err) => {
-                eprintln!("warning: starforge session-end: {err}");
+                warn(&format!("warning: starforge session-end: {err}"));
                 return;
             }
         };
     let Some(host) = crate::cli::sync_host_key(&server.api_url) else {
-        eprintln!("warning: starforge session-end: cannot parse server api_url");
+        warn("warning: starforge session-end: cannot parse server api_url");
         return;
     };
     let token = match crate::auth::resolve_token(paths, &host, |key| std::env::var(key).ok()) {
         Ok(resolved) => resolved.token().to_string(),
         Err(err) => {
-            eprintln!("warning: starforge session-end: {err}");
+            warn(&format!("warning: starforge session-end: {err}"));
             return;
         }
     };
@@ -204,20 +219,43 @@ async fn best_effort_upload(repo: &Path, paths: &crate::config::CliPaths) {
 /// upload pass. Always `0`.
 pub async fn hook_session_end(paths: &crate::config::CliPaths) -> u8 {
     if let Err(err) = session_end_inner(paths).await {
-        eprintln!("warning: starforge session-end: {err}");
+        warn(&format!("warning: starforge session-end: {err}"));
     }
     0
 }
 
+/// True when canonicalized `path` lies inside (or equals) canonicalized
+/// `root`. Falls back to a lexical component check when either side cannot
+/// be canonicalized (e.g. a not-yet-created payload cwd).
+fn path_inside(root: &Path, path: &Path) -> bool {
+    let root_c = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let path_c = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    path_c.starts_with(&root_c)
+}
+
+/// The repo this hook may act on.
+///
+/// The hook acts only on the repo containing the process's current
+/// directory. A payload `cwd` is honored only if it lies inside that same
+/// toplevel (canonicalized); otherwise it is ignored and the current dir's
+/// repo is used. If the current dir is not in a repo, the payload `cwd` is
+/// used only when it is inside a repo whose toplevel contains the current
+/// dir; otherwise `None` (do nothing, exit 0).
+fn resolve_hook_repo(payload_cwd: Option<&Path>, current_dir: &Path) -> Option<PathBuf> {
+    let current_toplevel = repo_toplevel(current_dir);
+    if let Some(toplevel) = current_toplevel {
+        return Some(toplevel);
+    }
+    let payload_cwd = payload_cwd?;
+    let toplevel = repo_toplevel(payload_cwd)?;
+    path_inside(&toplevel, current_dir).then_some(toplevel)
+}
+
 async fn session_end_inner(paths: &crate::config::CliPaths) -> Result<(), String> {
     let payload = read_payload();
-    let start = payload
-        .cwd
-        .as_deref()
-        .map(PathBuf::from)
-        .or_else(|| std::env::current_dir().ok())
-        .unwrap_or_else(|| PathBuf::from("."));
-    let Some(repo) = repo_toplevel(&start) else {
+    let payload_cwd = payload.cwd.as_deref().map(PathBuf::from);
+    let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let Some(repo) = resolve_hook_repo(payload_cwd.as_deref(), &current_dir) else {
         return Ok(());
     };
     let common = crate::git::common_dir(&repo).map_err(|err| err.to_string())?;

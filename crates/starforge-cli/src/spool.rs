@@ -151,24 +151,90 @@ pub struct UploadState {
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Create `path` (and ancestors) with mode `0700` on unix; plain
+/// `create_dir_all` elsewhere. Existing dirs are tightened best-effort.
+fn create_dir_private(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700);
+        builder.create(path)?;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(path)
+}
+
+/// Narrow `path` to `0700` (unix, best-effort: never fails the caller).
+fn tighten_dir(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
+/// Narrow `path` to `0600` (unix, best-effort: never fails the caller).
+fn tighten_file(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
 /// Write `bytes` to `path` atomically: temp file in the same directory,
 /// fsync, then rename. The temp name carries no `:` so it stays Windows-safe.
+/// The temp (and thus the result) is mode `0600` on unix.
 pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let tmp_name = format!(
-        "{}.tmp-{}-{n}",
-        path.file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "spool".to_string()),
-        std::process::id()
-    );
-    let tmp = path.with_file_name(tmp_name);
-    std::fs::write(&tmp, bytes)?;
-    let file = std::fs::File::open(&tmp)?;
-    file.sync_all()?;
-    drop(file);
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+    use std::io::Write as _;
+    let mut tmp = None;
+    let mut file = None;
+    for _ in 0..16 {
+        let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tmp_name = format!(
+            "{}.tmp-{}-{n}",
+            path.file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "spool".to_string()),
+            std::process::id()
+        );
+        let candidate = path.with_file_name(tmp_name);
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.mode(0o600);
+        }
+        match opts.open(&candidate) {
+            Ok(f) => {
+                tmp = Some(candidate);
+                file = Some(f);
+                break;
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    let tmp = tmp.ok_or_else(|| io::Error::other("could not create unique spool temp"))?;
+    let mut file = file.expect("spool temp opened");
+    let result: io::Result<()> = (|| {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 impl Spool {
@@ -180,9 +246,12 @@ impl Spool {
     }
 
     /// Create the spool directory layout (§7.3). Idempotent: existing files
-    /// are never truncated or rewritten.
+    /// are never truncated or rewritten. Dirs are `0700`, files `0600`
+    /// (unix); pre-existing root/dirs/files are tightened best-effort.
     pub fn ensure_layout(&self) -> io::Result<()> {
-        std::fs::create_dir_all(self.root.join("sessions"))?;
+        create_dir_private(&self.root.join("sessions"))?;
+        tighten_dir(&self.root);
+        tighten_dir(&self.root.join("sessions"));
         if !self.root.join("cursors.json").exists() {
             let empty = CursorsFile::default();
             atomic_write(
@@ -192,11 +261,13 @@ impl Spool {
                     .as_slice(),
             )?;
         }
+        tighten_file(&self.root.join("cursors.json"));
         for name in ["links.jsonl", "queue.jsonl"] {
             let path = self.root.join(name);
             if !path.exists() {
                 atomic_write(&path, b"")?;
             }
+            tighten_file(&path);
         }
         Ok(())
     }
@@ -272,8 +343,8 @@ impl Spool {
     /// fields; the session dir name is `meta.id`.
     pub fn put_session(&self, meta: &SessionMeta) -> Result<(), SpoolError> {
         let dir = self.session_dir(&meta.id.to_string())?;
-        std::fs::create_dir_all(dir.join("segments"))?;
-        std::fs::create_dir_all(dir.join("raw"))?;
+        create_dir_private(&dir.join("segments"))?;
+        create_dir_private(&dir.join("raw"))?;
         atomic_write(
             &dir.join("meta.json"),
             serde_json::to_vec_pretty(meta)
@@ -511,10 +582,15 @@ impl Spool {
     /// Append one [`LinkEntry`] object to `links.jsonl` (append-only).
     pub fn record_link(&self, entry: &LinkEntry) -> Result<(), SpoolError> {
         use std::io::Write as _;
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(self.root.join("links.jsonl"))?;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.mode(0o600);
+        }
+        let mut file = opts.open(self.root.join("links.jsonl"))?;
+        tighten_file(&self.root.join("links.jsonl"));
         writeln!(
             file,
             "{}",

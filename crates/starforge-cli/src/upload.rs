@@ -88,10 +88,12 @@ struct ConflictBody {
 impl UploadClient {
     /// Build a client for `api_url` with bearer `token` (30 s per request).
     pub fn new(api_url: String, token: String) -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+        let client = crate::discovery::forge_client(Duration::from_secs(30)).unwrap_or_else(|_| {
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("no-redirect http client must build")
+        });
         Self {
             api_url,
             token,

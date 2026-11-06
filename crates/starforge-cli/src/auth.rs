@@ -3,7 +3,11 @@
 //! Token resolution order (used by later tasks): `STARFORGE_TOKEN` env wins,
 //! else the credentials file entry for the target host, else an error naming
 //! both. [`resolve_token`] takes an injected env lookup so tests never touch
-//! the global environment.
+//! the global environment. The `host` argument MUST be the pinned discovery
+//! anchor origin (see `discovery::pin_api_url`): `STARFORGE_TOKEN` (for CI)
+//! is therefore sent only to the server named by the repo's own remote, or
+//! by an explicit `starforge.server` config — never to a host merely
+//! advertised in a well-known document.
 //!
 //! The credentials file shape is `{ [servers."<host>"] = Credentials }`,
 //! stored at [`CliPaths::credential_file`] with mode `0600` on unix.
@@ -99,6 +103,11 @@ impl ResolvedToken {
 /// Resolve the token for `host`: `STARFORGE_TOKEN` env wins, else the
 /// credentials file entry, else an error naming both.
 ///
+/// `host` must be the pinned discovery anchor origin's host key (derived
+/// from `ServerInfo.api_url`, which discovery normalizes to the anchor):
+/// the env token is for CI and goes only to the server named by the repo's
+/// own remote or by explicit `starforge.server` config.
+///
 /// `lookup_env` is injected so tests never touch the global environment;
 /// production passes `|k| std::env::var(k).ok()`.
 pub fn resolve_token(
@@ -137,6 +146,10 @@ pub fn load_credentials(paths: &CliPaths) -> Result<BTreeMap<String, Credentials
 /// Save all credentials atomically (temp file + rename), creating
 /// `config_dir` recursively. Mode `0600` on unix (documented no-op elsewhere:
 /// on Windows the file inherits the profile ACL).
+///
+/// The temp file is created exclusively (`create_new(true)`) with a random
+/// (ULID) suffix, fsynced, then renamed — never a predictable name, and a
+/// pre-planted symlink at any guessed temp path is never followed.
 pub fn save_credentials(
     paths: &CliPaths,
     map: &BTreeMap<String, Credentials>,
@@ -146,34 +159,49 @@ pub fn save_credentials(
         servers: map.clone(),
     };
     let raw = toml::to_string_pretty(&file).map_err(|err| AuthError::Config(err.to_string()))?;
-    let tmp = paths.credential_file.with_extension("toml.tmp");
-    // Drop a stale temp file first so the `mode(0o600)` below always applies
-    // at creation time (it has no effect when opening an existing file). The
-    // temp file holds secrets, so it is created with the restrictive mode up
-    // front — not chmod-after-write, which leaves a world-readable window.
-    // `rename` preserves the mode on the final path.
-    let _ = std::fs::remove_file(&tmp);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)
-            .and_then(|mut f| {
-                use std::io::Write;
-                f.write_all(raw.as_bytes())
-            })
-            .map_err(|err| AuthError::Io(err.to_string()))?;
+    let base = paths
+        .credential_file
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "credentials.toml".to_string());
+    for _ in 0..16 {
+        let tmp = paths
+            .config_dir
+            .join(format!("{base}.tmp.{}", ulid::Ulid::new()));
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = match opts.open(&tmp) {
+            Ok(f) => f,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(AuthError::Io(err.to_string())),
+        };
+        let write_result = (|| -> std::io::Result<()> {
+            use std::io::Write;
+            f.write_all(raw.as_bytes())?;
+            f.sync_all()?;
+            Ok(())
+        })();
+        if let Err(err) = write_result {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(AuthError::Io(err.to_string()));
+        }
+        drop(f);
+        match std::fs::rename(&tmp, &paths.credential_file) {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(AuthError::Io(err.to_string()));
+            }
+        }
     }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(&tmp, raw).map_err(|err| AuthError::Io(err.to_string()))?;
-    }
-    std::fs::rename(&tmp, &paths.credential_file).map_err(|err| AuthError::Io(err.to_string()))?;
-    Ok(())
+    Err(AuthError::Io(
+        "could not create a unique credentials temp file".to_string(),
+    ))
 }
 
 /// Look up the credentials for one server host.
@@ -277,7 +305,13 @@ impl DeviceFlow {
     /// Build a flow for `base_url` (trailing slashes are trimmed).
     pub fn new(base_url: String) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: crate::discovery::forge_client(std::time::Duration::from_secs(30))
+                .unwrap_or_else(|_| {
+                    reqwest::Client::builder()
+                        .redirect(reqwest::redirect::Policy::none())
+                        .build()
+                        .expect("no-redirect http client must build")
+                }),
             base_url: base_url.trim_end_matches('/').to_string(),
         }
     }

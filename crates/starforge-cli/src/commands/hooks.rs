@@ -642,7 +642,7 @@ fn pre_push_inner(repo: &Path) -> Result<(), String> {
         .map(|list| {
             list.into_iter()
                 .next()
-                .map(|(_, url)| url)
+                .map(|(_, url)| crate::discovery::sanitize_remote_url(&url))
                 .unwrap_or_default()
         })
         .unwrap_or_default();

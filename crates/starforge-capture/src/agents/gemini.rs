@@ -345,10 +345,27 @@ fn scan_doc(native_path: &std::path::Path) -> (Option<String>, Option<String>) {
 }
 
 /// Gemini CLI `getProjectHash`: sha256 hex digest of the absolute
-/// project root path string (see module docs for the source).
+/// project root path string (see module docs for the source). The input is
+/// the canonicalized worktree (matching gemini-cli's resolved cwd); when
+/// the path does not exist, the absolute lexical path without a trailing
+/// slash is hashed instead.
 fn project_hash(path: &std::path::Path) -> String {
+    let canonical = std::fs::canonicalize(path).ok();
+    let hash_input = match canonical {
+        Some(resolved) => resolved.to_string_lossy().into_owned(),
+        None => {
+            let absolute = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                std::env::current_dir()
+                    .map(|cwd| cwd.join(path))
+                    .unwrap_or_else(|_| path.to_path_buf())
+            };
+            absolute.to_string_lossy().trim_end_matches('/').to_string()
+        }
+    };
     let mut hasher = sha2::Sha256::new();
-    hasher.update(path.to_string_lossy().as_bytes());
+    hasher.update(hash_input.as_bytes());
     hex_encode(&hasher.finalize())
 }
 

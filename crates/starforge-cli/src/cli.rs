@@ -984,9 +984,14 @@ fn body_source(body: Option<&str>, body_file: Option<&std::path::Path>) -> Resul
     }
 }
 
-/// Host key for credential lookup from a server `api_url`: lowercased host
-/// plus an explicit port when present (mirrors [`crate::auth::normalize_server`]).
-pub(crate) fn sync_host_key(api_url: &str) -> Option<String> {
+/// Host key for credential lookup from a pinned server `api_url`:
+/// lowercased host plus an explicit port when present (mirrors
+/// [`crate::auth::normalize_server`]). Callers must pass
+/// `ServerInfo.api_url` as returned by discovery, which is normalized to
+/// the anchor origin (see `crate::discovery::pin_api_url`) — so the key
+/// (and any `STARFORGE_TOKEN` resolved for it) is bound to the pinned
+/// origin, never to a host merely advertised in a well-known document.
+pub fn sync_host_key(api_url: &str) -> Option<String> {
     let url = url::Url::parse(api_url).ok()?;
     let host = url.host_str()?.to_lowercase();
     Some(match url.port() {

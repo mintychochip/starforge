@@ -322,14 +322,20 @@ fn credentials_roundtrip_and_unix_mode() {
 
 #[cfg(unix)]
 #[test]
-fn save_overwrites_stale_temp_and_keeps_0600() {
+fn save_ignores_stale_predictable_temp_and_keeps_0600() {
     use std::os::unix::fs::PermissionsExt;
     let (_dir, paths) = test_paths();
     std::fs::create_dir_all(&paths.config_dir).unwrap();
-    // Simulate a crashed run's leftover temp file with wide permissions.
-    let tmp = paths.credential_file.with_extension("toml.tmp");
-    std::fs::write(&tmp, "junk").unwrap();
-    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644)).unwrap();
+    // A leftover file (or planted symlink target) at the old predictable
+    // temp path must never be followed or truncated by save.
+    let stale = paths.credential_file.with_extension("toml.tmp");
+    std::fs::write(&stale, "junk").unwrap();
+    std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let victim = paths.config_dir.join("victim.txt");
+    std::fs::write(&victim, "untouched").unwrap();
+    let link = paths.config_dir.join("planted-link");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&victim, &link).unwrap();
 
     let mut map = BTreeMap::new();
     map.insert(
@@ -342,7 +348,17 @@ fn save_overwrites_stale_temp_and_keeps_0600() {
     );
     starforge_cli::auth::save_credentials(&paths, &map).unwrap();
 
-    assert!(!tmp.exists(), "stale temp must be renamed away");
+    // Stale predictable temp is left alone (not renamed away, not followed).
+    assert_eq!(std::fs::read_to_string(&stale).unwrap(), "junk");
+    assert_eq!(std::fs::read_to_string(&victim).unwrap(), "untouched");
+    // No random-suffixed temp files are left behind.
+    for entry in std::fs::read_dir(&paths.config_dir).unwrap() {
+        let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+        assert!(
+            !name.starts_with("credentials.toml.tmp."),
+            "leftover temp file: {name}"
+        );
+    }
     let mode = std::fs::metadata(&paths.credential_file)
         .unwrap()
         .permissions()

@@ -36,9 +36,7 @@ impl ApiClient {
     /// (the discovery `ServerInfo.api_url` origin, e.g. `https://host`).
     pub fn new(api_url: &str, owner_repo: &str, token: &str) -> Result<ApiClient, ApiError> {
         let server = api_url.trim_end_matches('/').to_string();
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
+        let client = crate::discovery::forge_client(std::time::Duration::from_secs(30))
             .map_err(|err| ApiError::Transport(format!("cannot build http client: {err}")))?;
         let api_base = format!("{server}/api/v1/repos/{owner_repo}/");
         let web_base = format!("{server}/{owner_repo}/");

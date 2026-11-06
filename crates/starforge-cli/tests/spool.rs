@@ -119,6 +119,62 @@ fn ensure_layout_creates_every_path_and_is_idempotent() {
     assert_eq!(read_queue(&spool).unwrap().len(), 1);
 }
 
+/// Spool dirs are `0700` and files `0600` on unix; a pre-existing leaky
+/// root is tightened by `ensure_layout`.
+#[cfg(unix)]
+#[test]
+fn spool_layout_is_private_on_unix() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = TempDir::new().unwrap();
+    // Pre-create a leaky root to prove tightening.
+    let root = dir.path().join("starforge");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let spool = Spool::open(dir.path());
+    spool.ensure_layout().unwrap();
+    assert_eq!(
+        std::fs::metadata(&spool.root).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(
+        std::fs::metadata(spool.root.join("sessions"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    for name in ["cursors.json", "links.jsonl", "queue.jsonl"] {
+        assert_eq!(
+            std::fs::metadata(spool.root.join(name))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600,
+            "{name}"
+        );
+    }
+    // Session dirs and files are private too.
+    let ulid = ulid::Ulid::new().to_string();
+    let mut meta = test_meta(fixture_events().1, "fp", BTreeMap::new());
+    meta.id = ulid.parse().unwrap();
+    spool.put_session(&meta).unwrap();
+    let session = spool.root.join("sessions").join(&ulid);
+    assert_eq!(
+        std::fs::metadata(&session).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(
+        std::fs::metadata(session.join("meta.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+}
+
 #[test]
 fn planted_token_absent_from_segments_and_raw_with_counts_and_fingerprint() {
     let (repo_tmp, spool) = open_spool();

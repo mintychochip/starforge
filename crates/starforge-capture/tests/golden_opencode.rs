@@ -286,3 +286,38 @@ fn opencode_detect_false_without_store() {
     assert!(!a.detect(&roots));
     assert!(a.discover(&roots, &HashMap::new()).is_empty());
 }
+
+/// Unknown-cwd sessions are skipped, never attributed to the worktree under
+/// commit: empty `directory` plus an empty/missing project worktree must not
+/// discover.
+#[test]
+fn opencode_session_with_unknown_workdir_is_skipped() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let db = data.join("opencode.db");
+    let sql = "CREATE TABLE project(id TEXT PRIMARY KEY, worktree TEXT NOT NULL, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL);\
+        CREATE TABLE session_v2(id TEXT PRIMARY KEY, project_id TEXT NOT NULL, directory TEXT NOT NULL DEFAULT '', version TEXT NOT NULL DEFAULT '', parent_id TEXT, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, time_archived INTEGER);\
+        CREATE TABLE session_message(id TEXT PRIMARY KEY, session_id TEXT NOT NULL, type TEXT NOT NULL, seq INTEGER NOT NULL, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL);\
+        CREATE TABLE session_part(message_id TEXT NOT NULL, session_id TEXT NOT NULL, ordinal INTEGER NOT NULL, type TEXT NOT NULL, call_id TEXT, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL);\
+        INSERT INTO project(id, worktree, time_created, time_updated) VALUES('p1', '', 1, 1);\
+        INSERT INTO session_v2(id, project_id, directory, version, time_created, time_updated) VALUES('sess_unknown', 'p1', '', '2.0.29', 1, 1);\
+        INSERT INTO session_v2(id, project_id, directory, version, time_created, time_updated) VALUES('sess_missing_proj', 'nope', '', '2.0.29', 1, 1);\
+        INSERT INTO session_message(id, session_id, type, seq, time_created, time_updated, data) VALUES('m1', 'sess_unknown', 'user', 0, 1, 1, '{\"text\":\"hi\"}');\
+        INSERT INTO session_message(id, session_id, type, seq, time_created, time_updated, data) VALUES('m2', 'sess_missing_proj', 'user', 0, 1, 1, '{\"text\":\"hi\"}');";
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute_batch(sql)
+        .unwrap();
+    let roots = Roots {
+        config_dir: tmp.path().join("cfg"),
+        data_dir: data,
+        worktree: PathBuf::from("/repo"),
+    };
+    let a = OpencodeAdapter;
+    let found = a.discover(&roots, &HashMap::new());
+    assert!(
+        found.is_empty(),
+        "unknown-cwd sessions must be skipped, got {found:?}"
+    );
+}

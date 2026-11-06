@@ -434,15 +434,11 @@ fn tables_present(conn: &Connection) -> bool {
 }
 
 /// Workdir for one session row: `directory` when non-empty, else the
-/// project's `worktree`, else the caller's worktree.
-fn resolve_workdir(
-    conn: &Connection,
-    directory: &str,
-    project_id: &str,
-    fallback_worktree: &std::path::Path,
-) -> PathBuf {
+/// project's `worktree`, else `None` (unknown cwd — the session is skipped
+/// rather than attributed to the worktree under commit).
+fn resolve_workdir(conn: &Connection, directory: &str, project_id: &str) -> Option<PathBuf> {
     if !directory.is_empty() {
-        return PathBuf::from(directory);
+        return Some(PathBuf::from(directory));
     }
     let worktree: Result<Option<String>, _> = conn.query_row(
         "SELECT worktree FROM project WHERE id = ?1",
@@ -450,8 +446,8 @@ fn resolve_workdir(
         |row| row.get(0),
     );
     match worktree {
-        Ok(Some(w)) if !w.is_empty() => PathBuf::from(w),
-        _ => fallback_worktree.to_path_buf(),
+        Ok(Some(w)) if !w.is_empty() => Some(PathBuf::from(w)),
+        _ => None,
     }
 }
 
@@ -529,7 +525,9 @@ impl Adapter for OpencodeAdapter {
             if time_archived.is_some() || parent_id.is_some() {
                 continue;
             }
-            let workdir = resolve_workdir(&conn, &directory, &project_id, &roots.worktree);
+            let Some(workdir) = resolve_workdir(&conn, &directory, &project_id) else {
+                continue;
+            };
             if !workdir_inside(&roots.worktree, &workdir) {
                 continue;
             }
@@ -583,9 +581,12 @@ impl Adapter for OpencodeAdapter {
                 },
             )
             .map_err(|e| CaptureError::Sqlite(e.to_string()))?;
-        let workdir = resolve_workdir(&conn, &directory, &project_id, &candidate.workdir)
-            .to_string_lossy()
-            .into_owned();
+        let Some(workdir) = resolve_workdir(&conn, &directory, &project_id) else {
+            return Err(CaptureError::BadNative(
+                "session has no known workdir".to_string(),
+            ));
+        };
+        let workdir = workdir.to_string_lossy().into_owned();
         // All messages and parts: the header pass folds the whole session,
         // the event pass emits only messages newer than the cursor.
         let mut messages: Vec<OcMessage> = Vec::new();

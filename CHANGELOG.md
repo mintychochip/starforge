@@ -20,9 +20,14 @@ search, webhooks, and mirrors, on SQLite or Postgres.
 - **Sessions (M1):** Trace Format v1 (session metadata and normalized
   events, JSON Schemas), secret redaction with per-repository and site
   rules, content-addressed zstd segment storage with quotas, capture
-  adapters for Claude Code, Codex, Pi, OpenCode, and Gemini, session viewer
-  with in-session search and split view, quarantine on high-confidence
-  redaction hits, publish/unpublish/delete, export/import bundles.
+  adapters for Claude Code, Codex, Pi and omp, OpenCode (v2 SQLite store),
+  and Gemini CLI, read from each agent's own store directory (see
+  `docs/user/sessions.md`), session viewer with in-session search and split
+  view, quarantine on high-confidence redaction hits,
+  publish/unpublish/delete, export/import bundles. Only sessions whose
+  working directory lies inside the repository are captured; sessions with
+  no known working directory are never attributed. Antigravity CLI sessions
+  are not captured (see README "Known gaps").
 - **Trails (M2):** per-repository numbered Trails with comments, labels,
   assignees, and review requests; changes via `refs/for/*` (agit) with
   revisions, reviews, threaded comments, and pending (draft) reviews;
@@ -46,10 +51,18 @@ search, webhooks, and mirrors, on SQLite or Postgres.
   the OCI image (`Containerfile`, Alpine, non-root, `/data` volume),
   cargo-dist installers for `starforge`, and Playwright browser tests
   (`tests/browser/`).
-- **CLI:** `starforge` — `auth login` (device flow), `enable`/`disable`,
+- **CLI:** `starforge` — `auth login` (device flow, scopes `repo:read
+  trail:write session:upload`), `enable`/`disable` (git hooks plus the
+  Claude Code `SessionEnd` hook, which runs `starforge hook session-end`),
   `status`, `doctor`, `sync`, `sessions list/show/link/unlink/publish/
   unpublish/delete`, `export`/`import`, and `trail
-  list/show/create/comment/push/checkout/review/merge`.
+  list/show/create/comment/push/checkout/review/merge`. Server discovery
+  uses `GET /.well-known/starforge.json`; the advertised `api_url` must
+  share the origin of the repository's remote (or of `git config
+  starforge.server`), and plain `http` is accepted only for loopback.
+- **Configuration:** `server.base_url` must be an origin
+  (`https://forge.example.com`); Starforge cannot be served under a path
+  prefix.
 
 ### Migrations
 

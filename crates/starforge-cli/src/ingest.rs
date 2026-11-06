@@ -143,6 +143,37 @@ fn parse_ts(ts: &str) -> Option<OffsetDateTime> {
     OffsetDateTime::parse(ts, &time::format_description::well_known::Rfc3339).ok()
 }
 
+/// Scrub a free-text meta field; counts merge into the caller's map.
+fn redact_str(
+    compiled: &starforge_redact::Compiled,
+    text: &str,
+    counts: &mut BTreeMap<String, u64>,
+) -> String {
+    let (redacted, c) = starforge_redact::redact_text(compiled, text);
+    for (k, v) in c {
+        *counts.entry(k).or_insert(0) += v;
+    }
+    redacted
+}
+
+/// Whether raw native slices may be captured for `agent`.
+///
+/// Raw slices are byte ranges `[cursor.offset, next.offset)` into an
+/// append-only native file, so they are only meaningful when the cursor
+/// offset is a byte offset into a JSONL append-only transcript
+/// (claude-code, codex, pi). Gemini rewrites the whole chat JSON document
+/// on growth (`offset` is the whole-document length; the slice would be the
+/// entire document, not the incremental delta). OpenCode is a SQLite store
+/// whose cursor `offset` is the largest consumed message `seq`, not a byte
+/// offset; slicing the database file would leak arbitrary SQLite page bytes
+/// from every session into one session's spool.
+fn raw_slice_eligible(agent: &AgentName) -> bool {
+    matches!(
+        agent,
+        AgentName::ClaudeCode | AgentName::Codex | AgentName::Pi
+    )
+}
+
 /// Discover → read → redact → spool for every detecting adapter, each with
 /// its own [`Roots`] (keyed by agent key: `claude-code`, `codex`, `pi`,
 /// `opencode`, `gemini`; adapters without a roots entry are skipped).
@@ -239,14 +270,21 @@ pub fn ingest(
             // `append_events` needs the session dir: create it on first sight.
             // The fold below refreshes the header fields afterwards.
             if first_sight {
+                let mut meta_counts: BTreeMap<String, u64> = BTreeMap::new();
                 let mut meta = out.header.clone();
                 meta.id = ulid.parse().expect("fresh ULID parses");
+                // Scrub free-text header fields before they reach the spool:
+                // only the redacted copies are ever persisted.
+                if let Some(title) = meta.title.clone() {
+                    meta.title = Some(redact_str(&compiled, &title, &mut meta_counts));
+                }
                 let remotes = crate::git::remotes(repo_root).unwrap_or_default();
                 meta.repo = starforge_format::RepoInfo {
                     // Strip credential userinfo: secrets must never reach the spool.
                     remote_urls: remotes
                         .into_iter()
                         .map(|(_, url)| crate::discovery::sanitize_remote_url(&url))
+                        .map(|url| redact_str(&compiled, &url, &mut meta_counts))
                         .collect(),
                     branch: String::new(),
                     head_at_start: crate::git::head_commit(repo_root).unwrap_or_default(),
@@ -256,7 +294,7 @@ pub fn ingest(
                 meta.usage = Usage::default();
                 meta.redaction = starforge_format::RedactionSummary {
                     fingerprint: fingerprint.clone(),
-                    counts: BTreeMap::new(),
+                    counts: meta_counts,
                 };
                 meta.capture.mode = starforge_format::CaptureMode::Discovery;
                 meta.capture.cli_version = env!("CARGO_PKG_VERSION").to_string();
@@ -267,12 +305,14 @@ pub fn ingest(
 
             let mut counts: BTreeMap<String, u64> = BTreeMap::new();
             let mut lines = Vec::with_capacity(out.events.len());
+            let mut redacted_events = Vec::with_capacity(out.events.len());
             for event in &out.events {
                 let (redacted, c) = starforge_redact::redact_event(&compiled, event);
                 for (k, v) in c {
                     *counts.entry(k).or_insert(0) += v;
                 }
                 lines.push(serde_json::to_string(&redacted).expect("Event serializes"));
+                redacted_events.push(redacted);
             }
             let jsonl = lines.join("\n") + "\n";
             let nums = spool.append_events(
@@ -283,19 +323,27 @@ pub fn ingest(
             )?;
             stats.new_segments += nums.len();
 
-            // Raw native slice for the newly consumed byte range, redacted as text.
-            // A raw read failure only skips the raw bytes: events are already
-            // appended and the meta fold below must still run, otherwise
-            // models/usage/counts stay permanently stale for this batch.
-            let native = match std::fs::read(&candidate.native_path) {
-                Ok(native) => Some(native),
-                Err(err) => {
-                    tracing::warn!(
-                        "ingest: skipping raw slice for {agent}/{}: {err}",
-                        candidate.session_key
-                    );
-                    None
+            // Raw native slice for the newly consumed byte range, redacted as
+            // text. Only byte-offset adapters are eligible (see
+            // `raw_slice_eligible`): OpenCode/Gemini offsets are not byte
+            // offsets into an append-only file. A raw read failure only
+            // skips the raw bytes: events are already appended and the meta
+            // fold below must still run, otherwise models/usage/counts stay
+            // permanently stale for this batch.
+            let raw_eligible = raw_slice_eligible(&adapter.id());
+            let native = if raw_eligible {
+                match std::fs::read(&candidate.native_path) {
+                    Ok(native) => Some(native),
+                    Err(err) => {
+                        tracing::warn!(
+                            "ingest: skipping raw slice for {agent}/{}: {err}",
+                            candidate.session_key
+                        );
+                        None
+                    }
                 }
+            } else {
+                None
             };
             let mut raw_counts: BTreeMap<String, u64> = BTreeMap::new();
             if let Some(native) = native {
@@ -343,16 +391,38 @@ pub fn ingest(
             meta.usage.cache_read = meta.usage.cache_read.max(usage.cache_read);
             meta.usage.cache_write = meta.usage.cache_write.max(usage.cache_write);
             meta.usage.reasoning = meta.usage.reasoning.max(usage.reasoning);
+            let mut meta_counts: BTreeMap<String, u64> = BTreeMap::new();
             let mut files = std::collections::HashSet::new();
-            files.extend(meta.files_touched.iter().cloned());
-            for event in &out.events {
-                files.extend(event_files(event));
+            for f in &meta.files_touched {
+                files.insert(redact_str(&compiled, f, &mut meta_counts));
+            }
+            // Derive from REDACTED events so no unredacted path reaches the spool.
+            for event in &redacted_events {
+                for f in event_files(event) {
+                    files.insert(redact_str(&compiled, &f, &mut meta_counts));
+                }
             }
             let mut files: Vec<String> = files.into_iter().collect();
             files.sort();
             meta.files_touched = files;
-            if meta.title.is_none() {
-                meta.title = out.header.title.clone();
+            // Redact remaining free-text meta fields (branch; remote urls are
+            // already sanitized at first sight, redacted defensively here).
+            if !meta.repo.branch.is_empty() {
+                let branch = meta.repo.branch.clone();
+                meta.repo.branch = redact_str(&compiled, &branch, &mut meta_counts);
+            }
+            let mut urls = Vec::with_capacity(meta.repo.remote_urls.len());
+            for url in &meta.repo.remote_urls {
+                urls.push(redact_str(&compiled, url, &mut meta_counts));
+            }
+            meta.repo.remote_urls = urls;
+            if meta.title.is_none()
+                && let Some(title) = &out.header.title
+            {
+                meta.title = Some(redact_str(&compiled, title, &mut meta_counts));
+            }
+            for (k, v) in &meta_counts {
+                *meta.redaction.counts.entry(k.clone()).or_insert(0) += v;
             }
             let mut min_ts = meta.started_at.clone();
             let mut max_ts: Option<String> = None;

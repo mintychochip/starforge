@@ -611,6 +611,44 @@ fn pre_push_enqueues_unwritten_segments_and_always_succeeds() {
     assert_eq!(queue, queue2, "no duplicate queue entries");
 }
 
+/// The remote URL enqueued by `pre-push` is sanitized: embedded
+/// credentials never reach the queue.
+#[test]
+fn pre_push_enqueues_sanitized_remote_url() {
+    let (_dir, repo) = init_repo();
+    let (_home, paths) = test_paths();
+    let (_, code) = enable(&repo, &paths, false);
+    assert_eq!(code, 0);
+    git_ok(
+        &repo,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://user:token@example.com/o/r.git",
+        ],
+    );
+
+    let ulid = "01J9KQXF1T3NP2R8A5B6C7D9E5";
+    let common = common_dir(&repo).unwrap();
+    let spool = Spool::open(&common);
+    spool.ensure_layout().unwrap();
+    let events = format!("{}\n", tool_event(0, "Write", "new.txt"));
+    seed_session(&spool, ulid, &["new.txt"], &events);
+
+    assert_eq!(hook_pre_push(&repo, &paths), 0);
+    let queue = read_queue(&spool).unwrap();
+    let entry = queue
+        .iter()
+        .find(|e| e.op == QueueOp::Segment && e.ulid == ulid)
+        .expect("segment enqueued");
+    assert_eq!(entry.repo, "https://example.com/o/r.git");
+    assert!(
+        !format!("{:?}", queue).contains("token"),
+        "no credentials in queue"
+    );
+}
+
 // Pure trailer + selection helpers.
 
 #[test]

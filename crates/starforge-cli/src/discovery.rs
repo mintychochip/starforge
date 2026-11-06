@@ -14,12 +14,112 @@
 //! (scp-style) remotes probe `https://{host}`; `ssh://`, `file://`, bare
 //! paths, and anything else unparseable are skipped, never errors.
 //!
+//! Anchor pinning (C1/I7): `{base}` (or the configured `starforge.server`
+//! origin) is the anchor. The advertised `api_url` must be an origin-only
+//! http(s) URL on that exact origin, otherwise the candidate is refused;
+//! `ServerInfo.api_url` is normalized to the anchor, so tokens and uploads
+//! only ever go to the anchor. Redirects are never followed, bodies are
+//! capped at 64 KiB, and `http` is allowed only for loopback anchors.
+//!
 //! The sync half ([`local_config`], [`order_candidates`],
 //! [`probe_base_for_remote`], [`parse_well_known`]) is pure and unit-testable;
 //! only the HTTP fetch is async.
 
 use std::path::Path;
 use std::time::Duration;
+/// Maximum accepted size of a well-known document (64 KiB).
+pub const MAX_WELL_KNOWN_BYTES: usize = 64 * 1024;
+
+/// Build the single reqwest client used for forge traffic (discovery and,
+/// via [`forge_client`], the API/upload clients): redirects are never
+/// followed, so a server cannot bounce a probe or a token-bearing request
+/// to another origin.
+pub fn forge_client(timeout: Duration) -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+}
+
+/// Whether `host` is a loopback host: `localhost`, `127.0.0.0/8`, or `::1`.
+pub fn is_loopback_host(host: &str) -> bool {
+    let host = host.trim().trim_matches(['[', ']']);
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(ip)) => ip.octets()[0] == 127,
+        Ok(std::net::IpAddr::V6(ip)) => ip.is_loopback(),
+        Err(_) => false,
+    }
+}
+
+/// Whether transport to `anchor` (an origin) is allowed: `https` always,
+/// `http` only for loopback hosts. Pure check, unit-testable without I/O.
+pub fn anchor_transport_allowed(anchor: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(anchor) else {
+        return false;
+    };
+    match parsed.scheme() {
+        "https" => true,
+        "http" => parsed.host_str().is_some_and(is_loopback_host),
+        _ => false,
+    }
+}
+
+/// Origin (`scheme://host[:port]`, no trailing slash, IPv6 bracketed) of an
+/// absolute http(s) URL, or `None` when it has no http(s) origin.
+fn origin_of(url_str: &str) -> Option<String> {
+    let parsed = url::Url::parse(url_str.trim()).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return None;
+    }
+    let host = parsed.host_str()?;
+    let host = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    Some(match parsed.port() {
+        Some(port) => format!("{}://{host}:{port}", parsed.scheme()),
+        None => format!("{}://{host}", parsed.scheme()),
+    })
+}
+
+/// Validate `api_url` against the discovery `anchor` origin and return the
+/// normalized (pinned) `api_url`, which is always the anchor itself.
+///
+/// `api_url` must be an absolute http(s) URL whose origin equals `anchor`;
+/// a trailing slash or a path of exactly `/` is allowed, any other path
+/// (servers are origin-only) is rejected. On mismatch the returned message
+/// names both origins and the explicit-trust remedy.
+pub fn pin_api_url(api_url: &str, anchor: &str) -> Result<String, String> {
+    let advertised = api_url.trim();
+    let mismatch = || {
+        format!(
+            "server at {anchor} advertises api_url {advertised} on another origin; refusing (set git config starforge.server {advertised} to trust it explicitly)"
+        )
+    };
+    let Ok(parsed) = url::Url::parse(advertised) else {
+        return Err(mismatch());
+    };
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return Err(mismatch());
+    }
+    if !parsed.path().is_empty() && parsed.path() != "/" {
+        return Err(format!(
+            "server at {anchor} advertises api_url {advertised} with a non-origin path {:?}; refusing (servers are origin-only)",
+            parsed.path()
+        ));
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(mismatch());
+    }
+    match origin_of(advertised) {
+        Some(origin) if origin == anchor => Ok(anchor.to_string()),
+        _ => Err(mismatch()),
+    }
+}
 
 /// Server endpoints discovered via `/.well-known/starforge.json`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -223,24 +323,75 @@ pub fn local_config(repo: &Path) -> Result<LocalConfig, DiscoveryError> {
 /// by itself; only the final "no server anywhere" is an error.
 pub async fn probe_well_known(client: &reqwest::Client, remote_url: &str) -> Option<ServerInfo> {
     let base = probe_base_for_remote(remote_url)?;
-    fetch_well_known(client, &format!("{base}/.well-known/starforge.json")).await
+    match fetch_well_known(client, &format!("{base}/.well-known/starforge.json"), &base).await {
+        FetchOutcome::Ok(info) => Some(info),
+        FetchOutcome::Failed(_) => None,
+    }
 }
 
-async fn fetch_well_known(client: &reqwest::Client, url: &str) -> Option<ServerInfo> {
+/// Outcome of one well-known fetch against a pinned `anchor` origin.
+enum FetchOutcome {
+    Ok(ServerInfo),
+    /// Failed. `Some(msg)` is a security refusal (origin pin, transport, or
+    /// size) to surface when this candidate is final; `None` is a generic
+    /// fall-through (transport error, non-200 — including any redirect,
+    /// since the client never follows them — or invalid document).
+    Failed(Option<String>),
+}
+
+async fn fetch_well_known(client: &reqwest::Client, url: &str, anchor: &str) -> FetchOutcome {
+    if !anchor_transport_allowed(anchor) {
+        return FetchOutcome::Failed(Some(format!(
+            "server at {anchor} uses http for a non-loopback host; refusing (https is required; http is allowed only for localhost/loopback)"
+        )));
+    }
     for attempt in 0..2 {
         match client.get(url).timeout(Duration::from_secs(5)).send().await {
-            Ok(resp) => {
+            Ok(mut resp) => {
                 if !resp.status().is_success() {
-                    return None; // definitive: try the next candidate
+                    return FetchOutcome::Failed(None); // definitive: try the next candidate
                 }
-                let bytes = resp.bytes().await.ok()?;
-                return parse_well_known(&bytes).ok();
+                if let Some(len) = resp.content_length()
+                    && len > MAX_WELL_KNOWN_BYTES as u64
+                {
+                    return FetchOutcome::Failed(Some(format!(
+                        "well-known document from {anchor} exceeds {} bytes; refusing",
+                        MAX_WELL_KNOWN_BYTES
+                    )));
+                }
+                let mut bytes = Vec::new();
+                loop {
+                    match resp.chunk().await {
+                        Ok(Some(chunk)) => {
+                            bytes.extend_from_slice(&chunk);
+                            if bytes.len() > MAX_WELL_KNOWN_BYTES {
+                                return FetchOutcome::Failed(Some(format!(
+                                    "well-known document from {anchor} exceeds {} bytes; refusing",
+                                    MAX_WELL_KNOWN_BYTES
+                                )));
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(_) => return FetchOutcome::Failed(None),
+                    }
+                }
+                let info = match parse_well_known(&bytes) {
+                    Ok(info) => info,
+                    Err(_) => return FetchOutcome::Failed(None),
+                };
+                return match pin_api_url(&info.api_url, anchor) {
+                    Ok(pinned) => FetchOutcome::Ok(ServerInfo {
+                        api_url: pinned,
+                        ..info
+                    }),
+                    Err(msg) => FetchOutcome::Failed(Some(msg)),
+                };
             }
             Err(_) if attempt == 0 => continue, // one retry on transport errors
-            Err(_) => return None,
+            Err(_) => return FetchOutcome::Failed(None),
         }
     }
-    None
+    FetchOutcome::Failed(None)
 }
 
 /// Strip credential userinfo from a remote URL, preserving everything else.
@@ -308,33 +459,42 @@ pub async fn resolve_server(
             format!("https://{trimmed}")
         };
         // Fetch with the full configured URL, but never let userinfo reach
-        // errors, logs, or the returned chosen URL.
+        // errors, logs, or the returned chosen URL. The anchor is the
+        // configured origin: the advertised `api_url` must pin to it.
         let display = sanitized_base(&full);
         let url = format!("{full}/.well-known/starforge.json");
-        if let Some(info) = fetch_well_known(client, &url).await {
-            let owner_repo = configured_repo.unwrap_or_default();
-            return Ok((info, owner_repo, display));
-        }
-        return Err(DiscoveryError::Unreachable(display));
+        return match fetch_well_known(client, &url, &display).await {
+            FetchOutcome::Ok(info) => {
+                let owner_repo = configured_repo.unwrap_or_default();
+                Ok((info, owner_repo, display))
+            }
+            FetchOutcome::Failed(Some(msg)) => Err(DiscoveryError::Unreachable(msg)),
+            FetchOutcome::Failed(None) => Err(DiscoveryError::Unreachable(display)),
+        };
     }
 
     let mut tried = Vec::new();
+    let mut last_detail: Option<String> = None;
     for (_, remote_url) in &candidates {
         let Some(base) = probe_base_for_remote(remote_url) else {
             continue;
         };
         tried.push(base.clone());
-        if let Some(info) =
-            fetch_well_known(client, &format!("{base}/.well-known/starforge.json")).await
-        {
-            let owner_repo = configured_repo
-                .clone()
-                .unwrap_or_else(|| owner_repo_from_remote(remote_url));
-            return Ok((info, owner_repo, sanitize_remote_url(remote_url)));
+        match fetch_well_known(client, &format!("{base}/.well-known/starforge.json"), &base).await {
+            FetchOutcome::Ok(info) => {
+                let owner_repo = configured_repo
+                    .clone()
+                    .unwrap_or_else(|| owner_repo_from_remote(remote_url));
+                return Ok((info, owner_repo, sanitize_remote_url(remote_url)));
+            }
+            FetchOutcome::Failed(Some(msg)) => last_detail = Some(msg),
+            FetchOutcome::Failed(None) => {}
         }
     }
     if tried.is_empty() {
         Err(DiscoveryError::NoServer(repo.display().to_string()))
+    } else if let Some(msg) = last_detail {
+        Err(DiscoveryError::Unreachable(msg))
     } else {
         Err(DiscoveryError::Unreachable(tried.join(", ")))
     }

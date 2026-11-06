@@ -44,21 +44,84 @@ pub struct ClaudeAdapter;
 const HOOK_REL_PATH: &str = "settings.json";
 /// The `SessionEnd` hook command starforge installs.
 const HOOK_COMMAND: &str = "starforge hook session-end";
-/// Write `body` to `path` atomically: temp file in the same directory, then
-/// rename, preserving the existing file mode.
+/// Write `body` to `path` atomically, following a symlinked `path` so the
+/// link itself is preserved (dotfile managers): the resolved target is
+/// replaced in place. A dangling symlink is an error and the file is left
+/// untouched. The temp file is created exclusively (`create_new`) with a
+/// random suffix and mode `0600`, synced, given the final mode (existing
+/// file's mode, else `0644`) **before** the rename, so there is no
+/// world-readable window.
 fn write_settings(path: &std::path::Path, body: &Value) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt as _;
     let bytes = serde_json::to_string_pretty(body).unwrap();
-    let mode = std::fs::metadata(path).map(|m| m.permissions().mode()).ok();
-    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
-    let tmp = parent.join(format!(".settings.json.tmp.{}", std::process::id()));
-    std::fs::write(&tmp, &bytes)?;
-    if let Some(mode) = mode {
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))?;
+    let target: std::path::PathBuf = match std::fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_symlink() => std::fs::canonicalize(path).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("cannot resolve settings symlink {}: {e}", path.display()),
+            )
+        })?,
+        _ => path.to_path_buf(),
+    };
+    #[cfg(unix)]
+    let final_mode: u32 = std::fs::metadata(&target)
+        .map(|m| {
+            use std::os::unix::fs::PermissionsExt as _;
+            m.permissions().mode() & 0o7777
+        })
+        .unwrap_or(0o644);
+    #[cfg(not(unix))]
+    let final_mode: u32 = 0;
+    let parent = target.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let mut tmp = None;
+    let mut file = None;
+    for _ in 0..16 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let candidate = parent.join(format!(
+            ".settings.json.tmp.{}-{n}-{nanos}",
+            std::process::id()
+        ));
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.mode(0o600);
+        }
+        match opts.open(&candidate) {
+            Ok(f) => {
+                tmp = Some(candidate);
+                file = Some(f);
+                break;
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
     }
-    std::fs::rename(&tmp, path)?;
-    let _ = std::fs::remove_file(&tmp);
-    Ok(())
+    let tmp = tmp.ok_or_else(|| io::Error::other("could not create unique settings temp"))?;
+    let mut file = file.expect("temp file opened");
+    let result: io::Result<()> = (|| {
+        use std::io::Write as _;
+        file.write_all(bytes.as_bytes())?;
+        file.sync_all()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(final_mode))?;
+        }
+        #[cfg(not(unix))]
+        let _ = final_mode;
+        std::fs::rename(&tmp, &target)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 fn valid_ts(s: &str) -> bool {

@@ -118,6 +118,13 @@ Spool layout is `<git common dir>/starforge` (`sessions/<ULID>/`, `links.jsonl`,
 heuristic linking fires once per batch of new session activity. Auth is
 `STARFORGE_TOKEN` when set, else `starforge auth login` (device flow) storing
 per-host tokens in `~/.config/starforge/credentials.toml` (mode `0600`).
+CI tokens (`STARFORGE_TOKEN`) are sent only to the pinned discovery origin:
+the server named by the repository's own remote, or by an explicit
+`git config starforge.server` — never to a host merely advertised in a
+well-known document. Discovery pins the well-known `api_url` to that anchor
+origin (origin-only, `https` required except for loopback) and refuses any
+other origin; set `git config starforge.server <url>` to trust a different
+server explicitly. Redirects are never followed.
 Every command honors `--dry-run` (print, don't write) and `--verbose`.
 Exit codes: `0` ok, `1` operational error, `2` `sync` finished with items
 still queued. Hidden `_hook-prepare-commit-msg`, `_hook-post-commit`, and

@@ -9,9 +9,8 @@
 //!
 //! The fixture plants one `ghp_…` token twice: once in a user message (the
 //! CLI redacts it out of the stored segment bytes) and once in an `Edit`
-//! `file_path` (ingest folds pre-redaction events into `meta.files_touched`
-//! verbatim, so the server-side meta-scan quarantines the session with
-//! `known-token` while storing the redacted value).
+//! `file_path` (the CLI redacts it client-side before the spool, so the
+//! server-side meta-scan holds no token and quarantines nothing).
 mod common;
 
 use std::collections::BTreeMap;
@@ -68,7 +67,7 @@ async fn real_cli_ingest_sync_round_trip() {
     let work_str = work.to_string_lossy().into_owned();
     // Spaces delimit the token from the path: the high-entropy alphabet
     // includes `/ . _ = + -`, so a glued token loses the overlap to the
-    // low-confidence detector and the meta-scan would not quarantine.
+    // low-confidence detector and the client-side redaction would miss it.
     let file_with_token = format!("{work_str}/notes {PLANTED_TOKEN} rotated.md");
     let records = [
         serde_json::json!({
@@ -189,9 +188,22 @@ async fn real_cli_ingest_sync_round_trip() {
         .unwrap()
         .expect("session row");
     assert_eq!(session.lifecycle, "complete");
-    assert_eq!(session.quarantine, "quarantined");
-    assert_eq!(session.quarantine_reason, "known-token");
-    assert_eq!(session.quarantine_detail, "meta.files_touched[0]");
+    // The token was redacted client-side before upload, so the server
+    // meta-scan finds nothing and quarantines nothing.
+    assert_eq!(session.quarantine, "none");
+    assert_eq!(session.quarantine_reason, "");
+    assert_eq!(session.quarantine_detail, "");
+    // Stored files_touched carries no token (the client redacts first).
+    assert!(
+        !session.files_touched.contains(PLANTED_TOKEN),
+        "stored files_touched must not hold the raw token: {}",
+        session.files_touched
+    );
+    assert!(
+        session.files_touched.contains("[redacted:known-token]"),
+        "stored files_touched must hold the redaction marker: {}",
+        session.files_touched
+    );
 
     // Every segment row's hash equals the spool's `upload.json` hash.
     let segments = db_sessions::segments_of(s.core.db(), session.id)

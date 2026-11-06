@@ -17,9 +17,7 @@ pub async fn resolve_server(
     repo: &Path,
     _paths: &CliPaths,
 ) -> Result<(ServerInfo, String, String), DiscoveryError> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
+    let client = crate::discovery::forge_client(std::time::Duration::from_secs(5))
         .map_err(|err| DiscoveryError::Unreachable(format!("cannot build http client: {err}")))?;
     crate::discovery::resolve_server(&client, repo).await
 }

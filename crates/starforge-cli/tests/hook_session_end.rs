@@ -209,3 +209,94 @@ fn hook_session_end_outside_repo_exits_0() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// The hook acts only on the repo containing the process's current
+/// directory: a payload `cwd` pointing at another enabled repo must not
+/// ingest that repo's sessions. A `cwd` inside the current repo works.
+#[test]
+fn hook_session_end_ignores_payload_cwd_outside_current_repo() {
+    let home_dir = TempDir::new().unwrap();
+    let home = home_dir.path().to_path_buf();
+    let path = bin_path();
+    let (_dir_a, repo_a) = init_repo(&home, &path);
+    let (_dir_b, repo_b) = init_repo(&home, &path);
+
+    for repo in [&repo_a, &repo_b] {
+        let enable = starforge(repo, &home, &path, &["enable"], None);
+        assert!(
+            enable.status.success(),
+            "enable failed: {}",
+            String::from_utf8_lossy(&enable.stderr)
+        );
+    }
+
+    // A Claude transcript whose cwd is repo_b.
+    let session_id = "foreign-session";
+    let store = home.join(".claude/projects/foreign-slug");
+    std::fs::create_dir_all(&store).unwrap();
+    let transcript = store.join(format!("{session_id}.jsonl"));
+    std::fs::write(&transcript, claude_transcript(&repo_b, session_id)).unwrap();
+
+    // Run from repo_a with a payload cwd pointing at repo_b.
+    let payload = serde_json::json!({
+        "session_id": session_id,
+        "transcript_path": transcript.to_string_lossy(),
+        "cwd": repo_b.to_string_lossy(),
+        "hook_event_name": "SessionEnd",
+        "reason": "exit",
+    })
+    .to_string();
+    let out = starforge(
+        &repo_a,
+        &home,
+        &path,
+        &["hook", "session-end"],
+        Some(&payload),
+    );
+    assert!(
+        out.status.success(),
+        "hook must exit 0: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // repo_b's spool must have gained no cursor and no session from this call.
+    let common_b = common_dir(&repo_b).unwrap();
+    let spool_b = Spool::open(&common_b);
+    let records_b = spool_b.cursor_records().unwrap();
+    assert!(
+        !records_b
+            .values()
+            .any(|r| r.native_path == transcript.to_string_lossy()),
+        "foreign repo must not be ingested: {records_b:?}"
+    );
+
+    // And a payload cwd inside the current repo still works: run from
+    // repo_b with its own cwd and the session is ingested there.
+    let payload_b = serde_json::json!({
+        "session_id": session_id,
+        "transcript_path": transcript.to_string_lossy(),
+        "cwd": repo_b.to_string_lossy(),
+        "hook_event_name": "SessionEnd",
+        "reason": "exit",
+    })
+    .to_string();
+    let out = starforge(
+        &repo_b,
+        &home,
+        &path,
+        &["hook", "session-end"],
+        Some(&payload_b),
+    );
+    assert!(
+        out.status.success(),
+        "hook must exit 0: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let records_b = spool_b.cursor_records().unwrap();
+    assert!(
+        records_b
+            .values()
+            .any(|r| r.native_path == transcript.to_string_lossy()),
+        "cwd inside the current repo must ingest: {records_b:?}"
+    );
+}
