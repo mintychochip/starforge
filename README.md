@@ -248,8 +248,8 @@ nothing.
 The Conversation timeline merges stored events with derived rows in time
 order: linked sessions (one row per readable session linked through a
 commit, timed at the later of the upload and the first revision containing
-its commit), checks (one row per status posted on a revision head, with
-context, state, description, and an `http(s)` target link), and readable
+its commit), checks (the latest row per (context, head SHA), because the
+checks table upserts, with context, state, description, and an `http(s)` target link), and readable
 sentences for every stored `change.*`, `review.*`, and
 `trail.session_linked/unlinked` kind. Derived rows are computed per request
 and filtered for the viewer.

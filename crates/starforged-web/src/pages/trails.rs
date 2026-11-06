@@ -920,12 +920,7 @@ pub(crate) async fn sessions_view(
             .collect::<Vec<_>>();
         let mut totals = TokenTotals::default();
         for s in &g.sessions {
-            totals.input += s.totals.input;
-            totals.output += s.totals.output;
-            totals.cache_read += s.totals.cache_read;
-            totals.cache_write += s.totals.cache_write;
-            totals.reasoning += s.totals.reasoning;
-            totals.total += s.totals.total;
+            totals.add(&s.totals);
         }
         groups.push(SessionGroupView {
             sha: g.sha.clone(),

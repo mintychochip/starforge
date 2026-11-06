@@ -1580,7 +1580,7 @@ impl Core {
             Ok(t) => t,
             Err(e) if e.is_unique_violation() => {
                 return Err(CoreError::Conflict(
-                    "could not allocate a change number; please retry".into(),
+                    "could not allocate a change or revision number; please retry".into(),
                 ));
             }
             Err(e) => return Err(e.into()),

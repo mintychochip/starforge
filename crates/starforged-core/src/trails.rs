@@ -110,7 +110,9 @@ impl TokenTotals {
         TokenTotals { total, ..totals }
     }
 
-    fn add(&mut self, other: &TokenTotals) {
+    /// Adds another row's totals into this rollup (per-group and Trail-wide
+    /// sums reuse the already-computed row totals).
+    pub fn add(&mut self, other: &TokenTotals) {
         self.input += other.input;
         self.output += other.output;
         self.cache_read += other.cache_read;
@@ -1389,6 +1391,7 @@ impl Core {
         let mut commit_sessions: std::collections::HashMap<String, Vec<SessionLinkRow>> =
             std::collections::HashMap::new();
         let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        let mut totals = TokenTotals::default();
         for link in db_sessions::links_for_shas(self.db(), access.repo.id, &shas).await? {
             let session = match link.session_id {
                 Some(id) => db_sessions::session_by_id(self.db(), id).await?,
@@ -1404,11 +1407,16 @@ impl Core {
             if !can_read_session(viewer_fact, &access.repo, &session, is_member, is_admin) {
                 continue;
             }
-            seen.insert(session.id);
-            commit_sessions.entry(link.sha.clone()).or_default().push(
-                self.session_link_row(&link.confidence, link.seq_start, &session)
-                    .await?,
-            );
+            let row = self
+                .session_link_row(&link.confidence, link.seq_start, &session)
+                .await?;
+            if seen.insert(session.id) {
+                totals.add(&row.totals);
+            }
+            commit_sessions
+                .entry(link.sha.clone())
+                .or_default()
+                .push(row);
         }
         // Explicit links, oldest first, same read filter.
         let mut linked = Vec::new();
@@ -1423,8 +1431,11 @@ impl Core {
             if !can_read_session(viewer_fact, &access.repo, &session, is_member, is_admin) {
                 continue;
             }
-            seen.insert(session.id);
-            linked.push(self.session_link_row("explicit", None, &session).await?);
+            let row = self.session_link_row("explicit", None, &session).await?;
+            if seen.insert(session.id) {
+                totals.add(&row.totals);
+            }
+            linked.push(row);
         }
         // Commit groups in walk order, keeping only commits with a readable
         // session; Trail totals over distinct sessions.
@@ -1448,7 +1459,6 @@ impl Core {
                 sessions,
             });
         }
-        let totals = self.trail_session_totals(seen).await?;
         Ok(TrailSessions {
             commits,
             linked,
@@ -1486,21 +1496,6 @@ impl Core {
             seq_start,
             totals: TokenTotals::of(session),
         })
-    }
-
-    /// Trail-wide totals over distinct session ids (a session linked through
-    /// two commits counts once).
-    async fn trail_session_totals(
-        &self,
-        session_ids: std::collections::HashSet<i64>,
-    ) -> CoreResult<TokenTotals> {
-        let mut totals = TokenTotals::default();
-        for id in session_ids {
-            if let Some(session) = db_sessions::session_by_id(self.db(), id).await? {
-                totals.add(&TokenTotals::of(&session));
-            }
-        }
-        Ok(totals)
     }
 
     /// D5 commit-panel rows: every link filed under `sha` that `viewer` may
