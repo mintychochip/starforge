@@ -255,18 +255,13 @@ fn json_logs_emit_valid_json_startup_line() {
         String::from_utf8_lossy(&init.stderr)
     );
 
-    // SSH on a free port, not the default 2222, which a real Starforge on
-    // this machine may already hold.
-    let ssh_port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    // SSH on port 0, never the default 2222 that a real Starforge on this
+    // machine may already hold (the server binds it directly; no race).
     let mut child = Command::new(bin)
         .arg("--config")
         .arg(&config)
         .arg("serve")
-        .env("STARFORGE__SSH__LISTEN", format!("127.0.0.1:{ssh_port}"))
+        .env("STARFORGE__SSH__LISTEN", "127.0.0.1:0")
         .env("STARFORGE__LOG__FORMAT", "json")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

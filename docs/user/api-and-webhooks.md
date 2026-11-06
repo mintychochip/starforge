@@ -131,6 +131,11 @@ still queued. Hidden `_hook-prepare-commit-msg`, `_hook-post-commit`, and
 `_hook-pre-push` entry points back the installed git hooks.
 The CLI finds a server through `GET /.well-known/starforge.json` on the remote's host (or `git config starforge.server` / `starforge.repo`).
 `starforge auth login` requests the scopes `repo:read trail:write session:upload`.
+`starforge auth login` authenticates the CLI's own API calls only. The git
+transport that `starforge trail push`, `trail checkout`, and plain `git push`
+use authenticates with the remote's own credentials, and the CLI never hands
+its token to git. Use a token in the remote URL (`http://me:<token>@host/…`),
+a git credential helper, or an SSH remote.
 
 ### Command reference
 

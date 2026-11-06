@@ -119,8 +119,16 @@ fn rewrite_url(url: &str, ctx: &RepoDocContext, is_image: bool) -> String {
             .map(str::to_owned)
             .collect()
     };
-    for seg in path_part.split('/') {
-        let seg = percent_encoding::percent_decode_str(seg).decode_utf8_lossy();
+    for raw in path_part.split('/') {
+        let decoded = percent_encoding::percent_decode_str(raw).decode_utf8_lossy();
+        // A decoded `/` would add path structure the author never wrote (and
+        // could smuggle `..` past the clamp below), so such a segment stays
+        // literal; `content_href` then encodes its `%` like any other byte.
+        let seg = if decoded.contains('/') {
+            std::borrow::Cow::Borrowed(raw)
+        } else {
+            decoded
+        };
         match seg.as_ref() {
             "" | "." => {}
             ".." => {
@@ -316,5 +324,24 @@ mod tests {
             "{html}"
         );
         assert!(!html.contains("%2520"), "{html}");
+    }
+
+    #[test]
+    fn repo_document_encoded_dot_segments_still_clamp_at_root() {
+        let html = render_repo_document("[x](%2e%2e/%2E%2E/%2e%2e/secret.md)", &ctx("docs"));
+        assert!(
+            html.contains(r#"href="/alice/proj/blob/main/secret.md""#),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn repo_document_keeps_encoded_slashes_literal() {
+        let html = render_repo_document("[x](a%2F..%2F..%2Fadmin)", &ctx(""));
+        assert!(
+            html.contains("/alice/proj/blob/main/a%252F..%252F..%252Fadmin"),
+            "{html}"
+        );
+        assert!(!html.contains("/../"), "{html}");
     }
 }

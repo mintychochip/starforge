@@ -169,16 +169,10 @@ async fn quarantine_actions_require_csrf() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn health_shows_version_engine_git_and_job_aggregates() {
-    // A free port, not the default 2222: a real Starforge (or another test
-    // run) on this machine may already hold 2222.
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    let listen = format!("127.0.0.1:{port}");
-    let configured = listen.clone();
-    let s = TestServer::start_with(move |c| c.ssh.listen = configured).await;
+    // The harness default listen address (`127.0.0.1:0`), never the fixed
+    // 2222 that a real Starforge on this machine may already hold. The page
+    // shows the configured address, so only the host is asserted.
+    let s = TestServer::start().await;
     let _root = admin(&s).await;
 
     // One failed job and one queued job, so the aggregates name both states.
@@ -214,7 +208,7 @@ async fn health_shows_version_engine_git_and_job_aggregates() {
         starforged_db::Backend::Sqlite => "sqlite",
         starforged_db::Backend::Postgres => "postgres",
     };
-    let ssh_line = format!("enabled on {listen}");
+    let ssh_line = "enabled on 127.0.0.1:";
     for needle in [
         "Starforge version",
         "Database engine",
@@ -223,7 +217,7 @@ async fn health_shows_version_engine_git_and_job_aggregates() {
         "Git version",
         "Data directory free space",
         "SSH listener",
-        ssh_line.as_str(),
+        ssh_line,
         "Search index trails",
         "Oldest pending job",
         "test-health-kind",

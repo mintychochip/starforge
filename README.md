@@ -33,7 +33,8 @@ git push http://me:<token>@127.0.0.1:3000/me/<repository>.git main
 
 Log the `starforge` CLI in with the device flow (it prints a code; approve
 it in the browser at the printed `/oauth/device` page), then push a Trail
-change from a clone:
+change from a clone. The login covers the CLI's API calls; git itself
+authenticates with the clone URL's token (or a credential helper, or SSH):
 
 ```bash
 starforge auth login http://127.0.0.1:3000
