@@ -1238,6 +1238,9 @@ async fn gates_report_in_detail_and_endpoint() {
         false,
         false,
         "[]",
+        false,
+        false,
+        false,
         starforged_db::now(),
     )
     .await
@@ -1530,6 +1533,9 @@ async fn change_json_carries_allowed_methods() {
         false,
         false,
         r#"["squash"]"#,
+        false,
+        false,
+        false,
         starforged_db::now(),
     )
     .await
@@ -2052,6 +2058,9 @@ async fn pending_review_submit_converts_draft_once() {
         false,
         false,
         "[]",
+        false,
+        false,
+        false,
         starforged_db::now(),
     )
     .await
@@ -2349,6 +2358,9 @@ async fn pending_draft_thread_does_not_block_gates() {
         true,
         false,
         "[]",
+        false,
+        false,
+        false,
         starforged_db::now(),
     )
     .await

@@ -1,4 +1,5 @@
-//! Repository merge-gate rules (spec §6.2, M2c H7): CRUD on [`Core`].
+//! Repository merge-gate rules (spec §6.2, M2c H7) plus branch protection
+//! (spec §8.2, M3b B1): CRUD on [`Core`].
 //!
 //! `gates.rs` stays read-only evaluation; everything that writes a rule
 //! lives here. Any repo reader may list (rules hold no secrets, and the
@@ -9,14 +10,16 @@
 //! that window is accepted because duplicate rules AND together and stay
 //! fail-closed. Every successful mutation writes exactly one timeline row
 //! and one audit row in the same method, carrying the full normalized rule
-//! (after the write for created/updated, as it was for deleted).
+//! (after the write for created/updated, as it was for deleted). Updates
+//! that change nothing write no rows.
 
 use serde::{Deserialize, Serialize};
-use starforged_db::{checks as db_checks, now, trails as db_trails};
+use starforged_db::{checks as db_checks, now, protection as db_protection, trails as db_trails};
 
 use crate::accounts::User;
 use crate::checks::validate_context;
 use crate::permission::Permission;
+use crate::protection::{PushAllowlistDto, PushAllowlistInput};
 use crate::{Core, CoreError, CoreResult};
 
 /// Merge methods a rule may restrict merges to; `[]` means all three.
@@ -35,6 +38,10 @@ pub struct GateRuleDto {
     pub require_threads_resolved: bool,
     pub require_session_evidence: bool,
     pub allowed_methods: Vec<String>,
+    pub block_direct_push: bool,
+    pub block_force_push: bool,
+    pub block_deletion: bool,
+    pub push_allowlist: PushAllowlistDto,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -65,6 +72,14 @@ pub struct GateRuleInput {
     pub require_session_evidence: Option<Option<bool>>,
     #[serde(default, deserialize_with = "absent_or_null")]
     pub allowed_methods: Option<Option<Vec<String>>>,
+    #[serde(default, deserialize_with = "absent_or_null")]
+    pub block_direct_push: Option<Option<bool>>,
+    #[serde(default, deserialize_with = "absent_or_null")]
+    pub block_force_push: Option<Option<bool>>,
+    #[serde(default, deserialize_with = "absent_or_null")]
+    pub block_deletion: Option<Option<bool>>,
+    #[serde(default, deserialize_with = "absent_or_null")]
+    pub push_allowlist: Option<Option<PushAllowlistInput>>,
 }
 
 /// Absent-vs-null tracking for request bodies: a missing field never reaches
@@ -90,9 +105,12 @@ struct Normalized {
     threads_resolved: bool,
     session_evidence: bool,
     methods: Vec<String>,
+    block_direct: bool,
+    block_force: bool,
+    block_deletion: bool,
 }
 
-fn dto_of(row: &db_checks::GateRuleRow) -> CoreResult<GateRuleDto> {
+async fn dto_of(core: &Core, row: &db_checks::GateRuleRow) -> CoreResult<GateRuleDto> {
     let contexts: Vec<String> = serde_json::from_str(&row.required_contexts)
         .map_err(|e| CoreError::Internal(format!("unreadable required_contexts: {e}")))?;
     let methods: Vec<String> = serde_json::from_str(&row.allowed_methods)
@@ -108,6 +126,10 @@ fn dto_of(row: &db_checks::GateRuleRow) -> CoreResult<GateRuleDto> {
         require_threads_resolved: row.require_threads_resolved != 0,
         require_session_evidence: row.require_session_evidence != 0,
         allowed_methods: methods,
+        block_direct_push: row.block_direct_push != 0,
+        block_force_push: row.block_force_push != 0,
+        block_deletion: row.block_deletion != 0,
+        push_allowlist: core.push_allowlist_dto(row.id).await?,
         created_at: row.created_at,
         updated_at: row.updated_at,
     })
@@ -226,6 +248,17 @@ fn normalize(base: &GateRuleDto, input: &GateRuleInput) -> CoreResult<Normalized
             "require_session_evidence",
         )?,
         methods,
+        block_direct: resolve(
+            base.block_direct_push,
+            &input.block_direct_push,
+            "block_direct_push",
+        )?,
+        block_force: resolve(
+            base.block_force_push,
+            &input.block_force_push,
+            "block_force_push",
+        )?,
+        block_deletion: resolve(base.block_deletion, &input.block_deletion, "block_deletion")?,
     })
 }
 
@@ -241,9 +274,52 @@ fn default_dto() -> GateRuleDto {
         require_threads_resolved: false,
         require_session_evidence: false,
         allowed_methods: Vec::new(),
+        block_direct_push: false,
+        block_force_push: false,
+        block_deletion: false,
+        push_allowlist: PushAllowlistDto::default(),
         created_at: 0,
         updated_at: 0,
     }
+}
+
+/// True when the normalized scalar fields match the stored rule: the
+/// allow-list is compared separately ([`allowlist_unchanged`]).
+fn scalars_equal(current: &GateRuleDto, next: &Normalized) -> bool {
+    current.pattern == next.pattern
+        && current.required_approvals == next.approvals
+        && current.dismiss_on_push == next.dismiss_on_push
+        && current.block_on_request_changes == next.block_on_request_changes
+        && current.required_contexts == next.contexts
+        && current.require_up_to_date == next.up_to_date
+        && current.require_threads_resolved == next.threads_resolved
+        && current.require_session_evidence == next.session_evidence
+        && current.allowed_methods == next.methods
+        && current.block_direct_push == next.block_direct
+        && current.block_force_push == next.block_force
+        && current.block_deletion == next.block_deletion
+}
+
+/// True when the update carries no allow-list (`None`) or the replacement
+/// holds the same entries as the stored rows (order-insensitive).
+async fn allowlist_unchanged(
+    core: &Core,
+    rule_id: i64,
+    next: Option<&Vec<(Option<i64>, Option<i64>)>>,
+) -> CoreResult<bool> {
+    let Some(next) = next else {
+        return Ok(true);
+    };
+    let mut have: Vec<(Option<i64>, Option<i64>)> =
+        db_protection::push_allowlist_for_rule(core.db(), rule_id)
+            .await?
+            .into_iter()
+            .map(|row| (row.user_id, row.team_id))
+            .collect();
+    let mut next = next.clone();
+    have.sort();
+    next.sort();
+    Ok(have == next)
 }
 
 fn gate_rule_target(owner: &str, repo: &str, id: i64) -> String {
@@ -262,7 +338,7 @@ impl Core {
         let access = self.repo_for(viewer, owner, repo).await?;
         let mut out = Vec::new();
         for row in db_checks::gate_rules_for_repo(self.db(), access.repo.id).await? {
-            out.push(dto_of(&row)?);
+            out.push(dto_of(self, &row).await?);
         }
         Ok(out)
     }
@@ -291,10 +367,25 @@ impl Core {
                 )));
             }
         }
+        // The allow-list replaces nothing on create: absent means empty,
+        // `null` is rejected like every other non-pattern field.
+        let allowlist = match &input.push_allowlist {
+            None => Vec::new(),
+            Some(None) => {
+                return Err(CoreError::Invalid(
+                    "invalid push_allowlist (expected an object)".into(),
+                ));
+            }
+            Some(Some(list)) => {
+                self.resolve_push_allowlist(access.repo.owner_id, list)
+                    .await?
+            }
+        };
         let contexts = serde_json::to_string(&rule.contexts)
             .map_err(|e| CoreError::Internal(e.to_string()))?;
         let methods =
             serde_json::to_string(&rule.methods).map_err(|e| CoreError::Internal(e.to_string()))?;
+        let stamp = now();
         let row = db_checks::insert_gate_rule(
             self.db(),
             access.repo.id,
@@ -307,10 +398,14 @@ impl Core {
             rule.threads_resolved,
             rule.session_evidence,
             &methods,
-            now(),
+            rule.block_direct,
+            rule.block_force,
+            rule.block_deletion,
+            stamp,
         )
         .await?;
-        let view = dto_of(&row)?;
+        db_protection::replace_push_allowlist(self.db(), row.id, &allowlist, stamp).await?;
+        let view = dto_of(self, &row).await?;
         let payload =
             serde_json::to_string(&view).map_err(|e| CoreError::Internal(e.to_string()))?;
         db_trails::insert_timeline(
@@ -353,7 +448,8 @@ impl Core {
         let row = db_checks::gate_rule_by_id(self.db(), id, access.repo.id)
             .await?
             .ok_or(CoreError::NotFound)?;
-        let rule = normalize(&dto_of(&row)?, input)?;
+        let current = dto_of(self, &row).await?;
+        let rule = normalize(&current, input)?;
         for other in db_checks::gate_rules_for_repo(self.db(), access.repo.id).await? {
             if other.id != id && other.pattern == rule.pattern {
                 return Err(CoreError::Conflict(format!(
@@ -362,10 +458,29 @@ impl Core {
                 )));
             }
         }
+        // An explicit `null` allow-list is 422; absent keeps the current one.
+        let allowlist = match &input.push_allowlist {
+            None => None,
+            Some(None) => {
+                return Err(CoreError::Invalid(
+                    "invalid push_allowlist (expected an object)".into(),
+                ));
+            }
+            Some(Some(list)) => Some(
+                self.resolve_push_allowlist(access.repo.owner_id, list)
+                    .await?,
+            ),
+        };
+        if scalars_equal(&current, &rule)
+            && allowlist_unchanged(self, id, allowlist.as_ref()).await?
+        {
+            return Ok(current);
+        }
         let contexts = serde_json::to_string(&rule.contexts)
             .map_err(|e| CoreError::Internal(e.to_string()))?;
         let methods =
             serde_json::to_string(&rule.methods).map_err(|e| CoreError::Internal(e.to_string()))?;
+        let stamp = now();
         let row = db_checks::update_gate_rule(
             self.db(),
             id,
@@ -380,12 +495,18 @@ impl Core {
                 threads: Some(rule.threads_resolved),
                 session_ev: Some(rule.session_evidence),
                 methods: Some(&methods),
+                block_direct: Some(rule.block_direct),
+                block_force: Some(rule.block_force),
+                block_deletion: Some(rule.block_deletion),
             },
-            now(),
+            stamp,
         )
         .await?
         .ok_or(CoreError::NotFound)?;
-        let view = dto_of(&row)?;
+        if let Some(next) = allowlist {
+            db_protection::replace_push_allowlist(self.db(), id, &next, stamp).await?;
+        }
+        let view = dto_of(self, &row).await?;
         let payload =
             serde_json::to_string(&view).map_err(|e| CoreError::Internal(e.to_string()))?;
         db_trails::insert_timeline(
@@ -427,7 +548,7 @@ impl Core {
         let row = db_checks::gate_rule_by_id(self.db(), id, access.repo.id)
             .await?
             .ok_or(CoreError::NotFound)?;
-        let payload = serde_json::to_string(&dto_of(&row)?)
+        let payload = serde_json::to_string(&dto_of(self, &row).await?)
             .map_err(|e| CoreError::Internal(e.to_string()))?;
         if !db_checks::delete_gate_rule(self.db(), id, access.repo.id).await? {
             return Err(CoreError::NotFound);

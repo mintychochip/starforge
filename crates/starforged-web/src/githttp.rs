@@ -306,57 +306,21 @@ async fn rpc(
     // Pre-receive policy snapshot: the hook process never opens the database,
     // so the RPC layer passes identity, permission, and refs/for mode down as
     // env, plus the git-config entries that advertise push options and hide
-    // the server-only namespaces.
+    // the server-only namespaces. [`Core::git_rpc_env`] builds the whole
+    // block (SSH reuses it); this layer only adds the transport entries.
     let mut env: Vec<(&str, String)> = smart::rpc_env(service);
     // The nonce keys the push-option sidecars the hook writes per accepted
     // `refs/for` line; the post-push scan consumes exactly this push's files.
     let mut scan_nonce: Option<String> = None;
     if service == Service::ReceivePack {
-        let refs_for = state
-            .core
-            .refs_for_access(access.repo.id)
-            .await
-            .map_err(|e| GitHttpError::Internal(e.to_string()))?;
-        let is_member = match &user {
-            Some(user) => state
+        let nonce = pushsidecar::new_nonce();
+        env.extend(
+            state
                 .core
-                .is_repo_member(access.repo.id, user.id)
+                .git_rpc_env(&access, user.as_ref(), write_path, &nonce)
                 .await
                 .map_err(|e| GitHttpError::Internal(e.to_string()))?,
-            None => false,
-        };
-        env.push(("STARFORGE_REPO_ID", access.repo.id.to_string()));
-        if let Some(user) = &user {
-            env.push(("STARFORGE_USER_ID", user.id.to_string()));
-            env.push(("STARFORGE_USER_HANDLE", user.handle.clone()));
-        }
-        env.push((
-            "STARFORGE_PERMISSION",
-            access.permission.as_str().to_owned(),
-        ));
-        env.push((
-            "STARFORGE_IS_MEMBER",
-            if is_member {
-                "1".to_owned()
-            } else {
-                "0".to_owned()
-            },
-        ));
-        env.push(("STARFORGE_REFS_FOR", refs_for));
-        // The write tier admits branch/tag pushes in the hook; the read tier
-        // is `refs/for`-only down there too.
-        env.push((
-            "STARFORGE_SCOPE_WRITE",
-            if write_path {
-                "1".to_owned()
-            } else {
-                "0".to_owned()
-            },
-        ));
-        // The nonce keys the push-option sidecars the hook writes per accepted
-        // `refs/for` line; the post-push scan consumes exactly this push's files.
-        let nonce = pushsidecar::new_nonce();
-        env.push(("STARFORGE_PUSH_NONCE", nonce.clone()));
+        );
         scan_nonce = Some(nonce);
     }
     let gzip = headers

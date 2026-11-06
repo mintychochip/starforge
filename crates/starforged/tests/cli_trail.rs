@@ -606,6 +606,9 @@ async fn j5_rule(repo_id: i64, db: &starforged_db::Db, approvals: i64, methods: 
         false,
         false,
         methods,
+        false,
+        false,
+        false,
         starforged_db::now(),
     )
     .await

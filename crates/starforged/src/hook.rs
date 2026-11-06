@@ -4,7 +4,7 @@
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 
-use starforged_git::{pushsidecar, read, refpolicy};
+use starforged_git::{merge, pushsidecar, read, refpolicy};
 
 /// Snapshot of the push the RPC layer took at spawn: the hook process never
 /// opens the database, it only enforces this snapshot.
@@ -19,6 +19,10 @@ pub struct HookCtx {
     /// of a write-level permission; the RPC admits readers for `refs/for`.
     pub scope_write: bool,
     pub refs_for: String,
+    /// The parsed `STARFORGE_PROTECTION` snapshot; `Err` (missing or
+    /// malformed) fails closed for branch and tag pushes, while `refs/for`
+    /// keeps working.
+    pub protection: Result<refpolicy::Protection, String>,
     pub git_dir: PathBuf,
     pub branches: Vec<String>,
     pub nonce: String,
@@ -49,6 +53,10 @@ impl HookCtx {
                 .collect()
         });
         let nonce = env("STARFORGE_PUSH_NONCE").filter(|n| pushsidecar::valid_nonce(n));
+        let protection = match env("STARFORGE_PROTECTION") {
+            Some(raw) => refpolicy::parse_protection(&raw),
+            None => Err("missing protection snapshot".to_owned()),
+        };
         HookCtx {
             repo_id: env("STARFORGE_REPO_ID")
                 .and_then(|v| v.parse().ok())
@@ -59,6 +67,7 @@ impl HookCtx {
             is_member: env("STARFORGE_IS_MEMBER").is_some_and(|v| v == "1"),
             scope_write: env("STARFORGE_SCOPE_WRITE").is_some_and(|v| v == "1"),
             refs_for: env("STARFORGE_REFS_FOR").unwrap_or_else(|| "anyone_with_read".to_owned()),
+            protection,
             git_dir,
             branches,
             nonce: nonce.unwrap_or_else(pushsidecar::new_nonce),
@@ -127,8 +136,8 @@ pub fn pre_receive_with(input: impl BufRead, mut err: impl Write, ctx: &HookCtx)
                     }
                 }
             }
-            Ok(refpolicy::RefKind::Branch) | Ok(refpolicy::RefKind::Tag) => {
-                // The RPC admits readers for `refs/for`, so branches and tags
+            Ok(refpolicy::RefKind::Branch) => {
+                // The RPC admits readers for `refs/for`, so branches
                 // enforce the write half here: write-level permission plus a
                 // write-scoped token.
                 if let Err(message) =
@@ -137,6 +146,54 @@ pub fn pre_receive_with(input: impl BufRead, mut err: impl Write, ctx: &HookCtx)
                     let _ = writeln!(
                         err,
                         "starforge: pushing to {} is not allowed: {message}",
+                        update.name
+                    );
+                    code = 1;
+                    continue;
+                }
+                // Then the protection snapshot. A missing or malformed
+                // snapshot fails closed; ancestry runs with the hook's
+                // environment so quarantined objects stay visible.
+                match &ctx.protection {
+                    Err(reason) => {
+                        let _ = writeln!(
+                            err,
+                            "starforge: pushing to {} is not allowed: protection snapshot {reason}",
+                            update.name
+                        );
+                        code = 1;
+                    }
+                    Ok(protection) => {
+                        let git_dir = ctx.git_dir.clone();
+                        if let Err(message) =
+                            refpolicy::check_protected_update(protection, &update, |old, new| {
+                                merge::is_ancestor_inherit_env(&git_dir, old, new).unwrap_or(false)
+                            })
+                        {
+                            let _ = writeln!(err, "starforge: {message}");
+                            code = 1;
+                        }
+                    }
+                }
+            }
+            Ok(refpolicy::RefKind::Tag) => {
+                if let Err(message) =
+                    refpolicy::check_branch_push(ctx.permission.as_deref(), ctx.scope_write)
+                {
+                    let _ = writeln!(
+                        err,
+                        "starforge: pushing to {} is not allowed: {message}",
+                        update.name
+                    );
+                    code = 1;
+                    continue;
+                }
+                // Tag protection arrives with B2; until then a missing or
+                // malformed snapshot still fails closed.
+                if let Err(reason) = &ctx.protection {
+                    let _ = writeln!(
+                        err,
+                        "starforge: pushing to {} is not allowed: protection snapshot {reason}",
                         update.name
                     );
                     code = 1;
@@ -200,6 +257,7 @@ mod tests {
             is_member: false,
             scope_write: true,
             refs_for: "anyone_with_read".to_owned(),
+            protection: Ok(refpolicy::Protection { branches: vec![] }),
             git_dir,
             branches: vec!["main".to_owned(), "release/1.x".to_owned()],
             nonce: "testnonce".to_owned(),
@@ -422,5 +480,37 @@ mod tests {
         assert_eq!(pushsidecar::read_sidecar(&b[0]).unwrap().topic, "beta");
         assert_eq!(pushsidecar::read_sidecar(&a[0]).unwrap().new, new);
         assert_eq!(pushsidecar::read_sidecar(&b[0]).unwrap().new, new);
+    }
+    #[test]
+    fn missing_snapshot_fails_closed_for_branches_and_tags() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut c = ctx(tmp.path().to_owned());
+        c.permission = Some("write".to_owned());
+        c.protection = Err("missing protection snapshot".to_owned());
+        for line in ["0 1 refs/heads/main\n", "0 2 refs/tags/v1\n"] {
+            let (code, err) = run(line, &c);
+            assert_eq!(code, 1, "{line}");
+            assert!(err.contains("protection snapshot"), "{err}");
+        }
+        // `refs/for` keeps working without a snapshot.
+        let (code, err) = run(
+            &format!("{} {} refs/for/main/feat\n", sha('0'), sha('a')),
+            &c,
+        );
+        assert_eq!((code, err.as_str()), (0, ""));
+    }
+
+    #[test]
+    fn protected_direct_push_refuses_with_pattern() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut c = ctx(tmp.path().to_owned());
+        c.permission = Some("write".to_owned());
+        c.protection = refpolicy::parse_protection(
+            r#"{"v":1,"branches":[{"pattern":"main","direct":true,"force":false,"delete":false,"exempt":false}],"tags":[],"tag_ok":true,"namespaces":[]}"#,
+        );
+        let (code, err) = run(&format!("{} {} refs/heads/main\n", sha('0'), sha('a')), &c);
+        assert_eq!(code, 1);
+        assert!(err.contains("refs/heads/main"), "{err}");
+        assert!(err.contains("'main'"), "{err}");
     }
 }

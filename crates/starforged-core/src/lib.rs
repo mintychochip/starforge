@@ -23,6 +23,7 @@ pub mod oauth;
 pub mod orgs;
 pub mod passwords;
 pub mod permission;
+pub mod protection;
 pub mod quota;
 pub mod read;
 pub mod registration;

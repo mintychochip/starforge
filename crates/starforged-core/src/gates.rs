@@ -6,16 +6,16 @@
 //! change's base branch must pass; zero matching rules pass. A `NULL` or
 //! empty pattern matches all branches.
 //!
-//! Glob note: patterns are matched by the small in-task matcher
-//! [`pattern_matches`] (`*` matches any run, `?` matches one character,
-//! everything else is literal). No workspace pattern dependency exists, so a
-//! 20-line matcher beats a new crate dependency here.
+//! Glob note: patterns are matched by the single implementation
+//! [`starforged_git::refpolicy::pattern_matches`] (`*` matches any run, `?`
+//! matches one character, everything else is literal).
 //!
 //! Reads only: evaluation touches the database and git, never writes.
 
 use serde::{Deserialize, Serialize};
 use starforged_db::{changes as db_changes, checks as db_checks, sessions as db_sessions};
 use starforged_git::read;
+use starforged_git::refpolicy::pattern_matches;
 
 use crate::accounts::User;
 use crate::permission::Permission;
@@ -38,41 +38,6 @@ pub struct GateResult {
 pub struct GateReport {
     pub passed: bool,
     pub results: Vec<GateResult>,
-}
-
-/// Minimal glob: `*` matches any (possibly empty) run, `?` matches exactly
-/// one character, everything else matches literally. Case-sensitive.
-pub fn pattern_matches(pattern: Option<&str>, branch: &str) -> bool {
-    let pat = match pattern {
-        None | Some("") => return true,
-        Some(p) => p,
-    };
-    glob_match(pat.as_bytes(), branch.as_bytes())
-}
-
-fn glob_match(pat: &[u8], text: &[u8]) -> bool {
-    let (mut px, mut tx) = (0usize, 0usize);
-    let (mut star, mut mark) = (None, 0usize);
-    while tx < text.len() {
-        if px < pat.len() && (pat[px] == b'?' || pat[px] == text[tx]) {
-            px += 1;
-            tx += 1;
-        } else if px < pat.len() && pat[px] == b'*' {
-            star = Some(px);
-            mark = tx;
-            px += 1;
-        } else if let Some(s) = star {
-            px = s + 1;
-            mark += 1;
-            tx = mark;
-        } else {
-            return false;
-        }
-    }
-    while px < pat.len() && pat[px] == b'*' {
-        px += 1;
-    }
-    px == pat.len()
 }
 
 fn parse_strings(raw: &str) -> Vec<String> {
@@ -534,6 +499,9 @@ mod tests {
                 threads,
                 session_ev,
                 methods,
+                false,
+                false,
+                false,
                 1_700_000_000,
             )
             .await
@@ -553,6 +521,9 @@ mod tests {
                 false,
                 false,
                 "[]",
+                false,
+                false,
+                false,
                 1_700_000_000,
             )
             .await
@@ -571,6 +542,9 @@ mod tests {
                 false,
                 false,
                 "[]",
+                false,
+                false,
+                false,
                 1_700_000_000,
             )
             .await

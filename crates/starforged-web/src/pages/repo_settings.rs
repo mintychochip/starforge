@@ -216,6 +216,10 @@ fn form_input(form: &GateRuleForm) -> CoreResult<GateRuleInput> {
         require_threads_resolved: Some(Some(form.require_threads_resolved.is_some())),
         require_session_evidence: Some(Some(form.require_session_evidence.is_some())),
         allowed_methods: Some(Some(split_list(form.allowed_methods.as_deref()))),
+        block_direct_push: None,
+        block_force_push: None,
+        block_deletion: None,
+        push_allowlist: None,
     })
 }
 

@@ -49,6 +49,9 @@ pub struct GateRuleRow {
     pub require_threads_resolved: i64,
     pub require_session_evidence: i64,
     pub allowed_methods: String,
+    pub block_direct_push: i64,
+    pub block_force_push: i64,
+    pub block_deletion: i64,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -129,6 +132,9 @@ pub struct NewGateRule<'a> {
     pub threads: bool,
     pub session_ev: bool,
     pub methods: &'a str,
+    pub block_direct: bool,
+    pub block_force: bool,
+    pub block_deletion: bool,
     pub now: i64,
 }
 
@@ -152,6 +158,9 @@ pub struct GateRuleUpdate<'a> {
     pub threads: Option<bool>,
     pub session_ev: Option<bool>,
     pub methods: Option<&'a str>,
+    pub block_direct: Option<bool>,
+    pub block_force: Option<bool>,
+    pub block_deletion: Option<bool>,
 }
 
 macro_rules! select_check {
@@ -170,6 +179,7 @@ macro_rules! select_gate_rule {
             "SELECT id, repo_id, pattern, required_approvals, dismiss_on_push, ",
             "block_on_request_changes, required_contexts, require_up_to_date, ",
             "require_threads_resolved, require_session_evidence, allowed_methods, ",
+            "block_direct_push, block_force_push, block_deletion, ",
             "created_at, updated_at FROM gate_rules ",
             $tail
         )
@@ -225,6 +235,9 @@ fn gate_rule_from_row(row: &AnyRow) -> DbResult<GateRuleRow> {
         require_threads_resolved: row.try_get("require_threads_resolved")?,
         require_session_evidence: row.try_get("require_session_evidence")?,
         allowed_methods: row.try_get("allowed_methods")?,
+        block_direct_push: row.try_get("block_direct_push")?,
+        block_force_push: row.try_get("block_force_push")?,
+        block_deletion: row.try_get("block_deletion")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })
@@ -402,6 +415,9 @@ pub async fn insert_gate_rule(
     threads: bool,
     session_ev: bool,
     methods: &str,
+    block_direct: bool,
+    block_force: bool,
+    block_deletion: bool,
     now: i64,
 ) -> DbResult<GateRuleRow> {
     insert_gate_rule_row(
@@ -417,6 +433,9 @@ pub async fn insert_gate_rule(
             threads,
             session_ev,
             methods,
+            block_direct,
+            block_force,
+            block_deletion,
             now,
         },
     )
@@ -427,11 +446,11 @@ async fn insert_gate_rule_row(db: &Db, n: &NewGateRule<'_>) -> DbResult<GateRule
     let row = sqlx::query(
         "INSERT INTO gate_rules (repo_id, pattern, required_approvals, dismiss_on_push, block_on_request_changes, \
          required_contexts, require_up_to_date, require_threads_resolved, require_session_evidence, allowed_methods, \
-         created_at, updated_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $11) \
+         block_direct_push, block_force_push, block_deletion, created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $14) \
          RETURNING id, repo_id, pattern, required_approvals, dismiss_on_push, block_on_request_changes, \
          required_contexts, require_up_to_date, require_threads_resolved, require_session_evidence, allowed_methods, \
-         created_at, updated_at",
+         block_direct_push, block_force_push, block_deletion, created_at, updated_at",
     )
     .bind(n.repo_id)
     .bind(n.pattern)
@@ -443,6 +462,9 @@ async fn insert_gate_rule_row(db: &Db, n: &NewGateRule<'_>) -> DbResult<GateRule
     .bind(bool_to_int(n.threads))
     .bind(bool_to_int(n.session_ev))
     .bind(n.methods)
+    .bind(bool_to_int(n.block_direct))
+    .bind(bool_to_int(n.block_force))
+    .bind(bool_to_int(n.block_deletion))
     .bind(n.now)
     .fetch_one(db.pool())
     .await?;
@@ -513,6 +535,15 @@ pub async fn update_gate_rule(
     if let Some(m) = update.methods {
         rule.allowed_methods = m.to_owned();
     }
+    if let Some(b) = update.block_direct {
+        rule.block_direct_push = bool_to_int(b);
+    }
+    if let Some(b) = update.block_force {
+        rule.block_force_push = bool_to_int(b);
+    }
+    if let Some(b) = update.block_deletion {
+        rule.block_deletion = bool_to_int(b);
+    }
     // The write stays repo-scoped and its result is checked: a row deleted
     // (or moved) between the read above and this write reports `None`
     // instead of a phantom update with timeline/audit rows.
@@ -520,7 +551,8 @@ pub async fn update_gate_rule(
         "UPDATE gate_rules SET pattern = $1, required_approvals = $2, dismiss_on_push = $3, \
          block_on_request_changes = $4, required_contexts = $5, require_up_to_date = $6, \
          require_threads_resolved = $7, require_session_evidence = $8, allowed_methods = $9, \
-         updated_at = $10 WHERE id = $11 AND repo_id = $12",
+         block_direct_push = $10, block_force_push = $11, block_deletion = $12, \
+         updated_at = $13 WHERE id = $14 AND repo_id = $15",
     )
     .bind(rule.pattern.as_deref())
     .bind(rule.required_approvals)
@@ -531,6 +563,9 @@ pub async fn update_gate_rule(
     .bind(rule.require_threads_resolved)
     .bind(rule.require_session_evidence)
     .bind(&rule.allowed_methods)
+    .bind(rule.block_direct_push)
+    .bind(rule.block_force_push)
+    .bind(rule.block_deletion)
     .bind(now)
     .bind(rule.id)
     .bind(repo_id)
@@ -939,6 +974,9 @@ mod tests {
             false,
             true,
             r#"["merge","squash"]"#,
+            true,
+            false,
+            false,
             1_700_000_000,
         )
         .await
@@ -977,6 +1015,9 @@ mod tests {
             false,
             false,
             "[]",
+            false,
+            false,
+            false,
             1_700_000_000,
         )
         .await

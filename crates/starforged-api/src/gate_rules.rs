@@ -40,8 +40,18 @@ pub struct GateRuleJson {
     pub require_threads_resolved: bool,
     pub require_session_evidence: bool,
     pub allowed_methods: Vec<String>,
+    pub block_direct_push: bool,
+    pub block_force_push: bool,
+    pub block_deletion: bool,
+    pub push_allowlist: PushAllowlistJson,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Serialize)]
+pub struct PushAllowlistJson {
+    pub users: Vec<String>,
+    pub teams: Vec<String>,
 }
 
 fn gate_rule_json(view: &GateRuleDto) -> GateRuleJson {
@@ -56,6 +66,13 @@ fn gate_rule_json(view: &GateRuleDto) -> GateRuleJson {
         require_threads_resolved: view.require_threads_resolved,
         require_session_evidence: view.require_session_evidence,
         allowed_methods: view.allowed_methods.clone(),
+        block_direct_push: view.block_direct_push,
+        block_force_push: view.block_force_push,
+        block_deletion: view.block_deletion,
+        push_allowlist: PushAllowlistJson {
+            users: view.push_allowlist.users.clone(),
+            teams: view.push_allowlist.teams.clone(),
+        },
         created_at: rfc3339(view.created_at),
         updated_at: rfc3339(view.updated_at),
     }

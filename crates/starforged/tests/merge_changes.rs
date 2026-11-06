@@ -491,6 +491,9 @@ async fn gates_rechecked_at_merge_time_stale_report_refuses() {
         false,
         false,
         "[]",
+        false,
+        false,
+        false,
         starforged_db::now(),
     )
     .await
@@ -524,6 +527,9 @@ async fn approval_plus_status_satisfies_gate_then_merge() {
         false,
         false,
         "[]",
+        false,
+        false,
+        false,
         starforged_db::now(),
     )
     .await
@@ -631,6 +637,9 @@ async fn cas_retry_rechecks_allowed_methods() {
         false,
         false,
         "[\"merge\"]",
+        false,
+        false,
+        false,
         starforged_db::now(),
     )
     .await
@@ -889,6 +898,9 @@ async fn web_merge_form_merges_on_post() {
         false,
         false,
         "[]",
+        false,
+        false,
+        false,
         starforged_db::now(),
     )
     .await
@@ -963,6 +975,9 @@ async fn one_authors_two_approvals_count_once() {
         false,
         false,
         "[]",
+        false,
+        false,
+        false,
         starforged_db::now(),
     )
     .await

@@ -23,10 +23,10 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use starforged_db::{changes as db_changes, checks as db_checks, now, trails as db_trails};
+use starforged_git::refpolicy::pattern_matches;
 use starforged_git::{merge, read, write};
 
 use crate::accounts::User;
-use crate::gates::pattern_matches;
 use crate::jobs::Job;
 use crate::permission::Permission;
 use crate::{Core, CoreError, CoreResult};

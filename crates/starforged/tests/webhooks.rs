@@ -1708,6 +1708,9 @@ async fn review_dismissal_events() {
         false,
         false,
         "[]",
+        false,
+        false,
+        false,
         starforged_db::now(),
     )
     .await

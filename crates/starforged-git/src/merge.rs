@@ -107,6 +107,38 @@ pub async fn is_ancestor(repo: &Path, ancestor: &str, head: &str) -> Result<bool
     }
 }
 
+/// Sync `merge-base --is-ancestor` that inherits the process environment.
+/// The hook runs inside receive-pack with the quarantined objects visible
+/// through `GIT_OBJECT_DIRECTORY` / `GIT_ALTERNATE_OBJECT_DIRECTORIES`; the
+/// hermetic [`git`] builder strips exactly those variables, so hook
+/// ancestry checks must use this instead. Exit `0` is true, `1` is false;
+/// anything else (missing objects, timeouts) is `Err`, never a verdict.
+pub fn is_ancestor_inherit_env(repo: &Path, ancestor: &str, head: &str) -> Result<bool, GitError> {
+    if !refpolicy::is_oid(ancestor) || !refpolicy::is_oid(head) {
+        return Err(GitError::Failed {
+            command: "merge-base --is-ancestor".to_owned(),
+            stderr: "merge-base needs full object ids".to_owned(),
+        });
+    }
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .arg("merge-base")
+        .arg("--is-ancestor")
+        .arg(ancestor)
+        .arg(head)
+        .output()
+        .map_err(GitError::Io)?;
+    match out.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(GitError::Failed {
+            command: "merge-base --is-ancestor".to_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).trim().to_owned(),
+        }),
+    }
+}
+
 /// Splits merge-tree `--name-only` stdout into its tree line and conflict
 /// paths: the paths run from the second line to the first blank line.
 fn parse_merge_tree(stdout: &str) -> (Option<String>, Vec<String>) {

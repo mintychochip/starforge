@@ -889,3 +889,242 @@ async fn control_character_context_rejected_and_stores_nothing() {
         "rejected rule wrote no row: {list}"
     );
 }
+
+/// The push-restriction fields and the allow-list round-trip through the
+/// DTO on create, list, and update.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn protection_fields_round_trip() {
+    let c = Ctx::start().await;
+    let client = reqwest::Client::new();
+    let mut body = valid_body();
+    body["block_direct_push"] = json!(true);
+    body["block_force_push"] = json!(true);
+    body["block_deletion"] = json!(false);
+    body["push_allowlist"] = json!({"users": ["erin"], "teams": []});
+    let (status, created) = c.create(&c.bob_trail, &body).await;
+    assert_eq!(status, 201, "{created}");
+    assert_eq!(created["block_direct_push"], true);
+    assert_eq!(created["block_force_push"], true);
+    assert_eq!(created["block_deletion"], false);
+    assert_eq!(
+        created["push_allowlist"],
+        json!({"users": ["erin"], "teams": []})
+    );
+    let id = created["id"].as_i64().unwrap();
+
+    let res = client
+        .get(c.rules())
+        .bearer_auth(&c.carol_read)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let list = res.json::<Value>().await.unwrap();
+    assert_eq!(
+        list["gate_rules"][0]["push_allowlist"],
+        json!({"users": ["erin"], "teams": []})
+    );
+
+    let res = client
+        .patch(c.rule(id))
+        .bearer_auth(&c.bob_trail)
+        .json(&json!({
+            "block_deletion": true,
+            "push_allowlist": {"users": [], "teams": []},
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let updated = res.json::<Value>().await.unwrap();
+    assert_eq!(updated["block_deletion"], true);
+    assert_eq!(updated["block_direct_push"], true, "absent fields stay");
+    assert_eq!(
+        updated["push_allowlist"],
+        json!({"users": [], "teams": []}),
+        "a present allow-list replaces the whole list"
+    );
+}
+
+/// Unknown handles, unknown teams, and team entries on a user-owned
+/// repository are all 422 and store nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn protection_allowlist_validation() {
+    let c = Ctx::start().await;
+    let client = reqwest::Client::new();
+
+    let mut body = valid_body();
+    body["pattern"] = json!("allow-unknown-user");
+    body["push_allowlist"] = json!({"users": ["nobody"], "teams": []});
+    let (status, rejected) = c.create(&c.bob_trail, &body).await;
+    assert_eq!(status, 422, "{rejected}");
+    assert!(
+        rejected["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("nobody"),
+        "{rejected}"
+    );
+
+    // Team entries need an org-owned repository: on a user-owned repo any
+    // team entry is 422.
+    let mut body = valid_body();
+    body["pattern"] = json!("allow-team-user-repo");
+    body["push_allowlist"] = json!({"users": [], "teams": ["releases"]});
+    let (status, rejected) = c.create(&c.bob_trail, &body).await;
+    assert_eq!(status, 422, "{rejected}");
+    assert!(
+        rejected["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("org-owned"),
+        "{rejected}"
+    );
+
+    // On an org-owned repository an unknown slug names the team.
+    use starforged_core::orgs::{NewOrgInput, OrgRole};
+    use starforged_core::permission::Visibility;
+    use starforged_core::repos::CreateRepo;
+    c.s.core
+        .create_org(
+            &c.alice,
+            NewOrgInput {
+                handle: "acme".into(),
+                display_name: "Acme".into(),
+                description: String::new(),
+            },
+        )
+        .await
+        .unwrap();
+    c.s.core
+        .set_org_member(&c.alice, "acme", "bob", OrgRole::Member)
+        .await
+        .unwrap();
+    c.s.core
+        .create_repo(
+            &c.alice,
+            "acme",
+            CreateRepo {
+                name: "proj".into(),
+                description: String::new(),
+                visibility: Visibility::Private,
+                readme: false,
+            },
+        )
+        .await
+        .unwrap();
+    let res = client
+        .post(c.s.url("/api/v1/repos/acme/proj/gate-rules"))
+        .bearer_auth(&c.alice_trail)
+        .json(&json!({
+            "pattern": "allow-unknown-team",
+            "push_allowlist": {"users": [], "teams": ["nope"]},
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 422);
+    let rejected = res.json::<Value>().await.unwrap();
+    assert!(
+        rejected["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("nope"),
+        "{rejected}"
+    );
+
+    // A PATCH with an unknown handle is likewise refused.
+    let (status, created) = c.create(&c.bob_trail, &valid_body()).await;
+    assert_eq!(status, 201, "{created}");
+    let id = created["id"].as_i64().unwrap();
+    let res = client
+        .patch(c.rule(id))
+        .bearer_auth(&c.bob_trail)
+        .json(&json!({"push_allowlist": {"users": ["ghost"], "teams": []}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 422);
+
+    let res = client
+        .get(c.rules())
+        .bearer_auth(&c.bob_trail)
+        .send()
+        .await
+        .unwrap();
+    let list = res.json::<Value>().await.unwrap();
+    assert_eq!(list["gate_rules"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        list["gate_rules"][0]["push_allowlist"],
+        json!({"users": [], "teams": []}),
+        "rejected writes store nothing"
+    );
+}
+
+/// Protection changes write exactly one audit row per mutation, and a
+/// no-op update writes neither timeline nor audit rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn protection_changes_audit_once_and_noops_write_nothing() {
+    let c = Ctx::start().await;
+    let client = reqwest::Client::new();
+    let mut body = valid_body();
+    body["block_direct_push"] = json!(true);
+    body["push_allowlist"] = json!({"users": ["erin"], "teams": []});
+    let (status, created) = c.create(&c.bob_trail, &body).await;
+    assert_eq!(status, 201, "{created}");
+    let id = created["id"].as_i64().unwrap();
+    let target = format!("gate_rule:alice/proj#{id}");
+
+    async fn audit_count(c: &Ctx, action: &str, target: &str) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM audit_log WHERE action = $1 AND target = $2")
+            .bind(action)
+            .bind(target)
+            .fetch_one(c.s.core.db().pool())
+            .await
+            .unwrap()
+    }
+    async fn timeline_count(c: &Ctx, kind: &str) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM timeline_events WHERE kind = $1")
+            .bind(kind)
+            .fetch_one(c.s.core.db().pool())
+            .await
+            .unwrap()
+    }
+    assert_eq!(audit_count(&c, "gate_rule.created", &target).await, 1);
+
+    // Repeating the same state is a no-op: 200, but no new rows.
+    let res = client
+        .patch(c.rule(id))
+        .bearer_auth(&c.bob_trail)
+        .json(&json!({
+            "block_direct_push": true,
+            "push_allowlist": {"users": ["erin"], "teams": []},
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    assert_eq!(audit_count(&c, "gate_rule.updated", &target).await, 0);
+    assert_eq!(timeline_count(&c, "gate_rule.updated").await, 0);
+
+    // A real change writes exactly one row of each.
+    let res = client
+        .patch(c.rule(id))
+        .bearer_auth(&c.bob_trail)
+        .json(&json!({"block_force_push": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    assert_eq!(audit_count(&c, "gate_rule.updated", &target).await, 1);
+    assert_eq!(timeline_count(&c, "gate_rule.updated").await, 1);
+
+    let res = client
+        .delete(c.rule(id))
+        .bearer_auth(&c.bob_trail)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 204);
+    assert_eq!(audit_count(&c, "gate_rule.deleted", &target).await, 1);
+}

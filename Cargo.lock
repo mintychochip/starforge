@@ -4519,6 +4519,8 @@ name = "starforged-git"
 version = "0.0.0"
 dependencies = [
  "gix",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "tokio",

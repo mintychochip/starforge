@@ -960,6 +960,9 @@ async fn changes_list_shows_state_and_gate_summary() {
         false,
         false,
         "[]",
+        false,
+        false,
+        false,
         starforged_db::now(),
     )
     .await
@@ -1005,6 +1008,9 @@ async fn header_gate_panel_shows_gates_and_merge_form_by_role() {
         false,
         false,
         "[\"squash\"]",
+        false,
+        false,
+        false,
         starforged_db::now(),
     )
     .await
@@ -1321,6 +1327,9 @@ async fn gate_panel_ids_are_unique_with_two_open_changes() {
         false,
         false,
         "[]",
+        false,
+        false,
+        false,
         starforged_db::now(),
     )
     .await

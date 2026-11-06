@@ -17,14 +17,17 @@
 //! `receive.hideRefs`); the consumed `refs/for/*` pseudo-ref is deleted by
 //! the scan after a successful ingest.
 
-use crate::gates::pattern_matches;
 use crate::jobs::Job;
 use crate::webhooks::HookEvent;
 use crate::{Core, CoreError, CoreResult};
 use starforged_db::{
     changes as db_changes, checks as db_checks, now, repos as db_repos, trails as db_trails,
 };
-use starforged_git::{merge, read, refpolicy, write};
+use starforged_git::{
+    merge, read,
+    refpolicy::{self, pattern_matches},
+    write,
+};
 
 /// One ref motion observed by the post-receive scan: the full refname and
 /// the before/after oids. A zero oid marks a create (`old`) or a delete

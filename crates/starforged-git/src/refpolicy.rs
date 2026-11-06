@@ -311,6 +311,146 @@ pub fn check_branch_push(permission: Option<&str>, scope_write: bool) -> Result<
     Ok(())
 }
 
+/// One branch rule inside the hook's protection snapshot: the glob pattern
+/// (`None` matches all branches), the three blocks, and whether the pusher
+/// is exempt from the direct-push block (a user or team allow-list entry).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct BranchRule {
+    #[serde(default)]
+    pub pattern: Option<String>,
+    pub direct: bool,
+    pub force: bool,
+    pub delete: bool,
+    pub exempt: bool,
+}
+
+/// The parsed `STARFORGE_PROTECTION` snapshot: only `branches` is enforced
+/// here (tags and namespaces arrive with B2). Unknown fields are ignored so
+/// newer snapshots stay readable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Protection {
+    pub branches: Vec<BranchRule>,
+}
+
+/// Parses the hook's protection snapshot. Anything missing or malformed —
+/// bad JSON, a wrong version, a missing `branches` array, or a rule without
+/// its block kinds — is `Err`: the hook fails closed on it.
+pub fn parse_protection(raw: &str) -> Result<Protection, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(raw).map_err(|e| format!("invalid protection snapshot: {e}"))?;
+    let version = value
+        .get("v")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| "invalid protection snapshot: missing version".to_owned())?;
+    if version != 1 {
+        return Err(format!(
+            "invalid protection snapshot: unsupported version {version}"
+        ));
+    }
+    let branches = value
+        .get("branches")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "invalid protection snapshot: missing branches".to_owned())?;
+    let mut rules = Vec::with_capacity(branches.len());
+    for entry in branches {
+        let rule: BranchRule = serde_json::from_value(entry.clone())
+            .map_err(|e| format!("invalid protection snapshot: bad branch rule: {e}"))?;
+        rules.push(rule);
+    }
+    Ok(Protection { branches: rules })
+}
+
+/// Minimal glob: `*` matches any (possibly empty) run, `?` matches exactly
+/// one character, everything else matches literally. Case-sensitive. This is
+/// the single implementation: `starforged-core` gates, merges, and the change
+/// scan all call it — `None` and `""` match all branches.
+pub fn pattern_matches(pattern: Option<&str>, branch: &str) -> bool {
+    let pat = match pattern {
+        None | Some("") => return true,
+        Some(p) => p,
+    };
+    glob_match(pat.as_bytes(), branch.as_bytes())
+}
+
+fn glob_match(pat: &[u8], text: &[u8]) -> bool {
+    let (mut px, mut tx) = (0usize, 0usize);
+    let (mut star, mut mark) = (None, 0usize);
+    while tx < text.len() {
+        if px < pat.len() && (pat[px] == b'?' || pat[px] == text[tx]) {
+            px += 1;
+            tx += 1;
+        } else if px < pat.len() && pat[px] == b'*' {
+            star = Some(px);
+            mark = tx;
+            px += 1;
+        } else if let Some(s) = star {
+            px = s + 1;
+            mark += 1;
+            tx = mark;
+        } else {
+            return false;
+        }
+    }
+    while px < pat.len() && pat[px] == b'*' {
+        px += 1;
+    }
+    px == pat.len()
+}
+
+fn rule_label(pattern: &Option<String>) -> String {
+    pattern.clone().unwrap_or_else(|| "all branches".to_owned())
+}
+
+/// Enforces the snapshot on one branch push. Every matching rule applies; a
+/// push is refused when ANY matching rule blocks it: deletions with the new
+/// value at the zero oid and a `delete` block, force pushes (both oids set,
+/// old not an ancestor of new) with a `force` block, and any other update
+/// with a `direct` block unless the pusher is exempt on THAT rule. The
+/// exemption never covers force pushes or deletions. Non-branch refs pass:
+/// tags and namespaces are enforced elsewhere. Refusals name the ref and
+/// the rule pattern.
+pub fn check_protected_update(
+    protection: &Protection,
+    update: &RefUpdate,
+    is_ancestor: impl Fn(&str, &str) -> bool,
+) -> Result<(), String> {
+    let Some(branch) = update.name.strip_prefix("refs/heads/") else {
+        return Ok(());
+    };
+    let deleting = is_zero_oid(&update.new);
+    let creating = is_zero_oid(&update.old);
+    for rule in &protection.branches {
+        if !pattern_matches(rule.pattern.as_deref(), branch) {
+            continue;
+        }
+        let label = rule_label(&rule.pattern);
+        if deleting {
+            if rule.delete {
+                return Err(format!(
+                    "pushing to {} is not allowed: branch protection rule '{label}' blocks deletion",
+                    update.name
+                ));
+            }
+            continue;
+        }
+        let forced =
+            !creating && update.old != update.new && !is_ancestor(&update.old, &update.new);
+        if forced && rule.force {
+            return Err(format!(
+                "pushing to {} is not allowed: branch protection rule '{label}' blocks force pushes",
+                update.name
+            ));
+        }
+        if rule.direct && !rule.exempt {
+            return Err(format!(
+                "pushing to {} is not allowed: branch protection rule '{label}' blocks direct pushes (open a trail instead)",
+                update.name
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -586,6 +726,140 @@ mod tests {
             .is_err()
         );
         assert!(check_allowed("refs/notes/x", Some("admin"), true, "anyone_with_read").is_err());
+    }
+
+    #[test]
+    fn protection_blocks_each_kind() {
+        let pushing = |old: &str, new: &str| RefUpdate {
+            old: old.into(),
+            new: new.into(),
+            name: "refs/heads/main".into(),
+        };
+        let create = pushing(&"0".repeat(40), &"a".repeat(40));
+        let ff = pushing(&"a".repeat(40), &"b".repeat(40));
+        let delete = pushing(&"a".repeat(40), &"0".repeat(40));
+        // Direct-push block: creates and fast-forwards refuse, naming the pattern.
+        let direct = parse_protection(
+            r#"{"v":1,"branches":[{"pattern":"main","direct":true,"force":false,"delete":false,"exempt":false}],"tags":[],"tag_ok":true,"namespaces":[]}"#,
+        )
+        .unwrap();
+        for update in [&create, &ff] {
+            let err = check_protected_update(&direct, update, |_, _| true).unwrap_err();
+            assert!(err.contains("refs/heads/main"), "{err}");
+            assert!(err.contains("main"), "{err}");
+        }
+        assert!(check_protected_update(&direct, &delete, |_, _| true).is_ok());
+        // Force-push block: a non-ancestor move refuses, an ancestor move passes.
+        let force = parse_protection(
+            r#"{"v":1,"branches":[{"pattern":"main","direct":false,"force":true,"delete":false,"exempt":false}],"tags":[],"tag_ok":true,"namespaces":[]}"#,
+        )
+        .unwrap();
+        assert!(check_protected_update(&force, &ff, |_, _| true).is_ok());
+        let err = check_protected_update(&force, &ff, |_, _| false).unwrap_err();
+        assert!(err.contains("refs/heads/main"), "{err}");
+        assert!(err.contains("main"), "{err}");
+        assert!(check_protected_update(&force, &create, |_, _| false).is_ok());
+        assert!(check_protected_update(&force, &delete, |_, _| false).is_ok());
+        // Deletion block.
+        let del = parse_protection(
+            r#"{"v":1,"branches":[{"pattern":"main","direct":false,"force":false,"delete":true,"exempt":false}],"tags":[],"tag_ok":true,"namespaces":[]}"#,
+        )
+        .unwrap();
+        let err = check_protected_update(&del, &delete, |_, _| true).unwrap_err();
+        assert!(err.contains("refs/heads/main"), "{err}");
+        assert!(err.contains("main"), "{err}");
+        assert!(check_protected_update(&del, &create, |_, _| true).is_ok());
+        assert!(check_protected_update(&del, &ff, |_, _| true).is_ok());
+    }
+
+    #[test]
+    fn protection_applies_every_matching_rule() {
+        let update = RefUpdate {
+            old: "0".repeat(40),
+            new: "a".repeat(40),
+            name: "refs/heads/main".into(),
+        };
+        // Two rules match `main`; either one blocks.
+        let both = parse_protection(
+            r#"{"v":1,"branches":[{"pattern":"*","direct":false,"force":false,"delete":false,"exempt":false},{"pattern":"main","direct":true,"force":false,"delete":false,"exempt":false}],"tags":[],"tag_ok":true,"namespaces":[]}"#,
+        )
+        .unwrap();
+        assert!(check_protected_update(&both, &update, |_, _| true).is_err());
+        // A null pattern matches all branches; other branches are unaffected.
+        let all = parse_protection(
+            r#"{"v":1,"branches":[{"pattern":null,"direct":true,"force":false,"delete":false,"exempt":false}],"tags":[],"tag_ok":true,"namespaces":[]}"#,
+        )
+        .unwrap();
+        assert!(check_protected_update(&all, &update, |_, _| true).is_err());
+        let other = RefUpdate {
+            name: "refs/heads/feature".into(),
+            ..update.clone()
+        };
+        let scoped = parse_protection(
+            r#"{"v":1,"branches":[{"pattern":"main","direct":true,"force":false,"delete":false,"exempt":false}],"tags":[],"tag_ok":true,"namespaces":[]}"#,
+        )
+        .unwrap();
+        assert!(check_protected_update(&scoped, &other, |_, _| true).is_ok());
+        // Non-branch refs are not subject to branch protection.
+        let tag = RefUpdate {
+            name: "refs/tags/v1".into(),
+            ..update.clone()
+        };
+        assert!(check_protected_update(&all, &tag, |_, _| true).is_ok());
+    }
+
+    #[test]
+    fn protection_allowlist_exempts_only_the_direct_push_block() {
+        let create = RefUpdate {
+            old: "0".repeat(40),
+            new: "a".repeat(40),
+            name: "refs/heads/main".into(),
+        };
+        let force = RefUpdate {
+            old: "a".repeat(40),
+            new: "b".repeat(40),
+            ..create.clone()
+        };
+        let delete = RefUpdate {
+            old: "a".repeat(40),
+            new: "0".repeat(40),
+            ..create.clone()
+        };
+        let exempt = parse_protection(
+            r#"{"v":1,"branches":[{"pattern":"main","direct":true,"force":true,"delete":true,"exempt":true}],"tags":[],"tag_ok":true,"namespaces":[]}"#,
+        )
+        .unwrap();
+        assert!(check_protected_update(&exempt, &create, |_, _| false).is_ok());
+        assert!(check_protected_update(&exempt, &force, |_, _| true).is_ok());
+        // Exemption never covers force pushes or deletions.
+        assert!(check_protected_update(&exempt, &force, |_, _| false).is_err());
+        assert!(check_protected_update(&exempt, &delete, |_, _| true).is_err());
+        // A non-exempt rule still blocks even when another rule exempts.
+        let mixed = parse_protection(
+            r#"{"v":1,"branches":[{"pattern":"main","direct":true,"force":false,"delete":false,"exempt":true},{"pattern":"*","direct":true,"force":false,"delete":false,"exempt":false}],"tags":[],"tag_ok":true,"namespaces":[]}"#,
+        )
+        .unwrap();
+        assert!(check_protected_update(&mixed, &create, |_, _| true).is_err());
+    }
+
+    #[test]
+    fn protection_snapshot_must_parse() {
+        for bad in [
+            "",
+            "not json",
+            "{}",
+            r#"{"v":2,"branches":[]}"#,
+            r#"{"v":1}"#,
+            r#"{"v":1,"branches":[{}]}"#,
+        ] {
+            assert!(parse_protection(bad).is_err(), "{bad:?} must fail closed");
+        }
+        // Unknown top-level fields are tolerated for forward compatibility.
+        let ok = parse_protection(
+            r#"{"v":1,"branches":[],"tags":["v*"],"tag_ok":false,"namespaces":[],"future":1}"#,
+        )
+        .unwrap();
+        assert!(ok.branches.is_empty());
     }
 
     #[test]

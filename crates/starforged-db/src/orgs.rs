@@ -58,6 +58,15 @@ pub async fn owner_by_handle(db: &Db, handle: &str) -> DbResult<Option<OwnerRow>
     .transpose()
 }
 
+/// The handle of any owner row (user or org) by id.
+pub async fn owner_handle_by_id(db: &Db, id: i64) -> DbResult<Option<String>> {
+    let handle: Option<String> = sqlx::query_scalar("SELECT handle FROM owners WHERE id = $1")
+        .bind(id)
+        .fetch_optional(db.pool())
+        .await?;
+    Ok(handle)
+}
+
 /// Inserts the owner row (`kind = 'org'`), the org row, and the creator's owner
 /// membership in one transaction, returning the shared id.
 pub async fn create(
@@ -514,6 +523,18 @@ pub async fn team_by_slug(db: &Db, org_id: i64, slug: &str) -> DbResult<Option<T
     )
     .bind(org_id)
     .bind(slug)
+    .fetch_optional(db.pool())
+    .await?;
+    row.as_ref().map(from_team).transpose()
+}
+
+/// One team by id, if it still exists.
+pub async fn team_by_id(db: &Db, id: i64) -> DbResult<Option<TeamRow>> {
+    let row = sqlx::query(
+        "SELECT id, org_id, name, lower_name, description, permission, all_repos, created_at, updated_at \
+         FROM teams WHERE id = $1",
+    )
+    .bind(id)
     .fetch_optional(db.pool())
     .await?;
     row.as_ref().map(from_team).transpose()

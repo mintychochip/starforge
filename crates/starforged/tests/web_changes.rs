@@ -637,6 +637,9 @@ async fn change_page_renders_gate_panel() {
         false,
         false,
         "[]",
+        false,
+        false,
+        false,
         starforged_db::now(),
     )
     .await
