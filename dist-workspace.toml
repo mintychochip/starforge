@@ -1,0 +1,29 @@
+# cargo-dist configuration for the Starforge CLI (`starforge`).
+#
+# Written by hand, equivalent to `dist init` with
+# `--yes --installers=shell,homebrew,msi` on the starforge-cli package:
+# only the CLI is distributed; every server crate sets `dist = false`
+# via `[package.metadata.dist]` in its Cargo.toml.
+#
+# The orchestrator regenerates the release workflow with
+# `dist generate` (which writes `.github/workflows/release.yml`).
+[workspace]
+members = ["cargo:."]
+
+[dist]
+cargo-dist-version = "0.34.0"
+installers = ["shell", "homebrew", "msi"]
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+    "aarch64-pc-windows-msvc",
+]
+ci = ["github"]
+pr-run-mode = "plan"
+# The CLI is MIT OR Apache-2.0; exclude the AGPL license text that
+# auto-includes would otherwise bundle from the workspace root.
+auto-includes = false
+include = ["LICENSE-MIT", "LICENSE-APACHE-2.0", "README.md"]

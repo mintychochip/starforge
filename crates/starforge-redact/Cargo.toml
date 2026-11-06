@@ -5,6 +5,13 @@ edition.workspace = true
 rust-version.workspace = true
 license = "MIT OR Apache-2.0"
 publish = true
+description = "Deterministic redaction engine for secrets and PII in agent session traces"
+repository = "https://github.com/starforge/starforge"
+homepage = "https://github.com/starforge/starforge"
+readme = "../../README.md"
+keywords = ["starforge", "redaction", "secrets", "pii"]
+categories = ["cryptography"]
+authors = ["Starforge contributors"]
 
 [lints]
 workspace = true
@@ -16,7 +23,7 @@ serde_json.workspace = true
 toml.workspace = true
 blake3.workspace = true
 thiserror.workspace = true
-starforge-format = { path = "../starforge-format" }
+starforge-format.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

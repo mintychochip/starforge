@@ -183,7 +183,7 @@ pub struct ListQuery {
         (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
         (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
     ),
-    security(("bearer_auth" = [])),
+    security((), ("bearer_auth" = [])),
 )]
 
 pub async fn list_trails(
@@ -293,7 +293,7 @@ pub async fn create_trail(
         (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
         (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
     ),
-    security(("bearer_auth" = [])),
+    security((), ("bearer_auth" = [])),
 )]
 
 pub async fn get_trail(
@@ -419,7 +419,7 @@ pub async fn patch_trail(
         (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
         (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
     ),
-    security(("bearer_auth" = [])),
+    security((), ("bearer_auth" = [])),
 )]
 
 pub async fn list_comments(
@@ -808,7 +808,7 @@ fn trail_sessions_json(view: &starforged_core::trails::TrailSessions) -> Value {
         (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
         (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
     ),
-    security(("bearer_auth" = [])),
+    security((), ("bearer_auth" = [])),
 )]
 
 pub async fn get_trail_sessions(

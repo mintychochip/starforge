@@ -51,7 +51,8 @@ pub struct SessionListQuery {
     ),
     request_body = serde_json::Value,
     responses(
-        (status = 200, description = "Session metadata", body = serde_json::Value),
+        (status = 200, description = "Session metadata refreshed", body = serde_json::Value),
+        (status = 201, description = "Session created", body = serde_json::Value),
         (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
         (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
         (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
@@ -110,13 +111,18 @@ pub async fn put_meta(
         ("repo" = String, Path, description = "Repository name"),
         ("ulid" = String, Path, description = "Session ULID"),
         ("n" = i64, Path, description = "Segment number"),
+        ("x-starforge-blake3" = String, Header, description = "Lowercase BLAKE3 hex of the segment body"),
     ),
+    request_body(content = Vec<u8>, content_type = "application/octet-stream"),
     responses(
         (status = 200, description = "Segment stored", body = serde_json::Value),
         (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
         (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
         (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
         (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
+        (status = 409, description = "Different bytes already stored (hash body, not the error envelope)", body = serde_json::Value),
+        (status = 413, description = "Segment body over the configured cap", body = crate::openapi::ApiErrorBody),
+        (status = 422, description = "Hash mismatch or invalid body", body = crate::openapi::ApiErrorBody),
     ),
     security(("bearer_auth" = [])),
 )]
@@ -281,7 +287,7 @@ pub async fn post_links(
         (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
         (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
     ),
-    security(("bearer_auth" = [])),
+    security((), ("bearer_auth" = [])),
 )]
 
 pub async fn list_sessions(
@@ -611,7 +617,7 @@ fn json_column(raw: &str) -> Value {
         (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
         (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
     ),
-    security(("bearer_auth" = [])),
+    security((), ("bearer_auth" = [])),
 )]
 
 pub async fn get_session(
@@ -686,7 +692,7 @@ pub async fn get_session(
         (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
         (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
     ),
-    security(("bearer_auth" = [])),
+    security((), ("bearer_auth" = [])),
 )]
 
 pub async fn get_events(
@@ -744,7 +750,7 @@ pub async fn get_events(
         (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
         (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
     ),
-    security(("bearer_auth" = [])),
+    security((), ("bearer_auth" = [])),
 )]
 
 pub async fn get_links(
@@ -790,13 +796,13 @@ pub async fn get_links(
         ("n" = i64, Path, description = "Segment number"),
     ),
     responses(
-        (status = 200, description = "Raw segment bytes", body = Vec<u8>),
+        (status = 200, description = "Raw segment bytes", body = Vec<u8>, content_type = "application/octet-stream"),
         (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
         (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
         (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
         (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
     ),
-    security(("bearer_auth" = [])),
+    security((), ("bearer_auth" = [])),
 )]
 
 pub async fn get_segment(

@@ -195,7 +195,7 @@ impl Core {
         }
         // Claim before verifying: exactly one concurrent submission owns
         // the challenge; the loser is refused here and mints nothing.
-        let claimed = auth_factors::claim_challenge(self.db(), &hash, starforged_db::now())
+        let claimed = auth_factors::claim_challenge(self.db(), "totp", &hash, starforged_db::now())
             .await?
             .ok_or(CoreError::Unauthenticated)?;
         let code = code.trim();

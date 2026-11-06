@@ -113,7 +113,7 @@ pub async fn create(
         (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
         (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
     ),
-    security(("bearer_auth" = [])),
+    security((), ("bearer_auth" = [])),
 )]
 
 pub async fn show(
@@ -212,7 +212,7 @@ pub async fn delete(
         (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
         (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
     ),
-    security(("bearer_auth" = [])),
+    security((), ("bearer_auth" = [])),
 )]
 
 pub async fn list_repos(
@@ -306,7 +306,7 @@ pub async fn create_repo(
         (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
         (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
     ),
-    security(("bearer_auth" = [])),
+    security((), ("bearer_auth" = [])),
 )]
 
 pub async fn list_members(
@@ -491,7 +491,7 @@ pub async fn create_team(
         (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
         (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
     ),
-    security(("bearer_auth" = [])),
+    security((), ("bearer_auth" = [])),
 )]
 
 pub async fn list_teams(
@@ -521,7 +521,7 @@ pub async fn list_teams(
         (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
         (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
     ),
-    security(("bearer_auth" = [])),
+    security((), ("bearer_auth" = [])),
 )]
 
 pub async fn show_team(
@@ -635,7 +635,7 @@ pub async fn delete_team(
         (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
         (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
     ),
-    security(("bearer_auth" = [])),
+    security((), ("bearer_auth" = [])),
 )]
 
 pub async fn list_team_members(
@@ -740,7 +740,7 @@ pub async fn remove_team_member(
         (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
         (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
     ),
-    security(("bearer_auth" = [])),
+    security((), ("bearer_auth" = [])),
 )]
 
 pub async fn list_team_repos(

@@ -67,7 +67,7 @@ pub struct SessionsQuery {
         (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
         (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
     ),
-    security(("bearer_auth" = [])),
+    security((), ("bearer_auth" = [])),
 )]
 
 pub async fn search_trails(
@@ -125,7 +125,7 @@ pub async fn search_trails(
         (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
         (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
     ),
-    security(("bearer_auth" = [])),
+    security((), ("bearer_auth" = [])),
 )]
 
 pub async fn search_sessions(
@@ -209,7 +209,7 @@ pub struct CodeQuery {
         (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
         (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
     ),
-    security(("bearer_auth" = [])),
+    security((), ("bearer_auth" = [])),
 )]
 
 pub async fn search_code(

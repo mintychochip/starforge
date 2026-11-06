@@ -244,7 +244,7 @@ fn diff_range(query: &RevQuery) -> Result<(Option<i64>, Option<(i64, i64)>), Api
         (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
         (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
     ),
-    security(("bearer_auth" = [])),
+    security((), ("bearer_auth" = [])),
 )]
 
 pub async fn list_changes(
@@ -340,7 +340,7 @@ pub async fn create_change(
         (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
         (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
     ),
-    security(("bearer_auth" = [])),
+    security((), ("bearer_auth" = [])),
 )]
 
 pub async fn get_change(
@@ -385,7 +385,7 @@ pub async fn get_change(
         (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
         (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
     ),
-    security(("bearer_auth" = [])),
+    security((), ("bearer_auth" = [])),
 )]
 
 pub async fn get_gates(
@@ -548,7 +548,7 @@ pub async fn post_state(
         (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
         (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
     ),
-    security(("bearer_auth" = [])),
+    security((), ("bearer_auth" = [])),
 )]
 
 pub async fn list_revisions(
@@ -586,7 +586,7 @@ pub async fn list_revisions(
         (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
         (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
     ),
-    security(("bearer_auth" = [])),
+    security((), ("bearer_auth" = [])),
 )]
 
 pub async fn get_revision(
@@ -632,7 +632,7 @@ pub async fn get_revision(
         (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
         (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
     ),
-    security(("bearer_auth" = [])),
+    security((), ("bearer_auth" = [])),
 )]
 
 pub async fn get_diff(
@@ -761,7 +761,7 @@ pub struct HeadShaQuery {
         (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
         (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
     ),
-    security(("bearer_auth" = [])),
+    security((), ("bearer_auth" = [])),
 )]
 
 pub async fn list_changes_by_head(
@@ -802,7 +802,7 @@ pub async fn list_changes_by_head(
         (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
         (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
     ),
-    security(("bearer_auth" = [])),
+    security((), ("bearer_auth" = [])),
 )]
 
 pub async fn list_reviews(
@@ -937,7 +937,7 @@ pub async fn create_thread(
         (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
         (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
     ),
-    security(("bearer_auth" = [])),
+    security((), ("bearer_auth" = [])),
 )]
 
 pub async fn list_threads(
@@ -1111,7 +1111,7 @@ fn pending_review_json(view: &PendingReviewView) -> PendingReviewJson {
         (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
         (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
     ),
-    security(("bearer_auth" = [])),
+    security((), ("bearer_auth" = [])),
 )]
 
 pub async fn get_pending_review(

@@ -7,6 +7,48 @@ mod common;
 
 use common::*;
 use serde_json::Value;
+use std::collections::HashSet;
+
+/// The (method, full `/api/v1` path) pairs registered in
+/// `starforged_api::router`, mechanically scanned out of `lib.rs` so the
+/// spec and `ROUTES` are both checked against the router itself. Scans
+/// each `.route("<path>", <method>(handler)…)` registration and collects
+/// the method calls chained onto its path.
+fn router_routes() -> Vec<(&'static str, String)> {
+    let src = include_str!("../../starforged-api/src/lib.rs");
+    let mut out = Vec::new();
+    let mut rest = src;
+    while let Some(start) = rest.find(".route(") {
+        let after = &rest[start + ".route(".len()..];
+        let q1 = after.find('"').expect("route path literal");
+        let q2 = after[q1 + 1..].find('"').expect("route path literal end");
+        let path = &after[q1 + 1..q1 + 1 + q2];
+        let next = after.find(".route(").unwrap_or(usize::MAX);
+        let fallback = after.find(".fallback(").unwrap_or(usize::MAX);
+        let region = &after[..next.min(fallback).min(after.len())];
+        for method in ["get", "post", "put", "patch", "delete"] {
+            let mut found = false;
+            let mut hay = region;
+            while let Some(i) = hay.find(method) {
+                let before_ok = i == 0 || {
+                    let b = hay.as_bytes()[i - 1];
+                    !b.is_ascii_alphanumeric() && b != b'_'
+                };
+                let after_ok = hay[i + method.len()..].starts_with('(');
+                if before_ok && after_ok {
+                    found = true;
+                    break;
+                }
+                hay = &hay[i + 1..];
+            }
+            if found {
+                out.push((method, format!("/api/v1{path}")));
+            }
+        }
+        rest = &after[region.len()..];
+    }
+    out
+}
 
 const ROUTES: &[(&str, &str)] = &[
     ("get", "/api/v1/openapi.json"),
@@ -273,10 +315,23 @@ async fn openapi_document_is_valid_complete_and_stable() {
             "{method} {path} missing from the spec"
         );
     }
-    // No speculative extras: every spec path is a registered route.
+    // The maintained list equals the router's registrations, and the spec
+    // has no speculative extras either.
+    let from_router: HashSet<(&str, String)> = router_routes().into_iter().collect();
+    assert_eq!(
+        from_router.len(),
+        router_routes().len(),
+        "duplicate router registrations"
+    );
+    let from_list: HashSet<(&str, String)> =
+        ROUTES.iter().map(|(m, p)| (*m, (*p).to_string())).collect();
+    assert_eq!(
+        from_list, from_router,
+        "ROUTES must match the router's registrations in lib.rs"
+    );
     for path in paths.keys() {
         assert!(
-            ROUTES.iter().any(|(_, p)| p == path),
+            from_router.iter().any(|(_, p)| p == path),
             "spec path {path} is not a registered route"
         );
     }
@@ -310,6 +365,18 @@ async fn openapi_document_is_valid_complete_and_stable() {
     assert!(
         security.iter().any(|r| r["bearer_auth"].is_array()),
         "GET /api/v1/user requires bearer_auth: {security:?}"
+    );
+
+    // Anonymous callers are allowed where the handler uses `reader()`
+    // (`search` routes): an empty security requirement alongside bearer_auth.
+    let optional = paths["/api/v1/search/trails"]["get"]["security"]
+        .as_array()
+        .expect("security requirements");
+    assert!(
+        optional
+            .iter()
+            .any(|r| r.as_object().is_some_and(|o| o.is_empty())),
+        "GET /api/v1/search/trails allows anonymous callers: {optional:?}"
     );
 
     // DTO schemas are present (one named schema per DTO).

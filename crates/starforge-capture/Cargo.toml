@@ -5,6 +5,13 @@ edition.workspace = true
 rust-version.workspace = true
 license = "MIT OR Apache-2.0"
 publish = true
+description = "Session capture adapters that normalize agent transcripts into Trace Format events"
+repository = "https://github.com/starforge/starforge"
+homepage = "https://github.com/starforge/starforge"
+readme = "../../README.md"
+keywords = ["starforge", "agent-sessions", "capture"]
+categories = ["data-structures"]
+authors = ["Starforge contributors"]
 
 [lints]
 workspace = true
@@ -13,7 +20,7 @@ workspace = true
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-starforge-format = { path = "../starforge-format" }
+starforge-format.workspace = true
 thiserror.workspace = true
 time.workspace = true
 ulid.workspace = true

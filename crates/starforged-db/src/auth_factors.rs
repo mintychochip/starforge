@@ -74,6 +74,23 @@ pub async fn claim_totp_step(db: &Db, user_id: i64, step: i64) -> DbResult<bool>
     Ok(affected.rows_affected() > 0)
 }
 
+/// Atomically records `step` as the highest TOTP step accepted so far
+/// AND enables two-factor authentication, in one statement. Enrollment
+/// confirmation uses this so no window exists where the step is recorded
+/// but password login still sees TOTP disabled. Returns `false` when the
+/// step was already recorded or a newer step won the race.
+pub async fn claim_totp_step_and_enable(db: &Db, user_id: i64, step: i64) -> DbResult<bool> {
+    let affected = sqlx::query(
+        "UPDATE users SET totp_last_step = $1, totp_enabled = 1 \
+         WHERE id = $2 AND (totp_last_step IS NULL OR totp_last_step < $1)",
+    )
+    .bind(step)
+    .bind(user_id)
+    .execute(db.pool())
+    .await?;
+    Ok(affected.rows_affected() > 0)
+}
+
 /// Stores fresh recovery-code hashes for `user_id` (callers delete the old ones first).
 pub async fn insert_recovery_codes(db: &Db, user_id: i64, hashes: &[String]) -> DbResult<()> {
     for hash in hashes {
@@ -345,19 +362,23 @@ pub async fn delete_challenges_for_user(db: &Db, user_id: i64) -> DbResult<()> {
     Ok(())
 }
 
-/// Atomically claims a live challenge by deleting it; returns the claimed
-/// row, or `None` when the token is unknown, expired at `now_ts`, or a
-/// concurrent request already claimed it. The first claimer owns the
-/// challenge: single-use consumption, like `grant_device_tokens`.
+/// Atomically claims a live challenge of `kind` by deleting it; returns
+/// the claimed row, or `None` when the token is unknown, expired at
+/// `now_ts`, of a different kind, or a concurrent request already claimed
+/// it. The first claimer owns the challenge: single-use consumption,
+/// like `grant_device_tokens`. The kind rides in the WHERE clause so one
+/// flow can never claim another flow's challenge.
 pub async fn claim_challenge(
     db: &Db,
+    kind: &str,
     token_hash: &str,
     now_ts: i64,
 ) -> DbResult<Option<LoginChallengeRow>> {
     let row = sqlx::query(
-        "DELETE FROM login_challenges WHERE token_hash = $1 AND expires_at > $2 \
+        "DELETE FROM login_challenges WHERE kind = $1 AND token_hash = $2 AND expires_at > $3 \
          RETURNING id, kind, user_id, token_hash, state, nonce, code_verifier, attempts, expires_at",
     )
+    .bind(kind)
     .bind(token_hash)
     .bind(now_ts)
     .fetch_optional(db.pool())

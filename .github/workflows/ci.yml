@@ -1,0 +1,84 @@
+# CI: format, lints, and tests on SQLite and Postgres 17.
+# Browser tests are added here by the browser-tests task (see R3).
+# The crate set to test and the Postgres URL mirror scripts/check.sh.
+name: ci
+
+"on":
+  push:
+    branches: [next, main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: fmt
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5.0.0
+      - name: Install pinned toolchain
+        run: rustup show
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5.0.0
+      - name: Install pinned toolchain
+        run: rustup show
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test-sqlite:
+    name: test (sqlite)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5.0.0
+      - name: Install pinned toolchain
+        run: rustup show
+      - name: Test on SQLite
+        run: cargo test --workspace
+
+  test-postgres:
+    name: test (postgres 17)
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: starforge
+        options: >-
+          --shm-size=1g
+          --health-cmd="pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+        ports:
+          - 5432:5432
+    steps:
+      - uses: actions/checkout@v5.0.0
+      - name: Install pinned toolchain
+        run: rustup show
+      - name: Test on Postgres
+        env:
+          STARFORGE_TEST_PG_URL: postgres://postgres:starforge@127.0.0.1:5432/postgres
+        run: cargo test --workspace
+
+  browser:
+    name: browser tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5.0.0
+      - name: Install pinned toolchain
+        run: rustup show
+      - name: Install Node 22
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+      - name: Install Python compression libraries
+        run: pip install zstandard blake3
+      - name: Browser tests
+        run: scripts/browser-tests.sh

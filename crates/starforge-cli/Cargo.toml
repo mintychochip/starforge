@@ -5,6 +5,21 @@ edition.workspace = true
 rust-version.workspace = true
 license = "MIT OR Apache-2.0"
 publish = true
+description = "Command-line interface for Starforge: session capture, Trails, and git remotes"
+repository = "https://github.com/starforge/starforge"
+homepage = "https://github.com/starforge/starforge"
+readme = "../../README.md"
+keywords = ["starforge", "git", "forge", "cli", "agent-sessions"]
+categories = ["command-line-utilities"]
+authors = ["Starforge contributors"]
+
+# Stable WiX GUIDs for the cargo-dist MSI installer. dist regenerates
+# these if they are missing; keep them fixed so upgrades are stable.
+[package.metadata.wix]
+upgrade-guid = "EFAE5F1B-1C00-4CC9-A5FB-9BA24FBE7DF1"
+path-guid = "5D6A6181-B821-4584-A6ED-CA6650E1D013"
+license = false
+eula = false
 
 [[bin]]
 name = "starforge"
@@ -18,9 +33,9 @@ clap.workspace = true
 reqwest = { workspace = true, features = ["rustls"] }
 serde.workspace = true
 serde_json.workspace = true
-starforge-capture = { path = "../starforge-capture" }
-starforge-format = { path = "../starforge-format" }
-starforge-redact = { path = "../starforge-redact" }
+starforge-capture.workspace = true
+starforge-format.workspace = true
+starforge-redact.workspace = true
 thiserror.workspace = true
 time.workspace = true
 tokio.workspace = true

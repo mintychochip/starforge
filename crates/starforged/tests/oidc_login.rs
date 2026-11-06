@@ -146,6 +146,25 @@ async fn unknown_challenge_is_refused() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_finish_proceeds_exactly_once() {
+    let fake = FakeOidc::start_es256().await;
+    let server = oidc_server(&fake).await;
+
+    let (challenge, url) = server.core.oidc_begin(OidcIntent::Login).await.unwrap();
+    let (code, state) = authorize(&url).await;
+    let core = server.core.clone();
+    let (first, second) = tokio::join!(
+        core.oidc_finish(&challenge, &code, &state),
+        core.oidc_finish(&challenge, &code, &state),
+    );
+    let successes = [first, second].into_iter().filter(|r| r.is_ok()).count();
+    assert_eq!(
+        successes, 1,
+        "two concurrent callbacks with the same challenge proceed exactly once"
+    );
+}
+
 #[test]
 fn oidc_config_validation() {
     use starforged::config::{

@@ -40,6 +40,10 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha2 = "0.11.1"
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "any", "sqlite", "postgres", "migrate", "macros"] }
+starforge-capture = { path = "crates/starforge-capture", version = "0.0.0" }
+starforge-cli = { path = "crates/starforge-cli", version = "0.0.0" }
+starforge-format = { path = "crates/starforge-format", version = "0.0.0" }
+starforge-redact = { path = "crates/starforge-redact", version = "0.0.0" }
 subtle = "2.6.1"
 tantivy = "0.27.0"
 syntect = { version = "5.3.0", default-features = false, features = ["default-fancy"] }
@@ -67,3 +71,8 @@ all = { level = "warn", priority = -1 }
 # debug info each. Workspace crates keep full debug info.
 [profile.dev.package."*"]
 debug = false
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

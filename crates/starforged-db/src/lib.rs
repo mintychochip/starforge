@@ -112,8 +112,11 @@ impl Db {
                     .await?
             }
         };
+        // In-memory SQLite databases are named per connection by sqlx, so a
+        // second pool would be a different (empty) database: share one pool.
+        let in_memory = url.contains(":memory:") || url.contains("mode=memory");
         let read_pool = match backend {
-            Backend::Sqlite => {
+            Backend::Sqlite if !in_memory => {
                 AnyPoolOptions::new()
                     .max_connections(4)
                     .after_connect(|conn, _meta| {
@@ -131,7 +134,7 @@ impl Db {
                     .connect(url)
                     .await?
             }
-            Backend::Postgres => pool.clone(),
+            _ => pool.clone(),
         };
         Ok(Db {
             pool,
@@ -310,5 +313,23 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, DbError::UnsupportedUrl(_)));
+    }
+
+    /// `sqlite::memory:` must share one pool between writer and reader:
+    /// sqlx names each in-memory database uniquely per connection, so a
+    /// second pool would migrate and query a different, empty database.
+    #[tokio::test]
+    async fn in_memory_sqlite_shares_one_pool() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        db.migrate().await.unwrap();
+        sqlx::query("INSERT INTO owners (kind, handle, created_at) VALUES ('user', 'alice', 0)")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let owner = crate::orgs::owner_by_handle(&db, "alice")
+            .await
+            .unwrap()
+            .expect("row written through the writer is visible through read_pool");
+        assert_eq!(owner.kind, "user");
     }
 }

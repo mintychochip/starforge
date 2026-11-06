@@ -6,6 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[package.metadata.dist]
+dist = false
+
 [lints]
 workspace = true
 
@@ -24,8 +27,8 @@ sha2.workspace = true
 reqwest.workspace = true
 ring.workspace = true
 subtle.workspace = true
-starforge-format = { path = "../starforge-format" }
-starforge-redact = { path = "../starforge-redact" }
+starforge-format.workspace = true
+starforge-redact.workspace = true
 starforged-blob = { path = "../starforged-blob" }
 starforged-db = { path = "../starforged-db" }
 starforged-git = { path = "../starforged-git" }

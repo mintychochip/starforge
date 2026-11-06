@@ -6,6 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[package.metadata.dist]
+dist = false
+
 [lints]
 workspace = true
 
@@ -41,9 +44,9 @@ url.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
 sha2.workspace = true
-starforge-capture = { path = "../starforge-capture" }
-starforge-cli = { path = "../starforge-cli" }
-starforge-format = { path = "../starforge-format" }
+starforge-capture.workspace = true
+starforge-cli.workspace = true
+starforge-format.workspace = true
 starforged-core = { path = "../starforged-core", features = ["testing"] }
 starforged-db = { path = "../starforged-db", features = ["testing"] }
 tempfile.workspace = true

@@ -94,7 +94,7 @@ fn gate_rule_json(view: &GateRuleDto) -> GateRuleJson {
         (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
         (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
     ),
-    security(("bearer_auth" = [])),
+    security((), ("bearer_auth" = [])),
 )]
 
 pub async fn list_gate_rules(

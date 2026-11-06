@@ -57,7 +57,7 @@ fn tag_protection_json(view: &TagProtectionDto) -> TagProtectionJson {
         (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
         (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
     ),
-    security(("bearer_auth" = [])),
+    security((), ("bearer_auth" = [])),
 )]
 
 pub async fn list_tag_protections(

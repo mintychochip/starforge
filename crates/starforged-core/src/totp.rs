@@ -298,6 +298,22 @@ impl Core {
     /// Checks a code against the user's opened secret and records the
     /// matched step, refusing replays of the same or an older step.
     pub(crate) async fn check_totp_code(&self, user: &User, code: &str) -> CoreResult<()> {
+        let matched = self.matched_totp_step(user, code).await?;
+        // The CAS claim is the replay guard: a concurrent request that
+        // already recorded this step (or a newer one) makes it fail here,
+        // so exactly one caller ever passes for a given step.
+        if !auth_factors::claim_totp_step(self.db(), user.id, matched).await? {
+            return Err(CoreError::Invalid(
+                "That code has already been used. Wait for the next code.".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The step a code matches, verified against the user's opened secret
+    /// WITHOUT recording it. Callers that must record the step together
+    /// with another state change (enrollment) claim it themselves.
+    async fn matched_totp_step(&self, user: &User, code: &str) -> CoreResult<i64> {
         let state = auth_factors::totp_state(self.db(), user.id)
             .await?
             .ok_or_else(|| CoreError::Internal("user missing".into()))?;
@@ -308,17 +324,7 @@ impl Core {
         let now = starforged_db::now();
         let matched = verify(&secret, code, now)
             .ok_or_else(|| CoreError::Invalid("That code is not valid.".into()))?;
-        let matched =
-            i64::try_from(matched).map_err(|_| CoreError::Internal("step out of range".into()))?;
-        // The CAS claim is the replay guard: a concurrent request that
-        // already recorded this step (or a newer one) makes it fail here,
-        // so exactly one caller ever passes for a given step.
-        if !auth_factors::claim_totp_step(self.db(), user.id, matched).await? {
-            return Err(CoreError::Invalid(
-                "That code has already been used. Wait for the next code.".into(),
-            ));
-        }
-        Ok(())
+        i64::try_from(matched).map_err(|_| CoreError::Internal("step out of range".into()))
     }
 
     /// Confirms a pending enrollment with a valid code: enables 2FA, records
@@ -340,19 +346,14 @@ impl Core {
         if state.secret.is_none() {
             return Err(CoreError::Invalid("Start enrollment first.".into()));
         }
-        self.check_totp_code(user, code).await?;
-        // `check_totp_code` recorded the step; enable while preserving it.
-        let stored = auth_factors::totp_state(self.db(), user.id)
-            .await?
-            .ok_or_else(|| CoreError::Internal("user missing".into()))?;
-        auth_factors::set_totp(
-            self.db(),
-            user.id,
-            stored.secret.as_deref(),
-            true,
-            stored.last_step,
-        )
-        .await?;
+        let matched = self.matched_totp_step(user, code).await?;
+        // Record the step and enable 2FA in one statement: no window in
+        // which password login sees TOTP disabled with the step consumed.
+        if !auth_factors::claim_totp_step_and_enable(self.db(), user.id, matched).await? {
+            return Err(CoreError::Invalid(
+                "That code has already been used. Wait for the next code.".into(),
+            ));
+        }
         let codes = new_recovery_codes();
         let hashes: Vec<String> = codes.iter().map(|c| hash_recovery_code(c)).collect();
         auth_factors::insert_recovery_codes(self.db(), user.id, &hashes).await?;

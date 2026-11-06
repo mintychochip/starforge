@@ -1298,3 +1298,106 @@ async fn postgres_restore_round_trip_through_the_shims() {
         combined(&out)
     );
 }
+
+/// An incomplete backup (no `blobs/`) is refused before any write:
+/// the target data dir is never created.
+#[tokio::test]
+async fn restore_refuses_a_backup_missing_blobs_and_leaves_the_target_untouched() {
+    let fixture = fixture().await;
+    let backup_dir = fixture._tmp.path().join("backup");
+    let out = backup(&fixture, &backup_dir, &[]);
+    assert!(out.status.success(), "backup failed: {}", combined(&out));
+    std::fs::remove_dir_all(backup_dir.join("blobs")).unwrap();
+
+    let fresh_data = fixture._tmp.path().join("restored-data");
+    let target_config = fixture._tmp.path().join("restored.toml");
+    write_sqlite_config(&target_config, &fresh_data, &"0".repeat(64));
+    let out = restore_cmd(&backup_dir, Some(&target_config), None, None);
+    assert!(
+        !out.status.success(),
+        "restore of an incomplete backup succeeded"
+    );
+    assert!(
+        combined(&out).contains("blobs"),
+        "unexpected error: {}",
+        combined(&out)
+    );
+    assert!(
+        !fresh_data.exists(),
+        "the refusal must happen before the data dir is created"
+    );
+}
+
+/// A planted symlink in the backup (here: a repository hook pointing
+/// outside the backup) is refused before any write, so a hostile
+/// backup cannot plant files outside the restored data dir.
+#[cfg(unix)]
+#[tokio::test]
+async fn restore_refuses_a_planted_symlink_before_any_write() {
+    let fixture = fixture().await;
+    let backup_dir = fixture._tmp.path().join("backup");
+    let out = backup(&fixture, &backup_dir, &[]);
+    assert!(out.status.success(), "backup failed: {}", combined(&out));
+    let copied = backup_dir
+        .join("repos")
+        .join(format!("{:02}", fixture.repo_id.rem_euclid(100)))
+        .join(format!("{}.git", fixture.repo_id));
+    let hook = copied.join("hooks").join("pre-receive");
+    let _ = std::fs::remove_file(&hook);
+    std::os::unix::fs::symlink("/bin/true", &hook).unwrap();
+
+    let fresh_data = fixture._tmp.path().join("restored-data");
+    let target_config = fixture._tmp.path().join("restored.toml");
+    write_sqlite_config(&target_config, &fresh_data, &"0".repeat(64));
+    let out = restore_cmd(&backup_dir, Some(&target_config), None, None);
+    assert!(
+        !out.status.success(),
+        "restore of a backup with a planted symlink succeeded"
+    );
+    assert!(
+        combined(&out).contains("symlink"),
+        "unexpected error: {}",
+        combined(&out)
+    );
+    assert!(
+        !fresh_data.exists(),
+        "the refusal must happen before the data dir is created"
+    );
+}
+
+/// A manifest whose counts do not match the snapshot's contents is
+/// refused before any write.
+#[tokio::test]
+async fn restore_refuses_a_manifest_count_mismatch() {
+    let fixture = fixture().await;
+    let backup_dir = fixture._tmp.path().join("backup");
+    let out = backup(&fixture, &backup_dir, &[]);
+    assert!(out.status.success(), "backup failed: {}", combined(&out));
+    let manifest_path = backup_dir.join("manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    manifest["blobs"] = serde_json::json!(99);
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_string_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let fresh_data = fixture._tmp.path().join("restored-data");
+    let target_config = fixture._tmp.path().join("restored.toml");
+    write_sqlite_config(&target_config, &fresh_data, &"0".repeat(64));
+    let out = restore_cmd(&backup_dir, Some(&target_config), None, None);
+    assert!(
+        !out.status.success(),
+        "restore of a count-mismatched backup succeeded"
+    );
+    assert!(
+        combined(&out).contains("manifest counts"),
+        "unexpected error: {}",
+        combined(&out)
+    );
+    assert!(
+        !fresh_data.exists(),
+        "the refusal must happen before the data dir is created"
+    );
+}

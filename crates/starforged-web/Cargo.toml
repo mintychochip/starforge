@@ -6,6 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[package.metadata.dist]
+dist = false
+
 [lints]
 workspace = true
 [dependencies]
@@ -21,7 +24,7 @@ comrak.workspace = true
 percent-encoding.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-starforge-format = { path = "../starforge-format" }
+starforge-format.workspace = true
 starforged-core = { path = "../starforged-core" }
 starforged-git = { path = "../starforged-git" }
 subtle.workspace = true

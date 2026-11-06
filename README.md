@@ -87,7 +87,13 @@ For local development, `url = "file:///tmp/starforge-mail"` writes each message 
 it.
 
 Signed-in users manage their display name, email address, password, sessions, and tokens under **Settings**, and
-can delete their account there once they own no repositories.
+can delete their account there once they own no repositories. Account deletion requires typing the account's
+handle to confirm, and is refused while the account owns repositories that are not deleted, is the only
+active site administrator, or is the only owner of an organization (make another user an admin/owner first).
+It deletes every session the account uploaded — through the same session-delete path as a session delete,
+so blob reference counts are decremented and index documents are removed — before the user row itself;
+tokens and collaborator grants go with the account, deleted repositories are purged, and audit entries stay
+with the actor cleared. If a deletion is interrupted, rerunning it finishes the job (idempotent).
 
 
 ## Two-factor authentication
@@ -96,7 +102,7 @@ Any account can turn on TOTP two-factor authentication under **Settings → Two-
 
 1. **Enroll.** The page shows an `otpauth://` URI (issuer `Starforge`, one 20-byte secret, 6 digits, 30 s step) and the base32 secret. The secret is stored sealed with the server key, never in clear, and is never logged.
 2. **Confirm** with a current code. Only then is 2FA enabled, and 10 recovery codes (`xxxxx-xxxxx`) are shown **once** — save them. Signing in then asks for the password and a current code (or one recovery code) at `/login/two-factor`; no web session exists before the second factor.
-3. A code is accepted within one step either way, and a step is never reused. Each recovery code is shown once, five failed codes void the challenge and sign-in starts again, and challenges expire after five minutes. All of these write audit rows (`account.2fa_enabled`, `account.2fa_disabled`, `account.recovery_codes_regenerated`).
+3. A code is accepted within one step either way, and a step is never reused. Each recovery code is shown once, five failed codes void the challenge and sign-in starts again, and challenges expire after five minutes. All of these write audit rows (`account.2fa_enabled`, `account.2fa_disabled`, `account.recovery_codes_regenerated`, `login.2fa_failure`).
 4. Disable needs the password plus a code — for a password-less SSO-only account the password is waived but a current code is still required; regenerate needs a code and invalidates the old ones.
 
 Personal access tokens and OAuth device tokens are not affected by 2FA. A site admin can disable a user's 2FA from the admin user page (`/admin/users/{handle}`, audited as `user.2fa_reset`).
@@ -290,18 +296,19 @@ again before every fetch or push — passes
   closed if the host has rebound to a private address.
 - Dash-prefixed URLs, users, and hosts are refused outright (SSH
   `-oProxyCommand=` injection), as are whitespace/control characters. A
-  password pasted into a URL's userinfo is stripped: the stored and returned
-  URL never carries it, for every scheme.
+  password pasted into an `http`/`https`/`ssh` URL's userinfo is stripped: the stored and returned
+  URL never carries it (`file://` URLs carrying userinfo are refused instead).
 
 **Access and audit.** Mirror configuration is maintain+ (the `mirrors`
 capability); below-threshold readers get `403`, non-readers `404`, and readers
 can `GET` the configuration. Import mirrors the same matrix (readers see the
 state via `GET …/import`; start/delete need maintain+). Archived repositories
 refuse new configuration, imports, and mirror additions with `422` while
-staying readable. Every configuration change writes one audit row
-(`repo.import`, `mirror.create`, `mirror.update`, `mirror.delete`, plus
-`mirror.credentials_changed` when credentials are set or replaced). Web forms
-are CSRF-gated like every other state-changing form.
+staying readable. Scheduled pull syncs pause with "repository is archived; mirror paused" and
+resume on unarchive; "sync now" returns `422`, push mirrors keep running, and enable/disable/delete
+stay allowed. Every configuration change writes one audit row (`repo.import`, `mirror.create`,
+`mirror.update`, `mirror.delete`, plus `mirror.credentials_changed` when credentials are set or
+replaced). Web forms are CSRF-gated like every other state-changing form.
 
 **API.** `GET`/`DELETE /repos/{owner}/{repo}/import` and
 `POST …/import/start` (optional body replaces credentials); `PUT`/`GET`/`DELETE
@@ -463,6 +470,11 @@ push `refs/for/*`, maintain+), and
 with the new location.
 `GET`/`POST /user/keys` and `DELETE /user/keys/{id}` manage the caller's SSH keys (the same keys as **Settings → Keys**); `GET`/`POST /repos/{owner}/{repo}/keys` (with `"read_write"`) and `DELETE /repos/{owner}/{repo}/keys/{id}` manage that repository's deploy keys (admin only; below-threshold callers get `403`, non-readers `404`; archived repositories refuse adds). Key lists carry `id`, `title`, `algorithm`, `fingerprint`, and (for deploy keys) `read_write`.
 Errors use `{"error": {"code", "message"}}`.
+The whole API is described by an OpenAPI 3.1 document generated from the code
+with [utoipa](https://github.com/juharris/utoipa) and served unauthenticated at
+`GET /api/v1/openapi.json` (every route in the router appears in `paths`, with
+request/response schemas and the shared error envelope, and bearer auth is
+declared as `bearer_auth`).
 
 ## Trace format and redaction
 
@@ -504,10 +516,63 @@ Spool layout is `<git common dir>/starforge` (`sessions/<ULID>/`, `links.jsonl`,
 heuristic linking fires once per batch of new session activity. Auth is
 `STARFORGE_TOKEN` when set, else `starforge auth login` (device flow) storing
 per-host tokens in `~/.config/starforge/credentials.toml` (mode `0600`).
-Every command honors `--dry-run` (print, don't write) and `--verbose`;
-`sessions publish`/`unpublish`/`delete` and `export`/`import` are not in M1c
-and exit non-zero. Exit codes: `0` ok, `1` operational error,
-`2` `sync` finished with items still queued.
+Every command honors `--dry-run` (print, don't write) and `--verbose`.
+Exit codes: `0` ok, `1` operational error, `2` `sync` finished with items
+still queued. Hidden `_hook-prepare-commit-msg`, `_hook-post-commit`, and
+`_hook-pre-push` entry points back the installed git hooks.
+
+### Command reference
+
+| Command | Meaning and flags |
+|---|---|
+| `starforge auth login <server>` | Device-flow login against a server host or URL |
+| `starforge auth logout [server]` | Delete stored credentials (default: the single stored host) |
+| `starforge auth status` | Show auth status |
+| `starforge enable` / `disable` | Install / remove git hooks and repo config |
+| `starforge status` | Repo, session, and upload status |
+| `starforge doctor` | Environment, config, and connectivity checks |
+| `starforge sync` | Upload queued sessions (exit `2` while items remain queued) |
+| `starforge sessions list` | List local (spooled) sessions |
+| `starforge sessions show <ulid>` | Show a session's metadata (unambiguous prefix works) |
+| `starforge sessions link <ulid> [--commit <sha>]` | Link a session to a commit (default: `HEAD`) |
+| `starforge sessions unlink <ulid> --commit <sha>` | Remove a session's link to a commit |
+| `starforge sessions publish <ulid> [--repo <owner/repo>]` | Publish a server-side session (public repositories only) |
+| `starforge sessions unpublish <ulid> [--repo <owner/repo>]` | Unpublish a server-side session (`published` → `inherit`) |
+| `starforge sessions delete <ulid> [--repo <owner/repo>] --yes` | Delete a server-side session and its segments and links |
+| `starforge export --repo <owner/repo> [--session <ulid>…] <dir>` | Write a session bundle to `<dir>` (every readable session, or only the repeatable `--session` ULIDs) |
+| `starforge import <dir> --repo <owner/repo>` | Upload a bundle's sessions into the target repository |
+| `starforge trail list [--state open\|closed\|merged\|all] [--label L] [--assignee H] [--author H] [--has-changes BOOL] [--has-sessions BOOL] [--review-requested H] [--limit 1–100] [--after ID] [--format text\|json]` | List Trails (default state `open`, limit `30`) |
+| `starforge trail show <n> [--format text\|json\|agent]` | Show a Trail with its changes and comments |
+| `starforge trail create --title T [--body MD \| --body-file PATH] [--format text\|json]` | Create a Trail (`--body` and `--body-file` conflict; `-` reads stdin) |
+| `starforge trail comment <n> (--body MD \| --body-file PATH) [--format text\|json]` | Comment on a Trail (exactly one of `--body` / `--body-file`) |
+| `starforge trail push [--trail N] [--title T] [--base B] [--topic T] [--remote R] [--format text\|json]` | Push `HEAD` as a change revision (omit `--trail` to create one) |
+| `starforge trail checkout <n> [--change C] [--rev R] [--remote R] [--format text\|json]` | Check out a Trail change |
+| `starforge trail review <n> (--approve \| --request-changes \| --comment) [--body MD] [--body-file PATH] [--comments JSON\|@path\|@-] [--session ULID] [--change C] [--rev R] [--format text\|json]` | Submit a review (verdict flags are mutually exclusive, exactly one required) |
+| `starforge trail merge <n> [--method M] [--change C] [--format text\|json]` | Merge a Trail change (default: `merge` when allowed, else the allowed method) |
+
+`--repo` on `sessions publish`/`unpublish`/`delete` overrides the discovered
+`owner/repo`; on `export` it is the required source repository and on `import`
+the required target repository (imports never upload without a confirmed
+target). A user who cannot read a session cannot export it: the API answers
+`404` and the CLI reports `cannot export <ulid>: session not found or not readable`.
+
+**Bundle format.** `export` writes exactly what the API returns to the caller:
+
+```text
+<dir>/
+  bundle.json                              format version 1, server URL, exported_at
+  <owner>__<repo>/<ulid>/
+    session.json                           the API metadata, as returned
+    events.jsonl                           the normalized transcript (via /events)
+    segments/<n>.raw.zst                   stored bytes when the API serves raw;
+                                           otherwise the re-segmentation of the redacted /events stream
+    links.json                             commit links (via /links)
+```
+
+`import` uploads each session through the normal upload API (metadata,
+re-segmented events, complete), preserving ULIDs and re-creating `cli_claim`
+links from `links.json`; a ULID already present in the target repository is
+reported `exists` and skipped.
 
 ## Session capture and ingest
 
@@ -548,10 +613,24 @@ with `<img>` elements stripped entirely (even relative ones), so an image in an
 attacker-influenced transcript can never phone home when viewed; repository Markdown
 (READMEs, blobs) keeps images. Tool input, tool output, diffs, and unknown event kinds
 render as escaped text in collapsed
-`<details>` blocks, and `[redacted:<id>]` markers show verbatim. Tool calls expand inline —
-there is no JavaScript on the page, so nothing fetches or executes. The JSON API mirrors the
+`details>` blocks, and `[redacted:<id>]` markers show verbatim. Assistant events
+with usage show per-turn input, output, cache-read, cache-write, and reasoning
+counts. Commit markers render after the event at each commit link's `seq_end`,
+showing the short SHA and linking to the commit page and to the split view.
+In-session search is a GET form (`?q=`): a case-insensitive substring match
+over message text, tool names, and file paths, capped at 200 hits, each linking
+to the right page and `#turn-<seq>`. Split view (`?split=<sha>`) renders the
+linked commit's diff beside the transcript; the sha must be one of the
+session's linked commits in this repository (others answer `404`), and the
+diff requires repository read access. The JSON API mirrors the
 viewer: `GET /api/v1/repos/{owner}/{repo}/sessions/{ulid}` (metadata plus commit links) and
 `GET .../sessions/{ulid}/events?page=N`.
+
+The viewer works without JavaScript: search results and both split-view
+columns are server-rendered, and every control is a link, button, or input.
+One plain ES module (`/static/session-viewer.js`) only enhances the page —
+in-page search highlighting and switching split-view commits without a
+reload — and any failure falls back to normal link navigation.
 
 Quarantined sessions show a banner (reason plus detail) over the full transcript to the uploader
 and repo admins, with release, purge, and rescan buttons; everyone else gets `404`, so ULIDs
@@ -569,7 +648,7 @@ frame-ancestors 'none'; base-uri 'none'; form-action 'self'`) as defense in
 depth; other pages use the site default.
 
 Not yet: a repository session index (commit panels and direct ULID links are the discovery
-paths), blame syntax highlighting, and the §10.2 transcript/diff split view.
+paths) and blame syntax highlighting.
 
 ## Trails
 
@@ -1135,7 +1214,8 @@ never deletes database rows.
 `GET /healthz` answers `ok` unconditionally (liveness). `GET /readyz` answers
 `200` only while the database answers `SELECT 1` within 2 s, migrations are
 up to date, job workers have heartbeated within 30 s, the search index is
-open, and the data directory is present; otherwise it answers `503` with a
+open, the SSH listener is bound (when enabled), and the data directory is
+present; otherwise it answers `503` with a
 JSON list of the failing items (for example `{"status": "unavailable",
 "failing": ["jobs"]}`).
 
@@ -1177,6 +1257,22 @@ read" in one request is safe either way.
 scripts/check.sh                      # fmt, clippy, tests on SQLite
 STARFORGE_TEST_PG=1 scripts/check.sh  # also on Postgres 17 via podman or docker
 ```
+
+## Known gaps
+
+Explicit v0.1.0 non-goals (program rulings):
+
+- **Fluent message catalog (§10.6):** English strings stay in templates.
+  Moving every template string into Fluent is a large retrofit with no
+  user-visible change for an English-only release. Cost: translation later
+  needs the retrofit.
+- **htmx (§3 D12):** pages are plain server-rendered forms with the one JS
+  module. Nothing in the spec's behavior requires htmx. Cost: none
+  functional.
+- **Per-response CSP nonce (§11.1):** the CSP forbids inline scripts entirely
+  and serves scripts only from the origin, which is stricter than a nonce
+  allowance. Cost: none.
+
 
 ## License
 

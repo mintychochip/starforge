@@ -170,15 +170,30 @@ async fn push_revision(
     files: &[(&str, &[u8])],
     message: &str,
 ) {
+    // Count revisions BEFORE pushing: counting after the push races the
+    // ingest (a read of the old count then waits for a number already passed).
+    let before = match starforged_db::changes::open_agit_change(
+        c.s.core.db(),
+        repo_id,
+        c.alice.id,
+        "main",
+        topic,
+        None,
+    )
+    .await
+    .unwrap()
+    {
+        Some(change) => starforged_db::changes::revisions_of_change(c.s.core.db(), change.id)
+            .await
+            .unwrap()
+            .len(),
+        None => 0,
+    };
     commit_files(work, files, message).await;
     push_for(work, url, &format!("main/{topic}")).await;
     wait_for_change(&c.s, repo_id, c.alice.id, "main", topic).await;
     let id = change_id(&c.s, repo_id, c.alice.id, topic).await;
-    let before = starforged_db::changes::revisions_of_change(c.s.core.db(), id)
-        .await
-        .unwrap()
-        .len();
-    wait_for_revisions(&c.s, id, before.max(1)).await;
+    wait_for_revisions(&c.s, id, before + 1).await;
 }
 
 async fn csrf(client: &reqwest::Client, url: &str) -> String {

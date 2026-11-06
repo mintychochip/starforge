@@ -682,19 +682,18 @@ impl Core {
         state: &str,
     ) -> CoreResult<(Claims, Option<i64>)> {
         let config = self.oidc_config()?.clone();
-        let row =
-            auth_factors::challenge_by_token_hash(self.db(), &crypto::sha256_hex(challenge_id))
-                .await?
-                .ok_or_else(|| oidc_error("unknown login challenge"))?;
+        // Single use, claimed atomically: exactly one concurrent callback
+        // owns the challenge; a loser (or an unknown/expired challenge)
+        // gets the generic failure and never reaches the token exchange.
+        let row = auth_factors::claim_challenge(
+            self.db(),
+            "oidc",
+            &crypto::sha256_hex(challenge_id),
+            now(),
+        )
+        .await?
+        .ok_or_else(|| oidc_error("unknown login challenge"))?;
         let intent_user = row.user_id;
-        // Single use: the challenge is gone whatever happens next.
-        auth_factors::delete_challenge(self.db(), row.id).await?;
-        if row.kind != "oidc" {
-            return Err(oidc_error("not an oidc challenge"));
-        }
-        if row.expires_at < now() {
-            return Err(oidc_error("the login challenge expired"));
-        }
         let stored_state = row.state.as_deref().unwrap_or_default();
         if !bool::from(stored_state.as_bytes().ct_eq(state.as_bytes())) {
             return Err(oidc_error("the oidc state does not match"));
@@ -819,7 +818,27 @@ impl Core {
             }
             return Ok(());
         }
-        auth_factors::insert_identity(self.db(), user_id, &claims.iss, &claims.sub).await?;
+        // Check-then-insert races the unique `(issuer, subject)`: a
+        // concurrent loser re-reads the winner instead of failing with a 500.
+        match auth_factors::insert_identity(self.db(), user_id, &claims.iss, &claims.sub).await {
+            Ok(_) => {}
+            Err(err) if err.is_unique_violation() => {
+                return match auth_factors::identity_by_issuer_subject(
+                    self.db(),
+                    &claims.iss,
+                    &claims.sub,
+                )
+                .await?
+                {
+                    Some(existing) if existing.user_id == user_id => Ok(()),
+                    Some(_) => Err(CoreError::Invalid(
+                        "This sign-in is already linked to another account.".into(),
+                    )),
+                    None => Err(err.into()),
+                };
+            }
+            Err(err) => return Err(err.into()),
+        }
         let target = match self.user_by_id(user_id).await? {
             Some(user) => format!("user:{}", user.handle),
             None => format!("user:{user_id}"),
@@ -982,7 +1001,27 @@ impl Core {
                 if !user.active {
                     return Ok(Some(user));
                 }
-                auth_factors::insert_identity(self.db(), user.id, &claims.iss, &claims.sub).await?;
+                // A concurrent login may have linked first; return its user.
+                match auth_factors::insert_identity(self.db(), user.id, &claims.iss, &claims.sub)
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(err) if err.is_unique_violation() => {
+                        match auth_factors::identity_by_issuer_subject(
+                            self.db(),
+                            &claims.iss,
+                            &claims.sub,
+                        )
+                        .await?
+                        {
+                            Some(row) if row.user_id == user.id => {
+                                return self.user_by_id(row.user_id).await;
+                            }
+                            _ => return Err(err.into()),
+                        }
+                    }
+                    Err(err) => return Err(err.into()),
+                }
                 self.audit(
                     Some(user.id),
                     "account.identity_linked",
@@ -996,8 +1035,32 @@ impl Core {
         if config.auto_create && self.auto_create_allowed(email.as_deref()) {
             match self.auto_create_user(claims, email.as_deref()).await {
                 Ok(user) => {
-                    auth_factors::insert_identity(self.db(), user.id, &claims.iss, &claims.sub)
-                        .await?;
+                    // Two concurrent first logins may both auto-create; the
+                    // identity unique constraint picks the winner and the
+                    // loser returns the winner's account.
+                    match auth_factors::insert_identity(
+                        self.db(),
+                        user.id,
+                        &claims.iss,
+                        &claims.sub,
+                    )
+                    .await
+                    {
+                        Ok(_) => {}
+                        Err(err) if err.is_unique_violation() => {
+                            match auth_factors::identity_by_issuer_subject(
+                                self.db(),
+                                &claims.iss,
+                                &claims.sub,
+                            )
+                            .await?
+                            {
+                                Some(row) => return self.user_by_id(row.user_id).await,
+                                None => return Err(err.into()),
+                            }
+                        }
+                        Err(err) => return Err(err.into()),
+                    }
                     self.audit(
                         Some(user.id),
                         "account.identity_linked",
