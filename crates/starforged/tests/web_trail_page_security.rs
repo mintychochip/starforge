@@ -161,6 +161,17 @@ fn assert_payload_escaped(page: &str, payload: &str, surface: &str) {
     );
 }
 
+/// A corpus vector rendered inert on an escaped surface: raw-absent plus
+/// escaped-present (proving it rendered), or verbatim-present when there is
+/// nothing to escape (the bidi mark, inert without markup).
+fn assert_corpus_inert(page: &str, payload: &str, surface: &str) {
+    if escape_html(payload) == *payload {
+        assert!(page.contains(payload), "plain payload missing on {surface}");
+    } else {
+        assert_payload_escaped(page, payload, surface);
+    }
+}
+
 fn meta_body(ulid: &str, title: &str) -> Value {
     json!({
         "format": "starforge.session/v1",
@@ -772,10 +783,8 @@ async fn matrix_api() {
                 .unwrap()
                 .expect("draft")
                 .id;
-        // A foreign draft `review_id` is 404 on a public thread too: a
-        // pending review the actor doesn't own is indistinguishable from
-        // an unknown id (a 422 would re-open the oracle). Unknown ids stay
-        // 422.
+        // A foreign draft `review_id` is rejected exactly like an unknown id
+        // (422 "unknown review"): the two stay indistinguishable.
         let (s, b) = api_status(
             &client,
             "POST",
@@ -789,8 +798,12 @@ async fn matrix_api() {
         .await;
         assert_eq!(
             s.as_u16(),
-            404,
-            "foreign draft review_id invisible in {repo}: {b}"
+            422,
+            "foreign draft review_id rejected in {repo}: {b}"
+        );
+        assert!(
+            b.to_string().contains("unknown review"),
+            "same error as unknown ids in {repo}: {b}"
         );
         let (s, _) = api_status(
             &client,
@@ -840,6 +853,41 @@ async fn matrix_api() {
             s.as_u16() != 403 && s.as_u16() != 404,
             "wendy passes merge permission in {repo}: {b}"
         );
+        // Above-threshold roles pass every mutation threshold on every
+        // visibility: maintain, admin, owner, and the site admin link,
+        // unlink, and merge without 403/404 (gates decide merge 200/422).
+        for handle in ["mia", "adam", "alice", "root"] {
+            let (s, b) = api_status(
+                &client,
+                "POST",
+                &c.api(repo, &format!("/trails/{n}/sessions")),
+                Some(&tok(handle)),
+                Some(json!({"session": ULID_EXTRA})),
+            )
+            .await;
+            assert_eq!(s.as_u16(), 200, "{handle} link in {repo}: {b}");
+            let (s, b) = api_status(
+                &client,
+                "DELETE",
+                &c.api(repo, &format!("/trails/{n}/sessions/{ULID_EXTRA}")),
+                Some(&tok(handle)),
+                None,
+            )
+            .await;
+            assert_eq!(s.as_u16(), 200, "{handle} unlink in {repo}: {b}");
+            let (s, b) = api_status(
+                &client,
+                "POST",
+                &c.api(repo, &format!("/trails/{n}/changes/1/merge")),
+                Some(&tok(handle)),
+                Some(json!({"method": "merge"})),
+            )
+            .await;
+            assert!(
+                s.as_u16() != 403 && s.as_u16() != 404,
+                "{handle} passes merge permission in {repo}: {b}"
+            );
+        }
     }
 }
 
@@ -1133,6 +1181,39 @@ async fn matrix_web() {
             .await
             .unwrap();
         assert_eq!(res.status().as_u16(), 303, "anon bounced at merge");
+        // Above-threshold roles pass every web threshold too: maintain,
+        // admin, owner, and the site admin link, unlink, and post the
+        // merge form without 403/404 on every visibility.
+        for handle in ["mia", "adam", "alice", "root"] {
+            let t = token(handle);
+            let res = browser(handle)
+                .post(&link)
+                .form(&[("_csrf", t.as_str()), ("session", ULID_EXTRA)])
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(res.status().as_u16(), 303, "{handle} web link in {repo}");
+            let t = token(handle);
+            let res = browser(handle)
+                .post(&unlink)
+                .form(&[("_csrf", t.as_str())])
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(res.status().as_u16(), 303, "{handle} web unlink in {repo}");
+            let t = token(handle);
+            let res = browser(handle)
+                .post(&merge)
+                .form(&[("_csrf", t.as_str()), ("method", "merge")])
+                .send()
+                .await
+                .unwrap();
+            assert!(
+                res.status().as_u16() != 403 && res.status().as_u16() != 404,
+                "{handle} passes web merge permission in {repo}: {}",
+                res.status()
+            );
+        }
     }
 
     // Inter-revision view on proj: the pair renders, `from == to` is 422,
@@ -1184,6 +1265,23 @@ async fn matrix_archived() {
     let n = setup.n;
     let client = reqwest::Client::new();
     let alice = c.tok(&c.alice).await;
+    // A public thread predates the archive, so comment refusal is pinnable.
+    let carol_tok =
+        c.s.token(&c.carol, &[Scope::RepoRead, Scope::TrailWrite])
+            .await;
+    let (s, b) = api_status(
+        &client,
+        "POST",
+        &c.api("proj", &format!("/trails/{n}/changes/1/threads")),
+        Some(&carol_tok),
+        Some(json!({
+            "path": "a.txt", "side": "head",
+            "start_line": 1, "end_line": 1, "body": "pre-archive",
+        })),
+    )
+    .await;
+    assert_eq!(s.as_u16(), 201, "pre-archive thread: {b}");
+    let pre_tid = b["id"].as_i64().unwrap();
     c.s.core
         .archive_repo(&c.alice, "alice", "proj")
         .await
@@ -1272,6 +1370,106 @@ async fn matrix_archived() {
         .await
         .unwrap();
     assert_eq!(res.status().as_u16(), 422, "web archived thread");
+    // The pending family and the unlink form refuse too, with state
+    // unchanged: the hand link stays, and no thread, comment, or review
+    // row appears.
+    let threads_before = starforged_db::changes::threads_of_change(c.s.core.db(), setup.change_id)
+        .await
+        .unwrap()
+        .len();
+    let comments_before = starforged_db::changes::comments_of_thread(c.s.core.db(), pre_tid)
+        .await
+        .unwrap()
+        .len();
+    let reviews_before = starforged_db::changes::reviews_of_change(c.s.core.db(), setup.change_id)
+        .await
+        .unwrap()
+        .len();
+    for (url, form) in [
+        (
+            c.web("proj", &format!("/trails/1/sessions/{ULID_HAND}/unlink")),
+            vec![("_csrf", token.as_str())],
+        ),
+        (
+            c.web("proj", "/trails/1/changes/1/threads"),
+            vec![
+                ("_csrf", token.as_str()),
+                ("path", "a.txt"),
+                ("side", "head"),
+                ("start", "1"),
+                ("end", "1"),
+                ("body", "draft"),
+                ("pending", "true"),
+            ],
+        ),
+        (
+            c.web(
+                "proj",
+                &format!("/trails/1/changes/1/threads/{pre_tid}/comments"),
+            ),
+            vec![
+                ("_csrf", token.as_str()),
+                ("body", "late comment"),
+                ("pending", "true"),
+            ],
+        ),
+        (
+            c.web("proj", "/trails/1/changes/1/reviews"),
+            vec![
+                ("_csrf", token.as_str()),
+                ("verdict", "approve"),
+                ("body", "late review"),
+            ],
+        ),
+        (
+            c.web("proj", "/trails/1/changes/1/reviews/pending"),
+            vec![("_csrf", token.as_str())],
+        ),
+    ] {
+        let res = alice_browser.post(&url).form(&form).send().await.unwrap();
+        assert_eq!(res.status().as_u16(), 422, "web archived {url}");
+    }
+    let (s, b) = api_status(
+        &client,
+        "GET",
+        &c.api("proj", &format!("/trails/{n}/sessions")),
+        Some(&alice),
+        None,
+    )
+    .await;
+    assert_eq!(s.as_u16(), 200, "{b}");
+    assert!(
+        b["linked"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["ulid"] == ULID_HAND),
+        "hand link survives: {b}"
+    );
+    assert_eq!(
+        starforged_db::changes::threads_of_change(c.s.core.db(), setup.change_id)
+            .await
+            .unwrap()
+            .len(),
+        threads_before,
+        "no thread rows"
+    );
+    assert_eq!(
+        starforged_db::changes::comments_of_thread(c.s.core.db(), pre_tid)
+            .await
+            .unwrap()
+            .len(),
+        comments_before,
+        "no comment rows"
+    );
+    assert_eq!(
+        starforged_db::changes::reviews_of_change(c.s.core.db(), setup.change_id)
+            .await
+            .unwrap()
+            .len(),
+        reviews_before,
+        "no review rows"
+    );
 }
 
 /// §6.4 over every Trail-page session surface: quarantined, unpublished on
@@ -1457,6 +1655,21 @@ async fn section_64_all_surfaces() {
     for leak in [ULID_COMMIT, ULID_HAND, ULID_DAVE, "commit session seven"] {
         assert!(!tab.contains(leak), "triage tab leaks {leak}");
     }
+    // The timeline rows and the commit panel obey quarantine too: neither
+    // the stranger-reader nor anonymous viewers see titles or ULIDs there.
+    for (viewer, page) in [(&bob_web, "triage"), (&anon_web, "anon")] {
+        let trail_page = get_text(viewer, &c.web("open", &format!("/trails/{n}"))).await;
+        for leak in [ULID_COMMIT, ULID_HAND, ULID_DAVE, "commit session seven"] {
+            assert!(!trail_page.contains(leak), "{page} timeline leaks {leak}");
+        }
+        let commit_page = get_text(viewer, &c.web("open", &format!("/commit/{head}"))).await;
+        for leak in [ULID_COMMIT, "commit session seven"] {
+            assert!(
+                !commit_page.contains(leak),
+                "{page} commit panel leaks {leak}"
+            );
+        }
+    }
 
     // Published: anonymous readers see every linked surface.
     for ulid in [ULID_COMMIT, ULID_HAND, ULID_DAVE] {
@@ -1497,16 +1710,17 @@ async fn section_64_all_surfaces() {
 }
 
 /// Hostile-input corpus through every newly rendered M2f field. Each vector
-/// asserts raw-absent plus escaped-present (proving it rendered), plus the
-/// live-markup and live-handler scans on every page.
+/// asserts raw-absent plus escaped-present (proving it rendered) — except
+/// pending comment bodies, which render as sanitized Markdown, so the
+/// sanitizer strips hostile markup instead of escaping it and raw-absent
+/// (plus draft visibility) is the pin — plus the live-markup and
+/// live-handler scans on every page.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn xss_corpus() {
     let c = Ctx::start().await;
     let setup = setup_repo(&c, "proj").await;
     let n = setup.n;
     let payload_title = "<script>alert(1)</script>";
-    let payload_subject = "<img src=x onerror=alert(2)>";
-    let payload_path = "<svg onload=alert(3)>.txt";
     let payload_comment = "\"><script>alert(4)</script>";
 
     // Hostile session titles render escaped on the Sessions tab and the
@@ -1552,16 +1766,39 @@ async fn xss_corpus() {
         assert!(link.status().is_success(), "corpus claim {i}");
     }
 
-    // Hostile commit subjects: a second commit with attacker text.
+    // Hostile commit subjects: one push carrying the whole corpus as commit
+    // subjects; one session is claimed to each new SHA so every subject's
+    // group renders on the Sessions tab.
     let full = c.tok(&c.alice).await;
     let url = c.s.git_url("alice", "proj", Some(&full));
     let tmp = tempfile::tempdir().unwrap();
     let seed = work_repo(tmp.path(), "seed", &[("x.txt", "x\n")]).await;
     git_ok(&seed, &["fetch", "-q", &url, "feature/x:feature/x"]).await;
     git_ok(&seed, &["checkout", "-q", "feature/x"]).await;
-    commit_files(&seed, &[("evil.txt", b"evil\n")], payload_subject).await;
+    let mut subject_shas = Vec::new();
+    for (i, payload) in PAYLOADS.iter().enumerate() {
+        let name = format!("evil{i}.txt");
+        commit_files(&seed, &[(name.as_str(), b"evil\n".as_slice())], payload).await;
+        subject_shas.push(
+            git_ok(&seed, &["rev-parse", "HEAD"])
+                .await
+                .trim()
+                .to_owned(),
+        );
+    }
     git_ok(&seed, &["push", "-q", &url, "feature/x"]).await;
     wait_for_revisions(&c.s, setup.change_id).await;
+    for (i, sha) in subject_shas.iter().enumerate() {
+        let ulid = format!("01ARZ3NDEKTSV4RRFFQ69G5FC{i}");
+        let link = client
+            .post(c.api("proj", &format!("/sessions/{ulid}/links")))
+            .bearer_auth(&upload)
+            .json(&json!({"links": [{"sha": sha, "confidence": "exact"}]}))
+            .send()
+            .await
+            .unwrap();
+        assert!(link.status().is_success(), "subject claim {i}");
+    }
 
     // Hostile file paths: committed on a second trail's change.
     let n2 =
@@ -1578,50 +1815,49 @@ async fn xss_corpus() {
         &["checkout", "-q", "-b", "feature/evil", "FETCH_HEAD"],
     )
     .await;
-    commit_files(&work2, &[(payload_path, b"hostile\n")], "hostile path").await;
+    let path_names: Vec<String> = PAYLOADS
+        .iter()
+        .enumerate()
+        .map(|(i, p)| format!("{p}-{i}.txt"))
+        .collect();
+    let path_refs: Vec<(&str, &[u8])> = path_names
+        .iter()
+        .map(|n| (n.as_str(), b"hostile\n".as_slice()))
+        .collect();
+    commit_files(&work2, &path_refs, "hostile paths").await;
     git_ok(&work2, &["push", "-q", &url, "feature/evil"]).await;
     c.s.core
         .create_branch_change(&c.alice, "alice", "proj", n2, "feature/evil", "main")
         .await
         .unwrap();
 
-    // Hostile check context/description through the API; a `javascript:`
-    // target URL below Core validation (which rightly rejects it).
-    let head2 = git_ok(&seed, &["rev-parse", "HEAD"])
-        .await
-        .trim()
-        .to_owned();
-    // The hostile-subject commit group renders only with a readable session,
-    // so the first corpus session claims the evil head too.
-    let evil_claim = client
-        .post(c.api("proj", "/sessions/01ARZ3NDEKTSV4RRFFQ69G5FC0/links"))
-        .bearer_auth(&upload)
-        .json(&json!({"links": [{"sha": head2, "confidence": "exact"}]}))
-        .send()
-        .await
-        .unwrap();
-    assert!(evil_claim.status().is_success(), "evil claim");
-    c.s.core
-        .submit_status(
-            &c.alice,
-            "alice",
-            "proj",
-            &head2,
-            "failure",
-            "<b>ctx</b>",
-            Some("https://ci.example.com/evil"),
-            Some(payload_title),
-        )
-        .await
-        .unwrap();
+    // Hostile check context/description through the API (full corpus, one
+    // status each), plus a `javascript:` target with a distinct marker below
+    // Core validation (which rightly rejects it).
+    let head2 = subject_shas.last().unwrap().clone();
+    for (i, payload) in PAYLOADS.iter().enumerate() {
+        c.s.core
+            .submit_status(
+                &c.alice,
+                "alice",
+                "proj",
+                &head2,
+                "failure",
+                &format!("ctx-{i} {payload}"),
+                Some("https://ci.example.com/evil"),
+                Some(payload),
+            )
+            .await
+            .unwrap();
+    }
     let repo_id = c.repo_id("proj").await;
     db_checks::insert_check(
         c.s.core.db(),
         repo_id,
         &head2,
-        "xss-link",
+        "xss-link-marker",
         "failure",
-        Some("javascript:alert(3)"),
+        Some("javascript:alert(9)//marker-zq7"),
         Some("hostile"),
         Some(c.alice.id),
         starforged_db::now(),
@@ -1655,15 +1891,8 @@ async fn xss_corpus() {
     )
     .await;
     assert_payload_escaped(&tab, payload_title, "sessions tab title");
-    assert_payload_escaped(&tab, payload_subject, "sessions tab subject");
     for payload in PAYLOADS {
-        if escape_html(payload) == *payload {
-            // Nothing to escape (the bidi mark): it renders verbatim and is
-            // inert without markup.
-            assert!(tab.contains(payload), "plain payload missing on tab");
-        } else {
-            assert_payload_escaped(&tab, payload, "sessions tab corpus");
-        }
+        assert_corpus_inert(&tab, payload, "sessions tab corpus");
     }
     assert_no_live_markup(&tab, "sessions tab");
 
@@ -1680,15 +1909,36 @@ async fn xss_corpus() {
         &c.web("proj", &format!("/trails/{n2}/changes/1")),
     )
     .await;
-    assert_payload_escaped(&change, payload_path, "viewed form path");
+    // File paths go through git diff headers, which C-quote pathnames
+    // containing `"` (plus the diff's `b/` prefix, absorbed by substring
+    // matching): pin raw-absent plus whichever escaped form renders.
+    for payload in PAYLOADS {
+        let plain = escape_html(payload);
+        let quoted = escape_html(&payload.replace('"', "\\\""));
+        assert!(
+            !change.contains(payload) || plain == *payload,
+            "raw path renders: {payload:?}"
+        );
+        assert!(
+            change.contains(&plain) || change.contains(&quoted),
+            "escaped path missing: {payload:?}"
+        );
+    }
     assert_no_live_markup(&change, "change page");
 
     let trail_page = get_text(&alice_browser, &c.web("proj", &format!("/trails/{n}"))).await;
-    assert_payload_escaped(&trail_page, "<b>ctx</b>", "timeline check context");
-    assert_payload_escaped(&trail_page, payload_title, "timeline check description");
-    // The `javascript:` target never becomes a link (the substring itself
-    // appears inside the escaped corpus session titles, so only the live
-    // link form is pinned here), while an https target does.
+    for (i, payload) in PAYLOADS.iter().enumerate() {
+        let ctx = format!("ctx-{i} {payload}");
+        assert_corpus_inert(&trail_page, &ctx, "timeline check context");
+        assert_corpus_inert(&trail_page, payload, "timeline check description");
+    }
+    // The `javascript:` target carries a distinct marker and never becomes
+    // a link — the marker is absent raw (the substring itself also appears
+    // inside escaped corpus session titles, so the link form is pinned too).
+    assert!(
+        !trail_page.contains("marker-zq7"),
+        "javascript URL leaked:\n{trail_page}"
+    );
     assert!(
         !trail_page.contains("href=\"javascript:"),
         "javascript URL linked:\n{trail_page}"
@@ -1740,7 +1990,6 @@ async fn csrf_matrix() {
     let (alice, _) = c.s.login("alice").await;
     let (carol, _) = c.s.login("carol").await;
     let detail = c.web("proj", "/trails/1/changes/1");
-    let alice_csrf = extract_input(&get_text(&alice, &detail).await, "_csrf");
     let carol_csrf = extract_input(&get_text(&carol, &detail).await, "_csrf");
     async fn forged(client: &reqwest::Client, url: &str, form: &[(&str, &str)]) -> u16 {
         client
@@ -1952,5 +2201,4 @@ async fn csrf_matrix() {
         .unwrap()
         .unwrap();
     assert_eq!(row.state, "open", "change still open");
-    let _ = alice_csrf;
 }

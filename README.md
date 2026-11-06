@@ -354,9 +354,10 @@ The Trail list filters compose: `?state=open|closed|merged`, `?label=`,
 handle lists nothing, never `404`), 30 per page with pager links that keep
 the filters. `has_sessions=true` keeps Trails with at least one linked
 session the viewer may read (through commits or by hand); `false` keeps
-the rest; anything else is `422`. The API mirrors them as
-keyset filters — `GET .../trails?state=&label=&assignee=&author=&
-has_changes=&has_sessions=&review_requested=&after=&limit=` with a `next_after` cursor
+the rest. The API and CLI reject any other `has_sessions` value with `422`;
+the web list treats other values as no filter.
+The API mirrors these as
+keyset filters — `GET .../trails?state=&label=&assignee=&author=&has_changes=&has_sessions=&review_requested=&after=&limit=` with a `next_after` cursor
 (`has_changes=maybe` and `has_sessions=maybe` are `422`) — and the CLI as
 `starforge trail list [--state open|closed|merged|all] [--label=…]
 [--assignee=…] [--author=…] [--has-changes true|false]
