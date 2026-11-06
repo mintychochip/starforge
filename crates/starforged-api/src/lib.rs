@@ -57,6 +57,29 @@ pub fn router(core: Core, base_url: String) -> Router {
             get(orgs::show).patch(orgs::patch).delete(orgs::delete),
         )
         .route("/orgs/{org}/repos", get(orgs::list_repos))
+        .route(
+            "/orgs/{org}/teams",
+            get(orgs::list_teams).post(orgs::create_team),
+        )
+        .route(
+            "/orgs/{org}/teams/{team}",
+            get(orgs::show_team)
+                .patch(orgs::patch_team)
+                .delete(orgs::delete_team),
+        )
+        .route(
+            "/orgs/{org}/teams/{team}/members",
+            get(orgs::list_team_members),
+        )
+        .route(
+            "/orgs/{org}/teams/{team}/members/{handle}",
+            put(orgs::set_team_member).delete(orgs::remove_team_member),
+        )
+        .route("/orgs/{org}/teams/{team}/repos", get(orgs::list_team_repos))
+        .route(
+            "/orgs/{org}/teams/{team}/repos/{repo}",
+            put(orgs::add_team_repo).delete(orgs::remove_team_repo),
+        )
         .route("/orgs/{org}/members", get(orgs::list_members))
         .route(
             "/orgs/{org}/members/{handle}",

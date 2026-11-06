@@ -270,8 +270,9 @@ impl Core {
 
     /// Gathers every grant source for `repo` and `user` (D4): the org base
     /// permission and membership role when the owner is an org (one query),
-    /// the collaborator grant when signed in (one query), and the covering
-    /// team grants (A2; none today). Suspended users are anonymous.
+    /// the covering team grants when signed in (one query), and the
+    /// collaborator grant when signed in (one query). At most three queries.
+    /// Suspended users are anonymous.
     pub async fn grants_for(
         &self,
         repo: &Repo,
@@ -291,6 +292,18 @@ impl Core {
             ),
             None => (false, None),
         };
+        // Only repositories owned by the team's org count, and only for
+        // signed-in viewers: team members are org members, who are signed in.
+        let teams = match (org.is_some(), user_id) {
+            (true, Some(id)) => {
+                db_orgs::covering_team_grants(self.db(), repo.owner_id, id, repo.id)
+                    .await?
+                    .iter()
+                    .filter_map(|p| Permission::parse(p))
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
         let collaborator = match user_id {
             Some(id) => collaborators::permission(self.db(), repo.id, id)
                 .await?
@@ -303,7 +316,7 @@ impl Core {
             user_owner: org.is_none() && user_id == Some(repo.owner_id),
             org_owner,
             org_base,
-            teams: Vec::new(),
+            teams,
             collaborator,
             visibility: repo.visibility,
             signed_in: v.is_some(),

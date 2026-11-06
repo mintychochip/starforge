@@ -5,7 +5,9 @@ use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
-use starforged_core::orgs::{NewOrgInput, OrgMemberView, OrgRole, OrgView};
+use starforged_core::orgs::{
+    NewOrgInput, NewTeamInput, OrgMemberView, OrgRole, OrgView, TeamPatch, TeamView,
+};
 use starforged_core::tokens::Scope;
 
 use crate::ApiState;
@@ -209,6 +211,256 @@ pub async fn remove_member(
     state
         .core
         .remove_org_member(&auth.user, &org, &handle)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// --- Teams (A2, D8). -----------------------------------------------------------
+
+#[derive(Serialize)]
+pub struct TeamJson {
+    name: String,
+    slug: String,
+    description: String,
+    permission: String,
+    all_repos: bool,
+}
+
+fn team_json(view: TeamView) -> TeamJson {
+    TeamJson {
+        name: view.name,
+        slug: view.slug,
+        description: view.description,
+        permission: view.permission.as_str().to_owned(),
+        all_repos: view.all_repos,
+    }
+}
+
+#[derive(Serialize)]
+pub struct TeamMemberJson {
+    handle: String,
+    display_name: String,
+}
+
+#[derive(Serialize)]
+pub struct TeamRepoJson {
+    owner: String,
+    name: String,
+    full_name: String,
+    description: String,
+    visibility: &'static str,
+}
+
+#[derive(Deserialize)]
+pub struct CreateTeamBody {
+    name: String,
+    #[serde(default)]
+    description: String,
+    permission: String,
+    #[serde(default)]
+    all_repos: bool,
+}
+
+/// `POST /orgs/{org}/teams`: org owners only.
+pub async fn create_team(
+    State(state): State<ApiState>,
+    auth: ApiAuth,
+    Path(org): Path<String>,
+    body: Result<Json<CreateTeamBody>, JsonRejection>,
+) -> Result<(StatusCode, Json<TeamJson>), ApiError> {
+    let auth = auth.require(Scope::RepoWrite)?;
+    let Json(body) = body.map_err(|e| ApiError::Invalid(e.body_text()))?;
+    let view = state
+        .core
+        .create_team(
+            &auth.user,
+            &org,
+            NewTeamInput {
+                name: body.name,
+                description: body.description,
+                permission: body.permission,
+                all_repos: body.all_repos,
+            },
+        )
+        .await?;
+    Ok((StatusCode::CREATED, Json(team_json(view))))
+}
+
+/// `GET /orgs/{org}/teams`: members and site admins only, 404 otherwise.
+pub async fn list_teams(
+    State(state): State<ApiState>,
+    auth: ApiAuth,
+    Path(org): Path<String>,
+) -> Result<Json<Vec<TeamJson>>, ApiError> {
+    let Some(user) = auth.reader()? else {
+        return Err(ApiError::NotFound);
+    };
+    let teams = state.core.teams(user, &org).await?;
+    Ok(Json(teams.into_iter().map(team_json).collect()))
+}
+
+/// `GET /orgs/{org}/teams/{team}`: members and site admins only, 404 otherwise.
+pub async fn show_team(
+    State(state): State<ApiState>,
+    auth: ApiAuth,
+    Path((org, team)): Path<(String, String)>,
+) -> Result<Json<TeamJson>, ApiError> {
+    let Some(user) = auth.reader()? else {
+        return Err(ApiError::NotFound);
+    };
+    let view = state.core.team(user, &org, &team).await?;
+    Ok(Json(team_json(view)))
+}
+
+#[derive(Deserialize)]
+pub struct PatchTeamBody {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    permission: Option<String>,
+    #[serde(default)]
+    all_repos: Option<bool>,
+}
+
+/// `PATCH /orgs/{org}/teams/{team}`: org owners only.
+pub async fn patch_team(
+    State(state): State<ApiState>,
+    auth: ApiAuth,
+    Path((org, team)): Path<(String, String)>,
+    body: Result<Json<PatchTeamBody>, JsonRejection>,
+) -> Result<Json<TeamJson>, ApiError> {
+    let auth = auth.require(Scope::RepoWrite)?;
+    let Json(body) = body.map_err(|e| ApiError::Invalid(e.body_text()))?;
+    let view = state
+        .core
+        .update_team(
+            &auth.user,
+            &org,
+            &team,
+            TeamPatch {
+                name: body.name,
+                description: body.description,
+                permission: body.permission,
+                all_repos: body.all_repos,
+            },
+        )
+        .await?;
+    Ok(Json(team_json(view)))
+}
+
+/// `DELETE /orgs/{org}/teams/{team}`: org owners only.
+pub async fn delete_team(
+    State(state): State<ApiState>,
+    auth: ApiAuth,
+    Path((org, team)): Path<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    let auth = auth.require(Scope::RepoWrite)?;
+    state.core.delete_team(&auth.user, &org, &team).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `GET /orgs/{org}/teams/{team}/members`: members and site admins only.
+pub async fn list_team_members(
+    State(state): State<ApiState>,
+    auth: ApiAuth,
+    Path((org, team)): Path<(String, String)>,
+) -> Result<Json<Vec<TeamMemberJson>>, ApiError> {
+    let Some(user) = auth.reader()? else {
+        return Err(ApiError::NotFound);
+    };
+    let members = state.core.team_members(user, &org, &team).await?;
+    Ok(Json(
+        members
+            .into_iter()
+            .map(|m| TeamMemberJson {
+                handle: m.handle,
+                display_name: m.display_name,
+            })
+            .collect(),
+    ))
+}
+
+/// `PUT /orgs/{org}/teams/{team}/members/{handle}`: org owners only.
+pub async fn set_team_member(
+    State(state): State<ApiState>,
+    auth: ApiAuth,
+    Path((org, team, handle)): Path<(String, String, String)>,
+) -> Result<Json<TeamMemberJson>, ApiError> {
+    let auth = auth.require(Scope::RepoWrite)?;
+    let view = state
+        .core
+        .set_team_member(&auth.user, &org, &team, &handle)
+        .await?;
+    Ok(Json(TeamMemberJson {
+        handle: view.handle,
+        display_name: view.display_name,
+    }))
+}
+
+/// `DELETE /orgs/{org}/teams/{team}/members/{handle}`: org owners only.
+pub async fn remove_team_member(
+    State(state): State<ApiState>,
+    auth: ApiAuth,
+    Path((org, team, handle)): Path<(String, String, String)>,
+) -> Result<StatusCode, ApiError> {
+    let auth = auth.require(Scope::RepoWrite)?;
+    state
+        .core
+        .remove_team_member(&auth.user, &org, &team, &handle)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `GET /orgs/{org}/teams/{team}/repos`: members and site admins only.
+pub async fn list_team_repos(
+    State(state): State<ApiState>,
+    auth: ApiAuth,
+    Path((org, team)): Path<(String, String)>,
+) -> Result<Json<Vec<TeamRepoJson>>, ApiError> {
+    let Some(user) = auth.reader()? else {
+        return Err(ApiError::NotFound);
+    };
+    let repos = state.core.team_repos(user, &org, &team).await?;
+    Ok(Json(
+        repos
+            .into_iter()
+            .map(|r| TeamRepoJson {
+                full_name: r.full_name(),
+                owner: r.owner,
+                name: r.name,
+                description: r.description,
+                visibility: r.visibility.as_str(),
+            })
+            .collect(),
+    ))
+}
+
+/// `PUT /orgs/{org}/teams/{team}/repos/{repo}`: org owners only.
+pub async fn add_team_repo(
+    State(state): State<ApiState>,
+    auth: ApiAuth,
+    Path((org, team, repo)): Path<(String, String, String)>,
+) -> Result<StatusCode, ApiError> {
+    let auth = auth.require(Scope::RepoWrite)?;
+    state
+        .core
+        .add_team_repo(&auth.user, &org, &team, &repo)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `DELETE /orgs/{org}/teams/{team}/repos/{repo}`: org owners only.
+pub async fn remove_team_repo(
+    State(state): State<ApiState>,
+    auth: ApiAuth,
+    Path((org, team, repo)): Path<(String, String, String)>,
+) -> Result<StatusCode, ApiError> {
+    let auth = auth.require(Scope::RepoWrite)?;
+    state
+        .core
+        .remove_team_repo(&auth.user, &org, &team, &repo)
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }

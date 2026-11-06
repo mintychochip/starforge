@@ -838,6 +838,46 @@ async fn f3_claim(
     .unwrap();
 }
 
+/// Waits for the async post-receive scan to record `head` as revision 2 of
+/// change `k` on trail `n` and move the current pointer to it. Recording the
+/// same move explicitly would race the scan and append a duplicate revision,
+/// so tests push and then wait instead.
+async fn wait_for_branch_revision_2(
+    s: &TestServer,
+    repo_id: i64,
+    trail_n: i64,
+    k: i64,
+    head: &str,
+) {
+    let start = std::time::Instant::now();
+    let timeout = std::time::Duration::from_secs(20);
+    loop {
+        let trail = starforged_db::trails::trail_by_number(s.core.db(), repo_id, trail_n)
+            .await
+            .unwrap()
+            .unwrap();
+        let change = starforged_db::changes::change_by_trail_number(s.core.db(), trail.id, k)
+            .await
+            .unwrap()
+            .unwrap();
+        let revs = starforged_db::changes::revisions_of_change(s.core.db(), change.id)
+            .await
+            .unwrap();
+        if revs.len() == 2
+            && revs[1].head_sha == head
+            && change.current_revision_id == Some(revs[1].id)
+        {
+            return;
+        }
+        assert!(
+            start.elapsed() < timeout,
+            "timed out waiting for revision 2 of change {k} (have {})",
+            revs.len()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
 const F3_ULID_A: &str = "01ARZ3NDEKTSV4RRFFQ69G5FC8";
 const F3_ULID_B: &str = "01ARZ3NDEKTSV4RRFFQ69G5FC9";
 const F3_ULID_C: &str = "01ARZ3NDEKTSV4RRFFQ69G5FCA";
@@ -1322,10 +1362,6 @@ async fn timeline_merges_sessions_checks_and_reviews_in_order() {
     git_ok(&work, &["push", "-q", &url, "main"]).await;
     git_ok(&work, &["checkout", "-q", "-b", "feature/f4"]).await;
     commit_files(&work, &[("a.txt", b"two\n".as_slice())], "first work").await;
-    let r1 = git_ok(&work, &["rev-parse", "HEAD"])
-        .await
-        .trim()
-        .to_owned();
     git_ok(&work, &["push", "-q", &url, "feature/f4"]).await;
     c.s.core
         .create_branch_change(&c.alice, "alice", "proj", n, "feature/f4", "main")
@@ -1344,12 +1380,10 @@ async fn timeline_merges_sessions_checks_and_reviews_in_order() {
             .unwrap()
             .repo
             .id;
-    // A racing post-receive scan records the same head at most once: the
-    // latest-head guard makes the explicit move below idempotent.
-    c.s.core
-        .record_branch_move(repo_id, "feature/f4", Some(&r1), &r2, Some(c.alice.id))
-        .await
-        .unwrap();
+    // The post-receive scan records the push asynchronously; wait for it to
+    // make r2 the current revision instead of recording the move explicitly
+    // (the explicit call races the scan and duplicates the revision).
+    wait_for_branch_revision_2(&c.s, repo_id, n, 1, &r2).await;
     let up = c.s.token(&c.alice, &[Scope::SessionUpload]).await;
     let sid = f3_upload(
         &c.s,

@@ -1,5 +1,5 @@
-//! `orgs` + `org_members`: organizations and their membership (spec §6.1, D1-D2).
-//! Team tables live in the same migration; team queries arrive in A2.
+//! `orgs` + `org_members`: organizations and their membership (spec §6.1, D1-D3).
+//! Teams, team membership, and team repository links live here too.
 
 use sqlx::Row;
 use sqlx::any::AnyRow;
@@ -177,16 +177,6 @@ pub async fn role(db: &Db, org_id: i64, user_id: i64) -> DbResult<Option<String>
     Ok(role)
 }
 
-pub async fn owner_count(db: &Db, org_id: i64) -> DbResult<i64> {
-    let count: Option<i64> =
-        sqlx::query_scalar("SELECT COUNT(*) FROM org_members WHERE org_id = $1 AND role = 'owner'")
-            .bind(org_id)
-            .fetch_optional(db.pool())
-            .await?
-            .flatten();
-    Ok(count.unwrap_or(0))
-}
-
 pub async fn member_count(db: &Db, org_id: i64) -> DbResult<i64> {
     let count: Option<i64> =
         sqlx::query_scalar("SELECT COUNT(*) FROM org_members WHERE org_id = $1")
@@ -232,21 +222,416 @@ pub async fn add_member(db: &Db, org_id: i64, user_id: i64, role: &str) -> DbRes
     Ok(())
 }
 
-pub async fn set_role(db: &Db, org_id: i64, user_id: i64, role: &str) -> DbResult<()> {
-    sqlx::query("UPDATE org_members SET role = $1 WHERE org_id = $2 AND user_id = $3")
+pub async fn set_role(db: &Db, org_id: i64, user_id: i64, role: &str) -> DbResult<bool> {
+    let result = sqlx::query("UPDATE org_members SET role = $1 WHERE org_id = $2 AND user_id = $3")
         .bind(role)
         .bind(org_id)
         .bind(user_id)
         .execute(db.pool())
         .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Takes the per-org serialization lock. Must be the first statement of an
+/// owner-changing transaction: it is the row lock on Postgres and the write
+/// lock on SQLite. Conditional single statements are NOT enough — under
+/// READ COMMITTED two of them can each count 2 owners and change different
+/// rows (write skew), orphaning the org.
+async fn lock_org(tx: &mut sqlx::Transaction<'_, sqlx::Any>, org_id: i64) -> DbResult<()> {
+    sqlx::query("UPDATE orgs SET updated_at = updated_at WHERE id = $1")
+        .bind(org_id)
+        .execute(tx.as_mut())
+        .await?;
     Ok(())
 }
 
-pub async fn remove_member(db: &Db, org_id: i64, user_id: i64) -> DbResult<bool> {
-    let result = sqlx::query("DELETE FROM org_members WHERE org_id = $1 AND user_id = $2")
+async fn role_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    org_id: i64,
+    user_id: i64,
+) -> DbResult<Option<String>> {
+    let role: Option<String> =
+        sqlx::query_scalar("SELECT role FROM org_members WHERE org_id = $1 AND user_id = $2")
+            .bind(org_id)
+            .bind(user_id)
+            .fetch_optional(tx.as_mut())
+            .await?;
+    Ok(role)
+}
+
+async fn owner_count_in(tx: &mut sqlx::Transaction<'_, sqlx::Any>, org_id: i64) -> DbResult<i64> {
+    let count: Option<i64> =
+        sqlx::query_scalar("SELECT COUNT(*) FROM org_members WHERE org_id = $1 AND role = 'owner'")
+            .bind(org_id)
+            .fetch_optional(tx.as_mut())
+            .await?
+            .flatten();
+    Ok(count.unwrap_or(0))
+}
+
+/// The outcome of a serialized owner change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnerChange {
+    /// The change committed.
+    Done,
+    /// Refused: the target is an owner and the last one.
+    LastOwner,
+    /// The target membership is gone.
+    Gone,
+    /// The actor may not do this (lost or never had owner rights).
+    Forbidden,
+    /// Already in the target state; nothing to do and nothing to audit.
+    NoChange,
+}
+
+/// Demotes an owner to member, serialized per org: locks the org row, then
+/// re-checks the actor, the target, and the owner count inside one
+/// transaction. The last owner cannot be demoted.
+pub async fn demote_owner_serialized(
+    db: &Db,
+    org_id: i64,
+    actor_id: i64,
+    user_id: i64,
+) -> DbResult<OwnerChange> {
+    let mut tx = db.pool().begin().await?;
+    lock_org(&mut tx, org_id).await?;
+    if role_in(&mut tx, org_id, actor_id).await?.as_deref() != Some("owner") {
+        return Ok(OwnerChange::Forbidden);
+    }
+    match role_in(&mut tx, org_id, user_id).await?.as_deref() {
+        None => Ok(OwnerChange::Gone),
+        Some("member") => Ok(OwnerChange::NoChange),
+        Some(_) => {
+            if owner_count_in(&mut tx, org_id).await? <= 1 {
+                return Ok(OwnerChange::LastOwner);
+            }
+            sqlx::query(
+                "UPDATE org_members SET role = 'member' WHERE org_id = $1 AND user_id = $2",
+            )
+            .bind(org_id)
+            .bind(user_id)
+            .execute(tx.as_mut())
+            .await?;
+            tx.commit().await?;
+            Ok(OwnerChange::Done)
+        }
+    }
+}
+
+/// Removes a membership, serialized per org like [`demote_owner_serialized`].
+/// Owners go only while another owner remains; the member leaves the org's
+/// teams in the same transaction. Owners may remove anyone, a member may
+/// leave, and strangers learn nothing beyond `Gone`.
+pub async fn remove_member_serialized(
+    db: &Db,
+    org_id: i64,
+    actor_id: i64,
+    user_id: i64,
+) -> DbResult<OwnerChange> {
+    let mut tx = db.pool().begin().await?;
+    lock_org(&mut tx, org_id).await?;
+    let actor_role = role_in(&mut tx, org_id, actor_id).await?;
+    if actor_id != user_id && actor_role.as_deref() != Some("owner") {
+        return Ok(if actor_role.is_none() {
+            OwnerChange::Gone
+        } else {
+            OwnerChange::Forbidden
+        });
+    }
+    match role_in(&mut tx, org_id, user_id).await?.as_deref() {
+        None => Ok(OwnerChange::Gone),
+        Some("owner") => {
+            if owner_count_in(&mut tx, org_id).await? <= 1 {
+                return Ok(OwnerChange::LastOwner);
+            }
+            delete_member_in(&mut tx, org_id, user_id).await?;
+            tx.commit().await?;
+            Ok(OwnerChange::Done)
+        }
+        Some(_) => {
+            delete_member_in(&mut tx, org_id, user_id).await?;
+            tx.commit().await?;
+            Ok(OwnerChange::Done)
+        }
+    }
+}
+
+/// Deletes the membership and the org-team memberships in one transaction.
+async fn delete_member_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    org_id: i64,
+    user_id: i64,
+) -> DbResult<()> {
+    sqlx::query("DELETE FROM org_members WHERE org_id = $1 AND user_id = $2")
         .bind(org_id)
+        .bind(user_id)
+        .execute(tx.as_mut())
+        .await?;
+    sqlx::query(
+        "DELETE FROM team_members WHERE user_id = $1 \
+         AND team_id IN (SELECT id FROM teams WHERE org_id = $2)",
+    )
+    .bind(user_id)
+    .bind(org_id)
+    .execute(tx.as_mut())
+    .await?;
+    Ok(())
+}
+
+// --- Teams (A2, D3). ---------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TeamRow {
+    pub id: i64,
+    pub org_id: i64,
+    pub name: String,
+    pub lower_name: String,
+    pub description: String,
+    pub permission: String,
+    pub all_repos: bool,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TeamMemberRow {
+    pub user_id: i64,
+    pub handle: String,
+    pub display_name: String,
+}
+
+fn from_team(row: &AnyRow) -> DbResult<TeamRow> {
+    Ok(TeamRow {
+        id: row.try_get("id")?,
+        org_id: row.try_get("org_id")?,
+        name: row.try_get("name")?,
+        lower_name: row.try_get("lower_name")?,
+        description: row.try_get("description")?,
+        permission: row.try_get("permission")?,
+        all_repos: row.try_get::<i64, _>("all_repos")? != 0,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+    })
+}
+
+pub async fn create_team(
+    db: &Db,
+    org_id: i64,
+    name: &str,
+    lower_name: &str,
+    description: &str,
+    permission: &str,
+    all_repos: bool,
+) -> DbResult<i64> {
+    let ts = now();
+    let id: i64 = sqlx::query_scalar(
+        "INSERT INTO teams (org_id, name, lower_name, description, permission, all_repos, created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id",
+    )
+    .bind(org_id)
+    .bind(name)
+    .bind(lower_name)
+    .bind(description)
+    .bind(permission)
+    .bind(i64::from(all_repos))
+    .bind(ts)
+    .bind(ts)
+    .fetch_one(db.pool())
+    .await?;
+    Ok(id)
+}
+
+/// The team's URL slug is its lower name with spaces as `-` (D3); matching
+/// happens in SQL so callers never reimplement it.
+pub async fn team_by_slug(db: &Db, org_id: i64, slug: &str) -> DbResult<Option<TeamRow>> {
+    let row = sqlx::query(
+        "SELECT id, org_id, name, lower_name, description, permission, all_repos, created_at, updated_at \
+         FROM teams WHERE org_id = $1 AND REPLACE(lower_name, ' ', '-') = $2 ORDER BY id LIMIT 1",
+    )
+    .bind(org_id)
+    .bind(slug)
+    .fetch_optional(db.pool())
+    .await?;
+    row.as_ref().map(from_team).transpose()
+}
+
+/// A team whose lower name or slug collides with the candidate (for the
+/// case-insensitive uniqueness check, including the `-`/space ambiguity).
+pub async fn team_clash(
+    db: &Db,
+    org_id: i64,
+    lower_name: &str,
+    slug: &str,
+) -> DbResult<Option<TeamRow>> {
+    let row = sqlx::query(
+        "SELECT id, org_id, name, lower_name, description, permission, all_repos, created_at, updated_at \
+         FROM teams WHERE org_id = $1 AND (lower_name = $2 OR REPLACE(lower_name, ' ', '-') = $3) \
+         ORDER BY id LIMIT 1",
+    )
+    .bind(org_id)
+    .bind(lower_name)
+    .bind(slug)
+    .fetch_optional(db.pool())
+    .await?;
+    row.as_ref().map(from_team).transpose()
+}
+
+pub async fn list_teams(db: &Db, org_id: i64) -> DbResult<Vec<TeamRow>> {
+    let rows = sqlx::query(
+        "SELECT id, org_id, name, lower_name, description, permission, all_repos, created_at, updated_at \
+         FROM teams WHERE org_id = $1 ORDER BY lower_name",
+    )
+    .bind(org_id)
+    .fetch_all(db.pool())
+    .await?;
+    rows.iter().map(from_team).collect()
+}
+
+pub async fn set_team(
+    db: &Db,
+    id: i64,
+    name: &str,
+    lower_name: &str,
+    description: &str,
+    permission: &str,
+    all_repos: bool,
+) -> DbResult<()> {
+    sqlx::query(
+        "UPDATE teams SET name = $1, lower_name = $2, description = $3, permission = $4, all_repos = $5, \
+         updated_at = $6 WHERE id = $7",
+    )
+    .bind(name)
+    .bind(lower_name)
+    .bind(description)
+    .bind(permission)
+    .bind(i64::from(all_repos))
+    .bind(now())
+    .bind(id)
+    .execute(db.pool())
+    .await?;
+    Ok(())
+}
+
+/// Deletes the team; memberships and repo links cascade.
+pub async fn delete_team(db: &Db, id: i64) -> DbResult<()> {
+    sqlx::query("DELETE FROM teams WHERE id = $1")
+        .bind(id)
+        .execute(db.pool())
+        .await?;
+    Ok(())
+}
+
+/// Adds the member, or does nothing when already present (for idempotent
+/// retries). Returns whether the row was inserted.
+pub async fn team_member_add(db: &Db, team_id: i64, user_id: i64) -> DbResult<bool> {
+    let result = sqlx::query(
+        "INSERT INTO team_members (team_id, user_id, created_at) VALUES ($1, $2, $3) \
+         ON CONFLICT (team_id, user_id) DO NOTHING",
+    )
+    .bind(team_id)
+    .bind(user_id)
+    .bind(now())
+    .execute(db.pool())
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+pub async fn team_member_remove(db: &Db, team_id: i64, user_id: i64) -> DbResult<bool> {
+    let result = sqlx::query("DELETE FROM team_members WHERE team_id = $1 AND user_id = $2")
+        .bind(team_id)
         .bind(user_id)
         .execute(db.pool())
         .await?;
     Ok(result.rows_affected() == 1)
+}
+
+/// Memberships with handles, ordered by handle.
+pub async fn list_team_members(db: &Db, team_id: i64) -> DbResult<Vec<TeamMemberRow>> {
+    let rows = sqlx::query(
+        "SELECT m.user_id, o.handle, u.display_name FROM team_members m \
+         JOIN users u ON u.id = m.user_id JOIN owners o ON o.id = m.user_id \
+         WHERE m.team_id = $1 ORDER BY o.handle",
+    )
+    .bind(team_id)
+    .fetch_all(db.pool())
+    .await?;
+    rows.iter()
+        .map(|row| {
+            Ok(TeamMemberRow {
+                user_id: row.try_get("user_id")?,
+                handle: row.try_get("handle")?,
+                display_name: row.try_get("display_name")?,
+            })
+        })
+        .collect()
+}
+
+/// Links the repository, or does nothing when already linked. Returns whether
+/// the row was inserted.
+pub async fn team_repo_add(db: &Db, team_id: i64, repo_id: i64) -> DbResult<bool> {
+    let result = sqlx::query(
+        "INSERT INTO team_repos (team_id, repo_id, created_at) VALUES ($1, $2, $3) \
+         ON CONFLICT (team_id, repo_id) DO NOTHING",
+    )
+    .bind(team_id)
+    .bind(repo_id)
+    .bind(now())
+    .execute(db.pool())
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+pub async fn team_repo_remove(db: &Db, team_id: i64, repo_id: i64) -> DbResult<bool> {
+    let result = sqlx::query("DELETE FROM team_repos WHERE team_id = $1 AND repo_id = $2")
+        .bind(team_id)
+        .bind(repo_id)
+        .execute(db.pool())
+        .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// The team's repository ids, ordered by repository name.
+pub async fn list_team_repo_ids(db: &Db, team_id: i64) -> DbResult<Vec<i64>> {
+    let rows: Vec<i64> = sqlx::query_scalar(
+        "SELECT r.id FROM team_repos t JOIN repos r ON r.id = t.repo_id \
+         WHERE t.team_id = $1 ORDER BY r.lower_name",
+    )
+    .bind(team_id)
+    .fetch_all(db.pool())
+    .await?;
+    Ok(rows)
+}
+
+/// Every team permission covering `(org, user, repo)` in one query (D4): the
+/// user is a team member and the team grants all repos or names this one.
+pub async fn covering_team_grants(
+    db: &Db,
+    org_id: i64,
+    user_id: i64,
+    repo_id: i64,
+) -> DbResult<Vec<String>> {
+    let rows: Vec<String> = sqlx::query_scalar(
+        "SELECT t.permission FROM teams t JOIN team_members m ON m.team_id = t.id AND m.user_id = $2 \
+         WHERE t.org_id = $1 AND (t.all_repos = 1 \
+         OR EXISTS (SELECT 1 FROM team_repos r WHERE r.team_id = t.id AND r.repo_id = $3))",
+    )
+    .bind(org_id)
+    .bind(user_id)
+    .bind(repo_id)
+    .fetch_all(db.pool())
+    .await?;
+    Ok(rows)
+}
+
+/// Whether a live repository with this lower name exists outside the org (to
+/// tell "another owner's repo" 422 apart from "no such repo" 404).
+pub async fn repo_name_taken_by_other(db: &Db, org_id: i64, lower_name: &str) -> DbResult<bool> {
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM repos WHERE lower_name = $1 AND owner_id <> $2 AND deleted_at IS NULL",
+    )
+    .bind(lower_name)
+    .bind(org_id)
+    .fetch_one(db.pool())
+    .await?;
+    Ok(count > 0)
 }

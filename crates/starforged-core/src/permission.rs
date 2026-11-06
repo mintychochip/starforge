@@ -73,7 +73,7 @@ pub struct Viewer {
 
 /// Every grant source for one repository and viewer (D4). `org_base` is
 /// present only when the viewer is an org member and the base is not `none`;
-/// `teams` holds the covering team grants (empty until A2 wires them).
+/// `teams` holds the covering team grants.
 #[derive(Debug, Clone, Copy)]
 pub struct Grants<'a> {
     pub site_admin: bool,

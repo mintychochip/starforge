@@ -403,3 +403,640 @@ async fn org_handles_rejected_on_user_only_paths() {
         .unwrap();
     assert_eq!(res.status(), 422, "org as review request");
 }
+
+impl Ctx {
+    fn teams(&self, org: &str) -> String {
+        self.s.url(&format!("/api/v1/orgs/{org}/teams"))
+    }
+
+    fn team(&self, org: &str, team: &str) -> String {
+        self.s.url(&format!("/api/v1/orgs/{org}/teams/{team}"))
+    }
+
+    fn team_members(&self, org: &str, team: &str) -> String {
+        self.s
+            .url(&format!("/api/v1/orgs/{org}/teams/{team}/members"))
+    }
+
+    fn team_member(&self, org: &str, team: &str, handle: &str) -> String {
+        self.s
+            .url(&format!("/api/v1/orgs/{org}/teams/{team}/members/{handle}"))
+    }
+
+    fn team_repos(&self, org: &str, team: &str) -> String {
+        self.s
+            .url(&format!("/api/v1/orgs/{org}/teams/{team}/repos"))
+    }
+
+    fn team_repo(&self, org: &str, team: &str, repo: &str) -> String {
+        self.s
+            .url(&format!("/api/v1/orgs/{org}/teams/{team}/repos/{repo}"))
+    }
+
+    async fn org_with_team(&self) -> reqwest::Client {
+        let client = reqwest::Client::new();
+        let res = client
+            .post(self.orgs())
+            .bearer_auth(&self.alice)
+            .json(&json!({"handle": "acme"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 201);
+        let res = client
+            .put(self.member("acme", "bob"))
+            .bearer_auth(&self.alice)
+            .json(&json!({"role": "member"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        client
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn team_crud_owner_creates_member_forbidden() {
+    let c = Ctx::start().await;
+    let client = c.org_with_team().await;
+
+    // An owner creates a team.
+    let res = client
+        .post(c.teams("acme"))
+        .bearer_auth(&c.alice)
+        .json(&json!({"name": "Dev Team", "description": "d", "permission": "write", "all_repos": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 201, "owner creates team");
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["name"], "Dev Team");
+    assert_eq!(body["slug"], "dev-team");
+    assert_eq!(body["permission"], "write");
+    assert_eq!(body["all_repos"], true);
+    assert_eq!(
+        audit_count(&c.s, "team.create", "team:acme/dev-team").await,
+        1
+    );
+
+    // A plain member cannot create a team.
+    let res = client
+        .post(c.teams("acme"))
+        .bearer_auth(&c.bob)
+        .json(&json!({"name": "Other", "permission": "read"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 403, "member cannot create team");
+
+    // Members list teams; outsiders get 404.
+    let res = client
+        .get(c.teams("acme"))
+        .bearer_auth(&c.bob)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let teams: Value = res.json().await.unwrap();
+    assert_eq!(teams.as_array().unwrap().len(), 1);
+    let res = client
+        .get(c.teams("acme"))
+        .bearer_auth(&c.carol)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 404);
+
+    // The team itself is member-only too.
+    let res = client
+        .get(c.team("acme", "dev-team"))
+        .bearer_auth(&c.bob)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let res = client
+        .get(c.team("acme", "dev-team"))
+        .bearer_auth(&c.carol)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 404);
+
+    // A member cannot rename the team; the owner can, and the slug follows.
+    let res = client
+        .patch(c.team("acme", "dev-team"))
+        .bearer_auth(&c.bob)
+        .json(&json!({"name": "Ops"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 403, "member cannot rename team");
+    let res = client
+        .patch(c.team("acme", "dev-team"))
+        .bearer_auth(&c.alice)
+        .json(&json!({"description": "new"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    assert_eq!(
+        audit_count(&c.s, "team.update", "team:acme/dev-team").await,
+        1
+    );
+
+    // A member cannot delete the team either.
+    let res = client
+        .delete(c.team("acme", "dev-team"))
+        .bearer_auth(&c.bob)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 403, "member cannot delete team");
+    let res = client
+        .delete(c.team("acme", "dev-team"))
+        .bearer_auth(&c.alice)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 204);
+    assert_eq!(
+        audit_count(&c.s, "team.delete", "team:acme/dev-team").await,
+        1
+    );
+    let res = client
+        .get(c.team("acme", "dev-team"))
+        .bearer_auth(&c.alice)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 404);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_team_creates_report_one_clash() {
+    let c = Ctx::start().await;
+    let client = c.org_with_team().await;
+    let req = || {
+        client
+            .post(c.teams("acme"))
+            .bearer_auth(&c.alice)
+            .json(&json!({"name": "Dev", "permission": "write"}))
+    };
+    let (a, b) = tokio::join!(req().send(), req().send());
+    let mut statuses = [a.unwrap().status(), b.unwrap().status()];
+    statuses.sort();
+    assert_eq!(
+        statuses,
+        [
+            reqwest::StatusCode::CREATED,
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY
+        ]
+    );
+    assert_eq!(audit_count(&c.s, "team.create", "team:acme/dev").await, 1);
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn team_duplicate_name_case_insensitive_gives_422() {
+    let c = Ctx::start().await;
+    let client = c.org_with_team().await;
+    let res = client
+        .post(c.teams("acme"))
+        .bearer_auth(&c.alice)
+        .json(&json!({"name": "Dev Team", "permission": "write"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 201);
+
+    for name in ["dev team", "DEV TEAM", "Dev Team"] {
+        let res = client
+            .post(c.teams("acme"))
+            .bearer_auth(&c.alice)
+            .json(&json!({"name": name, "permission": "read"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 422, "duplicate team name {name:?}");
+    }
+    assert_eq!(
+        audit_count(&c.s, "team.create", "team:acme/dev-team").await,
+        1
+    );
+
+    // Renaming another team onto the name collides too.
+    let res = client
+        .post(c.teams("acme"))
+        .bearer_auth(&c.alice)
+        .json(&json!({"name": "Ops", "permission": "read"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 201);
+    let res = client
+        .patch(c.team("acme", "ops"))
+        .bearer_auth(&c.alice)
+        .json(&json!({"name": "DEV TEAM"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 422, "rename onto existing team name");
+
+    // Bad names and permissions are 422 as well.
+    for name in ["", "no/slash", "tab\there"] {
+        let res = client
+            .post(c.teams("acme"))
+            .bearer_auth(&c.alice)
+            .json(&json!({"name": name, "permission": "read"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 422, "bad team name {name:?}");
+    }
+    let res = client
+        .post(c.teams("acme"))
+        .bearer_auth(&c.alice)
+        .json(&json!({"name": "Fine", "permission": "superadmin"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 422, "bad team permission");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn team_member_must_be_org_member() {
+    let c = Ctx::start().await;
+    let client = c.org_with_team().await;
+    let res = client
+        .post(c.teams("acme"))
+        .bearer_auth(&c.alice)
+        .json(&json!({"name": "Dev", "permission": "write"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 201);
+
+    // Carol is not an org member: 422, not 404 — the team exists, she cannot join it.
+    let res = client
+        .put(c.team_member("acme", "dev", "carol"))
+        .bearer_auth(&c.alice)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 422, "non-org-member cannot join team");
+
+    // Bob is an org member: add works, and is a no-op the second time.
+    let res = client
+        .put(c.team_member("acme", "dev", "bob"))
+        .bearer_auth(&c.alice)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    assert_eq!(
+        audit_count(&c.s, "team.member_add", "team:acme/dev").await,
+        1
+    );
+    let res = client
+        .put(c.team_member("acme", "dev", "bob"))
+        .bearer_auth(&c.alice)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    assert_eq!(
+        audit_count(&c.s, "team.member_add", "team:acme/dev").await,
+        1,
+        "no audit for no-op add"
+    );
+
+    // A plain member cannot manage team membership.
+    let res = client
+        .put(c.team_member("acme", "dev", "carol"))
+        .bearer_auth(&c.bob)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 403);
+
+    // Removing someone who was never added is 404 and writes nothing.
+    let res = client
+        .delete(c.team_member("acme", "dev", "carol"))
+        .bearer_auth(&c.alice)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 404);
+    assert_eq!(
+        audit_count(&c.s, "team.member_remove", "team:acme/dev").await,
+        0
+    );
+
+    let res = client
+        .delete(c.team_member("acme", "dev", "bob"))
+        .bearer_auth(&c.alice)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 204);
+    assert_eq!(
+        audit_count(&c.s, "team.member_remove", "team:acme/dev").await,
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn team_repo_must_be_owned_by_the_org() {
+    let c = Ctx::start().await;
+    let client = c.org_with_team().await;
+    let res = client
+        .post(c.teams("acme"))
+        .bearer_auth(&c.alice)
+        .json(&json!({"name": "Dev", "permission": "write"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 201);
+
+    // `proj` exists but belongs to alice, not the org: 422.
+    c.s.repo(
+        &c.s.core.user_by_handle("alice").await.unwrap().unwrap(),
+        "proj",
+        starforged_core::permission::Visibility::Private,
+    )
+    .await;
+    let res = client
+        .put(c.team_repo("acme", "dev", "proj"))
+        .bearer_auth(&c.alice)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 422, "another owner's repo cannot join team");
+
+    // Move it into the org the way A3's repository creation will; now it joins.
+    let org_id = c.s.core.org(None, "acme").await.unwrap().id;
+    let repo_id: i64 = sqlx::query_scalar("SELECT id FROM repos WHERE lower_name = 'proj'")
+        .fetch_one(c.s.core.db().pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE repos SET owner_id = $1 WHERE id = $2")
+        .bind(org_id)
+        .bind(repo_id)
+        .execute(c.s.core.db().pool())
+        .await
+        .unwrap();
+    let res = client
+        .put(c.team_repo("acme", "dev", "proj"))
+        .bearer_auth(&c.alice)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 204);
+    assert_eq!(audit_count(&c.s, "team.repo_add", "team:acme/dev").await, 1);
+
+    // Re-adding is a no-op: still 204, no new audit row.
+    let res = client
+        .put(c.team_repo("acme", "dev", "proj"))
+        .bearer_auth(&c.alice)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 204);
+    assert_eq!(
+        audit_count(&c.s, "team.repo_add", "team:acme/dev").await,
+        1,
+        "no audit for no-op repo add"
+    );
+
+    // Unknown repositories are 404.
+    let res = client
+        .put(c.team_repo("acme", "dev", "missing"))
+        .bearer_auth(&c.alice)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 404);
+
+    let res = client
+        .delete(c.team_repo("acme", "dev", "proj"))
+        .bearer_auth(&c.alice)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 204);
+    assert_eq!(
+        audit_count(&c.s, "team.repo_remove", "team:acme/dev").await,
+        1
+    );
+    let res = client
+        .delete(c.team_repo("acme", "dev", "proj"))
+        .bearer_auth(&c.alice)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 404);
+
+    // The repo list reflects links, and outsiders get 404 on it.
+    let res = client
+        .put(c.team_repo("acme", "dev", "proj"))
+        .bearer_auth(&c.alice)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 204);
+    let res = client
+        .get(c.team_repos("acme", "dev"))
+        .bearer_auth(&c.bob)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let repos: Value = res.json().await.unwrap();
+    assert_eq!(repos.as_array().unwrap().len(), 1);
+    assert_eq!(repos[0]["full_name"], "acme/proj");
+    let res = client
+        .get(c.team_repos("acme", "dev"))
+        .bearer_auth(&c.carol)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 404);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn org_member_removal_drops_team_memberships() {
+    let c = Ctx::start().await;
+    let client = c.org_with_team().await;
+    let res = client
+        .post(c.teams("acme"))
+        .bearer_auth(&c.alice)
+        .json(&json!({"name": "Dev", "permission": "write", "all_repos": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 201);
+    let res = client
+        .put(c.team_member("acme", "dev", "bob"))
+        .bearer_auth(&c.alice)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+
+    // Removing bob from the org drops him from the team with one audit row.
+    let res = client
+        .delete(c.member("acme", "bob"))
+        .bearer_auth(&c.alice)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 204);
+    assert_eq!(audit_count(&c.s, "org.member_remove", "org:acme").await, 1);
+    let res = client
+        .get(c.team_members("acme", "dev"))
+        .bearer_auth(&c.alice)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let members: Value = res.json().await.unwrap();
+    assert!(
+        members.as_array().unwrap().is_empty(),
+        "team membership left behind: {members}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_demote_and_remove_keep_one_owner() {
+    // Two owners race: Alice demotes Bob while Bob removes Alice — and, in
+    // alternating rounds, both owners leave at once. Exactly one call wins
+    // and one owner remains; the org is never orphaned.
+    for i in 0..20 {
+        if i % 2 == 0 {
+            demote_vs_remove(i).await;
+        } else {
+            leave_vs_leave(i).await;
+        }
+    }
+
+    async fn two_owners(i: u32) -> (Ctx, reqwest::Client, String) {
+        let c = Ctx::start().await;
+        let client = reqwest::Client::new();
+        let org = format!("acme{i}");
+        let res = client
+            .post(c.orgs())
+            .bearer_auth(&c.alice)
+            .json(&json!({"handle": &org}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 201);
+        let res = client
+            .put(c.member(&org, "bob"))
+            .bearer_auth(&c.alice)
+            .json(&json!({"role": "owner"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        (c, client, org)
+    }
+
+    async fn check_one_owner(c: &Ctx, org: &str) {
+        let alice = c.s.core.user_by_handle("alice").await.unwrap().unwrap();
+        let bob = c.s.core.user_by_handle("bob").await.unwrap().unwrap();
+        let alice_role = c.s.core.org(Some(&alice), org).await.unwrap().viewer_role;
+        let bob_role = c.s.core.org(Some(&bob), org).await.unwrap().viewer_role;
+        let owners = [&alice_role, &bob_role]
+            .into_iter()
+            .filter(|r| **r == Some(starforged_core::orgs::OrgRole::Owner))
+            .count();
+        assert_eq!(
+            owners, 1,
+            "exactly one owner remains: {alice_role:?} / {bob_role:?}"
+        );
+        let target = format!("org:{org}");
+        let changes = audit_count(&c.s, "org.member_role", &target).await
+            + audit_count(&c.s, "org.member_remove", &target).await;
+        assert_eq!(changes, 1, "the loser writes no audit row");
+    }
+
+    fn check_loser<E: std::fmt::Debug>(r: &Result<E, starforged_core::CoreError>) {
+        // Either guard may fire: the last-owner guard (422) when the loser
+        // still held owner rights, or `Forbidden` when the winner's commit
+        // landed first and the loser was no longer an owner.
+        if let Err(e) = r {
+            assert!(
+                matches!(
+                    e,
+                    starforged_core::CoreError::Invalid(_) | starforged_core::CoreError::Forbidden
+                ),
+                "loser gets 422 or 403, not {e:?}"
+            );
+        }
+    }
+
+    async fn demote_vs_remove(i: u32) {
+        let (c, _client, org) = two_owners(i).await;
+        let alice = c.s.core.user_by_handle("alice").await.unwrap().unwrap();
+        let bob = c.s.core.user_by_handle("bob").await.unwrap().unwrap();
+        let (demote, remove) = tokio::join!(
+            c.s.core
+                .set_org_member(&alice, &org, "bob", starforged_core::orgs::OrgRole::Member),
+            c.s.core.remove_org_member(&bob, &org, "alice"),
+        );
+        assert!(
+            demote.is_ok() ^ remove.is_ok(),
+            "exactly one wins: {demote:?} / {remove:?}"
+        );
+        check_loser(&demote);
+        check_loser(&remove);
+        check_one_owner(&c, &org).await;
+    }
+
+    async fn leave_vs_leave(i: u32) {
+        let (c, _client, org) = two_owners(100 + i).await;
+        let alice = c.s.core.user_by_handle("alice").await.unwrap().unwrap();
+        let bob = c.s.core.user_by_handle("bob").await.unwrap().unwrap();
+        let (a, b) = tokio::join!(
+            c.s.core.remove_org_member(&alice, &org, "alice"),
+            c.s.core.remove_org_member(&bob, &org, "bob"),
+        );
+        assert!(a.is_ok() ^ b.is_ok(), "exactly one wins: {a:?} / {b:?}");
+        check_loser(&a);
+        check_loser(&b);
+        check_one_owner(&c, &org).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_member_adds_are_idempotent() {
+    let c = Ctx::start().await;
+    let client = reqwest::Client::new();
+    let res = client
+        .post(c.orgs())
+        .bearer_auth(&c.alice)
+        .json(&json!({"handle": "acme"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 201);
+
+    let alice = c.s.core.user_by_handle("alice").await.unwrap().unwrap();
+    // Two racing adds of Carol both succeed with a single audit row.
+    let (first, second) = tokio::join!(
+        c.s.core.set_org_member(
+            &alice,
+            "acme",
+            "carol",
+            starforged_core::orgs::OrgRole::Member
+        ),
+        c.s.core.set_org_member(
+            &alice,
+            "acme",
+            "carol",
+            starforged_core::orgs::OrgRole::Member
+        ),
+    );
+    assert!(first.is_ok() && second.is_ok(), "{first:?} / {second:?}");
+    assert_eq!(audit_count(&c.s, "org.member_add", "org:acme").await, 1);
+}

@@ -1019,6 +1019,46 @@ async fn pagination_limits() {
     }
 }
 
+/// Waits for the async post-receive scan to record `head` as revision 2 of
+/// change `k` on trail `n` and move the current pointer to it. Recording the
+/// same move explicitly would race the scan and append a duplicate revision,
+/// so tests push and then wait instead.
+async fn wait_for_branch_revision_2(
+    s: &TestServer,
+    repo_id: i64,
+    trail_n: i64,
+    k: i64,
+    head: &str,
+) {
+    let start = Instant::now();
+    let timeout = Duration::from_secs(20);
+    loop {
+        let trail = db_trails::trail_by_number(s.core.db(), repo_id, trail_n)
+            .await
+            .unwrap()
+            .unwrap();
+        let change = db_changes::change_by_trail_number(s.core.db(), trail.id, k)
+            .await
+            .unwrap()
+            .unwrap();
+        let revs = db_changes::revisions_of_change(s.core.db(), change.id)
+            .await
+            .unwrap();
+        if revs.len() == 2
+            && revs[1].head_sha == head
+            && change.current_revision_id == Some(revs[1].id)
+        {
+            return;
+        }
+        assert!(
+            start.elapsed() < timeout,
+            "timed out waiting for revision 2 of change {k} (have {})",
+            revs.len()
+        );
+        sleep(Duration::from_millis(50)).await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn thread_outdated_counts_final_line_without_newline() {
     let c = Ctx::start().await;
@@ -1059,10 +1099,10 @@ async fn thread_outdated_counts_final_line_without_newline() {
             .unwrap()
             .repo
             .id;
-    c.s.core
-        .record_branch_move(repo_id, "feature/eol", None, new_tip.trim(), None)
-        .await
-        .unwrap();
+    // The post-receive scan records the push asynchronously; wait for it to
+    // make the new tip the current revision instead of recording the move
+    // explicitly (the explicit call races the scan and duplicates the revision).
+    wait_for_branch_revision_2(&c.s, repo_id, n, 1, new_tip.trim()).await;
 
     let threads = format!("{}/threads", c.change(n, 1));
     // The last line (line 2, no trailing newline) still exists → not outdated.
