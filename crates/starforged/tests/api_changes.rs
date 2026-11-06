@@ -2143,3 +2143,233 @@ async fn pending_review_submit_converts_draft_once() {
         "approval counts after submit: {gates}"
     );
 }
+
+/// M2f F6 fix round 1 (RED): commenting on another author's pending-only
+/// thread is 404 (no 201-vs-404 oracle), and a foreign draft id as
+/// `review_id` is 404 too — while public threads still accept comments.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pending_comment_foreign_thread_and_review_id_are_404() {
+    let c = Ctx::start().await;
+    c.push_basic().await;
+    let n = c.trail().await;
+    c.create_branch_change(n, &c.bob_rw).await;
+    let client = reqwest::Client::new();
+    let threads = format!("{}/threads", c.change(n, 1));
+    let pending = format!("{}/reviews/pending", c.change(n, 1));
+
+    // Carol drafts one pending-only thread.
+    let res = client
+        .post(&threads)
+        .bearer_auth(&c.carol_rw)
+        .json(&json!({"path": "a.txt", "side": "head", "start_line": 1, "end_line": 1, "body": "draft one", "pending": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 201);
+    let tid = res.json::<Value>().await.unwrap()["id"].as_i64().unwrap();
+    let draft_id: i64 = client
+        .get(&pending)
+        .bearer_auth(&c.carol_rw)
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap()["id"]
+        .as_i64()
+        .unwrap();
+
+    // A foreign reader's posts to the draft thread are 404 — plain,
+    // pending, or naming the draft — and audit nothing.
+    for body in [
+        json!({"body": "sneaky"}),
+        json!({"body": "sneaky", "pending": true}),
+        json!({"body": "sneaky", "review_id": draft_id}),
+    ] {
+        let res = client
+            .post(format!("{threads}/{tid}/comments"))
+            .bearer_auth(&c.erin_rw)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 404, "foreign post is hidden: {body}");
+    }
+    let repo_id =
+        c.s.core
+            .repo_for(Some(&c.alice), "alice", "proj")
+            .await
+            .unwrap()
+            .repo
+            .id;
+    let trail = db_trails::trail_by_number(c.s.core.db(), repo_id, n)
+        .await
+        .unwrap()
+        .expect("trail");
+    let kinds = starforged_db::trails::timeline_of_trail(c.s.core.db(), trail.id)
+        .await
+        .unwrap()
+        .iter()
+        .map(|e| e.kind.clone())
+        .collect::<Vec<_>>();
+    assert!(!kinds.iter().any(|k| k == "thread.comment"), "{kinds:?}");
+
+    // A public thread still takes comments — but not with a foreign draft id.
+    let open = client
+        .post(&threads)
+        .bearer_auth(&c.carol_rw)
+        .json(&json!({"path": "a.txt", "side": "head", "start_line": 1, "end_line": 1, "body": "public"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(open.status(), 201);
+    let pub_tid = open.json::<Value>().await.unwrap()["id"].as_i64().unwrap();
+    let res = client
+        .post(format!("{threads}/{pub_tid}/comments"))
+        .bearer_auth(&c.erin_rw)
+        .json(&json!({"body": "sneaky", "review_id": draft_id}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 404, "foreign draft review_id is hidden");
+    let res = client
+        .post(format!("{threads}/{pub_tid}/comments"))
+        .bearer_auth(&c.erin_rw)
+        .json(&json!({"body": "agree"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 201, "public comment still works");
+}
+
+/// M2f F6 fix round 1 (RED): a pending-only draft thread never counts as
+/// unresolved for other readers, so a private draft cannot block merging.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pending_draft_thread_does_not_block_gates() {
+    let c = Ctx::start().await;
+    c.push_basic().await;
+    let n = c.trail().await;
+    c.create_branch_change(n, &c.bob_rw).await;
+    let client = reqwest::Client::new();
+    let threads = format!("{}/threads", c.change(n, 1));
+
+    starforged_db::checks::insert_gate_rule(
+        c.s.core.db(),
+        c.s.core
+            .repo_for(Some(&c.alice), "alice", "proj")
+            .await
+            .unwrap()
+            .repo
+            .id,
+        None,
+        0,
+        false,
+        false,
+        "[]",
+        false,
+        true,
+        false,
+        "[]",
+        starforged_db::now(),
+    )
+    .await
+    .unwrap();
+    let res = client
+        .post(&threads)
+        .bearer_auth(&c.carol_rw)
+        .json(&json!({"path": "a.txt", "side": "head", "start_line": 1, "end_line": 1, "body": "draft nit", "pending": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 201);
+    let gates: Value = client
+        .get(format!("{}/gates", c.change(n, 1)))
+        .bearer_auth(&c.erin_rw)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(gates["passed"], true, "draft never blocks: {gates}");
+    let listed: Value = client
+        .get(&threads)
+        .bearer_auth(&c.erin_rw)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(listed["threads"].as_array().unwrap().len(), 0, "{listed}");
+}
+
+/// M2f F6 fix round 1 (RED): submitting while holding a draft AND sending
+/// inline comments attaches both to the single submitted review.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pending_submit_with_inline_comments_attaches_both() {
+    let c = Ctx::start().await;
+    c.push_basic().await;
+    let n = c.trail().await;
+    c.create_branch_change(n, &c.bob_rw).await;
+    let client = reqwest::Client::new();
+    let threads = format!("{}/threads", c.change(n, 1));
+    let reviews = format!("{}/reviews", c.change(n, 1));
+    let pending = format!("{}/reviews/pending", c.change(n, 1));
+    let frank =
+        c.s.core
+            .user_by_handle("frank")
+            .await
+            .unwrap()
+            .expect("frank exists");
+    let frank_rw =
+        c.s.token(&frank, &[Scope::RepoRead, Scope::TrailWrite])
+            .await;
+
+    let res = client
+        .post(&threads)
+        .bearer_auth(&frank_rw)
+        .json(&json!({"path": "a.txt", "side": "head", "start_line": 1, "end_line": 1, "body": "draft one", "pending": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 201, "draft thread");
+    let res = client
+        .post(&reviews)
+        .bearer_auth(&frank_rw)
+        .json(&json!({
+            "verdict": "approve",
+            "body": "ship it",
+            "comments": [{"path": "b.txt", "side": "head", "start_line": 1, "end_line": 1, "body": "inline one"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 201, "submit");
+    let submitted: Value = res.json().await.unwrap();
+    assert_eq!(submitted["state"], "submitted", "{submitted}");
+    let review_id = submitted["id"].as_i64().unwrap();
+    let attached = submitted["threads"].as_array().unwrap();
+    assert_eq!(attached.len(), 2, "draft plus inline threads: {submitted}");
+    for t in attached {
+        assert_eq!(t["comments"].as_array().unwrap().len(), 1, "{t}");
+        assert_eq!(t["comments"][0]["review_id"], review_id, "{t}");
+    }
+    let res = client
+        .get(&pending)
+        .bearer_auth(&frank_rw)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 404, "draft consumed");
+    let listed: Value = client
+        .get(&reviews)
+        .bearer_auth(&c.erin_rw)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(listed["reviews"].as_array().unwrap().len(), 1, "{listed}");
+}

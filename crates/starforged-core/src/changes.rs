@@ -2447,7 +2447,7 @@ impl Core {
     }
 
     /// Reviews of one change keyed by id, for draft-visibility checks.
-    async fn reviews_by_id(
+    pub(crate) async fn reviews_by_id(
         &self,
         change_id: i64,
     ) -> CoreResult<std::collections::HashMap<i64, db_changes::ReviewRow>> {
@@ -2516,6 +2516,19 @@ impl Core {
         }))
     }
 
+    /// The draft review a comment is attached to, if any — the single place
+    /// that names the D9 draft rule. Read paths (`comment_visible`) and gate
+    /// counting share it.
+    pub(crate) fn comment_draft<'a>(
+        reviews: &'a std::collections::HashMap<i64, db_changes::ReviewRow>,
+        comment: &db_changes::ReviewCommentRow,
+    ) -> Option<&'a db_changes::ReviewRow> {
+        comment
+            .review_id
+            .and_then(|id| reviews.get(&id))
+            .filter(|row| row.state == "pending")
+    }
+
     /// A comment is visible when it is not attached to a draft, or when the
     /// viewer authored that draft. Unlinked comments and comments on
     /// submitted or dismissed reviews are always visible.
@@ -2524,21 +2537,10 @@ impl Core {
         reviews: &std::collections::HashMap<i64, db_changes::ReviewRow>,
         comment: &db_changes::ReviewCommentRow,
     ) -> bool {
-        let Some(review_id) = comment.review_id else {
+        let Some(draft) = Self::comment_draft(reviews, comment) else {
             return true;
         };
-        match reviews.get(&review_id) {
-            None => true,
-            Some(review) => {
-                if review.state != "pending" {
-                    return true;
-                }
-                match (viewer, review.author_id) {
-                    (Some(user), Some(author)) => user.id == author,
-                    _ => false,
-                }
-            }
-        }
+        matches!((viewer, draft.author_id), (Some(user), Some(author)) if user.id == author)
     }
 
     /// A thread is outdated iff its anchor is not the current revision AND
@@ -2674,18 +2676,31 @@ impl Core {
             .into_iter()
             .find(|t| t.id == thread_id)
             .ok_or(CoreError::NotFound)?;
+        let reviews = self.reviews_by_id(change.id).await?;
+        // D9: commenting on a thread the caller cannot see is `NotFound`,
+        // pending or plain alike — a 201 here would oracle foreign draft
+        // threads, and a plain comment would publish the thread with no
+        // prior `thread.open` row.
+        let visible = self
+            .thread_view(Some(user), &access, &change, &thread, &reviews)
+            .await?
+            .is_some();
+        if !visible {
+            return Err(CoreError::NotFound);
+        }
         if pending && review_id.is_some() {
             return Err(CoreError::Invalid(
                 "pending and review_id cannot be combined".into(),
             ));
         }
         if let Some(id) = review_id {
-            let known = db_changes::reviews_of_change(self.db(), change.id)
-                .await?
-                .iter()
-                .any(|r| r.id == id);
-            if !known {
-                return Err(CoreError::Invalid("unknown review".into()));
+            match reviews.get(&id) {
+                None => return Err(CoreError::Invalid("unknown review".into())),
+                // A draft id that is not the actor's own stays undiscoverable.
+                Some(row) if row.state == "pending" && row.author_id != Some(user.id) => {
+                    return Err(CoreError::NotFound);
+                }
+                Some(_) => {}
             }
         }
         let body = check_markdown(body, "comment body")?;

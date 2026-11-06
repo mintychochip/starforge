@@ -301,11 +301,23 @@ impl Core {
         }
 
         if rule.require_threads_resolved != 0 {
-            let open = db_changes::threads_of_change(self.db(), change.id)
-                .await?
-                .into_iter()
-                .filter(|t| t.anchor_revision_id == current.id && t.resolved == 0)
-                .count();
+            // D9: threads whose only comments are pending drafts are not
+            // public discussion yet — they count for nobody, so a private
+            // draft can neither leak through the report nor block merging.
+            let reviews = self.reviews_by_id(change.id).await?;
+            let mut open = 0;
+            for t in db_changes::threads_of_change(self.db(), change.id).await? {
+                if t.anchor_revision_id != current.id || t.resolved != 0 {
+                    continue;
+                }
+                let public = db_changes::comments_of_thread(self.db(), t.id)
+                    .await?
+                    .iter()
+                    .any(|c| Self::comment_draft(&reviews, c).is_none());
+                if public {
+                    open += 1;
+                }
+            }
             if open > 0 {
                 failures.push(format!(
                     "{open} unresolved thread{}",
@@ -1424,5 +1436,32 @@ mod tests {
             .await
             .unwrap();
         assert!(h.report().await.passed);
+    }
+    #[tokio::test]
+    async fn pending_only_threads_do_not_count_as_unresolved() {
+        let h = Harness::setup().await;
+        h.rule(None, 0, false, "[]", false, true, false, "[]").await;
+        assert!(h.report().await.passed);
+        // A pending-only draft thread on the current revision is invisible
+        // to the resolved-thread rule: it neither shows nor blocks.
+        h.core
+            .create_thread(
+                &h.bob,
+                "alice",
+                "proj-gates",
+                h.trail_n,
+                h.k,
+                None,
+                "feature.txt",
+                "head",
+                1,
+                1,
+                "draft nit",
+                true,
+            )
+            .await
+            .unwrap();
+        let report = h.report().await;
+        assert!(report.passed, "draft never blocks: {report:?}");
     }
 }
