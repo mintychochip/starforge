@@ -114,6 +114,18 @@ impl UploadClient {
         owner_repo: &str,
         meta: &starforge_format::SessionMeta,
     ) -> Result<(), UploadError> {
+        self.put_meta_status(owner_repo, meta).await.map(|_| ())
+    }
+
+    /// `PUT .../sessions/{ulid}`, reporting the created-vs-existing
+    /// outcome: `Ok(true)` on `201 Created`, `Ok(false)` on `200 OK`
+    /// (the session row already existed). Import derives "exists" from
+    /// this rather than a separate read probe, which needs `repo:read`.
+    pub async fn put_meta_status(
+        &self,
+        owner_repo: &str,
+        meta: &starforge_format::SessionMeta,
+    ) -> Result<bool, UploadError> {
         let url = self.session_url(owner_repo, &meta.id.to_string());
         let resp = self
             .client
@@ -122,7 +134,11 @@ impl UploadClient {
             .json(meta)
             .send()
             .await?;
-        check_status(owner_repo, resp).await
+        if resp.status() == reqwest::StatusCode::CREATED {
+            return Ok(true);
+        }
+        check_status(owner_repo, resp).await?;
+        Ok(false)
     }
 
     /// `PUT .../segments/{n}` with the exact spool bytes plus

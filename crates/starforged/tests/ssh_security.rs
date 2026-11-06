@@ -365,11 +365,15 @@ async fn sweep(visibility: Visibility, tag: &str) {
             assert_eq!(ssh_clone_ok, http_clone, "{cell}: clone equality");
         }
 
-        // Branch push (write).
-        let branch = format!("sweep/{tag}-{label}", label = row.label);
-        let refspec = format!("HEAD:refs/heads/{branch}");
+        // Branch push (write). Distinct branches per transport: the same
+        // refspec twice would let the second push succeed as an up-to-date
+        // no-op without exercising its write authorization.
+        let branch_ssh = format!("sweep/{tag}-{}-ssh", row.label);
+        let branch_http = format!("sweep/{tag}-{}-http", row.label);
+        let refspec_ssh = format!("HEAD:refs/heads/{branch_ssh}");
+        let refspec_http = format!("HEAD:refs/heads/{branch_http}");
         let ssh_branch = s
-            .ssh_git(&seed, &row.key, &["push", "-q", &ssh_url, &refspec])
+            .ssh_git(&seed, &row.key, &["push", "-q", &ssh_url, &refspec_ssh])
             .await;
         let ssh_branch_ok = ssh_branch.status.success();
         assert_eq!(
@@ -384,29 +388,31 @@ async fn sweep(visibility: Visibility, tag: &str) {
                 "{cell}: deploy branch push (D5)"
             );
         } else {
-            let http_branch = git(&seed, &["push", "-q", &http_url, &refspec])
+            let http_branch = git(&seed, &["push", "-q", &http_url, &refspec_http])
                 .await
                 .status
                 .success();
             assert_eq!(http_branch, row.writable, "{cell}: http branch push");
             assert_eq!(ssh_branch_ok, http_branch, "{cell}: branch equality");
-            let probe = git(
-                &tmp_path,
-                &[
-                    "ls-remote",
-                    &s.git_url(row.owner, row.repo, Some(&alice_tok)),
-                    &format!("refs/heads/{branch}"),
-                ],
-            )
-            .await;
-            assert!(probe.status.success(), "{cell}: ls-remote");
-            assert_eq!(
-                String::from_utf8(probe.stdout)
-                    .unwrap()
-                    .contains(&format!("refs/heads/{branch}")),
-                row.writable,
-                "{cell}: pushed branch present"
-            );
+            for (branch, who) in [(&branch_ssh, "ssh"), (&branch_http, "http")] {
+                let probe = git(
+                    &tmp_path,
+                    &[
+                        "ls-remote",
+                        &s.git_url(row.owner, row.repo, Some(&alice_tok)),
+                        &format!("refs/heads/{branch}"),
+                    ],
+                )
+                .await;
+                assert!(probe.status.success(), "{cell}: ls-remote {who}");
+                assert_eq!(
+                    String::from_utf8(probe.stdout)
+                        .unwrap()
+                        .contains(&format!("refs/heads/{branch}")),
+                    row.writable,
+                    "{cell}: {who} pushed branch present"
+                );
+            }
         }
 
         // refs/for push (read tier for readers, write tier for writers; deploy never).

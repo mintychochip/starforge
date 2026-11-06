@@ -197,6 +197,7 @@ async fn search_page_pagination_and_validation() {
         "from=notadate",
         "tab=sessions&commit=xyz",
         "page=0",
+        "page=999999",
     ] {
         let res = client
             .get(s.url(&format!("/search?q=pager&{qs}")))

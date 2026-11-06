@@ -1,0 +1,311 @@
+//! `starforged backup <dir>`: a transactionally consistent snapshot of the
+//! data directory (plan M5b O1, spec §12).
+//!
+//! Layout of the snapshot:
+//!
+//! - `manifest.json` — format version 1, starforged version, creation
+//!   time, database engine, latest applied migration, repository and blob
+//!   counts;
+//! - `database/` — SQLite through `VACUUM INTO`, Postgres through
+//!   `pg_dump` from `PATH` (decision D4);
+//! - `repos/` — every repository, copied under its exclusive repository
+//!   lock (one repository at a time), in the same sharded layout;
+//! - `blobs/` — the whole blob store;
+//! - `config/starforged.toml` — a copy of the running config (decision
+//!   D3), unless `--no-config` was passed. It contains `secret_key`: the
+//!   backup directory is created `0700` and the config file `0600`.
+//!
+//! The search index is skipped: it is rebuildable from the database.
+//!
+//! Consistency: the blob-GC lock is held shared from just before the
+//! database snapshot until the blob copy ends, so the GC cannot delete a
+//! blob the snapshot references; each repository is copied under its
+//! exclusive lock, which blocks that repository's writers (they hold the
+//! shared lock) for the copy without touching other repositories. A backup
+//! taken during a push therefore contains the pre-push or the post-push
+//! state of each repository, never a torn one.
+//!
+//! The target directory must be empty or absent.
+
+use std::path::{Path, PathBuf};
+use std::process::Command as ShellCommand;
+use std::time::SystemTime;
+
+use anyhow::{Context, bail};
+use serde::Serialize;
+use starforged_core::repolock::{BlobGcLock, RepoLock};
+use starforged_db::{Backend, Db};
+
+use crate::config::Config;
+
+/// Manifest format version written by this backup.
+pub const MANIFEST_FORMAT_VERSION: u32 = 1;
+
+#[derive(Serialize)]
+struct Manifest {
+    format_version: u32,
+    starforged_version: &'static str,
+    created_at: i64,
+    engine: &'static str,
+    latest_migration: Option<i64>,
+    repositories: u64,
+    blobs: u64,
+}
+
+/// Runs the backup into `target` and prints a one-line summary.
+pub async fn run(config_path: &Path, target: &Path, include_config: bool) -> anyhow::Result<()> {
+    prepare_target(target)?;
+
+    let config =
+        Config::load(config_path).with_context(|| format!("loading {}", config_path.display()))?;
+    let db = Db::connect(&config.database_url())
+        .await
+        .context("connecting to the database")?;
+    let engine = match db.backend() {
+        Backend::Sqlite => "sqlite",
+        Backend::Postgres => "postgres",
+    };
+    let latest_migration = db
+        .latest_migration()
+        .await
+        .context("reading the latest applied migration")?;
+
+    // The blob-GC lock is held shared from just before the database
+    // snapshot until the blob copy ends (Global Constraints).
+    let _blob_gc_lock = BlobGcLock::shared_async(&config.blob_dir())
+        .await
+        .context("taking the blob-GC lock")?;
+
+    // Database snapshot (transactionally consistent on both engines).
+    let database_dir = target.join("database");
+    make_dir(&database_dir)?;
+    match db.backend() {
+        Backend::Sqlite => {
+            db.vacuum_into_file(&database_dir.join("starforge.db"))
+                .await
+                .context("writing the SQLite snapshot (VACUUM INTO)")?;
+        }
+        Backend::Postgres => {
+            pg_dump(&config.database.url, &database_dir.join("starforge.pgdump"))
+                .context("writing the Postgres snapshot (pg_dump)")?;
+        }
+    }
+
+    // Repositories, one exclusive lock at a time.
+    let repos_dir = target.join("repos");
+    make_dir(&repos_dir)?;
+    let mut repositories = 0_u64;
+    for repo in repository_dirs(&config.repos_dir())? {
+        let _repo_lock = RepoLock::exclusive_async(&repo)
+            .await
+            .with_context(|| format!("locking repository {}", repo.display()))?;
+        let rel = repo
+            .strip_prefix(config.repos_dir())
+            .expect("repository_dirs yields paths under repos_dir");
+        copy_tree(&repo, &repos_dir.join(rel), Some("starforge.lock"))?;
+        repositories += 1;
+    }
+
+    // Blobs.
+    let blob_dir = config.blob_dir();
+    make_dir(&target.join("blobs"))?;
+    let blobs = if blob_dir.is_dir() {
+        copy_tree(&blob_dir, &target.join("blobs"), Some(".gc.lock"))?
+    } else {
+        0
+    };
+
+    drop(_blob_gc_lock);
+
+    // Config copy (contains `secret_key`; D3).
+    if include_config {
+        let config_dir = target.join("config");
+        make_dir(&config_dir)?;
+        let text = std::fs::read(config_path)
+            .with_context(|| format!("reading {}", config_path.display()))?;
+        let dest = config_dir.join("starforged.toml");
+        write_file(&dest, &text, 0o600)?;
+    }
+
+    let manifest = Manifest {
+        format_version: MANIFEST_FORMAT_VERSION,
+        starforged_version: env!("CARGO_PKG_VERSION"),
+        created_at: SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0),
+        engine,
+        latest_migration,
+        repositories,
+        blobs,
+    };
+    let json = serde_json::to_string_pretty(&manifest).context("serializing the manifest")?;
+    let mut out = json.into_bytes();
+    out.push(b'\n');
+    write_file(&target.join("manifest.json"), &out, 0o600)?;
+
+    println!(
+        "backed up {repositories} repositories and {blobs} blobs to {} (engine {engine})",
+        target.display()
+    );
+    Ok(())
+}
+
+/// Refuses a non-empty target; creates an absent one `0700`.
+fn prepare_target(target: &Path) -> anyhow::Result<()> {
+    if target.exists() {
+        if !target.is_dir() {
+            bail!("backup target {} is not a directory", target.display());
+        }
+        let mut entries =
+            std::fs::read_dir(target).with_context(|| format!("reading {}", target.display()))?;
+        if entries.next().is_some() {
+            bail!(
+                "backup directory {} is not empty; refusing to write into it",
+                target.display()
+            );
+        }
+    } else {
+        std::fs::create_dir_all(target)
+            .with_context(|| format!("creating {}", target.display()))?;
+        set_mode(target, 0o700)?;
+    }
+    Ok(())
+}
+
+/// Every `<repos>/<shard>/<id>.git` directory, sorted for a stable order.
+fn repository_dirs(repos_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let mut repos = Vec::new();
+    if !repos_dir.is_dir() {
+        return Ok(repos);
+    }
+    let mut shards: Vec<PathBuf> = std::fs::read_dir(repos_dir)
+        .with_context(|| format!("reading {}", repos_dir.display()))?
+        .map(|entry| entry.map(|e| e.path()))
+        .collect::<Result<_, _>>()
+        .with_context(|| format!("reading {}", repos_dir.display()))?;
+    shards.sort();
+    for shard in shards {
+        if !shard.is_dir() {
+            continue;
+        }
+        let mut entries: Vec<PathBuf> = std::fs::read_dir(&shard)
+            .with_context(|| format!("reading {}", shard.display()))?
+            .map(|entry| entry.map(|e| e.path()))
+            .collect::<Result<_, _>>()
+            .with_context(|| format!("reading {}", shard.display()))?;
+        entries.sort();
+        for entry in entries {
+            if entry.is_dir() && entry.extension().is_some_and(|ext| ext == "git") {
+                repos.push(entry);
+            }
+        }
+    }
+    Ok(repos)
+}
+
+/// Recursively copies `src` to `dest` (creating `dest`), skipping the
+/// root-level `skip` entry when given. Returns the number of files copied.
+/// File contents and permissions, and symlinks, are preserved.
+fn copy_tree(src: &Path, dest: &Path, skip: Option<&str>) -> anyhow::Result<u64> {
+    std::fs::create_dir_all(dest).with_context(|| format!("creating {}", dest.display()))?;
+    let mut files = 0_u64;
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(src)
+        .with_context(|| format!("reading {}", src.display()))?
+        .map(|entry| entry.map(|e| e.path()))
+        .collect::<Result<_, _>>()
+        .with_context(|| format!("reading {}", src.display()))?;
+    entries.sort();
+    for entry in entries {
+        if let Some(skip) = skip
+            && entry.parent() == Some(src)
+            && entry.file_name().is_some_and(|name| name == skip)
+        {
+            continue;
+        }
+        let dest_entry = dest.join(entry.file_name().expect("entries have names"));
+        let meta = std::fs::symlink_metadata(&entry)
+            .with_context(|| format!("reading {}", entry.display()))?;
+        if meta.file_type().is_symlink() {
+            let link = std::fs::read_link(&entry)
+                .with_context(|| format!("reading link {}", entry.display()))?;
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&link, &dest_entry)
+                .with_context(|| format!("linking {}", dest_entry.display()))?;
+            #[cfg(not(unix))]
+            std::fs::copy(&entry, &dest_entry)
+                .with_context(|| format!("copying {}", entry.display()))?;
+        } else if meta.is_dir() {
+            files += copy_tree(&entry, &dest_entry, None)?;
+        } else if meta.is_file() {
+            std::fs::copy(&entry, &dest_entry)
+                .with_context(|| format!("copying {}", entry.display()))?;
+            files += 1;
+        }
+    }
+    Ok(files)
+}
+
+fn make_dir(path: &Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(path).with_context(|| format!("creating {}", path.display()))?;
+    set_mode(path, 0o700)
+}
+
+fn write_file(path: &Path, bytes: &[u8], mode: u32) -> anyhow::Result<()> {
+    std::fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))?;
+    set_mode(path, mode)
+}
+
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: u32) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        .with_context(|| format!("setting permissions on {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn set_mode(path: &Path, _mode: u32) -> anyhow::Result<()> {
+    let _ = path;
+    Ok(())
+}
+
+/// `pg_dump --format=custom --no-owner --file <dest> <url>` (decision D4):
+/// the password travels through `PGPASSWORD` in the child environment,
+/// never argv, and a missing `pg_dump` fails naming the requirement.
+fn pg_dump(url: &str, dest: &Path) -> anyhow::Result<()> {
+    let (dump_url, password) = split_pg_password(url);
+    let mut command = ShellCommand::new("pg_dump");
+    command
+        .arg("--format=custom")
+        .arg("--no-owner")
+        .arg("--file")
+        .arg(dest)
+        .arg(&dump_url);
+    if let Some(password) = &password {
+        command.env("PGPASSWORD", password);
+    }
+    match command.status() {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => bail!("pg_dump exited with {status}"),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => bail!(
+            "pg_dump is required for Postgres backups but was not found in PATH; \
+             install the PostgreSQL client tools (postgresql-client) and retry"
+        ),
+        Err(err) => Err(err).context("running pg_dump"),
+    }
+}
+
+/// Splits `postgres://user:password@host/db` into a password-less URL and
+/// the password, so the password never appears in argv.
+fn split_pg_password(url: &str) -> (String, Option<String>) {
+    match url::Url::parse(url) {
+        Ok(mut parsed) => {
+            let password = parsed.password().map(str::to_owned);
+            if password.is_some() {
+                let _ = parsed.set_password(None);
+            }
+            (parsed.to_string(), password)
+        }
+        Err(_) => (url.to_owned(), None),
+    }
+}

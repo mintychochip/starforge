@@ -9,6 +9,7 @@ use starforged_core::ingest::IngestAuth;
 use starforged_core::permission::{Permission, Visibility};
 use starforged_core::tokens::Scope;
 use starforged_db::sessions as db_sessions;
+use starforged_db::trails as db_trails;
 
 const SHA40: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
@@ -349,6 +350,8 @@ async fn validation_answers_422() {
         ("trails", "per_page=51"),
         ("trails", "per_page=0"),
         ("trails", "page=0"),
+        ("trails", "page=1001"),
+        ("trails", "page=9223372036854775807"),
         ("trails", "from=notadate"),
         ("trails", "to=2026-13-45"),
         ("trails", "from=2026-01-01&to=2020-01-01"),
@@ -356,6 +359,7 @@ async fn validation_answers_422() {
         ("sessions", "per_page=51"),
         ("sessions", "from=notadate"),
         ("sessions", "commit=xyz"),
+        ("sessions", "page=999999"),
         ("sessions", "commit=abc"),
         (
             "sessions",
@@ -537,4 +541,68 @@ async fn token_without_read_scope_is_forbidden() {
     let client = reqwest::Client::new();
     let (status, _) = search(&client, &s, "trails", "q=zebra", Some(&upload_only)).await;
     assert_eq!(status, 403, "read search requires the repo:read scope");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropped_hit_before_boundary_no_duplicates() {
+    let s = TestServer::start().await;
+    let alice = s.user("alice").await;
+    let open = s.repo(&alice, "open", Visibility::Public).await;
+    let shut = s.repo(&alice, "shut", Visibility::Public).await;
+    s.core
+        .create_trail(&alice, "alice", "shut", "Dup dropped", "intent")
+        .await
+        .unwrap();
+    s.core
+        .create_trail(&alice, "alice", "open", "Dup alpha", "intent")
+        .await
+        .unwrap();
+    s.core
+        .create_trail(&alice, "alice", "open", "Dup beta", "intent")
+        .await
+        .unwrap();
+    drain(&s).await;
+    // Pin the index order (newest first): the hit that will drop sorts
+    // before both valid hits, so a raw-space page boundary would repeat
+    // "Dup alpha" on page 2.
+    for (repo_id, number, ts) in [(shut.id, 1, 300), (open.id, 1, 200), (open.id, 2, 100)] {
+        let mut row = db_trails::trail_by_number(s.db(), repo_id, number)
+            .await
+            .unwrap()
+            .unwrap();
+        row.updated_at = ts;
+        let comments = db_trails::comments_of(s.db(), row.id).await.unwrap();
+        let doc = starforged_core::search::trail_doc(&row, "public", &comments);
+        s.core.search_index().replace_trail(doc).unwrap();
+    }
+    s.core.search_index().commit().unwrap();
+    // The leading hit becomes unreadable without running the index job.
+    s.core
+        .set_visibility(&alice, "alice", "shut", Visibility::Private)
+        .await
+        .unwrap();
+    let client = reqwest::Client::new();
+    let mut titles = Vec::new();
+    let mut has = Vec::new();
+    for page in 1..=3 {
+        let (status, body) = search(
+            &client,
+            &s,
+            "trails",
+            &format!("q=dup&per_page=1&page={page}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, 200);
+        for result in body["results"].as_array().unwrap() {
+            titles.push(result["title"].as_str().unwrap().to_owned());
+        }
+        has.push(body["has_more"].as_bool().unwrap());
+    }
+    assert_eq!(
+        titles,
+        ["Dup alpha", "Dup beta"],
+        "no duplicates across pages past a dropped hit"
+    );
+    assert_eq!(has, [true, false, false]);
 }

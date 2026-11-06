@@ -5,6 +5,7 @@ pub mod auth;
 mod changes;
 pub mod error;
 mod gate_rules;
+mod github_import;
 mod moved;
 mod oauth;
 mod orgs;
@@ -100,6 +101,10 @@ pub fn router(core: Core, base_url: String) -> Router {
         )
         .route("/search/trails", get(search::search_trails))
         .route("/search/sessions", get(search::search_sessions))
+        .route(
+            "/repos/{owner}/{repo}/search/code",
+            get(search::search_code),
+        )
         .route("/oauth/device/code", post(oauth::device_code))
         .route("/oauth/token", post(oauth::token))
         .route(
@@ -132,6 +137,10 @@ pub fn router(core: Core, base_url: String) -> Router {
             post(repos::start_import),
         )
         .route(
+            "/repos/{owner}/{repo}/import/github",
+            post(github_import::start_github_import).get(github_import::get_github_import),
+        )
+        .route(
             "/repos/{owner}/{repo}/mirror/pull",
             put(repos::put_pull_mirror)
                 .get(repos::get_pull_mirror)
@@ -140,6 +149,18 @@ pub fn router(core: Core, base_url: String) -> Router {
         .route(
             "/repos/{owner}/{repo}/mirror/pull/sync",
             post(repos::sync_pull_mirror),
+        )
+        .route(
+            "/repos/{owner}/{repo}/mirror/push",
+            post(repos::add_push_mirror).get(repos::list_push_mirrors),
+        )
+        .route(
+            "/repos/{owner}/{repo}/mirror/push/{id}",
+            delete(repos::delete_push_mirror),
+        )
+        .route(
+            "/repos/{owner}/{repo}/mirror/push/{id}/sync",
+            post(repos::sync_push_mirror),
         )
         .route(
             "/repos/{owner}/{repo}/mirror/pull/enabled",

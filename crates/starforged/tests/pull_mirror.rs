@@ -666,3 +666,136 @@ async fn pull_mirror_schedule_access_and_failure() {
         denied.status()
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pull_mirror_https_credentials_never_disclosed() {
+    let s = TestServer::start_with(|c| c.remotes.allow_file_urls = true).await;
+    let alice = s.user("alice").await;
+    let rw = s.token(&alice, &[Scope::RepoRead, Scope::RepoWrite]).await;
+    let repo = s.repo(&alice, "proj", Visibility::Private).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (url, _src) = make_source(dir.path(), "src").await;
+
+    let client = reqwest::Client::new();
+    let (status, v) = api(
+        &client,
+        "PUT",
+        &s.url("/api/v1/repos/alice/proj/mirror/pull"),
+        &rw,
+        Some(&json!({
+            "url": url,
+            "interval_secs": 300,
+            "auth": {"kind": "https", "username": "bot", "password": "s3cr3t-pw"},
+        })),
+    )
+    .await;
+    assert_eq!(status, 200, "{v}");
+    assert_eq!(v["has_credentials"], true);
+    let raw = serde_json::to_string(&v).unwrap();
+    assert!(!raw.contains("s3cr3t-pw"), "password leaked: {raw}");
+    assert!(!raw.contains("sealed"), "sealed secret leaked: {raw}");
+    assert!(v.get("password").is_none(), "{v}");
+
+    // The settings page likewise carries no secret.
+    let (browser, _) = s.login("alice").await;
+    let page = get_text(&browser, &s.url("/alice/proj/settings/mirrors")).await;
+    assert!(page.contains("credentials: stored"), "{page}");
+    assert!(!page.contains("s3cr3t-pw"), "password on page: {page}");
+
+    // The stored row holds the seal, not the password.
+    let row = starforged_db::remotes::by_repo_role(s.core.db(), repo.id, "pull")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.auth, "https");
+    assert!(row.sealed_secret.is_some());
+    assert!(
+        !row.sealed_secret
+            .as_deref()
+            .unwrap_or("")
+            .contains("s3cr3t-pw")
+    );
+    assert!(audit_count(&s, "mirror.credentials_changed", "repo:alice/proj").await >= 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pull_mirror_skips_trails_and_for_refs() {
+    let s = TestServer::start_with(|c| c.remotes.allow_file_urls = true).await;
+    let alice = s.user("alice").await;
+    let rw = s.token(&alice, &[Scope::RepoRead, Scope::RepoWrite]).await;
+    let repo = s.repo(&alice, "proj", Visibility::Private).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (url, src) = make_source(dir.path(), "src").await;
+    // Upstream carries server-shaped refs that must never be fetched.
+    git_ok(&src, &["update-ref", "refs/trails/x", "HEAD"]).await;
+    git_ok(&src, &["update-ref", "refs/for/main", "HEAD"]).await;
+
+    let client = reqwest::Client::new();
+    let (status, _) = api(
+        &client,
+        "PUT",
+        &s.url("/api/v1/repos/alice/proj/mirror/pull"),
+        &rw,
+        Some(&json!({"url": url, "interval_secs": 300})),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let done = poll_mirror(&s, &rw, "alice", "proj").await;
+    assert!(done["last_success_at"].is_number(), "{done}");
+    let refs = server_refs(&s, repo.id).await;
+    assert!(refs.contains("refs/heads/main"), "{refs}");
+    assert!(
+        !refs.contains("refs/trails"),
+        "trail refs must not mirror: {refs}"
+    );
+    assert!(
+        !refs.contains("refs/for"),
+        "refs/for must not mirror: {refs}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pull_mirror_reconciler_revives_lost_schedule() {
+    let s = TestServer::start_with(|c| c.remotes.allow_file_urls = true).await;
+    let alice = s.user("alice").await;
+    let rw = s.token(&alice, &[Scope::RepoRead, Scope::RepoWrite]).await;
+    let _repo = s.repo(&alice, "proj", Visibility::Private).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (url, _src) = make_source(dir.path(), "src").await;
+
+    let client = reqwest::Client::new();
+    let (status, _) = api(
+        &client,
+        "PUT",
+        &s.url("/api/v1/repos/alice/proj/mirror/pull"),
+        &rw,
+        Some(&json!({"url": url, "interval_secs": 300})),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let done = poll_mirror(&s, &rw, "alice", "proj").await;
+    assert!(done["last_success_at"].is_number(), "{done}");
+
+    // Lose the schedule entirely: fail every pull_mirror job row.
+    sqlx::query("UPDATE jobs SET state = 'failed' WHERE kind = 'pull_mirror'")
+        .execute(s.core.db().pool())
+        .await
+        .unwrap();
+    let queued: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM jobs WHERE kind = 'pull_mirror' AND state = 'queued'",
+    )
+    .fetch_one(s.core.db().pool())
+    .await
+    .unwrap();
+    assert_eq!(queued, 0, "schedule must be gone");
+
+    // The reconciler (worker start / hourly cleanup) revives it.
+    s.core.reconcile_mirror_schedules().await.unwrap();
+    let queued: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM jobs WHERE kind = 'pull_mirror' AND state = 'queued'",
+    )
+    .fetch_one(s.core.db().pool())
+    .await
+    .unwrap();
+    assert_eq!(queued, 1, "reconciler must re-queue the mirror");
+}

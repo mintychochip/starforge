@@ -85,6 +85,8 @@ impl Server for ForgeServer {
     type Handler = Connection;
 
     fn new_client(&mut self, _: Option<std::net::SocketAddr>) -> Connection {
+        starforged_core::metrics::SSH_CONNECTIONS
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Connection {
             shared: self.shared.clone(),
             identity: None,
@@ -107,6 +109,8 @@ pub(crate) struct Connection {
 
 impl Drop for Connection {
     fn drop(&mut self) {
+        starforged_core::metrics::SSH_CONNECTIONS
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         if let Some(timer) = self.total_timer.take() {
             timer.abort();
         }
@@ -419,6 +423,30 @@ async fn spawn_pack_async(
     let core = shared.core.clone();
     let repo_path = core.repo_path(grant.access.repo.id);
     let is_receive = exec.kind == crate::command::PackKind::ReceivePack;
+    match exec.kind {
+        crate::command::PackKind::UploadPack => core.metrics().inc_git_rpc("upload-pack", "ssh"),
+        crate::command::PackKind::ReceivePack => core.metrics().inc_git_rpc("receive-pack", "ssh"),
+        crate::command::PackKind::UploadArchive => {}
+    }
+    // receive-pack writes inside the repository: hold the shared lock
+    // until the child (and the post-push scan) finishes (plan M5b O1).
+    let _repo_lock = if is_receive {
+        match core.repo_lock_shared(grant.access.repo.id).await {
+            Ok(guard) => Some(guard),
+            Err(err) => {
+                tracing::warn!(error = %err, "repository lock failed");
+                let _ = handle
+                    .extended_data(channel, 1, b"starforge: internal error\n".to_vec())
+                    .await;
+                let _ = handle.exit_status_request(channel, 1).await;
+                let _ = handle.eof(channel).await;
+                let _ = handle.close(channel).await;
+                return;
+            }
+        }
+    } else {
+        None
+    };
     let before = if is_receive {
         core.snapshot_refs(&repo_path).await
     } else {

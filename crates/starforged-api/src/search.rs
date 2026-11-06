@@ -160,3 +160,57 @@ pub async fn search_sessions(
         })),
     ))
 }
+
+#[derive(Debug, Default, Deserialize)]
+pub struct CodeQuery {
+    pub q: Option<String>,
+    pub case: Option<String>,
+}
+
+/// `GET /api/v1/repos/{owner}/{repo}/search/code?q=&case=sensitive|insensitive`.
+/// A repository the caller cannot read is `NotFound`, never `Forbidden`.
+pub async fn search_code(
+    State(state): State<ApiState>,
+    auth: ApiAuth,
+    axum::extract::Path((owner, repo)): axum::extract::Path<(String, String)>,
+    Query(query): Query<CodeQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let user = auth.reader()?;
+    let case_insensitive = match query.case.as_deref() {
+        None | Some("") => false,
+        Some("sensitive") => false,
+        Some("insensitive") => true,
+        Some(other) => {
+            return Err(ApiError::Invalid(format!(
+                "invalid case '{other}': want sensitive or insensitive"
+            )));
+        }
+    };
+    let result = state
+        .core
+        .code_search(
+            user,
+            &owner,
+            &repo,
+            query.q.as_deref().unwrap_or_default(),
+            case_insensitive,
+        )
+        .await?;
+    let matches: Vec<Value> = result
+        .matches
+        .iter()
+        .map(|m| {
+            json!({
+                "path": m.path,
+                "line": m.line,
+                "text": m.text,
+            })
+        })
+        .collect();
+    Ok(Json(json!({
+        "ref": result.ref_name,
+        "commit": result.commit,
+        "matches": matches,
+        "truncated": result.truncated,
+    })))
+}

@@ -163,6 +163,7 @@ impl Core {
         limit: &str,
     ) -> CoreResult<CoreError> {
         let target = format!("login:{login}");
+        self.metrics().inc_rate_limited(limit);
         self.audit_client(
             None,
             "auth.login_rate_limited",

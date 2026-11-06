@@ -6,6 +6,7 @@
 {% if let Some(e) = error %}<p class="error">{{ e }}</p>{% endif %}
 <h2>Pull mirror</h2>
 {% if let Some(m) = mirror %}
+<p class="muted">Pulls <code>{{ m.url }}</code> · every {{ m.interval_secs }} seconds · {% if m.enabled %}enabled{% else %}disabled{% endif %} · credentials: {% if m.has_credentials %}stored{% else %}none{% endif %}</p>
 {% if let Some(t) = m.last_success_at %}<p class="muted">Last successful sync: {{ crate::views::format_time(**t) }}</p>{% endif %}
 {% if let Some(k) = m.ssh_public_key %}<p>Install this public key upstream: <code>{{ k }}</code></p>{% endif %}
 {% if !m.last_error.is_empty() %}<p class="error">{{ m.last_error }}</p>{% endif %}
@@ -30,5 +31,32 @@
   <label>Password or token <input name="password" type="password" autocomplete="off"></label>
   <label>Sync every (seconds, minimum 300) <input name="interval_secs" type="number" min="300" value="3600"></label>
   <button type="submit">Save mirror</button>
+</form>
+<h2>Push mirrors</h2>
+{% if push_mirrors.is_empty() %}<p class="muted">No push mirrors configured. After every accepted push, branches and tags are mirrored here (debounced 30 seconds); <code>refs/trails/*</code> never leaves this repository.</p>{% endif %}
+{% for m in push_mirrors %}
+<div>
+<p><code>{{ m.url }}</code> ({{ m.auth }}){% if m.has_credentials %} · credentials stored{% endif %}</p>
+{% if let Some(t) = m.last_success_at %}<p class="muted">Last successful push: {{ crate::views::format_time(**t) }}</p>{% endif %}
+{% if let Some(k) = m.ssh_public_key %}<p>Install this public key upstream: <code>{{ k }}</code></p>{% endif %}
+{% if !m.last_error.is_empty() %}<p class="error">{{ m.last_error }}</p>{% endif %}
+<form method="post" action="/{{ head.owner }}/{{ head.name }}/settings/mirrors/push/{{ m.id }}/sync" class="inline"><input type="hidden" name="_csrf" value="{{ csrf }}"><button type="submit">Push now</button></form>
+<form method="post" action="/{{ head.owner }}/{{ head.name }}/settings/mirrors/push/{{ m.id }}/delete" class="inline"><input type="hidden" name="_csrf" value="{{ csrf }}"><button type="submit">Delete</button></form>
+</div>
+{% endfor %}
+<h3>Add push mirror</h3>
+<form method="post" action="/{{ head.owner }}/{{ head.name }}/settings/mirrors/push" class="stack">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <label>Target URL <input name="url" required maxlength="2000" placeholder="https://example.com/owner/repo.git"></label>
+  <label>Auth
+    <select name="auth">
+      <option value="none">none</option>
+      <option value="https">https credentials</option>
+      <option value="ssh">ssh key</option>
+    </select>
+  </label>
+  <label>Username <input name="username" maxlength="200"></label>
+  <label>Password or token <input name="password" type="password" autocomplete="off"></label>
+  <button type="submit">Add push mirror</button>
 </form>
 {% endblock %}

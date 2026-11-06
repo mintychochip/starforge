@@ -48,6 +48,13 @@ pub struct Config {
     /// 0.0.0.0:2222, host key under the data dir).
     #[serde(default)]
     pub ssh: SshConfig,
+    /// Logging (plan M5b D1). Missing section defaults cleanly (text, info).
+    #[serde(default)]
+    pub log: LogConfig,
+    /// Prometheus metrics (plan M5b D6). Missing section defaults cleanly
+    /// (no token: `/metrics` answers 404).
+    #[serde(default)]
+    pub metrics: MetricsConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -367,6 +374,50 @@ impl Default for SshConfig {
         }
     }
 }
+
+fn default_log_format() -> String {
+    "text".into()
+}
+
+fn default_log_level() -> String {
+    "info".into()
+}
+
+/// The `[log]` section (plan M5b D1): `format` is `text` or `json`,
+/// `level` is an `EnvFilter` string. Overridable by `STARFORGE__LOG__*`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogConfig {
+    #[serde(default = "default_log_format")]
+    pub format: String,
+    #[serde(default = "default_log_level")]
+    pub level: String,
+}
+
+impl Default for LogConfig {
+    fn default() -> Self {
+        LogConfig {
+            format: default_log_format(),
+            level: default_log_level(),
+        }
+    }
+}
+
+/// The `[metrics]` section (plan M5b D6): `token` protects `/metrics`.
+/// `None` (or empty) disables the endpoint (404). Never rendered in
+/// `Debug`. Overridable by `STARFORGE__METRICS__TOKEN`.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetricsConfig {
+    #[serde(default)]
+    pub token: Option<String>,
+}
+
+impl std::fmt::Debug for MetricsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MetricsConfig")
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
 fn default_github_api_url() -> String {
     "https://api.github.com".into()
 }
@@ -604,6 +655,15 @@ impl Config {
                         .parse()
                         .map_err(|_| anyhow::anyhow!("{key} must be a non-negative count"))?;
                 }
+                "log__format" => self.log.format = value,
+                "log__level" => self.log.level = value,
+                "metrics__token" => {
+                    self.metrics.token = if value.trim().is_empty() {
+                        None
+                    } else {
+                        Some(value)
+                    };
+                }
                 _ => bail!("unknown configuration override {key}"),
             }
         }
@@ -617,6 +677,17 @@ impl Config {
         }
         if self.server.base_url.ends_with('/') {
             bail!("server.base_url must not end with '/'");
+        }
+        if !matches!(self.log.format.as_str(), "text" | "json") {
+            bail!("log.format must be \"text\" or \"json\"");
+        }
+        if self.log.level.trim().is_empty() {
+            bail!("log.level must not be empty");
+        }
+        if let Some(token) = &self.metrics.token
+            && token.trim().is_empty()
+        {
+            bail!("metrics.token must not be blank");
         }
         self.registration_settings()?;
         self.mailer()?;
@@ -803,6 +874,8 @@ mod tests {
             limits: LimitsConfig::default(),
             oidc: OidcConfig::default(),
             ssh: SshConfig::default(),
+            log: LogConfig::default(),
+            metrics: MetricsConfig::default(),
         }
     }
 

@@ -305,6 +305,8 @@ impl Core {
 pub const DEFAULT_PER_PAGE: i64 = 20;
 /// The most results one search page may return (plan D4).
 pub const MAX_PER_PAGE: i64 = 50;
+/// The deepest page a search may request; bounds the valid-result skip.
+pub const MAX_PAGE: i64 = 1000;
 /// Candidates fetched per index round (plan D3: up to 3x the page size).
 const CANDIDATE_FACTOR: usize = 3;
 /// Snippets per session result (plan D4).
@@ -383,6 +385,11 @@ fn parse_page(query: &SearchQuery) -> CoreResult<(i64, i64)> {
     let page = query.page.unwrap_or(1);
     if page < 1 {
         return Err(CoreError::Invalid("page must be at least 1".into()));
+    }
+    if page > MAX_PAGE {
+        return Err(CoreError::Invalid(format!(
+            "page must be at most {MAX_PAGE}"
+        )));
     }
     let per_page = query.per_page.unwrap_or(DEFAULT_PER_PAGE);
     if !(1..=MAX_PER_PAGE).contains(&per_page) {
@@ -679,8 +686,11 @@ impl Core {
             to,
         };
         let idx = self.search_index();
-        let chunk = per_page as usize * CANDIDATE_FACTOR;
-        let mut offset = ((page - 1) * per_page) as usize;
+        let want = per_page as usize;
+        let skip = ((page - 1) * per_page) as usize;
+        let chunk = want * CANDIDATE_FACTOR;
+        let mut offset = 0usize;
+        let mut valid_seen = 0usize;
         let mut items: Vec<TrailResult> = Vec::new();
         let mut has_more = false;
         'fill: loop {
@@ -691,12 +701,15 @@ impl Core {
             for hit in hits {
                 offset += 1;
                 if let Some(result) = self.recheck_trail(viewer, &hit, &query.q).await? {
-                    items.push(result);
-                    if items.len() > per_page as usize {
-                        has_more = true;
-                        items.truncate(per_page as usize);
-                        break 'fill;
+                    if valid_seen >= skip {
+                        items.push(result);
+                        if items.len() > want {
+                            has_more = true;
+                            items.truncate(want);
+                            break 'fill;
+                        }
                     }
+                    valid_seen += 1;
                 }
             }
         }
@@ -840,6 +853,73 @@ impl Core {
             page,
             per_page,
             has_more,
+        })
+    }
+}
+
+/// One code search result (plan D6): the branch searched, the commit it
+/// resolved to, and the matches there. An empty repository answers with
+/// an empty `commit` and no matches.
+#[derive(Debug, Clone)]
+pub struct CodeSearchResult {
+    pub ref_name: String,
+    pub commit: String,
+    pub matches: Vec<starforged_git::grep::GrepMatch>,
+    pub truncated: bool,
+}
+
+impl Core {
+    /// Code search (spec §10.5, plan S4): a fixed-string `git grep` over
+    /// the default branch's tip commit only. Repository read access is
+    /// required — a repository the viewer cannot read is `NotFound` — and
+    /// archived repositories remain searchable (only pushes refuse them).
+    /// An empty query, or one longer than the git layer's cap, is
+    /// [`CoreError::Invalid`]; an empty repository (no branches) yields an
+    /// empty result, never an error.
+    pub async fn code_search(
+        &self,
+        viewer: Option<&User>,
+        owner: &str,
+        repo: &str,
+        query: &str,
+        case_insensitive: bool,
+    ) -> CoreResult<CodeSearchResult> {
+        let max_chars = starforged_git::grep::MAX_QUERY_CHARS;
+        if query.is_empty() || query.chars().count() > max_chars {
+            return Err(CoreError::Invalid(format!(
+                "query must be 1..={max_chars} characters"
+            )));
+        }
+        let access = self.repo_for(viewer, owner, repo).await?;
+        let branches = self.branches(&access).await?;
+        let ref_name = if branches.contains(&access.repo.default_branch) {
+            Some(access.repo.default_branch.clone())
+        } else {
+            branches.into_iter().next()
+        };
+        let Some(ref_name) = ref_name else {
+            return Ok(CodeSearchResult {
+                ref_name: access.repo.default_branch.clone(),
+                commit: String::new(),
+                matches: Vec::new(),
+                truncated: false,
+            });
+        };
+        let resolved = self.resolve(&access, &ref_name).await?;
+        let repo_dir = self.repo_path(access.repo.id);
+        let result = starforged_git::grep::grep(
+            &repo_dir,
+            &resolved.commit_id,
+            query,
+            case_insensitive,
+            &starforged_git::grep::GrepLimits::default(),
+        )
+        .await?;
+        Ok(CodeSearchResult {
+            ref_name,
+            commit: result.commit,
+            matches: result.matches,
+            truncated: result.truncated,
         })
     }
 }

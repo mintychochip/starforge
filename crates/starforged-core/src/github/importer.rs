@@ -32,18 +32,24 @@
 //! time (capped at 1 h). Other errors count toward the 5-failure cap
 //! (`github_imports.failures` mirrors the job retry ladder); at the cap the
 //! import is `failed`, the scrubbed error is stored, and the sealed token
-//! is deleted — as it is on completion.
+//! is deleted — as it is on completion. Each object's writes (row, labels,
+//! assignees / thread + first comment, and its count) land in ONE db
+//! transaction, so a crash cannot leave a partial object; the revision
+//! post-writes re-run on resume when revision 1 already exists. Only a
+//! `refs/pull/<n>/head` that `ls-remote` proves absent takes the
+//! unfetchable-head path (D3); a fetch failure is fatal and retries.
 
 use std::collections::HashSet;
 
 use starforged_db::changes as db_changes;
 use starforged_db::github_imports as db_imports;
 use starforged_db::now;
+use starforged_db::repos as db_repos;
 use starforged_db::trails as db_trails;
 use starforged_db::users as db_users;
 use starforged_git::diff as git_diff;
 use starforged_git::read as git_read;
-use starforged_git::remote::{self, RemoteCreds};
+use starforged_git::remote::{self, PinnedRemote, RemoteCreds};
 use starforged_git::write as git_write;
 
 use super::{GhIssue, GhLabel, GhPull, GhUser, GithubClient, GithubError};
@@ -85,16 +91,16 @@ struct Cursor {
 
 /// The per-import context every pagination helper shares: the repository,
 /// the import record, the GitHub coordinates, the client, and (once
-/// resolved) the pull-head remote. Passed by reference so the call chains
-/// stay short.
-struct ImportCtx<'a> {
+/// resolved from the repository metadata) the pull-head remote. Built once
+/// per run and passed by reference so the call chains stay short.
+struct ImportCtx {
     repo_id: i64,
-    row: &'a db_imports::GithubImportRow,
-    gh_owner: &'a str,
-    gh_repo: &'a str,
-    client: &'a GithubClient,
-    pinned: Option<&'a starforged_git::remote::PinnedRemote>,
-    creds: Option<&'a RemoteCreds>,
+    row: db_imports::GithubImportRow,
+    gh_owner: String,
+    gh_repo: String,
+    client: GithubClient,
+    pinned: Option<PinnedRemote>,
+    creds: Option<RemoteCreds>,
 }
 
 /// One GitHub issue or pull request as `import_trail` sees it (its API
@@ -230,18 +236,19 @@ impl Core {
                 .map(str::to_owned)
                 .collect(),
         };
-        let startup_ctx = ImportCtx {
+        let mut ctx = ImportCtx {
             repo_id,
-            row: &row,
-            gh_owner: &gh_owner,
-            gh_repo: &gh_repo,
-            client: &client,
+            row: row.clone(),
+            gh_owner,
+            gh_repo,
+            client,
             pinned: None,
             creds: None,
         };
-        let outcome = self.import_all(&startup_ctx, &token, &mut cursor).await;
+        let outcome = self.import_all(&mut ctx, &token, &mut cursor).await;
         match outcome {
             Ok(()) => {
+                self.save_cursor(&row, &cursor).await?;
                 db_imports::set_state(self.db(), row.id, "completed").await?;
                 db_imports::set_finished(self.db(), row.id, now()).await?;
                 db_imports::clear_token(self.db(), row.id).await?;
@@ -251,8 +258,8 @@ impl Core {
                 self.audit(
                     None,
                     "repo.github_import_finished",
-                    &format!("repo:{}", done.source),
-                    &counts_detail(&done),
+                    &self.repo_target(repo_id).await,
+                    &format!("slug={} {}", done.source, counts_detail(&done)),
                 )
                 .await?;
                 Ok(())
@@ -265,20 +272,33 @@ impl Core {
                     .await?;
                 Ok(())
             }
-            Err(Fail::Fatal(message)) => self.fail_import(repo_id, &row, message).await,
+            Err(Fail::Fatal(message)) => self.fail_import_at(repo_id, &row, &cursor, message).await,
         }
     }
 
-    /// Records one fatal failure: increments the failure count, and at the
-    /// cap marks the import `failed`, stores the scrubbed error, and deletes
-    /// the sealed token. Below the cap the error propagates so the job
-    /// retry ladder re-enqueues the run.
+    /// Records one fatal failure: persists the cursor (so progress and the
+    /// dropped-assignee summary survive), then increments the failure
+    /// count. At the cap the import is `failed`, the scrubbed error is
+    /// stored, and the sealed token is deleted; below the cap the error
+    /// propagates so the job retry ladder re-enqueues the run.
     async fn fail_import(
         &self,
         repo_id: i64,
         row: &db_imports::GithubImportRow,
         message: String,
     ) -> CoreResult<()> {
+        self.fail_import_at(repo_id, row, &stale_cursor(row), message)
+            .await
+    }
+
+    async fn fail_import_at(
+        &self,
+        repo_id: i64,
+        row: &db_imports::GithubImportRow,
+        cursor: &Cursor,
+        message: String,
+    ) -> CoreResult<()> {
+        self.save_cursor(row, cursor).await?;
         let failures = row.failures + 1;
         db_imports::set_error(self.db(), row.id, Some(&message), failures).await?;
         if failures >= MAX_FAILURES {
@@ -288,14 +308,24 @@ impl Core {
             self.audit(
                 None,
                 "repo.github_import_finished",
-                &format!("repo:{}", row.source),
-                &format!("state=failed error={message}"),
+                &self.repo_target(repo_id).await,
+                &format!("slug={} state=failed error={message}", row.source),
             )
             .await?;
             Ok(())
         } else {
             let _ = repo_id;
             Err(CoreError::Internal(message))
+        }
+    }
+
+    /// The audit target for `repo_id`, matching the started row's
+    /// `repo:{owner}/{repo}` shape; degrades to `repo:{id}` when the
+    /// repository row is gone.
+    async fn repo_target(&self, repo_id: i64) -> String {
+        match db_repos::by_id(self.db(), repo_id).await {
+            Ok(Some(repo)) => format!("repo:{}/{}", repo.owner_handle, repo.name),
+            _ => format!("repo:{repo_id}"),
         }
     }
 
@@ -310,60 +340,52 @@ impl Core {
     }
 
     /// The whole run: repository metadata (clone_url), issues, then pulls.
-    /// `import_ctx` carries the repository, import record, GitHub
-    /// coordinates, and client (without the pull-head remote yet); this
-    /// resolves the remote and rebuilds the context with it.
+    /// `ctx` is built once (remote unset); this resolves the pull-head
+    /// remote from the repository metadata and fills it in for the rest of
+    /// the run.
     async fn import_all(
         &self,
-        import_ctx: &ImportCtx<'_>,
+        ctx: &mut ImportCtx,
         token: &str,
         cursor: &mut Cursor,
     ) -> Result<(), Fail> {
-        let repository = import_ctx
+        let repository = ctx
             .client
-            .get_repository(import_ctx.gh_owner, import_ctx.gh_repo)
+            .get_repository(&ctx.gh_owner, &ctx.gh_repo)
             .await?;
         let pinned = self
             .check_remote_url(&repository.clone_url)
             .map_err(|e| Fail::Fatal(e.to_string()))?;
-        let creds = match pinned.scheme {
+        ctx.creds = Some(match pinned.scheme {
             starforged_git::remote::RemoteScheme::Https => RemoteCreds::Basic {
                 username: "x-access-token".to_owned(),
                 password: token.to_owned(),
             },
             _ => RemoteCreds::None,
-        };
-        let ctx = ImportCtx {
-            repo_id: import_ctx.repo_id,
-            row: import_ctx.row,
-            gh_owner: import_ctx.gh_owner,
-            gh_repo: import_ctx.gh_repo,
-            client: import_ctx.client,
-            pinned: Some(&pinned),
-            creds: Some(&creds),
-        };
+        });
+        ctx.pinned = Some(pinned);
         let start_issues = cursor.kind.is_empty() || cursor.kind == "issues";
         if start_issues {
-            self.import_issues(&ctx, cursor).await?;
+            self.import_issues(ctx, cursor).await?;
             cursor.kind = "pulls".to_owned();
             cursor.page = 1;
             cursor.number = None;
         }
-        self.import_pulls(&ctx, cursor).await?;
+        self.import_pulls(ctx, cursor).await?;
         Ok(())
     }
 
-    async fn import_issues(&self, ctx: &ImportCtx<'_>, cursor: &mut Cursor) -> Result<(), Fail> {
+    async fn import_issues(&self, ctx: &ImportCtx, cursor: &mut Cursor) -> Result<(), Fail> {
         cursor.kind = "issues".to_owned();
         let mut page = cursor.page.max(1);
         loop {
             cursor.page = page;
-            self.save_cursor(ctx.row, cursor)
+            self.save_cursor(&ctx.row, cursor)
                 .await
                 .map_err(|e| Fail::Fatal(e.to_string()))?;
             let page_res = ctx
                 .client
-                .list_issues(ctx.gh_owner, ctx.gh_repo, page as u32)
+                .list_issues(&ctx.gh_owner, &ctx.gh_repo, page as u32)
                 .await?;
             for issue in &page_res.items {
                 if issue.pull_request.is_some() {
@@ -382,7 +404,7 @@ impl Core {
 
     async fn import_issue(
         &self,
-        ctx: &ImportCtx<'_>,
+        ctx: &ImportCtx,
         issue: &GhIssue,
         cursor: &mut Cursor,
     ) -> Result<(), Fail> {
@@ -408,17 +430,17 @@ impl Core {
         Ok(())
     }
 
-    async fn import_pulls(&self, ctx: &ImportCtx<'_>, cursor: &mut Cursor) -> Result<(), Fail> {
+    async fn import_pulls(&self, ctx: &ImportCtx, cursor: &mut Cursor) -> Result<(), Fail> {
         cursor.kind = "pulls".to_owned();
         let mut page = cursor.page.max(1);
         loop {
             cursor.page = page;
-            self.save_cursor(ctx.row, cursor)
+            self.save_cursor(&ctx.row, cursor)
                 .await
                 .map_err(|e| Fail::Fatal(e.to_string()))?;
             let page_res = ctx
                 .client
-                .list_pulls(ctx.gh_owner, ctx.gh_repo, page as u32)
+                .list_pulls(&ctx.gh_owner, &ctx.gh_repo, page as u32)
                 .await?;
             for pull in &page_res.items {
                 self.import_pull(ctx, pull, cursor).await?;
@@ -434,7 +456,7 @@ impl Core {
 
     async fn import_pull(
         &self,
-        ctx: &ImportCtx<'_>,
+        ctx: &ImportCtx,
         pull: &GhPull,
         cursor: &mut Cursor,
     ) -> Result<(), Fail> {
@@ -477,11 +499,17 @@ impl Core {
         let revision = match db_changes::revision_by_number(self.db(), change.id, 1).await {
             Ok(Some(revision)) => Some(revision),
             Ok(None) => {
-                self.import_revision(ctx, pull, trail.number, change.id, &trail, cursor)
+                self.import_revision(ctx, pull, trail.number, change.id, &trail)
                     .await?
             }
             Err(e) => return Err(Fail::Fatal(e.to_string())),
         };
+        // The revision post-writes re-run on resume too, so a crash
+        // between the revision insert and any of them is repaired.
+        if let Some(revision) = &revision {
+            self.apply_revision_writes(ctx.repo_id, change.id, revision, trail.number)
+                .await?;
+        }
         // The change state follows the pull state (D3), also on resume —
         // but an unfetchable head already closed it in
         // `note_unfetchable_head`, and that stands.
@@ -502,6 +530,10 @@ impl Core {
             db_changes::set_change_state(self.db(), change.id, "closed", now())
                 .await
                 .map_err(|e| Fail::Fatal(e.to_string()))?;
+        } else if revision.is_some() {
+            db_changes::set_change_state(self.db(), change.id, "open", now())
+                .await
+                .map_err(|e| Fail::Fatal(e.to_string()))?;
         }
         self.import_issue_comments(ctx, pull.number, trail.id, cursor)
             .await?;
@@ -514,25 +546,34 @@ impl Core {
         Ok(())
     }
 
-    /// Fetches the pull head and records revision 1. An unfetchable head
-    /// (D3) closes the change with a note comment and yields no revision;
-    /// the import itself does not fail.
+    /// Fetches the pull head and records revision 1. Only a ref that
+    /// `ls-remote` proves absent takes the unfetchable-head path (D3); a
+    /// fetch failure is fatal, so the retry ladder re-runs the run instead
+    /// of permanently closing the change.
     async fn import_revision(
         &self,
-        ctx: &ImportCtx<'_>,
+        ctx: &ImportCtx,
         pull: &GhPull,
         trail_number: i64,
         change_id: i64,
         trail: &db_trails::TrailRow,
-        cursor: &mut Cursor,
     ) -> Result<Option<db_changes::RevisionRow>, Fail> {
+        let _ = trail_number;
+        // The pull-head fetch and the trail ref writes mutate the
+        // repository: hold the shared lock for the duration (plan M5b O1).
+        let _repo_lock = self
+            .repo_lock_shared(ctx.repo_id)
+            .await
+            .map_err(|e| Fail::Fatal(e.to_string()))?;
         let repo_dir = self.repo_path(ctx.repo_id);
         let head_ref = format!("refs/pull/{}/head", pull.number);
         let pinned = ctx
             .pinned
+            .as_ref()
             .ok_or_else(|| Fail::Fatal("import context has no pull-head remote".into()))?;
         let creds = ctx
             .creds
+            .as_ref()
             .ok_or_else(|| Fail::Fatal("import context has no pull-head credentials".into()))?;
         let head_sha = match remote::ls_remote_ref(
             &repo_dir,
@@ -551,7 +592,7 @@ impl Core {
                 return Ok(None);
             }
         };
-        if remote::fetch_pull_head(
+        remote::fetch_pull_head(
             &repo_dir,
             pinned,
             creds,
@@ -559,12 +600,7 @@ impl Core {
             PULL_HEAD_FETCH_TIMEOUT,
         )
         .await
-        .is_err()
-        {
-            self.note_unfetchable_head(ctx, pull, trail, change_id)
-                .await?;
-            return Ok(None);
-        }
+        .map_err(|e| Fail::Fatal(remote::scrub(&e.to_string(), &pinned.url)))?;
         let (author_id, _) = self.resolve_author(&pull.user).await;
         let revision = db_changes::insert_revision(
             self.db(),
@@ -576,10 +612,24 @@ impl Core {
         )
         .await
         .map_err(|e| Fail::Fatal(e.to_string()))?;
+        Ok(Some(revision))
+    }
+
+    /// The revision post-writes: current pointer, merge-base snapshot, and
+    /// the trail refs. Each is idempotent, so they re-run on every resume
+    /// and repair a crash between the revision insert and any of them.
+    async fn apply_revision_writes(
+        &self,
+        repo_id: i64,
+        change_id: i64,
+        revision: &db_changes::RevisionRow,
+        trail_number: i64,
+    ) -> Result<(), Fail> {
         db_changes::set_current_revision(self.db(), change_id, revision.id, now())
             .await
             .map_err(|e| Fail::Fatal(e.to_string()))?;
-        let merge_base = git_read::merge_base(&repo_dir, &pull.base.sha, &head_sha)
+        let repo_dir = self.repo_path(repo_id);
+        let merge_base = git_read::merge_base(&repo_dir, &revision.base_sha, &revision.head_sha)
             .ok()
             .flatten();
         db_changes::set_revision_snapshot(
@@ -591,16 +641,12 @@ impl Core {
         )
         .await
         .map_err(|e| Fail::Fatal(e.to_string()))?;
-        for name in [
-            format!("refs/trails/{trail_number}/changes/1/head"),
-            format!("refs/trails/{trail_number}/changes/1/rev/1"),
-        ] {
-            git_write::set_ref(&repo_dir, &name, &head_sha)
+        for name in revision_refs(trail_number) {
+            git_write::set_ref(&repo_dir, &name, &revision.head_sha)
                 .await
                 .map_err(|e| Fail::Fatal(e.to_string()))?;
         }
-        let _ = cursor;
-        Ok(Some(revision))
+        Ok(())
     }
 
     /// D3 unfetchable head: the change closes and a note comment records
@@ -608,7 +654,7 @@ impl Core {
     /// so the unique index keeps it to one row per pull across resumes.
     async fn note_unfetchable_head(
         &self,
-        ctx: &ImportCtx<'_>,
+        ctx: &ImportCtx,
         pull: &GhPull,
         trail: &db_trails::TrailRow,
         change_id: i64,
@@ -623,8 +669,9 @@ impl Core {
             .is_none()
         {
             let (author_id, imported_author) = self.resolve_author(&pull.user).await;
-            db_trails::insert_imported_comment(
+            db_trails::insert_imported_comment_counted(
                 self.db(),
+                ctx.row.id,
                 trail.id,
                 author_id,
                 imported_author.as_deref(),
@@ -634,24 +681,23 @@ impl Core {
                      the change is closed without a revision.",
                     pull.number
                 ),
+                false,
                 now(),
             )
             .await
             .map_err(|e| Fail::Fatal(e.to_string()))?;
-            db_imports::add_counts(self.db(), ctx.row.id, 0, 0, 1, 0, 0)
-                .await
-                .map_err(|e| Fail::Fatal(e.to_string()))?;
         }
         Ok(())
     }
 
-    /// Inserts (or reuses) the Trail for one GitHub issue or pull request,
-    /// applying labels and assignees, writing the single `trail.imported`
-    /// timeline row, and counting the object. Reuse on resume counts
-    /// nothing and writes no second timeline row.
+    /// Inserts (or reuses) the Trail for one GitHub issue or pull request.
+    /// A fresh insert is one db transaction (Trail, timeline, labels,
+    /// assignees, count). On resume the row, timeline, and count already
+    /// exist atomically; labels and assignees are re-applied idempotently
+    /// (which also re-derives the dropped-assignee summary).
     async fn import_trail(
         &self,
-        ctx: &ImportCtx<'_>,
+        ctx: &ImportCtx,
         subject: &TrailSubject<'_>,
         cursor: &mut Cursor,
     ) -> Result<db_trails::TrailRow, Fail> {
@@ -660,11 +706,19 @@ impl Core {
             .await
             .map_err(map_err)?
         {
+            self.apply_extras(ctx, existing.id, subject, cursor).await?;
             return Ok(existing);
         }
         let (author_id, imported_author) = self.resolve_author(subject.user).await;
-        let trail = db_trails::insert_imported_trail(
+        let (labels, assignees, dropped) = self.map_extras(ctx.repo_id, subject).await?;
+        for login in dropped {
+            if !cursor.dropped.contains(&login) {
+                cursor.dropped.push(login);
+            }
+        }
+        db_trails::insert_imported_trail_full(
             self.db(),
+            ctx.row.id,
             ctx.repo_id,
             subject.number,
             subject.title,
@@ -673,25 +727,60 @@ impl Core {
             author_id,
             imported_author.as_deref(),
             subject.github_id,
+            &labels,
+            &assignees,
+            subject.is_pull,
             now(),
         )
         .await
-        .map_err(map_err)?;
-        db_trails::insert_timeline(
-            self.db(),
-            ctx.repo_id,
-            Some(trail.id),
-            "trail.imported",
-            None,
-            &serde_json::json!({"number": subject.number, "github_id": subject.github_id})
-                .to_string(),
-            now(),
-        )
-        .await
-        .map_err(map_err)?;
+        .map_err(map_err)
+    }
+
+    /// Maps a subject's labels and assignees to storable values: labels
+    /// normalized (names Starforge rejects are skipped), assignees matched
+    /// to repo members — the unmappable ones come back as dropped logins
+    /// for the cursor's summary.
+    async fn map_extras(
+        &self,
+        repo_id: i64,
+        subject: &TrailSubject<'_>,
+    ) -> Result<(Vec<String>, Vec<i64>, Vec<String>), Fail> {
+        let mut labels = Vec::new();
         for label in subject.labels {
             if let Ok(name) = crate::trails::normalize_label(&label.name) {
-                db_trails::add_label(self.db(), trail.id, &name)
+                labels.push(name);
+            }
+        }
+        let mut assignees = Vec::new();
+        let mut dropped = Vec::new();
+        for assignee in subject.assignees {
+            if let (Some(user_id), _) = self.resolve_author(&Some(assignee.clone())).await
+                && self
+                    .is_repo_member(repo_id, user_id)
+                    .await
+                    .map_err(|e| Fail::Fatal(e.to_string()))?
+            {
+                assignees.push(user_id);
+            } else {
+                dropped.push(assignee.login.clone());
+            }
+        }
+        Ok((labels, assignees, dropped))
+    }
+
+    /// Re-applies labels/assignees on a resumed Trail (both inserts are
+    /// idempotent) and records the dropped-assignee summary.
+    async fn apply_extras(
+        &self,
+        ctx: &ImportCtx,
+        trail_id: i64,
+        subject: &TrailSubject<'_>,
+        cursor: &mut Cursor,
+    ) -> Result<(), Fail> {
+        let map_err = |e: starforged_db::DbError| Fail::Fatal(e.to_string());
+        for label in subject.labels {
+            if let Ok(name) = crate::trails::normalize_label(&label.name) {
+                db_trails::add_label(self.db(), trail_id, &name)
                     .await
                     .map_err(map_err)?;
             }
@@ -704,7 +793,7 @@ impl Core {
                         .await
                         .map_err(|e| Fail::Fatal(e.to_string()))? =>
                 {
-                    db_trails::add_assignee(self.db(), trail.id, user_id)
+                    db_trails::add_assignee(self.db(), trail_id, user_id)
                         .await
                         .map_err(map_err)?;
                 }
@@ -715,23 +804,12 @@ impl Core {
                 }
             }
         }
-        db_imports::add_counts(
-            self.db(),
-            ctx.row.id,
-            i64::from(!subject.is_pull),
-            i64::from(subject.is_pull),
-            0,
-            0,
-            0,
-        )
-        .await
-        .map_err(map_err)?;
-        Ok(trail)
+        Ok(())
     }
 
     async fn import_issue_comments(
         &self,
-        ctx: &ImportCtx<'_>,
+        ctx: &ImportCtx,
         number: i64,
         trail_id: i64,
         cursor: &mut Cursor,
@@ -741,7 +819,7 @@ impl Core {
         loop {
             let page_res = ctx
                 .client
-                .list_issue_comments(ctx.gh_owner, ctx.gh_repo, number, page)
+                .list_issue_comments(&ctx.gh_owner, &ctx.gh_repo, number, page)
                 .await?;
             for comment in &page_res.items {
                 if db_trails::comment_by_github_id(self.db(), comment.id)
@@ -752,20 +830,19 @@ impl Core {
                     continue;
                 }
                 let (author_id, imported_author) = self.resolve_author(&comment.user).await;
-                db_trails::insert_imported_comment(
+                db_trails::insert_imported_comment_counted(
                     self.db(),
+                    ctx.row.id,
                     trail_id,
                     author_id,
                     imported_author.as_deref(),
                     comment.id,
                     comment.body.as_deref().unwrap_or(""),
+                    false,
                     now(),
                 )
                 .await
                 .map_err(map_err)?;
-                db_imports::add_counts(self.db(), ctx.row.id, 0, 0, 1, 0, 0)
-                    .await
-                    .map_err(map_err)?;
             }
             let _ = cursor;
             if page_res.next.is_none() {
@@ -780,7 +857,7 @@ impl Core {
     /// mapped verdict; `PENDING` reviews are skipped.
     async fn import_reviews(
         &self,
-        ctx: &ImportCtx<'_>,
+        ctx: &ImportCtx,
         number: i64,
         change_id: i64,
         revision_id: i64,
@@ -791,7 +868,7 @@ impl Core {
         loop {
             let page_res = ctx
                 .client
-                .list_reviews(ctx.gh_owner, ctx.gh_repo, number, page)
+                .list_reviews(&ctx.gh_owner, &ctx.gh_repo, number, page)
                 .await?;
             for review in &page_res.items {
                 let verdict = match review.state.as_str() {
@@ -808,8 +885,9 @@ impl Core {
                     continue;
                 }
                 let (author_id, imported_author) = self.resolve_author(&review.user).await;
-                db_changes::insert_imported_review(
+                db_changes::insert_imported_review_counted(
                     self.db(),
+                    ctx.row.id,
                     change_id,
                     revision_id,
                     author_id,
@@ -821,9 +899,6 @@ impl Core {
                 )
                 .await
                 .map_err(map_err)?;
-                db_imports::add_counts(self.db(), ctx.row.id, 0, 0, 0, 1, 0)
-                    .await
-                    .map_err(map_err)?;
             }
             let _ = cursor;
             if page_res.next.is_none() {
@@ -840,7 +915,7 @@ impl Core {
     /// parent's thread. Anything else becomes a quoted Trail comment.
     async fn import_review_comments(
         &self,
-        ctx: &ImportCtx<'_>,
+        ctx: &ImportCtx,
         number: i64,
         change_id: i64,
         revision_id: i64,
@@ -853,7 +928,7 @@ impl Core {
         loop {
             let page_res = ctx
                 .client
-                .list_review_comments(ctx.gh_owner, ctx.gh_repo, number, page)
+                .list_review_comments(&ctx.gh_owner, &ctx.gh_repo, number, page)
                 .await?;
             for comment in &page_res.items {
                 if db_changes::thread_comment_by_github_id(self.db(), comment.id)
@@ -898,7 +973,7 @@ impl Core {
                     // A reply threads under its parent when the parent is
                     // already imported; comments arrive in id order, so the
                     // parent precedes the reply.
-                    let thread_id = match comment.in_reply_to_id {
+                    let parent_thread = match comment.in_reply_to_id {
                         Some(parent_id) => {
                             db_changes::thread_comment_by_github_id(self.db(), parent_id)
                                 .await
@@ -906,24 +981,6 @@ impl Core {
                                 .map(|parent| parent.thread_id)
                         }
                         None => None,
-                    };
-                    let thread_id = match thread_id {
-                        Some(thread_id) => thread_id,
-                        None => {
-                            db_changes::insert_thread(
-                                self.db(),
-                                change_id,
-                                revision_id,
-                                &path,
-                                side,
-                                line,
-                                line,
-                                now(),
-                            )
-                            .await
-                            .map_err(map_err)?
-                            .id
-                        }
                     };
                     let review_id = match comment.pull_request_review_id {
                         Some(github_review_id) => {
@@ -934,18 +991,42 @@ impl Core {
                         }
                         None => None,
                     };
-                    db_changes::insert_imported_thread_comment(
-                        self.db(),
-                        thread_id,
-                        review_id,
-                        author_id,
-                        imported_author.as_deref(),
-                        comment.id,
-                        body,
-                        now(),
-                    )
-                    .await
-                    .map_err(map_err)?;
+                    match parent_thread {
+                        Some(thread_id) => {
+                            db_changes::insert_imported_thread_comment_counted(
+                                self.db(),
+                                ctx.row.id,
+                                thread_id,
+                                review_id,
+                                author_id,
+                                imported_author.as_deref(),
+                                comment.id,
+                                body,
+                                now(),
+                            )
+                            .await
+                            .map_err(map_err)?;
+                        }
+                        None => {
+                            db_changes::insert_thread_with_imported_comment(
+                                self.db(),
+                                ctx.row.id,
+                                change_id,
+                                revision_id,
+                                &path,
+                                side,
+                                line,
+                                review_id,
+                                author_id,
+                                imported_author.as_deref(),
+                                comment.id,
+                                body,
+                                now(),
+                            )
+                            .await
+                            .map_err(map_err)?;
+                        }
+                    }
                 } else {
                     let quoted = match (comment.path.as_deref(), line) {
                         (Some(p), Some(l)) => format!(
@@ -954,21 +1035,20 @@ impl Core {
                         ),
                         _ => body.to_owned(),
                     };
-                    db_trails::insert_imported_comment(
+                    db_trails::insert_imported_comment_counted(
                         self.db(),
+                        ctx.row.id,
                         trail.id,
                         author_id,
                         imported_author.as_deref(),
                         comment.id,
                         &quoted,
+                        true,
                         now(),
                     )
                     .await
                     .map_err(map_err)?;
                 }
-                db_imports::add_counts(self.db(), ctx.row.id, 0, 0, 0, 0, 1)
-                    .await
-                    .map_err(map_err)?;
             }
             let _ = cursor;
             if page_res.next.is_none() {
@@ -1048,6 +1128,30 @@ impl Core {
         }
         (None, Some(user.login.clone()))
     }
+}
+
+/// The cursor as persisted on the import row, for failures before the run
+/// could build its own (the client construction failure).
+fn stale_cursor(row: &db_imports::GithubImportRow) -> Cursor {
+    Cursor {
+        kind: row.cursor_kind.clone(),
+        page: row.cursor_page.max(1),
+        number: row.cursor_number,
+        dropped: row
+            .dropped_assignees
+            .split(';')
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect(),
+    }
+}
+
+/// The trail refs revision 1 points at: the change head and the revision.
+fn revision_refs(trail_number: i64) -> [String; 2] {
+    [
+        format!("refs/trails/{trail_number}/changes/1/head"),
+        format!("refs/trails/{trail_number}/changes/1/rev/1"),
+    ]
 }
 
 /// The `trail.imported` audit detail: the import counts.

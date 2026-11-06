@@ -538,6 +538,7 @@ fn parse_next_link(link: Option<&reqwest::header::HeaderValue>, base: &url::Url)
 }
 
 pub mod importer;
+pub mod status;
 
 #[cfg(test)]
 mod tests;

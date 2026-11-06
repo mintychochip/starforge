@@ -52,6 +52,15 @@ enum Command {
         #[arg(long)]
         fix: bool,
     },
+    /// Write a consistent snapshot of the data directory. The target must
+    /// be empty or absent. Contains `secret_key` (see `backup --help`).
+    Backup {
+        /// The (empty or absent) directory to write the snapshot into.
+        dir: PathBuf,
+        /// Omit the config copy (which contains `secret_key`).
+        #[arg(long)]
+        no_config: bool,
+    },
     /// Entry points for git hooks in hosted repositories.
     #[command(hide = true)]
     Hook {
@@ -162,10 +171,9 @@ async fn main() -> anyhow::Result<()> {
             println!("database schema is up to date");
         }
         Command::Serve => {
-            let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-            tracing_subscriber::fmt().with_env_filter(filter).init();
-            starforged::serve::run(Config::load(&cli.config)?).await?;
+            let config = Config::load(&cli.config)?;
+            init_tracing(&config);
+            starforged::serve::run(config).await?;
         }
         Command::Admin { command } => {
             let config = Config::load(&cli.config)?;
@@ -220,6 +228,9 @@ async fn main() -> anyhow::Result<()> {
         Command::Doctor { fix } => {
             std::process::exit(starforged::doctor::run(&cli.config, fix).await?);
         }
+        Command::Backup { dir, no_config } => {
+            starforged::backup::run(&cli.config, &dir, !no_config).await?;
+        }
         Command::Hook {
             hook: HookCommand::PreReceive,
         } => {
@@ -230,4 +241,18 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Initializes tracing from the config (plan M5b D1): `log.format` picks
+/// text or JSON output, `log.level` is the `EnvFilter` string. A
+/// `RUST_LOG` environment override still wins, matching the old behavior.
+fn init_tracing(config: &Config) {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(config.log.level.clone()));
+    let builder = tracing_subscriber::fmt().with_env_filter(filter);
+    if config.log.format == "json" {
+        builder.json().init();
+    } else {
+        builder.init();
+    }
 }

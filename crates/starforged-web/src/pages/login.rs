@@ -327,11 +327,11 @@ pub async fn oidc_callback(
         .unwrap_or_default();
     let jar = jar.remove(removal(OIDC_COOKIE));
     if challenge.is_empty() {
-        return Ok(oidc_failed(None).into_response());
+        return Ok((jar, oidc_failed(None)).into_response());
     }
     let (code, callback_state) = match (query.code, query.state, query.error) {
         (Some(code), Some(callback_state), None) => (code, callback_state),
-        _ => return Ok(oidc_failed(None).into_response()),
+        _ => return Ok((jar, oidc_failed(None)).into_response()),
     };
     let (claims, intent_user) = match state
         .core
@@ -339,7 +339,7 @@ pub async fn oidc_callback(
         .await
     {
         Ok(done) => done,
-        Err(_) => return Ok(oidc_failed(None).into_response()),
+        Err(_) => return Ok((jar, oidc_failed(None)).into_response()),
     };
     let user_agent = headers
         .get(header::USER_AGENT)
@@ -347,10 +347,10 @@ pub async fn oidc_callback(
         .unwrap_or("");
     if let Some(user_id) = intent_user {
         let Some(session) = session else {
-            return Ok(oidc_failed(None).into_response());
+            return Ok((jar, oidc_failed(None)).into_response());
         };
         if session.user.id != user_id {
-            return Ok(oidc_failed(None).into_response());
+            return Ok((jar, oidc_failed(None)).into_response());
         }
         match state
             .core
@@ -358,7 +358,7 @@ pub async fn oidc_callback(
             .await
         {
             Ok(()) => Ok((jar, Redirect::to("/settings/identities")).into_response()),
-            Err(_) => Ok(oidc_failed(Some(NavUser::from_session(&session))).into_response()),
+            Err(_) => Ok((jar, oidc_failed(Some(NavUser::from_session(&session)))).into_response()),
         }
     } else {
         match state
@@ -393,15 +393,18 @@ pub async fn oidc_callback(
                 ),
             )
                 .into_response()),
-            Err(CoreError::Unauthenticated) => Ok(oidc_failed(None).into_response()),
+            Err(CoreError::Unauthenticated) => Ok((jar, oidc_failed(None)).into_response()),
             Err(CoreError::RateLimited) => Ok((
-                StatusCode::TOO_MANY_REQUESTS,
-                crate::pages::message::MessagePage::new(
-                    None,
-                    "Too many attempts",
-                    "Too many login attempts. Please try again later.",
-                )
-                .with_link("/login", "Back to sign in"),
+                jar,
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    crate::pages::message::MessagePage::new(
+                        None,
+                        "Too many attempts",
+                        "Too many login attempts. Please try again later.",
+                    )
+                    .with_link("/login", "Back to sign in"),
+                ),
             )
                 .into_response()),
             Err(other) => Err(other.into()),

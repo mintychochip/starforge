@@ -215,6 +215,9 @@ impl Core {
             }
         };
         let path = self.repo_path(id);
+        // Initializing the bare directory writes inside it: hold the
+        // shared lock so a backup never copies a half-created tree.
+        let _repo_lock = self.repo_lock_shared(id).await?;
         if let Err(err) = self
             .initialize(
                 actor,
@@ -567,6 +570,9 @@ impl Core {
                 "there is no branch named '{branch}'"
             )));
         }
+        // `HEAD` is written inside the repository: hold the shared lock
+        // for the duration (plan M5b O1).
+        let _repo_lock = self.repo_lock_shared(access.repo.id).await?;
         starforged_git::write::set_head(&self.repo_path(access.repo.id), branch).await?;
         db_repos::set_default_branch(self.db(), access.repo.id, branch).await?;
         self.audit(
@@ -904,6 +910,10 @@ impl Core {
         if !still_deleted {
             return Ok(());
         }
+        // Purge moves and deletes the repository directory: hold the
+        // exclusive lock so no writer runs against it and a backup never
+        // copies a half-removed tree (plan M5b O1).
+        let _repo_lock = self.repo_lock_exclusive(repo.id).await?;
         let path = self.repo_path(repo.id);
         let tmp = &self.config().tmp_dir;
         let parked = tmp.join(format!("purge-{}.git", repo.id));

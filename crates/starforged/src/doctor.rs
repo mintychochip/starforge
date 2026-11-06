@@ -21,20 +21,27 @@
 //!    carries the expected hooks.
 //! 6. `stray repository directories` — no `repos/<shard>/<id>.git`
 //!    directory without a database row (WARN).
-//! 7. `orphan blobs` — no blob file without a database row (WARN), and no
+//! 7. `repository locks` — no repository `starforge.lock` and no blob-GC
+//!    lock is held by another process (WARN; a running writer or backup
+//!    is not a fault).
+//! 8. `orphan blobs` — no blob file without a database row (WARN), and no
 //!    zero-ref blob row older than the GC window (WARN).
-//! 8. `search index` — the index opens and its document counts are within
+//! 9. `search index` — the index opens and its document counts are within
 //!    1% of the database counts (WARN, suggesting `index rebuild`).
-//! 9. `migrations` — the applied schema is at the latest known version.
+//! 10. `migrations` — the applied schema is at the latest known version.
 //!
 //! `--fix` repairs only two things, both filesystem-side: it reinstalls
 //! missing or wrong repository hooks, and it removes orphaned blob files
 //! older than one hour. It never deletes database rows. When a fix fully
 //! repairs a check, that check reports `[OK]` in the same run.
 //!
-//! Doctor runs offline: when a server holds the search-index writer, the
-//! index check reports `[OK]` with a note that verification was skipped
-//! rather than counting a throwaway index against the database.
+//! Doctor never mutates the search index: the index check opens it
+//! read-only, so a missing or corrupt index reports as a warning
+//! without being recreated.
+//!
+//! Doctor never follows symlinks when walking the blob store, so a
+//! symlinked shard cannot redirect `--fix` deletes outside the data
+//! directory.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -54,8 +61,9 @@ use crate::config::Config;
 const MIN_GIT_VERSION: (u64, u64) = (2, 38);
 /// Zero-ref blob rows older than this are reported (the GC sweep in the
 /// jobs worker deletes zero-ref rows immediately today; the window is the
-/// grace period doctor tolerates before a row reads as stale). O1 will
-/// land the blob-GC lock; until then this window is doctor's own policy.
+/// grace period doctor tolerates before a row reads as stale). The GC sweep
+/// holds the blob-GC lock exclusive (plan M5b O1), so a row this old is
+/// stale even with a backup paused deletion in between.
 pub const BLOB_GC_WINDOW_SECS: i64 = 24 * 60 * 60;
 /// `--fix` only removes orphaned blob files older than this, so a file
 /// that a concurrent ingest just wrote is never deleted mid-write.
@@ -132,6 +140,7 @@ pub async fn run(config_path: &Path, fix: bool) -> anyhow::Result<i32> {
     )
     .await;
     check_stray_repos(&mut report, &config, db.as_ref(), db_error.as_deref()).await;
+    check_repository_locks(&mut report, &config);
     check_orphan_blobs(&mut report, &config, db.as_ref(), fix, db_error.as_deref()).await;
     check_search_index(&mut report, &config, db.as_ref(), db_error.as_deref()).await;
     check_migrations(&mut report, db.as_ref(), db_error.as_deref()).await;
@@ -518,6 +527,61 @@ async fn check_stray_repos(
     }
 }
 
+/// Repository locks (plan M5b O1, decisions D2): probes every
+/// repository's `starforge.lock` and the blob-GC lock with a non-blocking
+/// exclusive acquisition. A lock that is held means another process is
+/// writing (or backing up) that repository right now — a WARN, since
+/// doctor is read-only and a busy writer is not a fault.
+fn check_repository_locks(report: &mut Report, config: &Config) {
+    use starforged_core::repolock::{BlobGcLock, LockError, RepoLock};
+    let mut held: Vec<String> = Vec::new();
+    let mut probed = 0_usize;
+    let repos_dir = config.repos_dir();
+    if let Ok(shards) = std::fs::read_dir(&repos_dir) {
+        for shard in shards.flatten() {
+            let shard_path = shard.path();
+            if !shard_path.is_dir() {
+                continue;
+            }
+            if let Ok(entries) = std::fs::read_dir(&shard_path) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if !path.is_dir() {
+                        continue;
+                    }
+                    probed += 1;
+                    match RepoLock::try_exclusive(&path) {
+                        Ok(_) => {}
+                        Err(LockError::WouldBlock { .. }) => held.push(path.display().to_string()),
+                        Err(err) => held.push(format!("{} ({err})", path.display())),
+                    }
+                }
+            }
+        }
+    }
+    match BlobGcLock::try_exclusive(&config.blob_dir()) {
+        Ok(_) => {}
+        Err(LockError::WouldBlock { .. }) => held.push("the blob-GC lock".to_owned()),
+        Err(err) => held.push(format!("the blob-GC lock ({err})")),
+    }
+    if held.is_empty() {
+        report.line(
+            Status::Ok,
+            "repository locks",
+            &format!("{probed} repository lock(s) and the blob-GC lock are free"),
+        );
+    } else {
+        report.line(
+            Status::Warn,
+            "repository locks",
+            &format!(
+                "held by another process (a writer or backup is running): {}",
+                held.join(", ")
+            ),
+        );
+    }
+}
+
 /// Blob files are `<blob_dir>/<hash[0..2]>/<hash>` (spec §5.3): a file
 /// whose hash has no row is orphaned; a zero-ref row older than
 /// [`BLOB_GC_WINDOW_SECS`] is stale. Both are WARNs. `--fix` removes
@@ -553,13 +617,22 @@ async fn check_orphan_blobs(
     if let Ok(shards) = std::fs::read_dir(&blob_dir) {
         for shard in shards.flatten() {
             let shard_path = shard.path();
-            if !shard_path.is_dir() {
+            // Never follow symlinks: a symlinked shard could point
+            // outside the data directory, and `--fix` must not delete
+            // files there.
+            let Ok(meta) = std::fs::symlink_metadata(&shard_path) else {
+                continue;
+            };
+            if meta.file_type().is_symlink() || !meta.is_dir() {
                 continue;
             }
             if let Ok(entries) = std::fs::read_dir(&shard_path) {
                 for entry in entries.flatten() {
                     let path = entry.path();
-                    if !path.is_file() {
+                    let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                        continue;
+                    };
+                    if meta.file_type().is_symlink() || !meta.is_file() {
                         continue;
                     }
                     let hash = path
@@ -650,43 +723,25 @@ async fn check_search_index(
         return;
     };
     let index_dir = config.index_dir();
-    let probe = match starforged_index::SearchIndex::open_or_create_fresh(&index_dir) {
-        Ok((index, fresh)) => (index, fresh),
-        Err(starforged_index::IndexError::Locked(_)) => {
-            report.line(
-                Status::Ok,
-                "search index",
-                "in use by a running server; counts not verified",
-            );
-            return;
-        }
-        Err(err) => {
+    // Read-only probe: doctor never recreates a missing or corrupt
+    // index (and `--fix` may only repair hooks and orphan files), so a
+    // running server's writer is irrelevant here — a reader serves the
+    // committed segments either way.
+    let stats = match starforged_index::SearchIndex::stats_in_dir(&index_dir) {
+        Ok(stats) => stats,
+        Err(_) => {
             report.line(
                 Status::Warn,
                 "search index",
-                &format!("could not open the index ({err}); run `starforged index rebuild`"),
+                "the index directory is missing or corrupt; run `starforged index rebuild`",
             );
             return;
         }
     };
-    let (probe, fresh) = probe;
-    if fresh {
-        drop(probe);
-        report.line(
-            Status::Warn,
-            "search index",
-            "the index directory was missing or corrupt and has been recreated empty; run `starforged index rebuild`",
-        );
-        return;
-    }
-    let stats = probe.stats().unwrap_or(starforged_index::IndexStats {
-        trails: 0,
-        events: 0,
-    });
-    drop(probe);
-    // Count the database side through a Core opened without auto-migrate,
-    // so doctor never writes the schema it is checking. The probe is
-    // dropped first, so the Core opens the real index, not a throwaway.
+    // Count the database side through a Core opened without
+    // auto-migrate, so doctor never writes the schema it is checking.
+    // Only the database counts come from the Core; the index counts
+    // above came from the read-only probe.
     let mut doctor_config = config.clone();
     doctor_config.database.auto_migrate = false;
     let core = match open_core(&doctor_config, std::env::current_exe().unwrap_or_default()).await {

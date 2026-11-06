@@ -22,6 +22,7 @@ pub mod jobs;
 pub mod limits;
 pub mod mail;
 pub mod merge;
+pub mod metrics;
 pub mod oauth;
 pub mod oidc;
 pub mod orgs;
@@ -32,6 +33,7 @@ pub mod quota;
 pub mod read;
 pub mod registration;
 pub mod remotes;
+pub mod repolock;
 pub mod repos;
 pub mod rescan;
 pub mod scan;
@@ -195,6 +197,14 @@ struct Inner {
     oidc_cache: oidc::OidcCache,
     /// In-memory fixed-window rate-limit counters (plan M5a D1).
     limits: limits::Limiters,
+    /// Prometheus counters/histograms (plan M5b D6); gauges are computed
+    /// from the database and index at scrape time.
+    metrics: metrics::Metrics,
+    /// Unix seconds of the last job-worker heartbeat. Initialized at
+    /// construction so a fresh process reads ready; workers refresh it
+    /// every loop, and [`Core::run_due_jobs`] refreshes it too (tests run
+    /// jobs directly, without workers).
+    worker_heartbeat: std::sync::atomic::AtomicI64,
 }
 
 impl Core {
@@ -212,6 +222,8 @@ impl Core {
                 account_delete_hook: std::sync::Mutex::new(None),
                 ingest_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
                 limits: limits::Limiters::default(),
+                metrics: metrics::Metrics::new(),
+                worker_heartbeat: std::sync::atomic::AtomicI64::new(starforged_db::now()),
             }),
         }
     }
@@ -234,6 +246,33 @@ impl Core {
     /// corrupt). Startup enqueues a full `RebuildIndex` job in that case.
     pub fn search_index_was_recreated(&self) -> bool {
         self.inner.search_index_recreated
+    }
+
+    /// Prometheus counters and histograms (plan M5b D6).
+    pub fn metrics(&self) -> &metrics::Metrics {
+        &self.inner.metrics
+    }
+
+    /// Records a job-worker heartbeat at `now`.
+    pub fn record_worker_heartbeat(&self) {
+        self.inner
+            .worker_heartbeat
+            .store(starforged_db::now(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Unix seconds of the last job-worker heartbeat.
+    pub fn worker_heartbeat(&self) -> i64 {
+        self.inner
+            .worker_heartbeat
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Test hook: backdates the worker heartbeat so `/readyz` reports the
+    /// workers as stopped (stale heartbeat).
+    pub fn set_worker_heartbeat_for_test(&self, ts: i64) {
+        self.inner
+            .worker_heartbeat
+            .store(ts, std::sync::atomic::Ordering::Relaxed);
     }
 }
 

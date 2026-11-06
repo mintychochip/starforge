@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block title %}Import from GitHub · {{ head.owner }}/{{ head.name }}{% endblock %}
+{% block content %}
+{% include "repo_head.html" %}
+{% include "repo_settings_nav.html" %}
+{% if let Some(e) = error %}<p class="error">{{ e }}</p>{% endif %}
+<h2>Import from GitHub</h2>
+<p class="muted">Imports issues and pull requests (with their comments, reviews, and labels) from a GitHub repository into this empty repository, preserving their numbers. The token needs read-only access (<code>repo</code> scope for a private repository, or public-read access for a public one) and is sealed at rest, deleted when the import finishes or fails, and never shown again.</p>
+{% if let Some(imp) = import %}
+<h3>Import of {{ imp.source }}</h3>
+<p>State: <strong>{{ imp.state }}</strong></p>
+<table>
+<tr><th>Issues</th><td>{{ imp.issues_count }}</td></tr>
+<tr><th>Pull requests</th><td>{{ imp.pulls_count }}</td></tr>
+<tr><th>Comments</th><td>{{ imp.comments_count }}</td></tr>
+<tr><th>Reviews</th><td>{{ imp.reviews_count }}</td></tr>
+<tr><th>Review comments</th><td>{{ imp.review_comments_count }}</td></tr>
+</table>
+{% if !dropped.is_empty() %}
+<h4>Dropped assignees</h4>
+<p class="muted">These GitHub users could not be matched to a local repository member, so they were dropped:</p>
+<ul>{% for name in dropped %}<li>{{ name }}</li>{% endfor %}</ul>
+{% endif %}
+{% if let Some(err) = imp.error %}<p class="error">{{ err }}</p>{% endif %}
+{% endif %}
+<h3>Start an import</h3>
+<form method="post" action="/{{ head.owner }}/{{ head.name }}/settings/github-import" class="stack">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <label>GitHub repository <input name="repository" required maxlength="200" placeholder="octo/proj"></label>
+  <label>GitHub token <input name="token" type="password" required autocomplete="off"></label>
+  <button type="submit">Start import</button>
+</form>
+{% endblock %}

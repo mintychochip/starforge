@@ -183,6 +183,8 @@ fn oidc_config_validation() {
             ..Default::default()
         },
         oidc: std::mem::take(&mut oidc),
+        log: starforged::config::LogConfig::default(),
+        metrics: starforged::config::MetricsConfig::default(),
     };
     // Disabled OIDC needs nothing.
     assert!(config(OidcConfig::default()).validate().is_ok());
@@ -724,5 +726,59 @@ async fn oidc_login_outcome_no_account_without_auto_create() {
     assert!(
         matches!(outcome, OidcLoginOutcome::NoAccount),
         "{outcome:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unverified_local_email_does_not_link() {
+    let fake = FakeOidc::start_es256().await;
+    let s = oidc_server(&fake).await;
+    // The provider verified the email, but the LOCAL account's address
+    // is unverified: linking would bypass the EmailUnverified refusal.
+    let alice = s
+        .core
+        .create_user(CreateUser {
+            handle: "alice".into(),
+            email: Some("fake-user@example.com".into()),
+            email_verified: false,
+            password: Some(PASSWORD.into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let (_client, response) = browser_oidc_login(&s).await;
+    assert_eq!(response.status(), 401);
+    let body = response.text().await.unwrap();
+    assert!(body.contains("No account for this sign-in"), "{body}");
+    assert!(
+        s.core.linked_identities(alice.id).await.unwrap().is_empty(),
+        "an unverified local email must not link"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn suspended_email_match_inserts_no_identity() {
+    let fake = FakeOidc::start_es256().await;
+    let s = oidc_server(&fake).await;
+    let alice = user_with_email(&s, "alice", "fake-user@example.com").await;
+    let admin = s
+        .core
+        .create_user(CreateUser {
+            handle: "root".into(),
+            password: Some(PASSWORD.into()),
+            is_admin: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    // Suspend BEFORE any login, so the email-link path would insert.
+    s.core.suspend_user(&admin, alice.id).await.unwrap();
+
+    let (_client, response) = browser_oidc_login(&s).await;
+    assert_eq!(response.status(), 401);
+    assert!(
+        s.core.linked_identities(alice.id).await.unwrap().is_empty(),
+        "a refused suspended login must not insert an identity row"
     );
 }

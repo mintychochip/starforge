@@ -301,6 +301,22 @@ fn page_routes() -> Router<AppState> {
             post(pages::remotes::delete),
         )
         .route(
+            "/{owner}/{repo}/settings/mirrors/push",
+            post(pages::remotes::add_push),
+        )
+        .route(
+            "/{owner}/{repo}/settings/mirrors/push/{id}/sync",
+            post(pages::remotes::sync_push),
+        )
+        .route(
+            "/{owner}/{repo}/settings/mirrors/push/{id}/delete",
+            post(pages::remotes::delete_push),
+        )
+        .route(
+            "/{owner}/{repo}/settings/github-import",
+            get(pages::github_import::show).post(pages::github_import::start),
+        )
+        .route(
             "/{owner}/{repo}/settings/refs-for-access",
             post(pages::repo_settings::change_refs_for_access),
         )
@@ -381,6 +397,7 @@ fn page_routes() -> Router<AppState> {
             post(pages::repo_new::import_delete),
         )
         .route("/{owner}/{repo}", get(pages::code::repo_home))
+        .route("/{owner}/{repo}/search", get(pages::search::code_search))
         .route("/{owner}/{repo}/tree/{*rest}", get(pages::code::tree))
         .route("/{owner}/{repo}/blob/{*rest}", get(pages::code::blob))
         .route("/{owner}/{repo}/raw/{*rest}", get(pages::code::raw))
@@ -525,6 +542,7 @@ fn page_routes() -> Router<AppState> {
         .route("/{owner}/{repo}/tags", get(pages::refs::tags))
         .route("/static/starforge.css", get(stylesheet))
         .route("/static/highlight.css", get(highlight_stylesheet))
+        .route("/static/session-viewer.js", get(session_viewer_js))
 }
 
 /// Smart HTTP. Pushes can be arbitrarily large, so the request body limit is disabled here.
@@ -559,6 +577,16 @@ async fn highlight_stylesheet() -> impl IntoResponse {
             (header::CACHE_CONTROL, "public, max-age=3600"),
         ],
         highlight::STYLESHEET.as_str(),
+    )
+}
+
+async fn session_viewer_js() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
+            (header::CACHE_CONTROL, "public, max-age=3600"),
+        ],
+        include_str!("../static/session-viewer.js"),
     )
 }
 

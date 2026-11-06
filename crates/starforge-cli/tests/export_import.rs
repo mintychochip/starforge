@@ -258,6 +258,33 @@ async fn export_writes_full_bundle() {
 }
 
 #[tokio::test]
+async fn export_without_raw_serves_redacted_segments() {
+    // The server guards stored bytes behind the raw-storage gate, so with no
+    // segment route the bundle's segments must be the re-segmentation of the
+    // redacted `/events` stream — not stored bytes.
+    let mut routes = session_routes(ULID, b"unused");
+    routes.retain(|(_, path, _, _, _, _)| !path.contains("/segments/"));
+    let (base, _app) = start(routes).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("bundle");
+    let (_out, code) = export(&ctx_for(&base), &[ULID.to_string()], &dir).await;
+    assert_eq!(code, 0);
+    let exported = std::fs::read(
+        dir.join("o__r")
+            .join(ULID)
+            .join("segments")
+            .join("0.raw.zst"),
+    )
+    .unwrap();
+    let text = String::from_utf8(starforge_format::decompress(&exported).unwrap()).unwrap();
+    let body: Vec<Value> = text
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(body, events(), "segments carry the redacted stream");
+}
+
+#[tokio::test]
 async fn export_without_session_lists_all_readable() {
     let segment_bytes = starforge_format::compress(b"x");
     let mut routes = session_routes(ULID, &segment_bytes);
@@ -334,13 +361,6 @@ async fn import_uploads_meta_segments_complete_and_links() {
     write_bundle(&dir, ULID, &text, links());
     let (base, app) = start(vec![
         route(
-            "GET",
-            &sessions_path(&format!("/{ULID}")),
-            "",
-            404,
-            json!({"error": {"code": "not_found", "message": "not found", "details": null}}),
-        ),
-        route(
             "PUT",
             &sessions_path(&format!("/{ULID}")),
             "",
@@ -385,7 +405,6 @@ async fn import_uploads_meta_segments_complete_and_links() {
     assert_eq!(
         sequence,
         vec![
-            ("GET", sessions_path(&format!("/{ULID}")).as_str()),
             ("PUT", sessions_path(&format!("/{ULID}")).as_str()),
             (
                 "PUT",
@@ -395,7 +414,7 @@ async fn import_uploads_meta_segments_complete_and_links() {
             ("POST", sessions_path(&format!("/{ULID}/links")).as_str()),
         ]
     );
-    let meta: Value = serde_json::from_slice(&recorded[1].body).unwrap();
+    let meta: Value = serde_json::from_slice(&recorded[0].body).unwrap();
     assert_eq!(meta["id"], ULID, "ULID preserved: {meta}");
     assert_eq!(meta["format"], "starforge.session/v1");
     assert_eq!(meta["agent"]["name"], "pi");
@@ -411,11 +430,11 @@ async fn import_uploads_meta_segments_complete_and_links() {
     );
     assert_eq!(meta["usage"]["input"], 10);
     assert_eq!(
-        recorded[2].body,
+        recorded[1].body,
         starforge_format::compress(text.as_bytes()),
         "segment bytes are the re-segmented events"
     );
-    let links_body: Value = serde_json::from_slice(&recorded[4].body).unwrap();
+    let links_body: Value = serde_json::from_slice(&recorded[3].body).unwrap();
     assert_eq!(links_body["links"], links());
     assert!(
         recorded
@@ -430,11 +449,11 @@ async fn import_existing_ulid_is_skipped() {
     let dir = tmp.path().join("bundle");
     write_bundle(&dir, ULID, &events_text(), links());
     let (base, app) = start(vec![route(
-        "GET",
+        "PUT",
         &sessions_path(&format!("/{ULID}")),
         "",
         200,
-        session_meta(ULID),
+        json!({"ulid": ULID}),
     )])
     .await;
     let (out, code) = import(&ctx_for(&base), &dir).await;
@@ -444,8 +463,56 @@ async fn import_existing_ulid_is_skipped() {
         format!("{ULID}: exists, skipped\nimported 0 session(s), 1 already present")
     );
     let recorded = app.recorded.lock().unwrap();
-    assert_eq!(recorded.len(), 1, "only the exists probe");
-    assert_eq!(recorded[0].method, "GET");
+    assert_eq!(recorded.len(), 1, "only the meta PUT");
+    assert_eq!(recorded[0].method, "PUT");
+}
+
+#[tokio::test]
+async fn import_first_403_is_an_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("bundle");
+    write_bundle(&dir, ULID, &events_text(), links());
+    let (base, _app) = start(vec![route(
+        "PUT",
+        &sessions_path(&format!("/{ULID}")),
+        "",
+        403,
+        json!({"error": {"code": "forbidden", "message": "permission denied", "details": null}}),
+    )])
+    .await;
+    let (out, code) = import(&ctx_for(&base), &dir).await;
+    assert_eq!(code, 1);
+    assert!(out.contains("importing"), "out: {out}");
+}
+
+#[tokio::test]
+async fn import_403_after_successful_write_is_exists_skip() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("bundle");
+    write_bundle(&dir, ULID, &events_text(), links());
+    write_bundle(&dir, ULID2, &events_text(), links());
+    let (base, _app) = start(vec![
+        route("PUT", &sessions_path(&format!("/{ULID}")), "", 201, json!({"ulid": ULID})),
+        route("PUT", &sessions_path(&format!("/{ULID}/segments/0")), "", 200, json!({"ulid": ULID})),
+        route("POST", &sessions_path(&format!("/{ULID}/complete")), "", 200, json!({"ulid": ULID})),
+        route("POST", &sessions_path(&format!("/{ULID}/links")), "", 200, json!({"accepted": 1})),
+        route(
+            "PUT",
+            &sessions_path(&format!("/{ULID2}")),
+            "",
+            403,
+            json!({"error": {"code": "forbidden", "message": "permission denied", "details": null}}),
+        ),
+    ])
+    .await;
+    let (out, code) = import(&ctx_for(&base), &dir).await;
+    assert_eq!(code, 0, "out: {out}");
+    assert_eq!(
+        out,
+        format!(
+            "{ULID}: imported\n{ULID2}: exists, skipped\nimported 1 session(s), 1 already present"
+        )
+    );
 }
 
 #[tokio::test]

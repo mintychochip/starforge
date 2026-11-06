@@ -288,6 +288,139 @@ pub async fn insert_imported_trail(
     Ok(trail)
 }
 
+/// Inserts one imported Trail with everything it owns in a single
+/// transaction (plan Global Constraints: one transaction per imported
+/// object): the sequence advance, the Trail row, its `trail.imported`
+/// timeline row, labels, assignees, and the `github_imports` count. A crash
+/// therefore leaves either the whole object or none of it, so a resume
+/// needs no repair. `is_pull` selects which count the object feeds.
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
+pub async fn insert_imported_trail_full(
+    db: &Db,
+    import_id: i64,
+    repo_id: i64,
+    number: i64,
+    title: &str,
+    intent: &str,
+    state: &str,
+    author_id: Option<i64>,
+    imported_author: Option<&str>,
+    github_id: i64,
+    labels: &[String],
+    assignees: &[i64],
+    is_pull: bool,
+    now: i64,
+) -> DbResult<TrailRow> {
+    let mut tx = db.pool().begin().await?;
+    sqlx::query(
+        "INSERT INTO trail_sequences (repo_id, next_number) VALUES ($1, $2) \
+         ON CONFLICT (repo_id) DO UPDATE SET next_number = CASE WHEN trail_sequences.next_number < $2 THEN $2 ELSE trail_sequences.next_number END",
+    )
+    .bind(repo_id)
+    .bind(number + 1)
+    .execute(&mut *tx)
+    .await?;
+    let row = sqlx::query(
+        "INSERT INTO trails (repo_id, number, title, intent, state, ready, author_id, imported_author, github_id, created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, $5, 0, $6, $7, $8, $9, $9) \
+         RETURNING id, repo_id, number, title, intent, state, ready, author_id, imported_author, github_id, created_at, updated_at, closed_at, merged_at",
+    )
+    .bind(repo_id)
+    .bind(number)
+    .bind(title)
+    .bind(intent)
+    .bind(state)
+    .bind(author_id)
+    .bind(imported_author)
+    .bind(github_id)
+    .bind(now)
+    .fetch_one(&mut *tx)
+    .await?;
+    let trail = trail_from_row(&row)?;
+    sqlx::query(
+        "INSERT INTO timeline_events (repo_id, trail_id, kind, actor_id, payload, created_at) \
+         VALUES ($1, $2, 'trail.imported', NULL, $3, $4)",
+    )
+    .bind(repo_id)
+    .bind(trail.id)
+    .bind(format!("{{\"number\":{number},\"github_id\":{github_id}}}"))
+    .bind(now)
+    .execute(&mut *tx)
+    .await?;
+    for label in labels {
+        sqlx::query("INSERT INTO trail_labels (trail_id, name) VALUES ($1, $2)")
+            .bind(trail.id)
+            .bind(label)
+            .execute(&mut *tx)
+            .await?;
+    }
+    for user_id in assignees {
+        sqlx::query("INSERT INTO trail_assignees (trail_id, user_id) VALUES ($1, $2)")
+            .bind(trail.id)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    sqlx::query(
+        "UPDATE github_imports SET issues_count = issues_count + $1, pulls_count = pulls_count + $2, \
+         updated_at = $3 WHERE id = $4",
+    )
+    .bind(i64::from(!is_pull))
+    .bind(i64::from(is_pull))
+    .bind(now)
+    .bind(import_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(trail)
+}
+
+/// Inserts one imported Trail comment and bumps the import's comment
+/// count in the same transaction (one transaction per object).
+/// `review_comments` selects which counter the comment feeds (quoted
+/// review comments count as review comments).
+#[allow(clippy::too_many_arguments)]
+pub async fn insert_imported_comment_counted(
+    db: &Db,
+    import_id: i64,
+    trail_id: i64,
+    author_id: Option<i64>,
+    imported_author: Option<&str>,
+    github_id: i64,
+    body: &str,
+    review_comments: bool,
+    now: i64,
+) -> DbResult<TrailCommentRow> {
+    let mut tx = db.pool().begin().await?;
+    let row = sqlx::query(
+        "INSERT INTO trail_comments (trail_id, author_id, imported_author, github_id, body, created_at) \
+         VALUES ($1, $2, $3, $4, $5, $6) \
+         RETURNING id, trail_id, author_id, imported_author, github_id, body, created_at, edited_at",
+    )
+    .bind(trail_id)
+    .bind(author_id)
+    .bind(imported_author)
+    .bind(github_id)
+    .bind(body)
+    .bind(now)
+    .fetch_one(&mut *tx)
+    .await?;
+    let comment = comment_from_row(&row)?;
+    sqlx::query(
+        "UPDATE github_imports SET comments_count = comments_count + $1, \
+         review_comments_count = review_comments_count + $2, updated_at = $3 WHERE id = $4",
+    )
+    .bind(i64::from(!review_comments))
+    .bind(i64::from(review_comments))
+    .bind(now)
+    .bind(import_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(comment)
+}
+
 /// The imported Trail with this GitHub id, if any (idempotent resumption).
 pub async fn trail_by_github_id(db: &Db, github_id: i64) -> DbResult<Option<TrailRow>> {
     let row = sqlx::query(select_trail!("WHERE github_id = $1"))

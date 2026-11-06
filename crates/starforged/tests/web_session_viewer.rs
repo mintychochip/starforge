@@ -648,3 +648,68 @@ async fn visibility_rules_apply_to_search_split_and_markers() {
     assert!(html.contains("quarantine"), "uploader banner in:\n{html}");
     assert!(html.contains("#turn-0"), "uploader search in:\n{html}");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn viewer_js_module_is_served_same_origin() {
+    let s = TestServer::start().await;
+    let client = reqwest::Client::new();
+    let res = client
+        .get(s.url("/static/session-viewer.js"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let content_type = res.headers()["content-type"].to_str().unwrap();
+    assert!(
+        content_type.contains("javascript"),
+        "JS content type, got {content_type:?}"
+    );
+    let body = res.text().await.unwrap();
+    assert!(body.contains("createTreeWalker"), "highlighter in:\n{body}");
+    assert!(body.contains("split-col"), "split switch in:\n{body}");
+    assert!(
+        !body.contains("<script"),
+        "module must not emit markup:\n{body}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn search_query_longer_than_200_chars_yields_no_hits() {
+    let s = TestServer::start().await;
+    let alice = s.user("alice").await;
+    s.repo(&alice, "proj", Visibility::Private).await;
+    let token = s.token(&alice, &[Scope::SessionUpload]).await;
+    let client = reqwest::Client::new();
+    upload(
+        &s,
+        &client,
+        &token,
+        &alice,
+        "alice",
+        "proj",
+        ULID_SEARCH,
+        meta_body(ULID_SEARCH, true),
+        &[vec![event(
+            0,
+            "user_message",
+            json!({"text": "x".repeat(250)}),
+        )]],
+    )
+    .await;
+    let (alice_client, _) = s.login("alice").await;
+    let url = viewer_url(&s, "alice", "proj", ULID_SEARCH);
+    // 201 x's: a substring of the message, so only the cap yields no hits.
+    let long = "x".repeat(201);
+    assert_eq!(long.chars().count(), 201);
+    let html = get_text(&alice_client, &format!("{url}?q={long}")).await;
+    assert!(html.contains("0 hits"), "over-long query in:\n{html}");
+    assert!(
+        !html.contains("#turn-0"),
+        "over-long query must not hit:\n{html}"
+    );
+    // A 200-char query still searches and finds the message.
+    let max = "x".repeat(200);
+    assert_eq!(max.chars().count(), 200);
+    let html = get_text(&alice_client, &format!("{url}?q={max}")).await;
+    assert!(html.contains("#turn-0"), "max-length query in:\n{html}");
+}

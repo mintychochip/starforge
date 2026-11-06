@@ -53,6 +53,8 @@ pub fn run(opts: &InitOptions<'_>) -> anyhow::Result<Config> {
         oidc: crate::config::OidcConfig::default(),
         limits: crate::config::LimitsConfig::default(),
         ssh: crate::config::SshConfig::default(),
+        log: crate::config::LogConfig::default(),
+        metrics: crate::config::MetricsConfig::default(),
     };
     config.validate()?;
     // Document the blob_dir resolution rule in the generated file so operators

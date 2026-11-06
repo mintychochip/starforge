@@ -21,6 +21,10 @@ pub const VIEWER_PER_PAGE: i64 = 200;
 /// Maximum hits from one in-session search (D3): at most 200 hits.
 pub const SEARCH_MAX_HITS: usize = 200;
 
+/// Maximum query length (chars) for one in-session search (D3): longer
+/// queries yield no hits.
+pub const SEARCH_MAX_QUERY_CHARS: usize = 200;
+
 /// One in-session search hit (D3): a server-redacted event whose searched
 /// text contains the query (case-insensitive substring). `preview` is a
 /// snippet of the matched text; redaction ran before the search, so
@@ -133,6 +137,35 @@ impl Core {
             .await?;
         Ok((access, session))
     }
+
+    /// The raw-segment gate (§11.2): the stored segment blob is served only
+    /// when raw storage is enabled for the session (`raw_enabled`) AND the
+    /// viewer is the uploader or a site admin. Stored bytes are as-uploaded —
+    /// the server re-redacts on every other read path, because low-confidence
+    /// scan hits are never scrubbed out of storage — so anyone weaker only
+    /// ever sees the re-redacted rendering. Everything else answers
+    /// [`CoreError::NotFound`] (indistinguishable from an absent segment).
+    pub async fn authorize_raw_segment_read(
+        &self,
+        user: Option<&User>,
+        owner: &str,
+        name: &str,
+        ulid: &str,
+    ) -> CoreResult<(RepoAccess, SessionRow)> {
+        let (access, session) = self
+            .authorize_session_read_by_ulid(user, owner, name, ulid)
+            .await?;
+        if session.raw_enabled == 0 {
+            return Err(CoreError::NotFound);
+        }
+        let active = user.filter(|user| user.active);
+        let permitted =
+            active.is_some_and(|viewer| viewer.id == session.uploader_id || viewer.is_admin);
+        if !permitted {
+            return Err(CoreError::NotFound);
+        }
+        Ok((access, session))
+    }
 }
 /// One dashboard session row: its repository coordinates plus the fields
 /// the dashboard renders and links.
@@ -153,7 +186,7 @@ const DASHBOARD_SESSION_CANDIDATES: i64 = 100;
 const DASHBOARD_SESSIONS: usize = 10;
 /// Candidate cap for the readable session listing: export enumerates
 /// sessions through it, so a repository past the cap silently truncates.
-const READABLE_SESSION_LIST_LIMIT: i64 = 10_000;
+pub const READABLE_SESSION_LIST_LIMIT: i64 = 10_000;
 
 impl Core {
     /// The viewer's own uploads that pass the §6.4 read check for them now,
@@ -302,13 +335,15 @@ impl Core {
     /// tool inputs are never searched. At most [`SEARCH_MAX_HITS`] hits,
     /// each naming the 1-based page and `turn-<seq>` anchor it lives on.
     /// Callers authorize the session first; an empty query yields no hits.
+    /// Queries longer than [`SEARCH_MAX_QUERY_CHARS`] chars yield no hits
+    /// (before loading the stream — a bound on work per request).
     pub async fn search_session(
         &self,
         session_id: i64,
         query: &str,
     ) -> CoreResult<Vec<SessionSearchHit>> {
         let needle = query.to_lowercase();
-        if needle.trim().is_empty() {
+        if needle.trim().is_empty() || needle.chars().count() > SEARCH_MAX_QUERY_CHARS {
             return Ok(Vec::new());
         }
         let items = self.load_session_items(session_id).await?;
@@ -1375,6 +1410,11 @@ mod proptests {
         let mut out = Vec::new();
         for site_admin in [false, true] {
             for viewer in [None, Some(OWNER), Some(UPLOADER), Some(OTHER)] {
+                // A site admin is signed in by construction; the anonymous
+                // combination cannot arise and must not be counted.
+                if site_admin && viewer.is_none() {
+                    continue;
+                }
                 // Owner-and-uploader needs a separate id; use OWNER with
                 // `uploader = OWNER` below, covered by the dedicated case.
                 for is_member in [false, true] {
@@ -1442,11 +1482,6 @@ mod proptests {
             published,
             quarantined,
         } = f;
-        // A site admin is necessarily signed in; that combination cannot
-        // arise from the real call sites.
-        if site_admin && viewer_id.is_none() {
-            return true;
-        }
         let uploader = match viewer_id {
             Some(-1) => OWNER,
             _ => UPLOADER,
@@ -1486,11 +1521,13 @@ mod proptests {
     #[test]
     fn can_read_session_matches_spec_reference_exhaustively() {
         let all = facts();
-        // Exact coverage: 2 site × [4 viewers × 3 grant combos (an admin
+        // Exact coverage: non-admin [4 viewers × 3 grant combos (an admin
         // grant requires membership) + 1 owner-and-uploader viewer × 2
-        // membership values] × 3 visibilities × 2 published × 2 quarantined
-        // = 336. Pinning the count so the generator cannot silently shrink.
-        assert_eq!(all.len(), 336, "fact space shrank: {}", all.len());
+        // memberships] plus admin [3 signed viewers × 3 + 1 × 2], each
+        // × 3 visibilities × 2 published × 2 quarantined = 300, with no
+        // anonymous-site-admin combinations. Pinning the count so the
+        // generator cannot silently shrink.
+        assert_eq!(all.len(), 300, "fact space shrank: {}", all.len());
         for fact in all {
             check_one(fact);
         }
@@ -1521,6 +1558,7 @@ mod proptests {
             published in proptest::bool::ANY,
             quarantined in proptest::bool::ANY,
         ) {
+            proptest::prop_assume!(!(site_admin && viewer.is_none()));
             // An explicit admin grant exists only on top of a grant.
             let admin_grant = is_member && want_admin;
             check_one(Facts {

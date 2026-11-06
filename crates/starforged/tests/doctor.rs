@@ -147,6 +147,7 @@ async fn healthy_data_dir_exits_zero() {
         "[OK] data directory permissions:",
         "[OK] repository hooks:",
         "[OK] stray repository directories:",
+        "[OK] repository locks:",
         "[OK] orphan blobs:",
         "[OK] search index:",
         "[OK] migrations:",
@@ -285,6 +286,77 @@ async fn removed_index_warns() {
     assert!(text.contains("index rebuild"), "{text}");
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn symlinked_blob_shard_is_not_followed_by_fix() {
+    let fixture = fixture().await;
+    // An outside directory holding an old file, reachable only through a
+    // symlinked blob shard.
+    let outside = fixture._tmp.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    let victim = outside.join("ffdeadbeef");
+    std::fs::write(&victim, b"do not delete").unwrap();
+    backdate(&victim, 2 * 3600);
+    std::fs::create_dir_all(fixture.config.blob_dir()).unwrap();
+    let shard = fixture.config.blob_dir().join("ff");
+    std::os::unix::fs::symlink(&outside, &shard).unwrap();
+
+    let _out = doctor(&fixture, true);
+    assert!(
+        victim.exists(),
+        "--fix must not delete through a symlinked shard"
+    );
+    // And the plain (non-fix) run must not report it as an orphan either.
+    let out = doctor(&fixture, false);
+    let text = combined(&out);
+    assert!(text.contains("[OK] orphan blobs:"), "{text}");
+}
+
+#[tokio::test]
+async fn corrupt_index_is_not_mutated_by_doctor() {
+    let fixture = fixture().await;
+    // Replace the healthy index with garbage bytes, then snapshot the
+    // directory; doctor and doctor --fix must leave it byte-identical.
+    let index_dir = fixture.config.index_dir();
+    std::fs::remove_dir_all(&index_dir).unwrap();
+    std::fs::create_dir_all(&index_dir).unwrap();
+    std::fs::write(index_dir.join("meta.json"), b"not a real index").unwrap();
+    std::fs::write(index_dir.join("garbage.bin"), b"\x00\x01\x02").unwrap();
+
+    let snapshot = || -> Vec<(PathBuf, Vec<u8>)> {
+        let mut entries = Vec::new();
+        let mut stack = vec![index_dir.clone()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    entries.push((path.clone(), std::fs::read(&path).unwrap()));
+                }
+            }
+        }
+        entries.sort();
+        entries
+    };
+    let before = snapshot();
+
+    let out = doctor(&fixture, false);
+    let text = combined(&out);
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(text.contains("[WARN] search index:"), "{text}");
+    assert!(text.contains("index rebuild"), "{text}");
+    assert_eq!(snapshot(), before, "doctor mutated the index directory");
+
+    let out = doctor(&fixture, true);
+    assert!(out.status.code().is_some(), "doctor --fix did not run");
+    assert_eq!(
+        snapshot(),
+        before,
+        "doctor --fix mutated the index directory"
+    );
+}
+
 #[tokio::test]
 async fn old_git_fails() {
     let fixture = fixture().await;
@@ -363,4 +435,16 @@ async fn fix_reinstalls_hook_and_removes_orphan_file() {
         .await
         .unwrap();
     assert_eq!(row.as_deref(), Some(kept_hash.as_str()));
+}
+
+/// A repository lock held by another process (a writer or backup in
+/// flight) warns; doctor itself stays read-only and exits 2.
+#[tokio::test]
+async fn held_repository_lock_warns() {
+    let fixture = fixture().await;
+    let _held = starforged_core::repolock::RepoLock::exclusive(&fixture.repo_path).unwrap();
+    let out = doctor(&fixture, false);
+    let text = combined(&out);
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(text.contains("[WARN] repository locks:"), "{text}");
 }

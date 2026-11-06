@@ -170,14 +170,63 @@ pub async fn identities_for_user(db: &Db, user_id: i64) -> DbResult<Vec<Identity
     rows.iter().map(identity_from_row).collect()
 }
 
-/// Removes one identity link; `false` when it belongs to someone else or is missing.
-pub async fn delete_identity(db: &Db, id: i64, user_id: i64) -> DbResult<bool> {
-    let affected = sqlx::query("DELETE FROM user_identities WHERE id = $1 AND user_id = $2")
+/// Why an identity unlink was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnlinkIdentityError {
+    /// The identity belongs to someone else or is missing (or the user is gone).
+    NotFound,
+    /// The account has no password and this is its only identity: unlinking
+    /// would leave it with no way to sign in.
+    LastMeansOfLogin,
+}
+
+/// Removes one identity link unless it is the account's last means of
+/// sign-in (no password and no other identity). The check and the delete
+/// run in one transaction behind a parent-row lock on `users`
+/// (`display_name = display_name` is a no-op update that takes the row
+/// lock; `users` has no `updated_at`), so two concurrent unlinks cannot
+/// strand a password-less account under Postgres READ COMMITTED.
+pub async fn delete_identity_unless_last(
+    db: &Db,
+    id: i64,
+    user_id: i64,
+) -> DbResult<Result<(), UnlinkIdentityError>> {
+    let mut tx = db.pool().begin().await?;
+    sqlx::query("UPDATE users SET display_name = display_name WHERE id = $1")
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+    let password_hash: Option<Option<String>> =
+        sqlx::query_scalar("SELECT password_hash FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let Some(password_hash) = password_hash else {
+        return Ok(Err(UnlinkIdentityError::NotFound));
+    };
+    let exists: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM user_identities WHERE id = $1 AND user_id = $2")
+            .bind(id)
+            .bind(user_id)
+            .fetch_one(&mut *tx)
+            .await?;
+    if exists == 0 {
+        return Ok(Err(UnlinkIdentityError::NotFound));
+    }
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM user_identities WHERE user_id = $1")
+        .bind(user_id)
+        .fetch_one(&mut *tx)
+        .await?;
+    if password_hash.is_none() && count <= 1 {
+        return Ok(Err(UnlinkIdentityError::LastMeansOfLogin));
+    }
+    sqlx::query("DELETE FROM user_identities WHERE id = $1 AND user_id = $2")
         .bind(id)
         .bind(user_id)
-        .execute(db.pool())
+        .execute(&mut *tx)
         .await?;
-    Ok(affected.rows_affected() > 0)
+    tx.commit().await?;
+    Ok(Ok(()))
 }
 
 /// One in-progress login: a TOTP second step (kind `totp`) or, from the later

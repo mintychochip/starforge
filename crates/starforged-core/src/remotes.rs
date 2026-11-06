@@ -115,8 +115,15 @@ pub fn check_url(
         if !allow_file_urls {
             return Err(invalid("file:// remote urls are not allowed"));
         }
+        // Like the scheme branch below: the stored URL carries no
+        // password, ever. Credentials arrive only via the explicit auth
+        // fields (sealed), so userinfo in a `file://` URL is stripped
+        // before the URL is stored, echoed, or audited.
+        let parsed = url::Url::parse(url).map_err(|_| invalid("remote url does not parse"))?;
+        let mut sanitized = parsed;
+        let _ = sanitized.set_password(None);
         return Ok(PinnedRemote {
-            url: url.to_owned(),
+            url: sanitized.to_string(),
             scheme: RemoteScheme::File,
             host: String::new(),
             port: 0,
@@ -365,6 +372,58 @@ pub const IMPORT_REFSPECS: [&str; 2] = ["+refs/heads/*:refs/heads/*", "+refs/tag
 pub const PULL_MIRROR_FETCH_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// Minimum pull-mirror interval (M4b D4), in seconds.
 pub const PULL_MIRROR_MIN_INTERVAL_SECS: i64 = 300;
+/// Push timeout for one mirror push (M4b global constraints: 10 minutes).
+pub const PUSH_MIRROR_PUSH_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// Debounce after an accepted push before the push-mirror job runs (M4b D5).
+pub const PUSH_MIRROR_DEBOUNCE_SECS: i64 = 30;
+/// Backoff after a failed push-mirror run before the retry (M4b global
+/// constraints: failures are backed off, never hammered).
+pub const PUSH_MIRROR_BACKOFF_SECS: i64 = 300;
+/// Maximum push mirrors per repository (M4b D5 / D2).
+pub const PUSH_MIRROR_MAX: usize = 10;
+/// Only these refs ever leave a push mirror (M4b D5): branches and tags.
+/// `refs/trails/*` and `refs/for/*` never go out.
+pub const PUSH_MIRROR_REFSPECS: [&str; 2] =
+    ["+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"];
+
+/// The `POST …/mirror/push` body in core terms (M4b D5). Credentials travel
+/// exactly like an import's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PushMirrorInput {
+    pub url: String,
+    pub auth: ImportAuth,
+}
+
+/// What the API and pages show for one push mirror: never a secret, only
+/// `has_credentials` and, for SSH, the public key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PushMirrorView {
+    pub id: i64,
+    pub repo_id: i64,
+    pub url: String,
+    pub auth: String,
+    pub has_credentials: bool,
+    pub ssh_public_key: Option<String>,
+    pub enabled: bool,
+    pub last_attempt_at: Option<i64>,
+    pub last_success_at: Option<i64>,
+    pub last_error: String,
+}
+
+fn push_mirror_view(row: &db_remotes::RemoteRow) -> PushMirrorView {
+    PushMirrorView {
+        id: row.id,
+        repo_id: row.repo_id,
+        url: row.url.clone(),
+        auth: row.auth.clone(),
+        has_credentials: row.sealed_secret.is_some(),
+        ssh_public_key: row.ssh_public_key.clone(),
+        enabled: row.enabled != 0,
+        last_attempt_at: row.last_attempt_at,
+        last_success_at: row.last_success_at,
+        last_error: row.last_error.clone(),
+    }
+}
 
 /// The `PUT …/mirror/pull` body in core terms (M4b D4). Credentials travel
 /// exactly like an import's: HTTPS username + password/token, or SSH with a
@@ -470,7 +529,7 @@ fn pull_creds(core: &Core, row: &db_remotes::RemoteRow) -> Result<RemoteCreds, S
 }
 
 fn now_plus(secs: i64) -> i64 {
-    starforged_db::now() + secs
+    starforged_db::now().saturating_add(secs)
 }
 
 /// Credentials for an import source, as the API and web form express them.
@@ -712,6 +771,12 @@ impl Core {
     }
 
     async fn fetch_import(&self, repo_id: i64, row: &db_remotes::RemoteRow) -> Result<(), String> {
+        // The fetch writes refs inside the repository: hold the shared
+        // lock for the duration (plan M5b O1).
+        let _repo_lock = self
+            .repo_lock_shared(repo_id)
+            .await
+            .map_err(|e| e.to_string())?;
         let pinned = self
             .check_remote_url(&row.url)
             .map_err(|e| starforged_git::remote::scrub(&e.to_string(), &row.url))?;
@@ -807,9 +872,9 @@ impl Core {
                 "archived repositories cannot mirror".into(),
             ));
         }
-        if input.interval_secs < 300 {
+        if input.interval_secs < 300 || input.interval_secs > 30 * 24 * 3600 {
             return Err(CoreError::Invalid(
-                "mirror interval must be at least 300 seconds".into(),
+                "mirror interval must be between 300 and 2592000 seconds (30 days)".into(),
             ));
         }
         let prepared = self
@@ -1039,7 +1104,33 @@ impl Core {
         Ok(())
     }
 
+    /// Re-queues a sync for every enabled pull mirror and a run for every
+    /// enabled push mirror. Self-rescheduling alone has no recovery: a
+    /// worker stop between completion and reschedule, or a job exhausted
+    /// by lease expiry, would silently stop the mirror forever. Runs at
+    /// worker start and from the hourly cleanup; the per-key dedupe makes
+    /// each enqueue idempotent (a queued job is left alone, whatever its
+    /// `run_at`). Push mirrors enqueue at `now` here (not debounced):
+    /// reconciliation only fires when no run is queued at all.
+    pub async fn reconcile_mirror_schedules(&self) -> CoreResult<()> {
+        for repo_id in db_remotes::enabled_pull_repo_ids(self.db()).await? {
+            self.enqueue(&crate::jobs::Job::PullMirror { repo_id })
+                .await?;
+        }
+        for remote_id in db_remotes::enabled_push_remote_ids(self.db()).await? {
+            self.enqueue(&crate::jobs::Job::PushMirror { remote_id })
+                .await?;
+        }
+        Ok(())
+    }
+
     async fn fetch_pull(&self, repo_id: i64, row: &db_remotes::RemoteRow) -> Result<(), String> {
+        // The fetch writes refs inside the repository: hold the shared
+        // lock for the fetch and the resulting ingest (plan M5b O1).
+        let _repo_lock = self
+            .repo_lock_shared(repo_id)
+            .await
+            .map_err(|e| e.to_string())?;
         let pinned = self
             .check_remote_url(&row.url)
             .map_err(|e| starforged_git::remote::scrub(&e.to_string(), &row.url))?;
@@ -1106,6 +1197,258 @@ impl Core {
         self.ingest_branch_moves(&ingest, repo_id, None, &moves)
             .await;
         self.record_push(repo_id, None, &updates).await;
+        Ok(())
+    }
+
+    // --- Push mirrors (M4b D5). ------------------------------------------
+    //
+    // Up to 10 `push` remotes per repository. After every accepted push the
+    // post-receive scan enqueues one `PushMirror` job per enabled remote at
+    // now + 30 s, deduped per remote, so pushes inside the window coalesce
+    // into one run. The job runs `git push --prune` with the explicit
+    // branches/tags refspecs: a true mirror, where a deleted branch or tag
+    // disappears upstream too. `refs/trails/*` and `refs/for/*` never go
+    // out. Failures are recorded (scrubbed) on the remote row and retried
+    // after the backoff; a successful run does not reschedule itself — the
+    // next accepted push debounces a fresh run. A push mirror never blocks
+    // the repository's own pushes.
+
+    /// Adds one push mirror. Maintain+ only; archived repositories refuse.
+    /// The URL passes the outbound policy and credentials are sealed,
+    /// exactly like an import. The 11th mirror is refused (422).
+    pub async fn add_push_mirror(
+        &self,
+        actor: &User,
+        owner: &str,
+        name: &str,
+        input: &PushMirrorInput,
+    ) -> CoreResult<PushMirrorView> {
+        let access = self
+            .require_repo(Some(actor), owner, name, Permission::Maintain)
+            .await?;
+        if access.repo.archived_at.is_some() {
+            return Err(CoreError::Invalid(
+                "archived repositories cannot mirror".into(),
+            ));
+        }
+        let existing = db_remotes::list_by_repo(self.db(), access.repo.id)
+            .await?
+            .into_iter()
+            .filter(|row| row.role == "push")
+            .count();
+        if existing >= PUSH_MIRROR_MAX {
+            return Err(CoreError::Invalid(format!(
+                "a repository may have at most {PUSH_MIRROR_MAX} push mirrors"
+            )));
+        }
+        let prepared = self
+            .prepare_import(&ImportInput {
+                url: input.url.clone(),
+                auth: input.auth.clone(),
+            })
+            .await?;
+        let target = format!("repo:{owner}/{name}");
+        let id = db_remotes::insert(
+            self.db(),
+            &db_remotes::NewRemote {
+                repo_id: access.repo.id,
+                role: "push",
+                url: &prepared.url,
+                auth: prepared.auth,
+                username: &prepared.username,
+                sealed_secret: prepared.sealed_secret.as_deref(),
+                ssh_public_key: prepared.ssh_public_key.as_deref(),
+                created_by: actor.id,
+            },
+        )
+        .await?;
+        self.audit(Some(actor.id), "mirror.create", &target, &prepared.url)
+            .await?;
+        if prepared.sealed_secret.is_some() {
+            self.audit(
+                Some(actor.id),
+                "mirror.credentials_changed",
+                &target,
+                "push",
+            )
+            .await?;
+        }
+        self.enqueue_at(
+            &crate::jobs::Job::PushMirror { remote_id: id },
+            now_plus(PUSH_MIRROR_DEBOUNCE_SECS),
+        )
+        .await?;
+        let row = db_remotes::by_id(self.db(), id)
+            .await?
+            .ok_or(CoreError::Internal("push remote vanished".into()))?;
+        Ok(push_mirror_view(&row))
+    }
+
+    /// Every push mirror of one repository; readers may see them (404
+    /// otherwise).
+    pub async fn list_push_mirrors(
+        &self,
+        actor: Option<&User>,
+        owner: &str,
+        name: &str,
+    ) -> CoreResult<Vec<PushMirrorView>> {
+        let access = self.repo_for(actor, owner, name).await?;
+        Ok(db_remotes::list_by_repo(self.db(), access.repo.id)
+            .await?
+            .into_iter()
+            .filter(|row| row.role == "push")
+            .map(|row| push_mirror_view(&row))
+            .collect())
+    }
+
+    /// The push mirrors of one repository for the settings page (already
+    /// access-checked by the caller).
+    pub async fn push_mirrors_for(&self, repo_id: i64) -> CoreResult<Vec<PushMirrorView>> {
+        Ok(db_remotes::list_by_repo(self.db(), repo_id)
+            .await?
+            .into_iter()
+            .filter(|row| row.role == "push")
+            .map(|row| push_mirror_view(&row))
+            .collect())
+    }
+
+    /// Deletes one push mirror. Queued jobs for it become no-ops.
+    pub async fn delete_push_mirror(
+        &self,
+        actor: &User,
+        owner: &str,
+        name: &str,
+        remote_id: i64,
+    ) -> CoreResult<()> {
+        let access = self
+            .require_repo(Some(actor), owner, name, Permission::Maintain)
+            .await?;
+        let Some(row) = db_remotes::by_id(self.db(), remote_id).await? else {
+            return Err(CoreError::NotFound);
+        };
+        if row.repo_id != access.repo.id || row.role != "push" {
+            return Err(CoreError::NotFound);
+        }
+        db_remotes::delete(self.db(), row.id).await?;
+        self.audit(
+            Some(actor.id),
+            "mirror.delete",
+            &format!("repo:{owner}/{name}"),
+            &row.url,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// "Sync now" for one push mirror: queues an immediate run (deduped per
+    /// remote; a queued debounced run is expedited).
+    pub async fn sync_push_mirror(
+        &self,
+        actor: &User,
+        owner: &str,
+        name: &str,
+        remote_id: i64,
+    ) -> CoreResult<PushMirrorView> {
+        let access = self
+            .require_repo(Some(actor), owner, name, Permission::Maintain)
+            .await?;
+        let Some(row) = db_remotes::by_id(self.db(), remote_id).await? else {
+            return Err(CoreError::NotFound);
+        };
+        if row.repo_id != access.repo.id || row.role != "push" {
+            return Err(CoreError::NotFound);
+        }
+        self.enqueue_or_expedite(&crate::jobs::Job::PushMirror { remote_id })
+            .await?;
+        Ok(push_mirror_view(&row))
+    }
+
+    /// One debounced run after an accepted push: enqueue every enabled push
+    /// mirror of the repository at now + 30 s, deduped per remote. Called by
+    /// the post-receive scan; never fails the push (the caller logs and
+    /// ignores errors).
+    pub(crate) async fn enqueue_push_mirrors(&self, repo_id: i64) -> CoreResult<()> {
+        for row in db_remotes::list_by_repo(self.db(), repo_id).await? {
+            if row.role != "push" || row.enabled == 0 {
+                continue;
+            }
+            self.enqueue_at(
+                &crate::jobs::Job::PushMirror { remote_id: row.id },
+                now_plus(PUSH_MIRROR_DEBOUNCE_SECS),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// One push-mirror run: `git push --prune` with the explicit
+    /// branches/tags refspecs. Failures are recorded (scrubbed) on the
+    /// remote row and the job succeeds, so a failing target never blocks
+    /// the repository; the post-run reschedule backs it off.
+    pub(crate) async fn run_push_mirror(&self, remote_id: i64) -> CoreResult<()> {
+        let Some(row) = db_remotes::by_id(self.db(), remote_id).await? else {
+            return Ok(());
+        };
+        if row.role != "push" || row.enabled == 0 {
+            return Ok(());
+        }
+        let outcome = self.push_remote(&row).await;
+        match outcome {
+            Ok(()) => {
+                db_remotes::record_attempt(self.db(), row.id, true, "").await?;
+            }
+            Err(message) => {
+                db_remotes::record_attempt(self.db(), row.id, false, &message).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Schedules the retry after a failed run (called by the job runner once
+    /// the current row is done, so the insert never collides with the
+    /// dedupe key the running job still holds): at the backoff after a
+    /// failure. A successful run does not reschedule — the next accepted
+    /// push debounces a fresh run. A disabled or deleted mirror never
+    /// reschedules.
+    pub(crate) async fn reschedule_push_mirror(&self, remote_id: i64) -> CoreResult<()> {
+        let Some(row) = db_remotes::by_id(self.db(), remote_id).await? else {
+            return Ok(());
+        };
+        if row.role != "push" || row.enabled == 0 || row.last_error.is_empty() {
+            return Ok(());
+        }
+        self.enqueue_at(
+            &crate::jobs::Job::PushMirror { remote_id },
+            now_plus(PUSH_MIRROR_BACKOFF_SECS),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn push_remote(&self, row: &db_remotes::RemoteRow) -> Result<(), String> {
+        // A push reads every ref tip of the repository: hold the shared repo
+        // lock for the whole push so a concurrent exclusive writer (backup,
+        // purge) cannot move refs mid-push (O1).
+        let _guard = self
+            .repo_lock_shared(row.repo_id)
+            .await
+            .map_err(|e| starforged_git::remote::scrub(&e.to_string(), &row.url))?;
+        let pinned = self
+            .check_remote_url(&row.url)
+            .map_err(|e| starforged_git::remote::scrub(&e.to_string(), &row.url))?;
+        let creds =
+            pull_creds(self, row).map_err(|e| starforged_git::remote::scrub(&e, &row.url))?;
+        let repo_dir = self.repo_path(row.repo_id);
+        let refspecs: Vec<String> = PUSH_MIRROR_REFSPECS.iter().map(|s| s.to_string()).collect();
+        starforged_git::remote::push(
+            &repo_dir,
+            &pinned,
+            &creds,
+            &refspecs,
+            PUSH_MIRROR_PUSH_TIMEOUT,
+        )
+        .await
+        .map_err(|e| starforged_git::remote::scrub(&e.to_string(), &row.url))?;
         Ok(())
     }
 

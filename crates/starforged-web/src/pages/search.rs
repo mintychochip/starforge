@@ -8,10 +8,10 @@
 use crate::AppState;
 use crate::auth::MaybeUser;
 use crate::error::WebError;
-use crate::views::{NavUser, format_age, nav};
+use crate::views::{NavUser, RepoHead, content_href, format_age, nav};
 use askama::Template;
 use askama_web::WebTemplate;
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue};
 use axum::response::IntoResponse;
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
@@ -320,6 +320,123 @@ pub async fn show(
             sessions,
             prev_href,
             next_href,
+        },
+    ))
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct CodeSearchParams {
+    q: Option<String>,
+    case: Option<String>,
+}
+
+pub struct CodeMatchRow {
+    href: String,
+    path: String,
+    line: u32,
+    text: String,
+}
+
+#[derive(Template, WebTemplate)]
+#[template(path = "code_search.html")]
+pub struct CodeSearchPage {
+    nav_user: Option<NavUser>,
+    head: RepoHead,
+    q: String,
+    case: String,
+    ref_name: String,
+    commit: String,
+    matches: Vec<CodeMatchRow>,
+    truncated: bool,
+    searched: bool,
+}
+
+/// `GET /{owner}/{repo}/search?q=&case=sensitive|insensitive`: fixed-string
+/// search over the default branch, one repository at a time. A repository
+/// the viewer cannot read is 404 (through `Core::repo_for`); an empty
+/// `q` renders the form with no results; match text is askama-escaped,
+/// never `|safe`.
+pub async fn code_search(
+    State(state): State<AppState>,
+    MaybeUser(session): MaybeUser,
+    Path((owner, repo)): Path<(String, String)>,
+    Query(params): Query<CodeSearchParams>,
+) -> Result<impl IntoResponse, WebError> {
+    let case = params.case.clone().unwrap_or_default();
+    let case_insensitive = match case.as_str() {
+        "" | "sensitive" => false,
+        "insensitive" => true,
+        other => {
+            return Err(WebError::Unprocessable(format!(
+                "invalid case '{other}': want sensitive or insensitive"
+            )));
+        }
+    };
+    // `repo_for` first, so the head (and the 404 for non-readers) is
+    // decided before any grep runs.
+    let user = session.as_ref().map(|s| &s.user);
+    let access = state.core.repo_for(user, &owner, &repo).await?;
+    let head = RepoHead::new(&access, "code", None);
+    let q = params.q.clone().unwrap_or_default();
+    if q.is_empty() {
+        return Ok((
+            noindex_headers(),
+            CodeSearchPage {
+                nav_user: nav(session.as_ref()),
+                head,
+                q,
+                case,
+                ref_name: access.repo.default_branch.clone(),
+                commit: String::new(),
+                matches: Vec::new(),
+                truncated: false,
+                searched: false,
+            },
+        ));
+    }
+    let result = state
+        .core
+        .code_search(user, &owner, &repo, &q, case_insensitive)
+        .await
+        .map_err(|err| match err {
+            CoreError::Invalid(message) => WebError::Unprocessable(message),
+            other => WebError::from(other),
+        })?;
+    let matches = result
+        .matches
+        .iter()
+        .map(|m| {
+            let href = format!(
+                "{}#L{}",
+                content_href(
+                    &access.repo.owner,
+                    &access.repo.name,
+                    "blob",
+                    &result.ref_name,
+                    &m.path
+                ),
+                m.line
+            );
+            CodeMatchRow {
+                href,
+                path: m.path.clone(),
+                line: m.line,
+                text: m.text.clone(),
+            }
+        })
+        .collect();
+    Ok((
+        noindex_headers(),
+        CodeSearchPage {
+            nav_user: nav(session.as_ref()),
+            head,
+            q,
+            case,
+            ref_name: result.ref_name,
+            commit: result.commit,
+            matches,
+            truncated: result.truncated,
+            searched: true,
         },
     ))
 }

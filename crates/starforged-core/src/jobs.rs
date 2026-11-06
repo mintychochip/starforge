@@ -99,6 +99,10 @@ pub enum Job {
     /// re-enqueues itself at the mirror's interval (or the backoff floor
     /// after a failure) while the mirror stays enabled.
     PullMirror { repo_id: i64 },
+    /// One debounced push-mirror run (M4b D5). Deduplicated per remote; the
+    /// post-receive scan enqueues it at now + 30 s after every accepted
+    /// push, and a failed run re-enqueues itself after the backoff.
+    PushMirror { remote_id: i64 },
 }
 
 impl Job {
@@ -124,6 +128,7 @@ impl Job {
             Job::ImportRepo { .. } => "import_repo",
             Job::ImportGithub { .. } => "import_github",
             Job::PullMirror { .. } => "pull_mirror",
+            Job::PushMirror { .. } => "push_mirror",
         }
     }
 
@@ -148,6 +153,7 @@ impl Job {
             Job::ImportRepo { .. } => None,
             Job::ImportGithub { .. } => None,
             Job::PullMirror { .. } => None,
+            Job::PushMirror { .. } => None,
             Job::WebhookDelivery { .. } => None,
             Job::SessionWebhookOutbox { .. } => None,
         }
@@ -175,6 +181,7 @@ impl Job {
             Job::ImportRepo { repo_id } => Some(format!("import_repo:{repo_id}")),
             Job::ImportGithub { repo_id } => Some(format!("import_github:{repo_id}")),
             Job::PullMirror { repo_id } => Some(format!("pull_mirror:{repo_id}")),
+            Job::PushMirror { remote_id } => Some(format!("push_mirror:{remote_id}")),
             _ => self.recurrence().map(|_| self.kind().to_owned()),
         }
     }
@@ -238,6 +245,7 @@ impl Core {
 
     /// Runs every due job in this task and returns how many ran. `serve` uses workers; tests call this.
     pub async fn run_due_jobs(&self) -> CoreResult<usize> {
+        self.record_worker_heartbeat();
         let mut ran = 0;
         while self.run_one_job().await? {
             ran += 1;
@@ -259,6 +267,7 @@ impl Core {
                 "unreadable job payload: {err}"
             ))),
         };
+        let mut counter_outcome = "ok";
         let finished = match outcome {
             Ok(()) => {
                 jobs::complete(self.db(), row.id).await?;
@@ -271,11 +280,18 @@ impl Core {
                 } else {
                     None
                 };
+                counter_outcome = if retry_at.is_some() {
+                    "retry"
+                } else {
+                    "failed"
+                };
                 tracing::warn!(job = row.id, kind = %row.kind, attempts = row.attempts, error = %err, "job failed");
                 jobs::fail(self.db(), row.id, &err.to_string(), retry_at).await?;
                 retry_at.is_none()
             }
         };
+        self.metrics().inc_job(&row.kind, counter_outcome);
+        self.record_worker_heartbeat();
         // A recurring job schedules its next run once it is finished, whether it succeeded or gave up.
         if finished
             && let Ok(job) = &job
@@ -290,6 +306,13 @@ impl Core {
         // by the running job.
         if finished && let Ok(Job::PullMirror { repo_id }) = &job {
             self.reschedule_pull_mirror(*repo_id).await?;
+        }
+        // A push mirror only retries after a failure (the next accepted
+        // push debounces a fresh run after a success). Same post-run
+        // placement as the pull mirror so the re-enqueue never collides
+        // with the dedupe key still held by the running job.
+        if finished && let Ok(Job::PushMirror { remote_id }) = &job {
+            self.reschedule_push_mirror(*remote_id).await?;
         }
         Ok(true)
     }
@@ -321,6 +344,7 @@ impl Core {
             Job::ImportRepo { repo_id } => self.run_import(*repo_id).await,
             Job::ImportGithub { repo_id } => self.run_github_import(*repo_id).await,
             Job::PullMirror { repo_id } => self.run_pull_mirror(*repo_id).await,
+            Job::PushMirror { remote_id } => self.run_push_mirror(*remote_id).await,
             Job::WebhookDelivery {
                 webhook_id,
                 event,
@@ -352,6 +376,7 @@ impl Core {
 
     async fn hourly_cleanup(&self) -> CoreResult<()> {
         let ts = now();
+        self.reconcile_mirror_schedules().await?;
         web_sessions::delete_expired(self.db(), ts).await?;
         starforged_db::email_tokens::delete_expired(self.db(), ts).await?;
         starforged_db::invites::delete_expired_before(self.db(), ts - 30 * DAY).await?;
@@ -373,6 +398,11 @@ impl Core {
         // concurrent incref between selection and deletion loses the race for the
         // row, so its bytes survive. One bad blob warns and is skipped; cleanup
         // never fails because of the sweep.
+        // The sweep deletes blob files: hold the blob-GC lock exclusive
+        // so a running backup (shared) finishes copying every blob its
+        // snapshot references before deletion resumes (plan M5b O1).
+        let _blob_gc_lock =
+            crate::repolock::BlobGcLock::exclusive_async(&self.config().blob_dir).await?;
         for blob in db_sessions::zero_ref_blobs(self.db(), 100).await? {
             match db_sessions::delete_blob_if_unreferenced(self.db(), &blob.hash).await {
                 Ok(true) => {}
@@ -422,6 +452,13 @@ impl Core {
         let live = starforged_db::repos::by_id(self.db(), repo_id)
             .await?
             .is_some_and(|row| row.deleted_at.is_none());
+        // `git maintenance` rewrites objects inside the repository: hold
+        // the shared lock for the duration (plan M5b O1).
+        let _repo_lock = if live {
+            Some(self.repo_lock_shared(repo_id).await?)
+        } else {
+            None
+        };
         if live {
             starforged_git::maintenance::run_auto(&self.repo_path(repo_id)).await?;
         }
@@ -430,6 +467,7 @@ impl Core {
 
     async fn worker(self) {
         loop {
+            self.record_worker_heartbeat();
             match self.run_one_job().await {
                 Ok(true) => continue,
                 Ok(false) => {}
@@ -448,6 +486,7 @@ pub async fn start_workers(core: &Core, count: usize) -> CoreResult<()> {
     for job in [Job::HourlyCleanup, Job::DailyPrune, Job::PurgeDeletedRepos] {
         core.enqueue(&job).await?;
     }
+    core.reconcile_mirror_schedules().await?;
     for _ in 0..count {
         tokio::spawn(core.clone().worker());
     }

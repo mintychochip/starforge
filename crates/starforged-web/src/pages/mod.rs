@@ -8,6 +8,7 @@ pub mod collaborators;
 pub mod compare;
 pub mod dashboard;
 pub mod device;
+pub mod github_import;
 pub mod history;
 pub mod identities;
 pub mod join;

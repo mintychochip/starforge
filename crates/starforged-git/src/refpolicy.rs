@@ -1335,7 +1335,7 @@ mod proptests {
         fn parse_for_ref_agrees_with_components(name in refname()) {
             if let Some(parsed) = parse_for_ref(&name) {
                 prop_assert!(name.starts_with("refs/for/"), "{name:?}");
-                prop_assert!(valid_component(&parsed.base) || parsed.base.contains('/'));
+                prop_assert!(parsed.base.split('/').all(valid_component));
                 prop_assert!(parsed.topic.is_empty() || valid_component(&parsed.topic));
             }
         }

@@ -4,6 +4,7 @@
 pub mod blame;
 pub mod command;
 pub mod diff;
+pub mod grep;
 pub mod http;
 pub mod init;
 pub mod maintenance;

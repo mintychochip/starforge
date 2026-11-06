@@ -238,3 +238,21 @@ pub async fn set_enabled(db: &Db, id: i64, enabled: bool) -> DbResult<()> {
         .await?;
     Ok(())
 }
+
+/// Repositories with an enabled pull mirror, for the schedule reconciler.
+pub async fn enabled_pull_repo_ids(db: &Db) -> DbResult<Vec<i64>> {
+    let rows: Vec<i64> =
+        sqlx::query_scalar("SELECT repo_id FROM repo_remotes WHERE role = 'pull' AND enabled = 1")
+            .fetch_all(db.pool())
+            .await?;
+    Ok(rows)
+}
+
+/// Enabled push-mirror remote ids, for the schedule reconciler (M4b D5).
+pub async fn enabled_push_remote_ids(db: &Db) -> DbResult<Vec<i64>> {
+    let rows: Vec<i64> =
+        sqlx::query_scalar("SELECT id FROM repo_remotes WHERE role = 'push' AND enabled = 1")
+            .fetch_all(db.pool())
+            .await?;
+    Ok(rows)
+}

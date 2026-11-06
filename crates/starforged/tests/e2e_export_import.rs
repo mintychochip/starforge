@@ -162,10 +162,23 @@ async fn export_delete_import_round_trip() {
     assert_eq!(exported_meta["ulid"], ULID);
     let exported_events = std::fs::read_to_string(session_dir.join("events.jsonl")).unwrap();
     assert_eq!(exported_events.lines().count(), 3);
+    // The stored bytes sit behind the raw-storage gate (§11.2), which is off,
+    // so the bundle's segments are the re-segmentation of the server-redacted
+    // `/events` stream — the events it carries equal the exported events.
+    let exported_segment = std::fs::read(session_dir.join("segments").join("0.raw.zst")).unwrap();
+    let round_tripped: Vec<Value> =
+        String::from_utf8(starforge_format::decompress(&exported_segment).unwrap())
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+    let exported_parsed: Vec<Value> = exported_events
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
     assert_eq!(
-        std::fs::read(session_dir.join("segments").join("0.raw.zst")).unwrap(),
-        segment_bytes,
-        "exported segment must be byte-faithful"
+        round_tripped, exported_parsed,
+        "exported segments must carry the redacted events"
     );
     let exported_links: Value =
         serde_json::from_str(&std::fs::read_to_string(session_dir.join("links.json")).unwrap())
@@ -255,8 +268,12 @@ async fn export_delete_import_round_trip() {
     assert_eq!(links[0].sha, SHA);
     assert_eq!(links[0].confidence, "exact");
 
-    // Re-importing reports exists and skips.
-    let (out, code) = import(&ctx_dst, &dir).await;
+    // Re-importing reports exists and skips — with an upload-only token (no
+    // `repo:read`), proving exists derives from `put_meta` 200, not a read probe.
+    let upload_only = s.token(&alice, &[Scope::SessionUpload]).await;
+    let api_upload = ApiClient::new(&s.base, "alice/dst", &upload_only).unwrap();
+    let ctx_upload = BundleCtx::new(api_upload, &s.base, "alice/dst", &upload_only);
+    let (out, code) = import(&ctx_upload, &dir).await;
     assert_eq!(code, 0, "re-import out: {out}");
     assert_eq!(
         out,
@@ -318,4 +335,85 @@ async fn export_unreadable_session_is_a_clear_cli_error() {
         out,
         format!("error: cannot export session {ULID}: session not found or not readable")
     );
+}
+
+/// The raw segment endpoint must never hand out the stored bytes
+/// unredacted: a server-detectable secret that `/events` shows as
+/// `[redacted:…]` is still present in storage, so the raw download stays
+/// gated (`404` for anonymous readers and for the uploader alike — raw
+/// storage is never enabled in this server).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn raw_segment_download_is_gated() {
+    const SECRET: &str = "ghp_a1B2c3D4e5F6g7H8i9J0kLmNoPqRsTuVwXyZ12";
+    let s = TestServer::start().await;
+    let alice = s.user("alice").await;
+    s.repo(&alice, "open", Visibility::Public).await;
+    let token = s
+        .token(&alice, &[Scope::SessionUpload, Scope::RepoRead])
+        .await;
+    let upload = UploadClient::new(s.base.clone(), token.clone());
+    upload.put_meta("alice/open", &meta()).await.unwrap();
+    let line = format!(
+        r#"{{"v":1,"seq":0,"ts":"2026-11-04T00:00:00Z","kind":"user_message","text":"the rotated credential {SECRET} from env did not help"}}"#
+    );
+    let bytes = starforge_format::compress(format!("{line}\n").as_bytes());
+    upload
+        .put_segment("alice/open", ULID, 0, &bytes)
+        .await
+        .unwrap();
+    upload.post_complete("alice/open", ULID).await.unwrap();
+
+    // The secret is in storage verbatim (the server never scrubs stored bytes).
+    let repo = repo_id(&s, &alice, "open").await;
+    let session = db_sessions::session_by_ulid(s.core.db(), repo, ULID)
+        .await
+        .unwrap()
+        .expect("session row");
+    let stored = s
+        .core
+        .config()
+        .blob_store
+        .get_by_hash(
+            &db_sessions::segments_of(s.core.db(), session.id)
+                .await
+                .unwrap()[0]
+                .blob_hash,
+        )
+        .await
+        .unwrap();
+    assert_eq!(stored, bytes, "storage keeps the secret verbatim");
+    assert!(session.raw_enabled == 0, "raw storage is never enabled");
+
+    // The server-rendered stream redacts it…
+    let client = reqwest::Client::new();
+    let events = client
+        .get(s.url(&format!("/api/v1/repos/alice/open/sessions/{ULID}/events")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(events.status(), 200);
+    let events = events.json::<Value>().await.unwrap();
+    let text = serde_json::to_string(&events["events"]).unwrap();
+    assert!(!text.contains(SECRET), "render must redact: {text}");
+    assert!(
+        text.contains("[redacted:known-token]"),
+        "render must mark: {text}"
+    );
+
+    // …but neither the uploader nor an anonymous reader gets the raw bytes.
+    for who in [Some(&token), None] {
+        let mut req = client.get(s.url(&format!(
+            "/api/v1/repos/alice/open/sessions/{ULID}/segments/0"
+        )));
+        if let Some(t) = who {
+            req = req.bearer_auth(t);
+        }
+        let resp = req.send().await.unwrap();
+        assert_eq!(
+            resp.status(),
+            404,
+            "raw segment download must stay gated for every caller"
+        );
+    }
 }

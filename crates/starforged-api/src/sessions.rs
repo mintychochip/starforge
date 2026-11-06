@@ -111,6 +111,10 @@ pub async fn put_segment(
             .map_err(|_| ApiError::BadRequest("invalid X-Starforge-Blake3 header".into()))?
             .to_owned(),
     };
+    state
+        .core
+        .metrics()
+        .add_session_upload_bytes(body.len() as u64);
     match state
         .core
         .put_segment(&ingest, &ulid, n, &body, Some(claimed))
@@ -182,9 +186,11 @@ pub async fn post_links(
 
 /// `GET /repos/{owner}/{repo}/sessions`: the sessions the caller may read
 /// under the §6.4 rule (ULIDs of unreadable sessions stay undiscoverable),
-/// oldest first. `?quarantined=true` keeps its older meaning — the admin
-/// quarantine queue (repo `admin` only; visible-but-insufficient answers
-/// `403`, invisible repositories `404`). `?quarantined=false` answers `422`.
+/// oldest first. `truncated` is `true` when the listing hit the candidate
+/// cap. `?quarantined=true` keeps its older meaning — the admin quarantine
+/// queue (repo `admin` only; visible-but-insufficient answers `403`,
+/// invisible repositories `404`). `?quarantined=false` answers `422`
+/// (after authentication, like every other validation here).
 pub async fn list_sessions(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -201,13 +207,20 @@ pub async fn list_sessions(
             let sessions = state.core.list_quarantined(&access).await?;
             Ok((noindex_headers(), Json(json!({ "sessions": sessions }))).into_response())
         }
-        Some(false) => Err(ApiError::Invalid(
-            "only ?quarantined=true is supported".into(),
-        )),
+        Some(false) => {
+            // Authenticate before validating: no token answers `401`, a token
+            // without the upload scope `403` — only then the `422` below.
+            auth.require(Scope::SessionUpload)?;
+            Err(ApiError::Invalid(
+                "only ?quarantined=true is supported".into(),
+            ))
+        }
         None => {
             let user = auth.reader()?;
             let access = state.core.repo_for(user, &owner, &repo).await?;
             let sessions = state.core.list_readable_sessions(user, &access).await?;
+            let truncated =
+                sessions.len() >= starforged_core::read::READABLE_SESSION_LIST_LIMIT as usize;
             let rows = sessions
                 .iter()
                 .map(|row| {
@@ -222,7 +235,11 @@ pub async fn list_sessions(
                     })
                 })
                 .collect::<Vec<_>>();
-            Ok((noindex_headers(), Json(json!({ "sessions": rows }))).into_response())
+            Ok((
+                noindex_headers(),
+                Json(json!({ "sessions": rows, "truncated": truncated })),
+            )
+                .into_response())
         }
     }
 }
@@ -502,9 +519,12 @@ pub async fn get_links(
 
 /// `GET /repos/{owner}/{repo}/sessions/{ulid}/segments/{n}`: the exact
 /// stored bytes of segment `n` (the compressed JSONL blob, verbatim) as
-/// `application/octet-stream` — the raw segment download the export bundle
-/// carries. One [`Core::authorize_session_read_by_ulid`] check; an absent
-/// segment answers `404`.
+/// `application/octet-stream` — the raw segment download, gated behind the
+/// raw-storage gate ([`Core::authorize_raw_segment_read`]: raw storage
+/// enabled and the uploader or a site admin). Stored bytes are
+/// as-uploaded and never re-redacted, while every other read path renders
+/// server-redacted content (§11.2), so weaker readers answer `404` here
+/// even for sessions they could read through `/events`.
 pub async fn get_segment(
     State(state): State<ApiState>,
     auth: ApiAuth,
@@ -513,7 +533,7 @@ pub async fn get_segment(
     let user = auth.reader()?;
     let (_, row) = state
         .core
-        .authorize_session_read_by_ulid(user, &owner, &repo, &ulid)
+        .authorize_raw_segment_read(user, &owner, &repo, &ulid)
         .await?;
     let bytes = state.core.session_segment_bytes(row.id, n).await?;
     let mut headers = noindex_headers();

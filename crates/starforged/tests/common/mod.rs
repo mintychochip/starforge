@@ -3,6 +3,7 @@
 
 pub mod fake_github;
 pub mod fake_oidc;
+pub mod pg_shims;
 use std::path::{Path, PathBuf};
 use std::process::Output;
 
@@ -73,6 +74,8 @@ impl TestServer {
                 host_key_path: PathBuf::from("ssh_host_ed25519_key"),
                 ..Default::default()
             },
+            log: starforged::config::LogConfig::default(),
+            metrics: starforged::config::MetricsConfig::default(),
         };
         configure(&mut config);
         let ssh_listener = if config.ssh.enabled {
@@ -137,6 +140,10 @@ impl TestServer {
     /// The test database (for seeding imported rows directly, M4c G1).
     pub fn db(&self) -> &starforged_db::Db {
         &self._db.db
+    }
+    /// The test database's connection URL (for backup/CLI tests, M5b O1).
+    pub fn db_url(&self) -> &str {
+        &self._db.url
     }
 
     pub async fn start() -> TestServer {

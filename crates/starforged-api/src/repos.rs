@@ -520,6 +520,118 @@ pub async fn set_pull_mirror_enabled(
     Ok(Json(pull_mirror_json(view)))
 }
 
+/// What the API shows for one push mirror: never a secret, only
+/// `has_credentials` and, for SSH, the public key (mirroring the pull shape).
+#[derive(Serialize)]
+pub struct PushMirrorJson {
+    id: i64,
+    repo_id: i64,
+    url: String,
+    auth: String,
+    has_credentials: bool,
+    ssh_public_key: Option<String>,
+    enabled: bool,
+    last_attempt_at: Option<i64>,
+    last_success_at: Option<i64>,
+    last_error: String,
+}
+
+fn push_mirror_json(view: starforged_core::remotes::PushMirrorView) -> PushMirrorJson {
+    PushMirrorJson {
+        id: view.id,
+        repo_id: view.repo_id,
+        url: view.url,
+        auth: view.auth,
+        has_credentials: view.has_credentials,
+        ssh_public_key: view.ssh_public_key,
+        enabled: view.enabled,
+        last_attempt_at: view.last_attempt_at,
+        last_success_at: view.last_success_at,
+        last_error: view.last_error,
+    }
+}
+
+#[derive(Deserialize)]
+pub struct PushMirrorBody {
+    pub url: String,
+    #[serde(default)]
+    pub auth: Option<ImportAuthBody>,
+}
+
+/// `POST /repos/{owner}/{repo}/mirror/push` (M4b D5): adds one push mirror
+/// (at most 10 per repository). Maintain+ (enforced in core); the URL
+/// policy runs at save time and again before every push. 422 for a policy
+/// refusal or a full mirror list.
+pub async fn add_push_mirror(
+    State(state): State<ApiState>,
+    auth: ApiAuth,
+    Path((owner, repo)): Path<(String, String)>,
+    body: Result<Json<PushMirrorBody>, JsonRejection>,
+) -> Result<(StatusCode, Json<PushMirrorJson>), ApiError> {
+    let auth = auth.require(Scope::RepoWrite)?;
+    let Json(body) = body.map_err(|e| ApiError::Invalid(e.body_text()))?;
+    if body.url.trim().is_empty() {
+        return Err(ApiError::Invalid("mirror url is empty".into()));
+    }
+    let view = state
+        .core
+        .add_push_mirror(
+            &auth.user,
+            &owner,
+            &repo,
+            &starforged_core::remotes::PushMirrorInput {
+                url: body.url,
+                auth: parse_import_auth(body.auth)?,
+            },
+        )
+        .await?;
+    Ok((StatusCode::CREATED, Json(push_mirror_json(view))))
+}
+
+/// `GET /repos/{owner}/{repo}/mirror/push`: readers see the push mirrors
+/// with their last result and (scrubbed) error.
+pub async fn list_push_mirrors(
+    State(state): State<ApiState>,
+    auth: ApiAuth,
+    Path((owner, repo)): Path<(String, String)>,
+) -> Result<Json<Vec<PushMirrorJson>>, ApiError> {
+    let views = state
+        .core
+        .list_push_mirrors(auth.reader()?, &owner, &repo)
+        .await?;
+    Ok(Json(views.into_iter().map(push_mirror_json).collect()))
+}
+
+/// `DELETE /repos/{owner}/{repo}/mirror/push/{id}`: deletes one push
+/// mirror. Maintain+ (enforced in core).
+pub async fn delete_push_mirror(
+    State(state): State<ApiState>,
+    auth: ApiAuth,
+    Path((owner, repo, id)): Path<(String, String, i64)>,
+) -> Result<StatusCode, ApiError> {
+    let auth = auth.require(Scope::RepoWrite)?;
+    state
+        .core
+        .delete_push_mirror(&auth.user, &owner, &repo, id)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `POST /repos/{owner}/{repo}/mirror/push/{id}/sync`: queues an immediate
+/// run (deduplicated per remote).
+pub async fn sync_push_mirror(
+    State(state): State<ApiState>,
+    auth: ApiAuth,
+    Path((owner, repo, id)): Path<(String, String, i64)>,
+) -> Result<Json<PushMirrorJson>, ApiError> {
+    let auth = auth.require(Scope::RepoWrite)?;
+    let view = state
+        .core
+        .sync_push_mirror(&auth.user, &owner, &repo, id)
+        .await?;
+    Ok(Json(push_mirror_json(view)))
+}
+
 #[derive(Deserialize)]
 pub struct EnableBody {
     enabled: bool,

@@ -364,6 +364,26 @@ impl SearchIndex {
         })
     }
 
+    /// Document counts per kind, opening the index in `dir` read-only:
+    /// no writer lock is taken and a missing or corrupt directory is
+    /// reported, never recreated. `starforged doctor` uses this so an
+    /// offline inspection cannot mutate the index.
+    pub fn stats_in_dir(dir: &Path) -> Result<IndexStats> {
+        let (schema, fields) = build_schema();
+        let index = Index::open_in_dir(dir)?;
+        if index.schema() != schema {
+            return Err(IndexError::Corrupt);
+        }
+        let reader = index.reader().map_err(IndexError::Tantivy)?;
+        let searcher = reader.searcher();
+        let trails = searcher.search(&term_query(fields.doc_kind, "trail"), &Count)?;
+        let events = searcher.search(&term_query(fields.doc_kind, "event"), &Count)?;
+        Ok(IndexStats {
+            trails: trails as u64,
+            events: events as u64,
+        })
+    }
+
     pub fn search_trails(
         &self,
         q: &TrailQuery,

@@ -118,6 +118,14 @@ impl Db {
         &self.pool
     }
 
+    /// Answers `SELECT 1` (the `/readyz` database check, plan M5b D5).
+    pub async fn ping(&self) -> DbResult<()> {
+        sqlx::query_scalar::<_, i64>("SELECT 1")
+            .fetch_one(self.pool())
+            .await?;
+        Ok(())
+    }
+
     pub fn backend(&self) -> Backend {
         self.backend
     }
@@ -146,6 +154,35 @@ impl Db {
             .map(|migration| migration.version)
             .max()
             .unwrap_or(0)
+    }
+
+    /// Writes a transactionally consistent copy of the SQLite database to
+    /// `dest` via `VACUUM INTO` (`starforged backup`). The destination
+    /// must not exist. Backups only; on Postgres this errors (use
+    /// `pg_dump`).
+    pub async fn vacuum_into_file(&self, dest: &std::path::Path) -> DbResult<()> {
+        if self.backend != Backend::Sqlite {
+            return Err(DbError::UnsupportedUrl(
+                "VACUUM INTO is only available for SQLite databases".into(),
+            ));
+        }
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent).map_err(|err| {
+                DbError::UnsupportedUrl(format!(
+                    "creating the backup database directory {}: {err}",
+                    parent.display()
+                ))
+            })?;
+        }
+        // Single quotes in the path are doubled (SQL string-literal
+        // escaping); the statement itself is fixed.
+        let literal = dest.to_string_lossy().replace('\'', "''");
+        // Safe: the statement is a fixed `VACUUM INTO` with one escaped
+        // string literal built from a filesystem path.
+        sqlx::query(sqlx::AssertSqlSafe(format!("VACUUM INTO '{literal}'")))
+            .execute(self.pool())
+            .await?;
+        Ok(())
     }
 }
 

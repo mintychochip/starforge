@@ -207,7 +207,11 @@ fn assert_no_raw_payloads(html: &str, surface: &str) {
     // `<details>` blocks), so only the hostile open-tag forms are forbidden.
     // (`<img>` has no legitimate form on session surfaces — the prose
     // sanitizer drops image elements entirely; the viewer asserts that
-    // separately below.)
+    // separately below.) The one allowed active tag is the same-origin
+    // viewer ES module; remove exactly that one instance before checking,
+    // so any corpus-injected tag still fails.
+    let module_tag = r#"<script type="module" src="/static/session-viewer.js"></script>"#;
+    let html = html.replacen(module_tag, "", 1);
     for raw in ["<script", "<svg", "<img src=x onerror", "<details ontoggle"] {
         assert!(
             !html.contains(raw),
@@ -426,13 +430,19 @@ async fn xss_corpus_escaped_on_all_surfaces() {
 
     // 5. DOM-level browser assertions (no Playwright harness in this repo):
     // tool calls render as inline `<details>` (progressive enhancement, no
-    // htmx fragment fetch), and the page carries no executable script.
+    // htmx fragment fetch), and the page carries no inline or foreign
+    // script: the only `<script>` allowed is the same-origin ES module.
     assert!(
         html.contains(r#"<details class="event event-tool-call">"#),
         "tool-call details missing"
     );
     assert!(html.contains(r#"id="turn-0""#), "turn anchor missing");
-    assert!(!html.contains("<script"), "inline script in:\n{html}");
+    let module_tag = r#"<script type="module" src="/static/session-viewer.js"></script>"#;
+    assert_eq!(
+        html.matches("<script").count(),
+        html.matches(module_tag).count(),
+        "inline or foreign script present:\n{html}"
+    );
     assert!(!html.contains("hx-get"), "unexpected htmx in:\n{html}");
 }
 

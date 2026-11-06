@@ -230,6 +230,18 @@ impl Core {
         }));
         self.record_push(repo_id, pusher.as_ref(), &push_updates)
             .await;
+        // Push mirrors (M4b D5): every accepted heads/tags push debounces
+        // one run per enabled push mirror (deduped per remote, so pushes
+        // inside the 30 s window coalesce). Only a heads/tags move needs a
+        // run — a `refs/for`-only push changes nothing the mirror carries.
+        // Never fails the push: the enqueue only warns.
+        let heads_or_tags = changes
+            .iter()
+            .any(|(name, _, _)| name.starts_with("refs/heads/") || name.starts_with("refs/tags/"))
+            || !deletes.is_empty();
+        if heads_or_tags && let Err(err) = self.enqueue_push_mirrors(repo_id).await {
+            tracing::warn!(repo_id, error = %err, "push scan: push-mirror enqueue failed");
+        }
     }
 }
 

@@ -426,6 +426,10 @@ impl Core {
                 "this repository is a pull mirror".into(),
             ));
         }
+        // The merge moves the base ref inside the repository: hold the
+        // shared repository lock for the whole merge so a backup copies
+        // either the pre-merge or the post-merge state (plan M5b O1).
+        let _repo_lock = self.repo_lock_shared(access.repo.id).await?;
         let trail = db_trails::trail_by_number(self.db(), access.repo.id, trail_n)
             .await?
             .ok_or(CoreError::NotFound)?;

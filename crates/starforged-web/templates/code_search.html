@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% block title %}Search code · {{ head.owner }}/{{ head.name }}{% endblock %}
+{% block content %}
+{% include "repo_head.html" %}
+<h2>Search code</h2>
+<form method="get" action="/{{ head.owner }}/{{ head.name }}/search" class="filters">
+  <label>Query <input type="text" name="q" value="{{ q }}"></label>
+  <label>Case
+    <select name="case">
+      <option value="sensitive"{% if case != "insensitive" %} selected{% endif %}>Sensitive</option>
+      <option value="insensitive"{% if case == "insensitive" %} selected{% endif %}>Insensitive</option>
+    </select>
+  </label>
+  <button type="submit">Search</button>
+</form>
+{% if searched %}
+<p class="muted">Searched <span class="badge">{{ ref_name }}</span>{% if !commit.is_empty() %} at <code>{{ commit }}</code>{% endif %} for <code>{{ q }}</code>.</p>
+{% if matches.is_empty() %}
+<p class="muted">No results.</p>
+{% else %}
+<ul class="search-results">
+{% for m in matches %}
+  <li><a href="{{ m.href }}">{{ m.path }}:{{ m.line }}</a> <code>{{ m.text }}</code></li>
+{% endfor %}
+</ul>
+{% endif %}
+{% if truncated %}<p class="muted">Results truncated.</p>{% endif %}
+{% endif %}
+{% endblock %}

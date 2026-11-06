@@ -37,8 +37,16 @@ git push http://me:<token>@127.0.0.1:3000/me/<repository>.git main
 | `database.auto_migrate` | Migrate the schema at startup (default `true`) |
 | `storage.data_dir` | Repositories, SQLite database, and runtime files |
 | `security.secret_key` | 64 hex characters; losing it logs everyone out |
-| `registration.mode` | Who can sign up: `invite` (default; invite links only), `open`, or `domains` |
+| `registration.mode` | Who can sign up: `invite` (default; invite links only), `open`, `domains`, or `sso` (no sign-up forms; accounts arrive only through single sign-on) |
 | `registration.allowed_domains` | Email domains that `domains` mode accepts, e.g. `["example.com"]` |
+| `oidc.enabled` | Whether single sign-on is offered on the sign-in page (default `false`) |
+| `oidc.issuer` | Provider issuer URL (`https://`, or `http://` only for loopback providers such as tests) |
+| `oidc.client_id` | The client id registered with the provider |
+| `oidc.client_secret` | The client secret (never logged or rendered) |
+| `oidc.scopes` | Requested scopes (default `["openid", "email", "profile"]`) |
+| `oidc.button_label` | Sign-in page button text (default `"Sign in with SSO"`) |
+| `oidc.auto_create` | Create a password-less account on first sign-in when no account matches (default `false`) |
+| `oidc.link_by_email` | Link first sign-ins by a provider-verified email that exactly matches one locally verified email (default `true`) |
 | `mail.url` | Empty for no email; `smtp://user:pass@host:587` (STARTTLS), `smtps://user:pass@host:465`, or `file:///dir` (writes `.eml` files) |
 | `mail.from` | Sender, e.g. `Starforge <forge@example.com>` |
 | `ssh.enabled` | Whether the SSH listener starts (default `true`) |
@@ -73,6 +81,40 @@ it.
 Signed-in users manage their display name, email address, password, sessions, and tokens under **Settings**, and
 can delete their account there once they own no repositories.
 
+
+## Two-factor authentication
+
+Any account can turn on TOTP two-factor authentication under **Settings → Two-factor** (`/settings/two-factor`):
+
+1. **Enroll.** The page shows an `otpauth://` URI (issuer is the site name, one 20-byte secret, 6 digits, 30 s step) and the base32 secret. The secret is stored sealed with the server key, never in clear, and is never logged.
+2. **Confirm** with a current code. Only then is 2FA enabled, and 10 recovery codes (`xxxxx-xxxxx`) are shown **once** — save them. Signing in then asks for the password and a current code (or one recovery code) at `/login/two-factor`; no web session exists before the second factor.
+3. A code is accepted within one step either way, and a step is never reused. Each recovery code is shown once, five failed codes void the challenge and sign-in starts again, and challenges expire after five minutes. All of these write audit rows (`account.2fa_enabled`, `account.2fa_disabled`, `account.recovery_codes_regenerated`).
+4. Disable needs the password plus a code; regenerate needs a code and invalidates the old ones.
+
+Personal access tokens and OAuth device tokens are not affected by 2FA. A site admin can disable a user's 2FA from the admin user page (`/admin/users/{handle}`, audited as `user.2fa_reset`).
+
+## Single sign-on (OIDC)
+
+With an `[oidc]` section enabled, the sign-in page offers a single sign-on button that runs the authorization-code flow with PKCE against any compliant provider:
+
+```toml
+[oidc]
+enabled = true
+issuer = "https://idp.example.com"
+client_id = "<client id from the provider>"
+client_secret = "<client secret>"
+auto_create = false
+link_by_email = true
+```
+
+Every key also works as `STARFORGE__OIDC__*`. The redirect URI is `<server.base_url>/login/oidc/callback`. Only RS256 or ES256 ID tokens are accepted; signature, issuer, audience, expiry, and nonce are all checked, and any failure shows one generic message. Provider discovery and keys are cached (discovery for an hour; keys by `kid`).
+
+**Linking rules.** On sign-in Starforge resolves: (1) an already linked (issuer, subject) signs straight in (a suspended user is refused); (2) otherwise, when `link_by_email` is on and the provider reports `email_verified`, an exact match against exactly one locally **verified** email links the identity (`account.identity_linked`) — an unverified email on either side never links; (3) otherwise, when `auto_create` is on and the registration mode allows it, a password-less account is created with a sanitized, deduplicated handle; (4) otherwise the page says "No account for this sign-in".
+
+**Settings.** **Settings → Linked sign-ins** (`/settings/identities`) links and unlinks provider identities. Unlinking is refused when it is the account's last way to sign in (no password and no other identity).
+
+**SSO-only mode.** `registration.mode = "sso"` disables sign-up; new accounts come only from `auto_create`. Password login stays available for accounts that have a password, including the bootstrap admin.
+
 ## Repositories
 
 New repositories can start with a README. Each repository has a **Settings** tab for maintainers and admins:
@@ -89,6 +131,63 @@ visibility, manage collaborators, rename, archive, and delete.
 The code views show branches, tags, comparisons between two refs (`/{owner}/{repo}/compare/{base}...{head}`), and
 syntax-highlighted files with linkable line numbers (`#L42`). After each push, a background job runs
 `git maintenance run --auto` for the repository.
+
+## Import from GitHub
+
+An empty repository (no Trails yet, not archived) can import its issues and pull
+requests from GitHub, from **Settings → GitHub import**
+(`/{owner}/{repo}/settings/github-import`, repository admins only) or the API below.
+The repository must already hold the git history (pushed, mirrored, or imported),
+since pull-request heads are fetched from `refs/pull/<n>/head`.
+
+**Prerequisites and token.** A GitHub personal access token with read-only access:
+the `repo` scope for a private repository, or public-read access for a public one.
+The token is sealed at rest (the credential box), deleted when the import finishes
+or fails, and never logged or rendered. Outbound requests go only to
+`github.api_url` (default `https://api.github.com`, GitHub Enterprise allowed),
+with a 30 s timeout, a 10 MiB response cap, no redirects, and pagination that
+follows only same-origin `Link: rel="next"` URLs.
+
+**Mapping.** GitHub numbers are preserved (issues and PRs share one number space;
+new Trails continue after the highest imported number, gaps stay gaps), and an
+import refuses a repository that already has Trails (`422`):
+
+| GitHub | Starforge |
+|---|---|
+| Issue | Trail without changes (open or closed) |
+| Pull request | Trail with one `imported` change (open, closed, or merged); head from `refs/pull/<n>/head` |
+| Issue / PR comment | Trail comment |
+| Review comment | Review thread on revision 1 where its line exists, else a quoted Trail comment |
+| Labels / assignees | Labels by name; assignees by matched local user |
+| Author | Local user with a matching verified email, else a placeholder |
+
+**Placeholders.** When no local user matches the GitHub author's verified email,
+the author column stays empty and the original GitHub handle renders as
+`handle (imported)` — escaped text, never a link to a local account. Assignees
+who match no local repository member are dropped and listed in the import
+summary (the settings page and the API status). Labels are created by name.
+Imported bodies are Markdown through the sanitizing pipeline. The import writes
+one `trail.imported` timeline row per Trail, dispatches no webhooks, and records
+`repo.github_import_started` / `repo.github_import_finished` audit rows.
+
+**Rate limits and resumption.** A `403`/`429` with `X-RateLimit-Remaining: 0` or
+`Retry-After` pauses the import at its cursor and re-enqueues the job at the
+reset time (capped at 1 h) — not a failure. Other errors follow the retry
+ladder; after 5 failures the import is `failed` with the scrubbed error, and the
+sealed token is deleted either way. An import runs once per repository: every
+object is keyed by its GitHub id, so a resumed run never duplicates a Trail,
+comment, or review.
+
+**API.** `POST /api/v1/repos/{owner}/{repo}/import/github` with
+`{"repository": "octo/proj", "token": "…"}` starts the import (admin only;
+below-threshold callers get `403`, non-readers `404`, archived or non-empty
+repositories `422`) and answers `202` with the status object. The token is
+accepted only in the body and is never echoed. `GET` on the same path reports
+the status for readers: `state` (`pending`, `running`, `rate_limited`,
+`completed`, `failed`), the cursor, the object counts
+(`issues_count`, `pulls_count`, `comments_count`, `reviews_count`,
+`review_comments_count`), `dropped_assignees`, `has_token`, and the last
+scrubbed `error`.
 
 ## Organizations and teams
 

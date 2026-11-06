@@ -232,8 +232,14 @@ async fn owner_sees_kinds_and_strangers_get_404() {
         assert!(html.contains(needle), "missing {needle:?} in:\n{html}");
     }
     // Active markup escaped, never raw (`onerror` survives only as inert
-    // escaped text inside the unknown-kind `<pre>` block).
-    assert!(!html.contains("<script"), "raw script in:\n{html}");
+    // escaped text inside the unknown-kind `<pre>` block). The only
+    // `<script>` allowed is the same-origin viewer ES module.
+    let module_tag = r#"<script type="module" src="/static/session-viewer.js"></script>"#;
+    assert_eq!(
+        html.matches("<script").count(),
+        html.matches(module_tag).count(),
+        "raw script in:\n{html}"
+    );
     assert!(!html.contains("<img"), "raw image in:\n{html}");
     // The untrusted frame stays visible and intact around prose.
     assert!(

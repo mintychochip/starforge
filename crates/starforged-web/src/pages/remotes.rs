@@ -10,7 +10,7 @@ use axum::response::{IntoResponse, Redirect, Response};
 use axum_extra::extract::Form;
 use serde::Deserialize;
 use starforged_core::permission::Permission;
-use starforged_core::remotes::PullMirrorView;
+use starforged_core::remotes::{PullMirrorView, PushMirrorView};
 use starforged_core::sessions::WebSession;
 use starforged_core::{CoreError, CoreResult};
 
@@ -27,6 +27,7 @@ pub struct MirrorsPage {
     head: RepoHead,
     settings_page: &'static str,
     mirror: Option<PullMirrorView>,
+    push_mirrors: Vec<PushMirrorView>,
     error: Option<String>,
 }
 
@@ -157,6 +158,76 @@ pub async fn delete(
     Ok(Redirect::to(&format!("/{owner}/{repo}/settings/mirrors")).into_response())
 }
 
+/// Adds one push mirror. Success redirects 303 back to this page; a policy
+/// refusal re-renders with 422.
+pub async fn add_push(
+    State(state): State<AppState>,
+    RequireUser(session): RequireUser,
+    Path((owner, repo)): Path<(String, String)>,
+    Form(form): Form<MirrorForm>,
+) -> Result<Response, WebError> {
+    verify_csrf(&session.csrf_token, &form.csrf)?;
+    let auth = match form.auth.trim() {
+        "https" => starforged_core::remotes::ImportAuth::Https {
+            username: form.username.trim().to_owned(),
+            password: form.password.clone(),
+        },
+        "ssh" => starforged_core::remotes::ImportAuth::Ssh,
+        "" | "none" => starforged_core::remotes::ImportAuth::None,
+        _ => return Err(WebError::BadRequest("unknown mirror auth".into())),
+    };
+    match state
+        .core
+        .add_push_mirror(
+            &session.user,
+            &owner,
+            &repo,
+            &starforged_core::remotes::PushMirrorInput {
+                url: form.url.trim().to_owned(),
+                auth,
+            },
+        )
+        .await
+    {
+        Ok(_) => Ok(Redirect::to(&format!("/{owner}/{repo}/settings/mirrors")).into_response()),
+        Err(CoreError::Invalid(message) | CoreError::Conflict(message)) => {
+            let page = page(&state, &session, &owner, &repo, Some(message)).await?;
+            Ok((StatusCode::UNPROCESSABLE_ENTITY, page).into_response())
+        }
+        Err(other) => Err(other.into()),
+    }
+}
+
+/// Queues an immediate run for one push mirror (deduplicated per remote).
+pub async fn sync_push(
+    State(state): State<AppState>,
+    RequireUser(session): RequireUser,
+    Path((owner, repo, id)): Path<(String, String, i64)>,
+    Form(form): Form<CsrfForm>,
+) -> Result<Response, WebError> {
+    verify_csrf(&session.csrf_token, &form.csrf)?;
+    state
+        .core
+        .sync_push_mirror(&session.user, &owner, &repo, id)
+        .await?;
+    Ok(Redirect::to(&format!("/{owner}/{repo}/settings/mirrors")).into_response())
+}
+
+/// Deletes one push mirror.
+pub async fn delete_push(
+    State(state): State<AppState>,
+    RequireUser(session): RequireUser,
+    Path((owner, repo, id)): Path<(String, String, i64)>,
+    Form(form): Form<CsrfForm>,
+) -> Result<Response, WebError> {
+    verify_csrf(&session.csrf_token, &form.csrf)?;
+    state
+        .core
+        .delete_push_mirror(&session.user, &owner, &repo, id)
+        .await?;
+    Ok(Redirect::to(&format!("/{owner}/{repo}/settings/mirrors")).into_response())
+}
+
 async fn page(
     state: &AppState,
     session: &WebSession,
@@ -169,12 +240,14 @@ async fn page(
         .require_repo(Some(&session.user), owner, repo, Permission::Maintain)
         .await?;
     let mirror = state.core.pull_mirror_for(access.repo.id).await?;
+    let push_mirrors = state.core.push_mirrors_for(access.repo.id).await?;
     Ok(MirrorsPage {
         nav_user: Some(NavUser::from_session(session)),
         csrf: session.csrf_token.clone(),
         head: RepoHead::new(&access, "settings", None),
         settings_page: "mirrors",
         mirror,
+        push_mirrors,
         error,
     })
 }

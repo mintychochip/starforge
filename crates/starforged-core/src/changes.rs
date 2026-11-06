@@ -1054,6 +1054,10 @@ impl Core {
         r: i64,
         sha: &str,
     ) -> CoreResult<()> {
+        // Trail ref writes mutate the repository: hold the shared lock
+        // for the duration (plan M5b O1). Callers may already hold it
+        // (shared locks are mutually compatible, so nesting is safe).
+        let _repo_lock = self.repo_lock_shared(repo_id).await?;
         let repo = self.repo_path(repo_id);
         write::set_ref(
             &repo,

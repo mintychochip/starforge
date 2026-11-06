@@ -5,14 +5,17 @@
 
 use askama::Template;
 use askama_web::WebTemplate;
+use axum::extract::ConnectInfo;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
+use axum::http::{HeaderMap, header};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum_extra::extract::Form;
 use serde::Deserialize;
 use starforged_core::CoreError;
 use starforged_core::oidc::LinkedIdentity;
 use starforged_core::sessions::WebSession;
+use std::net::SocketAddr;
 
 use crate::AppState;
 use crate::auth::{RequireUser, verify_csrf};
@@ -96,12 +99,22 @@ pub async fn link(
 
 pub async fn unlink(
     State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     RequireUser(session): RequireUser,
     Path(id): Path<i64>,
     Form(form): Form<IdentitiesForm>,
 ) -> Result<Response, WebError> {
     verify_csrf(&session.csrf_token, &form.csrf)?;
-    match state.core.unlink_identity(&session.user, id, "", "").await {
+    let user_agent = headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    match state
+        .core
+        .unlink_identity(&session.user, id, user_agent, &addr.ip().to_string())
+        .await
+    {
         Ok(()) => Ok(
             page(&state, &session, Some("Sign-in removed.".to_owned()), None)
                 .await?

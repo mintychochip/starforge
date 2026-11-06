@@ -1148,6 +1148,151 @@ pub async fn review_by_github_id(db: &Db, github_id: i64) -> DbResult<Option<Rev
     row.as_ref().map(review_from_row).transpose()
 }
 
+/// Inserts one imported review and bumps the import's review count in
+/// the same transaction (one transaction per imported object).
+#[allow(clippy::too_many_arguments)]
+pub async fn insert_imported_review_counted(
+    db: &Db,
+    import_id: i64,
+    change_id: i64,
+    revision_id: i64,
+    author_id: Option<i64>,
+    imported_author: Option<&str>,
+    github_id: i64,
+    verdict: &str,
+    body: &str,
+    now: i64,
+) -> DbResult<ReviewRow> {
+    let mut tx = db.pool().begin().await?;
+    let row = sqlx::query(
+        "INSERT INTO reviews (change_id, revision_id, author_id, imported_author, github_id, verdict, body, session_ulid, state, created_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, 'submitted', $8) \
+         RETURNING id, change_id, revision_id, author_id, imported_author, github_id, verdict, body, session_ulid, state, created_at",
+    )
+    .bind(change_id)
+    .bind(revision_id)
+    .bind(author_id)
+    .bind(imported_author)
+    .bind(github_id)
+    .bind(verdict)
+    .bind(body)
+    .bind(now)
+    .fetch_one(&mut *tx)
+    .await?;
+    let review = review_from_row(&row)?;
+    sqlx::query(
+        "UPDATE github_imports SET reviews_count = reviews_count + 1, updated_at = $1 WHERE id = $2",
+    )
+    .bind(now)
+    .bind(import_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(review)
+}
+
+/// Inserts one imported review-thread comment (a reply into an existing
+/// thread) and bumps the import's review-comment count in the same
+/// transaction (one transaction per imported object).
+#[allow(clippy::too_many_arguments)]
+pub async fn insert_imported_thread_comment_counted(
+    db: &Db,
+    import_id: i64,
+    thread_id: i64,
+    review_id: Option<i64>,
+    author_id: Option<i64>,
+    imported_author: Option<&str>,
+    github_id: i64,
+    body: &str,
+    now: i64,
+) -> DbResult<ReviewCommentRow> {
+    let mut tx = db.pool().begin().await?;
+    let row = sqlx::query(
+        "INSERT INTO review_comments (thread_id, review_id, author_id, imported_author, github_id, body, created_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7) \
+         RETURNING id, thread_id, review_id, author_id, imported_author, github_id, body, created_at",
+    )
+    .bind(thread_id)
+    .bind(review_id)
+    .bind(author_id)
+    .bind(imported_author)
+    .bind(github_id)
+    .bind(body)
+    .bind(now)
+    .fetch_one(&mut *tx)
+    .await?;
+    let comment = comment_from_row(&row)?;
+    sqlx::query(
+        "UPDATE github_imports SET review_comments_count = review_comments_count + 1, updated_at = $1 WHERE id = $2",
+    )
+    .bind(now)
+    .bind(import_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(comment)
+}
+
+/// Inserts one imported review thread with its first comment and bumps
+/// the import's review-comment count, all in one transaction (one
+/// transaction per imported object): a crash can no longer orphan a
+/// thread without its comment or duplicate the pair on resume.
+#[allow(clippy::too_many_arguments)]
+pub async fn insert_thread_with_imported_comment(
+    db: &Db,
+    import_id: i64,
+    change_id: i64,
+    anchor_revision_id: i64,
+    path: &str,
+    side: &str,
+    line: i64,
+    review_id: Option<i64>,
+    author_id: Option<i64>,
+    imported_author: Option<&str>,
+    github_id: i64,
+    body: &str,
+    now: i64,
+) -> DbResult<ReviewCommentRow> {
+    let mut tx = db.pool().begin().await?;
+    let thread_id: i64 = sqlx::query_scalar(
+        "INSERT INTO review_threads (change_id, anchor_revision_id, path, side, start_line, end_line, \
+         resolved, created_at) \
+         VALUES ($1, $2, $3, $4, $5, $5, 0, $6) RETURNING id",
+    )
+    .bind(change_id)
+    .bind(anchor_revision_id)
+    .bind(path)
+    .bind(side)
+    .bind(line)
+    .bind(now)
+    .fetch_one(&mut *tx)
+    .await?;
+    let row = sqlx::query(
+        "INSERT INTO review_comments (thread_id, review_id, author_id, imported_author, github_id, body, created_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7) \
+         RETURNING id, thread_id, review_id, author_id, imported_author, github_id, body, created_at",
+    )
+    .bind(thread_id)
+    .bind(review_id)
+    .bind(author_id)
+    .bind(imported_author)
+    .bind(github_id)
+    .bind(body)
+    .bind(now)
+    .fetch_one(&mut *tx)
+    .await?;
+    let comment = comment_from_row(&row)?;
+    sqlx::query(
+        "UPDATE github_imports SET review_comments_count = review_comments_count + 1, updated_at = $1 WHERE id = $2",
+    )
+    .bind(now)
+    .bind(import_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(comment)
+}
+
 /// Reviews of the change in insert order.
 pub async fn reviews_of_change(db: &Db, change_id: i64) -> DbResult<Vec<ReviewRow>> {
     let rows = sqlx::query(select_review!("WHERE change_id = $1 ORDER BY id ASC"))

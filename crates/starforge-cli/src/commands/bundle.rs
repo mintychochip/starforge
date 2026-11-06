@@ -6,7 +6,9 @@
 //! bundle.json                              format version 1, server, exported_at
 //! <owner>__<repo>/<ulid>/session.json      the API metadata, as returned
 //! <owner>__<repo>/<ulid>/events.jsonl      the normalized transcript (via /events)
-//! <owner>__<repo>/<ulid>/segments/<n>.raw.zst   only when the API serves raw
+//! <owner>__<repo>/<ulid>/segments/<n>.raw.zst   stored bytes when the API serves raw,
+//!                                            else the re-segmentation of the redacted
+//!                                            `/events` stream (§11.2)
 //! <owner>__<repo>/<ulid>/links.json        commit links (via /links)
 //! ```
 //!
@@ -90,13 +92,13 @@ const MAX_SEGMENTS_PROBED: i64 = 10_000;
 /// Output is one `exported <ulid>` line per session plus a summary; any
 /// unreadable session aborts with a clear error.
 pub async fn export(ctx: &BundleCtx, sessions: &[String], dir: &Path) -> (String, u8) {
-    let ulids = if sessions.is_empty() {
+    let (ulids, truncated) = if sessions.is_empty() {
         match list_session_ulids(&ctx.api).await {
-            Ok(ulids) => ulids,
+            Ok(listed) => listed,
             Err(err) => return (err, 1),
         }
     } else {
-        sessions.to_vec()
+        (sessions.to_vec(), false)
     };
     let (owner, repo) = ctx
         .owner_repo
@@ -104,6 +106,12 @@ pub async fn export(ctx: &BundleCtx, sessions: &[String], dir: &Path) -> (String
         .expect("owner_repo validated at resolve time");
     let root = dir.join(format!("{owner}__{repo}"));
     let mut lines = Vec::new();
+    if truncated {
+        lines.push(
+            "warning: session listing truncated at 10000; export may be incomplete".to_string(),
+        );
+    }
+
     for ulid in &ulids {
         match export_one(ctx, ulid, &root).await {
             Ok(()) => lines.push(format!("exported {ulid}")),
@@ -133,8 +141,9 @@ pub async fn export(ctx: &BundleCtx, sessions: &[String], dir: &Path) -> (String
 }
 
 /// The readable sessions of the repository, oldest first, via the listing
-/// endpoint. Errors are pre-formatted `error: …` strings.
-async fn list_session_ulids(api: &ApiClient) -> Result<Vec<String>, String> {
+/// endpoint, plus the server's `truncated` flag. Errors are pre-formatted
+/// `error: …` strings.
+async fn list_session_ulids(api: &ApiClient) -> Result<(Vec<String>, bool), String> {
     let value = api
         .get("sessions", &[])
         .await
@@ -143,15 +152,22 @@ async fn list_session_ulids(api: &ApiClient) -> Result<Vec<String>, String> {
         .get("sessions")
         .and_then(Value::as_array)
         .ok_or_else(|| "error: unexpected response: missing sessions array".to_string())?;
-    Ok(sessions
-        .iter()
-        .filter_map(|session| {
-            session
-                .get("ulid")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .collect())
+    let truncated = value
+        .get("truncated")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    Ok((
+        sessions
+            .iter()
+            .filter_map(|session| {
+                session
+                    .get("ulid")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect(),
+        truncated,
+    ))
 }
 
 /// Export one session under `root/<ulid>/`. A `404` anywhere in the read
@@ -180,18 +196,34 @@ async fn export_one(ctx: &BundleCtx, ulid: &str, root: &Path) -> Result<(), Stri
         events_text.push('\n');
     }
     let mut segments = Vec::new();
+    let mut probe_capped = false;
     for n in 0..MAX_SEGMENTS_PROBED {
         match ctx
             .api
             .get_bytes(&format!("sessions/{ulid}/segments/{n}"), &[])
             .await
         {
-            Ok(bytes) => {
-                segments.push((n, bytes));
-            }
+            Ok(bytes) => segments.push((n, bytes)),
             Err(ApiError::Status { status: 404, .. }) => break,
             Err(err) => return Err(readable_error(&ctx.api, err, ulid)),
         }
+        probe_capped = (n + 1) == MAX_SEGMENTS_PROBED;
+    }
+    if probe_capped && !segments.is_empty() {
+        return Err(format!(
+            "error: cannot export session {ulid}: more than {MAX_SEGMENTS_PROBED} segments; raw segment probe truncated"
+        ));
+    }
+    if segments.is_empty() {
+        // The server guards stored bytes behind the raw-storage gate (§11.2),
+        // so without raw access the bundle's segments are the re-segmentation
+        // of the server-redacted `/events` stream — the only segment content
+        // this user may hold.
+        segments = starforge_format::split_jsonl(&events_text, DEFAULT_SEGMENT_CAP)
+            .into_iter()
+            .enumerate()
+            .map(|(n, bytes)| (n as i64, bytes))
+            .collect();
     }
     std::fs::create_dir_all(&session_dir)
         .map_err(|err| format!("error: cannot create {}: {err}", session_dir.display()))?;
@@ -280,8 +312,9 @@ pub async fn import(ctx: &BundleCtx, dir: &Path) -> (String, u8) {
     let mut lines = Vec::new();
     let mut imported = 0usize;
     let mut exists = 0usize;
+    let mut write_proven = false;
     for session_dir in &session_dirs {
-        match import_one(ctx, session_dir).await {
+        match import_one(ctx, session_dir, &mut write_proven).await {
             Ok(Outcome::Imported(ulid)) => {
                 lines.push(format!("{ulid}: imported"));
                 imported += 1;
@@ -375,19 +408,21 @@ pub fn discover_session_dirs(dir: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(dirs)
 }
 
-/// Import one session directory: skip when the ULID already exists in the
-/// target repository, else upload meta + re-segmented events + complete +
-/// links.
-async fn import_one(ctx: &BundleCtx, session_dir: &Path) -> Result<Outcome, String> {
+/// Import one session directory: `put_meta` derives exists from the upload
+/// path itself (`201` created vs `200` existing) — no read probe, which
+/// would need `repo:read` and cannot distinguish "absent" from "exists but
+/// unreadable" under §6.4. A `403` proves nothing on its own (it is also the
+/// no-write-access answer), so it counts as exists-skip only after this run
+/// already wrote successfully (write access proven).
+async fn import_one(
+    ctx: &BundleCtx,
+    session_dir: &Path,
+    write_proven: &mut bool,
+) -> Result<Outcome, String> {
     let ulid = session_dir
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
-    match ctx.api.get(&format!("sessions/{ulid}"), &[]).await {
-        Ok(_) => return Ok(Outcome::Exists(ulid)),
-        Err(ApiError::Status { status: 404, .. }) => {}
-        Err(err) => return Err(ctx.api.render_error(err).0),
-    }
     let meta_text = std::fs::read_to_string(session_dir.join("session.json"))
         .map_err(|err| format!("error: cannot read {}: {err}", session_dir.display()))?;
     let meta: Value = serde_json::from_str(&meta_text).map_err(|err| {
@@ -406,10 +441,22 @@ async fn import_one(ctx: &BundleCtx, session_dir: &Path) -> Result<Outcome, Stri
     })?;
     let links = links.as_array().cloned().unwrap_or_default();
     let session_meta = build_meta(&ulid, &meta, &events_text)?;
-    ctx.upload
-        .put_meta(&ctx.owner_repo, &session_meta)
+    match ctx
+        .upload
+        .put_meta_status(&ctx.owner_repo, &session_meta)
         .await
-        .map_err(|err| format!("error: importing {ulid}: {err}"))?;
+    {
+        Ok(created) => {
+            *write_proven = true;
+            if !created {
+                return Ok(Outcome::Exists(ulid));
+            }
+        }
+        Err(crate::upload::UploadError::Auth { .. }) if *write_proven => {
+            return Ok(Outcome::Exists(ulid));
+        }
+        Err(err) => return Err(format!("error: importing {ulid}: {err}")),
+    }
     for (n, bytes) in starforge_format::split_jsonl(&events_text, DEFAULT_SEGMENT_CAP)
         .into_iter()
         .enumerate()

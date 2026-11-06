@@ -847,21 +847,17 @@ impl Core {
         ip: &str,
     ) -> CoreResult<()> {
         let user_agent: String = user_agent.chars().take(256).collect();
-        let identities = auth_factors::identities_for_user(self.db(), user.id).await?;
-        if !identities.iter().any(|row| row.id == identity_id) {
-            return Err(CoreError::NotFound);
-        }
-        let row = users::by_id(self.db(), user.id)
-            .await?
-            .ok_or(CoreError::NotFound)?;
-        if row.password_hash.is_none() && identities.len() <= 1 {
-            return Err(CoreError::Invalid(
-                "This is the only way to sign in to this account; set a password or link another sign-in first."
-                    .into(),
-            ));
-        }
-        if !auth_factors::delete_identity(self.db(), identity_id, user.id).await? {
-            return Err(CoreError::NotFound);
+        match auth_factors::delete_identity_unless_last(self.db(), identity_id, user.id).await? {
+            Ok(()) => {}
+            Err(auth_factors::UnlinkIdentityError::NotFound) => {
+                return Err(CoreError::NotFound);
+            }
+            Err(auth_factors::UnlinkIdentityError::LastMeansOfLogin) => {
+                return Err(CoreError::Invalid(
+                    "This is the only way to sign in to this account; set a password or link another sign-in first."
+                        .into(),
+                ));
+            }
         }
         self.audit_client(
             Some(user.id),
@@ -978,27 +974,46 @@ impl Core {
             && let Some(row) = users::by_email(self.db(), email).await?
         {
             let user = User::from(row);
-            auth_factors::insert_identity(self.db(), user.id, &claims.iss, &claims.sub).await?;
-            self.audit(
-                Some(user.id),
-                "account.identity_linked",
-                &format!("user:{}", user.handle),
-                &claims.iss,
-            )
-            .await?;
-            return Ok(Some(user));
+            // Plan D5 step 2 requires exactly one local VERIFIED email:
+            // an unverified local address never links (it falls through),
+            // and a suspended account is resolved here so the login is
+            // refused below — but no identity is inserted for either.
+            if user.email_verified {
+                if !user.active {
+                    return Ok(Some(user));
+                }
+                auth_factors::insert_identity(self.db(), user.id, &claims.iss, &claims.sub).await?;
+                self.audit(
+                    Some(user.id),
+                    "account.identity_linked",
+                    &format!("user:{}", user.handle),
+                    &claims.iss,
+                )
+                .await?;
+                return Ok(Some(user));
+            }
         }
         if config.auto_create && self.auto_create_allowed(email.as_deref()) {
-            let user = self.auto_create_user(claims, email.as_deref()).await?;
-            auth_factors::insert_identity(self.db(), user.id, &claims.iss, &claims.sub).await?;
-            self.audit(
-                Some(user.id),
-                "account.identity_linked",
-                &format!("user:{}", user.handle),
-                &claims.iss,
-            )
-            .await?;
-            return Ok(Some(user));
+            match self.auto_create_user(claims, email.as_deref()).await {
+                Ok(user) => {
+                    auth_factors::insert_identity(self.db(), user.id, &claims.iss, &claims.sub)
+                        .await?;
+                    self.audit(
+                        Some(user.id),
+                        "account.identity_linked",
+                        &format!("user:{}", user.handle),
+                        &claims.iss,
+                    )
+                    .await?;
+                    return Ok(Some(user));
+                }
+                // The handle or email is already taken (e.g. the email
+                // belongs to an unverified local account that could not
+                // link): the generic no-account outcome, never a 400
+                // naming the collision.
+                Err(CoreError::Conflict(_)) => return Ok(None),
+                Err(other) => return Err(other),
+            }
         }
         Ok(None)
     }

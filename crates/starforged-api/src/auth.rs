@@ -61,6 +61,7 @@ pub async fn rate_limit(State(state): State<ApiState>, request: Request, next: N
     let decision = state.core.check_api_rate(auth.token_id);
     tracing::info!(token_id = auth.token_id, "api request rate check");
     if !decision.allowed {
+        state.core.metrics().inc_rate_limited("api");
         let retry_after = (decision.reset_at - starforged_core::limits::now_secs()).max(1);
         return ApiError::RateLimited {
             retry_after,

@@ -174,6 +174,10 @@ pub async fn info_refs(
             "only the smart HTTP protocol is supported\n",
         ))?;
     let (access, _, _) = authorize(&state, &headers, &owner, &repo, service).await?;
+    state
+        .core
+        .metrics()
+        .inc_git_rpc(service_counter(service), "http");
     let path = state.core.repo_path(access.repo.id);
     // The per-service env tells push clients that `-o` options are accepted
     // and hides the server-only namespaces (`refs/for`, `refs/trails`) from
@@ -211,6 +215,13 @@ pub async fn receive_pack(
     rpc(state, &owner, &repo, headers, body, Service::ReceivePack).await
 }
 
+/// Bounded label value for `starforged_git_rpc_total{service}`.
+fn service_counter(service: Service) -> &'static str {
+    match service {
+        Service::UploadPack => "upload-pack",
+        Service::ReceivePack => "receive-pack",
+    }
+}
 /// Streams the request body into `git <service> --stateless-rpc` and its stdout back out.
 async fn rpc(
     state: AppState,
@@ -221,6 +232,10 @@ async fn rpc(
     service: Service,
 ) -> Result<Response, GitHttpError> {
     let (access, user, write_path) = authorize(&state, &headers, owner, repo, service).await?;
+    state
+        .core
+        .metrics()
+        .inc_git_rpc(service_counter(service), "http");
     let path = state.core.repo_path(access.repo.id);
     // Snapshot every ref tip before spawning receive-pack: the post-push task
     // diffs per ref and enumerates the newly reachable commits for the trailer
@@ -253,6 +268,20 @@ async fn rpc(
     let gzip = headers
         .get(header::CONTENT_ENCODING)
         .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"gzip"));
+    // receive-pack writes inside the repository: hold the shared lock
+    // until the child (and the post-push scan) finishes, so a backup
+    // copies either the pre-push or the post-push state (plan M5b O1).
+    let repo_lock = if service == Service::ReceivePack {
+        Some(
+            state
+                .core
+                .repo_lock_shared(access.repo.id)
+                .await
+                .map_err(|e| GitHttpError::Internal(e.to_string()))?,
+        )
+    } else {
+        None
+    };
     let process = smart::spawn_rpc(&path, service, git_protocol(&headers).as_deref(), &env)
         .map_err(|e| GitHttpError::Internal(e.to_string()))?;
 
@@ -282,6 +311,8 @@ async fn rpc(
         )
     });
     tokio::spawn(async move {
+        // Held for the whole child + scan lifetime (see above).
+        let _repo_lock = repo_lock;
         let mut text = String::new();
         let _ = stderr.read_to_string(&mut text).await;
         let status = child.wait().await;
