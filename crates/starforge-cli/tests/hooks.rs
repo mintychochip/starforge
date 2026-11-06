@@ -12,6 +12,8 @@ mod common;
 
 use common::hermetic_command;
 
+use clap::Parser as _;
+use starforge_cli::cli::Cli;
 use starforge_cli::commands::hooks::{
     disable, enable, hook_post_commit, hook_pre_push, hook_prepare,
 };
@@ -800,4 +802,67 @@ fn pre_push_dispatcher_propagates_orig_exit_status() {
         "failing orig pre-push hook fails the push"
     );
     assert_eq!(run(false).status.code(), Some(0), "no orig hook exits 0");
+}
+
+// Drift guard: every hook command `enable` installs must parse with the
+// real CLI, so a renamed subcommand fails here instead of in users' shells.
+#[test]
+fn installed_hook_commands_parse_with_real_cli() {
+    let (_dir, repo) = init_repo();
+    let (_home, paths) = test_paths();
+    let (_out, code) = enable(&repo, &paths, false);
+    assert_eq!(code, 0);
+
+    let mut commands: Vec<String> = Vec::new();
+
+    // Claude SessionEnd hook commands from <home>/.claude/settings.json.
+    let settings_path = paths.home.join(".claude").join("settings.json");
+    let settings: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+    if let Some(hooks_obj) = settings.get("hooks").and_then(|v| v.as_object()) {
+        for groups in hooks_obj.values() {
+            for group in groups.as_array().into_iter().flatten() {
+                for entry in group
+                    .get("hooks")
+                    .and_then(|v| v.as_array())
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(cmd) = entry.get("command").and_then(|v| v.as_str()) {
+                        commands.push(cmd.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    // Git dispatcher `starforge ...` lines (shell args like "$1" -> MSG).
+    let dir = hooks_dir(&repo);
+    for hook in HOOKS {
+        let body = std::fs::read_to_string(dir.join(hook)).unwrap();
+        for line in body.lines() {
+            let line = line.trim();
+            if let Some(rest) = line.strip_prefix("starforge ") {
+                let rest = rest.replace("\"$1\"", "MSG").replace("$1", "MSG");
+                commands.push(format!("starforge {rest}"));
+            }
+        }
+    }
+
+    assert!(
+        commands.len() >= 4,
+        "expected at least 4 installed hook commands, got {}: {commands:?}",
+        commands.len()
+    );
+    for command in &commands {
+        let argv: Vec<&str> = command.split_whitespace().collect();
+        assert!(
+            !argv.is_empty() && argv[0] == "starforge",
+            "hook command must start with starforge: {command}"
+        );
+        assert!(
+            Cli::try_parse_from(argv).is_ok(),
+            "installed hook command must parse with the real CLI: {command}"
+        );
+    }
 }

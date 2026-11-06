@@ -698,10 +698,26 @@ async fn best_effort_returns_with_stub_down() {
     )
     .await;
 
+    // The best-effort pass reconciles before draining, so every unsent
+    // operation for the ended session is queued and survives the failure:
+    // meta, the one segment, and complete (nothing is lost, nothing extra).
+    let mut queued: Vec<(QueueOp, Option<u64>)> = read_queue(&spool)
+        .unwrap()
+        .into_iter()
+        .map(|e| {
+            assert_eq!(e.ulid, ulid, "only the seeded session is queued");
+            (e.op, e.segment)
+        })
+        .collect();
+    queued.sort_by_key(|(op, seg)| (format!("{op:?}"), *seg));
     assert_eq!(
-        read_queue(&spool).unwrap().len(),
-        1,
-        "entry stays queued after a swallowed failure"
+        queued,
+        vec![
+            (QueueOp::Complete, None),
+            (QueueOp::Meta, None),
+            (QueueOp::Segment, Some(0)),
+        ],
+        "every unsent op stays queued after a swallowed failure"
     );
     assert!(sleeper.sleeps().is_empty(), "best effort never backs off");
     let _ = summary;
@@ -807,4 +823,61 @@ async fn sync_derives_missing_work_from_spool_state() {
         before,
         "second sync makes zero requests"
     );
+}
+// ---------------------------------------------------------------------------
+// Fix round 2: `sync_best_effort` reconciles first. A session whose `upload.json`
+// records meta + segments as uploaded but whose meta then changed (ended_at set)
+// with one unsent link line and an EMPTY queue still uploads PUT meta, POST
+// complete, and POST links — the hook path must not need an explicit `sync`.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn best_effort_reconciles_changed_meta_complete_and_links() {
+    let (_tmp, spool) = open_spool();
+    let (meta, _blobs) = seed_session(&spool, false, 1);
+    let ulid = meta.id.to_string();
+    // Mark meta + segment as uploaded, then change the meta (ended_at set).
+    let old_hash = starforge_format::blake3_hex(
+        &serde_json::to_vec(&spool.read_meta(&ulid).unwrap()).unwrap(),
+    );
+    spool.mark_meta_uploaded(&ulid, old_hash).unwrap();
+    spool.mark_segment_uploaded(&ulid, 0).unwrap();
+    let mut ended = spool.read_meta(&ulid).unwrap();
+    ended.ended_at = Some("2026-11-02T00:00:00Z".to_string());
+    spool.put_session(&ended).unwrap();
+    seed_link(&spool, &ulid);
+    assert!(
+        read_queue(&spool).unwrap().is_empty(),
+        "no queue entries seeded"
+    );
+
+    let stub = start_stub(StubConfig::ok()).await;
+    let server = stub.server_info();
+    let sleeper = FakeSleeper::default();
+    let summary = starforge_cli::commands::sync::sync_best_effort(
+        &spool, &server, OWNER_REPO, TOKEN, &sleeper, NOW,
+    )
+    .await;
+
+    let session = format!("/api/v1/repos/{OWNER_REPO}/sessions/{ulid}");
+    let reqs = stub.requests();
+    assert_eq!(
+        reqs.iter().map(|r| r.path.as_str()).collect::<Vec<_>>(),
+        vec![
+            session.as_str(),
+            format!("{session}/complete").as_str(),
+            format!("{session}/links").as_str(),
+        ],
+        "no segment PUT (already uploaded); PUT meta, POST complete, POST links"
+    );
+    assert_eq!(summary.exit_code(), 0, "drained");
+    assert!(read_queue(&spool).unwrap().is_empty(), "queue drained");
+
+    let state = spool.read_upload(&ulid).unwrap();
+    let new_hash = starforge_format::blake3_hex(
+        &serde_json::to_vec(&spool.read_meta(&ulid).unwrap()).unwrap(),
+    );
+    assert_eq!(state.meta_hash.as_deref(), Some(new_hash.as_str()));
+    assert!(state.complete, "complete recorded");
+    assert_eq!(state.sent_links.len(), 1, "one links line recorded as sent");
 }

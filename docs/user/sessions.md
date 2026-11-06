@@ -1,6 +1,8 @@
 # Sessions
 
-`starforge sync` uploads spooled sessions to `/api/v1/repos/{owner}/{repo}/sessions/{ulid}` with a
+`starforge sync` (and every hook pass — the pre-push hook and `starforge hook
+session-end` — which reconciles the spool first) uploads spooled sessions to
+`/api/v1/repos/{owner}/{repo}/sessions/{ulid}` with a
 `session:upload` token (`starforge auth login` prints a device code the browser approves at
 `/oauth/device`). The uploader needs write access to the repository; anything else answers `403`.
 Four calls make an upload: `PUT` metadata (Trace Format v1 JSON, path ULID matching `meta.id`),

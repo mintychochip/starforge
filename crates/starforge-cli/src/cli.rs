@@ -1031,8 +1031,7 @@ async fn run_sync(paths: CliPaths, dry_run: bool) -> std::process::ExitCode {
     // nothing was ever queued. A bad transcript must not block a drainable
     // queue: warn and continue draining.
     {
-        let roots =
-            crate::commands::hooks::all_adapter_roots(&paths, &repo, |k| std::env::var(k).ok());
+        let roots = crate::commands::hooks::all_adapter_roots(&paths, &repo);
         match crate::ingest::ingest(&spool, &roots, &repo, time::OffsetDateTime::now_utc()) {
             Ok(stats) => tracing::debug!(
                 "sync ingest: {} session(s), {} new event(s)",

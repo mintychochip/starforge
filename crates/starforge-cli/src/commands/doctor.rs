@@ -64,9 +64,7 @@ pub async fn doctor(repo: &Path, paths: &CliPaths, dry_run: bool) -> (String, u8
         use starforge_capture::agents::{
             ClaudeAdapter, CodexAdapter, GeminiAdapter, OpencodeAdapter, PiAdapter,
         };
-        let roots_for = |agent: &str| {
-            super::hooks::adapter_roots_for(agent, paths, repo, |k| std::env::var(k).ok())
-        };
+        let roots_for = |agent: &str| super::hooks::adapter_roots_for(agent, paths, repo);
         let adapters: [(&str, bool); 5] = [
             (
                 "claude-code",

@@ -75,7 +75,7 @@ impl SyncSummary {
 /// for links not yet recorded as sent. The queue stays the retry record:
 /// reconcile only appends entries no queued entry already covers, failures
 /// keep their bumped entries and backoff, and `sync_best_effort` (pre-push)
-/// keeps draining whatever is queued without reconciling.
+/// reconciles first too, then drains.
 pub async fn sync(
     spool: &Spool,
     server: &ServerInfo,
@@ -287,9 +287,11 @@ fn dry_run_summary(spool: &Spool, now_rfc3339: &str) -> Result<SyncSummary, Uplo
     })
 }
 
-/// Best-effort upload for the `pre-push` path: at most one attempt per entry,
-/// a 10 s overall deadline, every failure swallowed. Always returns (never
-/// fails the push); the queue keeps whatever did not make it.
+/// Best-effort upload for the `pre-push` path: reconcile the queue from spool
+/// state first (a reconcile failure is logged and ignored, so the hook never
+/// fails), then at most one attempt per entry, a 10 s overall deadline, every
+/// failure swallowed. Always returns (never fails the push); the queue keeps
+/// whatever did not make it.
 pub async fn sync_best_effort(
     spool: &Spool,
     server: &ServerInfo,
@@ -298,6 +300,9 @@ pub async fn sync_best_effort(
     sleeper: &impl Sleeper,
     now_rfc3339: &str,
 ) -> SyncSummary {
+    if let Err(err) = reconcile_queue(spool, now_rfc3339) {
+        tracing::debug!("sync_best_effort: reconcile failed, draining queue as-is: {err}");
+    }
     let run = sync_with_retries(
         spool,
         server,

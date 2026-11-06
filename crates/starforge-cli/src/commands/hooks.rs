@@ -22,7 +22,10 @@
 //! session with no new events since its last link is inactive and gains no
 //! further heuristic trailers). `pre-push` enqueues segment uploads for
 //! sessions with unwritten segments and then runs one best-effort sync pass
-//! (no retries); every failure stays queued with a `warning:` on stderr.
+//! (no retries); that pass first reconciles the queue from spool state
+//! (changed meta, segments, `complete`, and commit links) and then makes
+//! one bounded upload attempt; every failure stays queued with a
+//! `warning:` on stderr.
 //! The starforge hook steps never fail the git operation (every starforge
 //! error becomes a `warning:` with exit `0`), but the dispatcher propagates
 //! a failing user hook's exit status, so a failing `.starforge-orig`
@@ -59,13 +62,9 @@ struct PendingRecord {
     seq_end: u64,
 }
 
-fn env_lookup(key: &str) -> Option<String> {
-    std::env::var(key).ok()
-}
-
-/// Per-agent [`Roots`](starforge_capture::Roots) resolution. Pure: takes an
-/// injected env `lookup`. `base` is `paths.home`; when `STARFORGE_HOME` is
-/// set, agent env overrides are ignored (hermetic tests).
+/// Per-agent [`Roots`](starforge_capture::Roots) resolution. `base` is
+/// `paths.home`; agent-dir env overrides come from `paths.agent_dirs`
+/// (captured only by `CliPaths::resolve_with`; see its docs).
 ///
 /// claude-code: `$CLAUDE_CONFIG_DIR` else `<base>/.claude` (data = config);
 /// codex: `$CODEX_HOME` else `<base>/.codex` (data = config);
@@ -77,23 +76,23 @@ pub fn adapter_roots_for(
     agent: &str,
     paths: &crate::config::CliPaths,
     repo: &Path,
-    lookup: impl Fn(&str) -> Option<String>,
 ) -> starforge_capture::Roots {
     let base = paths.home.clone();
-    let has_sf_home = lookup("STARFORGE_HOME").is_some_and(|v| !v.is_empty());
-    let env_dir = |key: &str| -> Option<PathBuf> {
-        if has_sf_home {
-            return None;
-        }
-        lookup(key).filter(|v| !v.is_empty()).map(PathBuf::from)
-    };
     let (data_dir, config_dir) = match agent {
         "claude-code" => {
-            let dir = env_dir("CLAUDE_CONFIG_DIR").unwrap_or_else(|| base.join(".claude"));
+            let dir = paths
+                .agent_dirs
+                .claude_config_dir
+                .clone()
+                .unwrap_or_else(|| base.join(".claude"));
             (dir.clone(), dir)
         }
         "codex" => {
-            let dir = env_dir("CODEX_HOME").unwrap_or_else(|| base.join(".codex"));
+            let dir = paths
+                .agent_dirs
+                .codex_home
+                .clone()
+                .unwrap_or_else(|| base.join(".codex"));
             (dir.clone(), dir)
         }
         "gemini" => {
@@ -101,10 +100,16 @@ pub fn adapter_roots_for(
             (dir.clone(), dir)
         }
         "opencode" => {
-            let data = env_dir("XDG_DATA_HOME")
+            let data = paths
+                .agent_dirs
+                .xdg_data_home
+                .clone()
                 .map(|d| d.join("opencode"))
                 .unwrap_or_else(|| base.join(".local/share/opencode"));
-            let config = env_dir("XDG_CONFIG_HOME")
+            let config = paths
+                .agent_dirs
+                .xdg_config_home
+                .clone()
                 .map(|d| d.join("opencode"))
                 .unwrap_or_else(|| base.join(".config/opencode"));
             (data, config)
@@ -122,16 +127,10 @@ pub fn adapter_roots_for(
 pub fn all_adapter_roots(
     paths: &crate::config::CliPaths,
     repo: &Path,
-    lookup: impl Fn(&str) -> Option<String>,
 ) -> BTreeMap<String, starforge_capture::Roots> {
     ["claude-code", "codex", "pi", "opencode", "gemini"]
         .into_iter()
-        .map(|agent| {
-            (
-                agent.to_string(),
-                adapter_roots_for(agent, paths, repo, &lookup),
-            )
-        })
+        .map(|agent| (agent.to_string(), adapter_roots_for(agent, paths, repo)))
         .collect()
 }
 
@@ -148,22 +147,24 @@ mod root_tests {
             .collect();
         move |key: &str| map.get(key).cloned()
     }
+    fn resolved(pairs: &[(&str, &str)]) -> crate::config::CliPaths {
+        crate::config::CliPaths::resolve_with(lookup(pairs))
+    }
     #[test]
     fn defaults() {
         let p = paths();
         let repo = Path::new("/repo");
-        let no_env = |_: &str| None;
-        let claude = adapter_roots_for("claude-code", &p, repo, no_env);
+        let claude = adapter_roots_for("claude-code", &p, repo);
         assert_eq!(claude.data_dir, PathBuf::from("/home/u/.claude"));
         assert_eq!(claude.config_dir, claude.data_dir);
         assert_eq!(claude.worktree, repo);
-        let codex = adapter_roots_for("codex", &p, repo, no_env);
+        let codex = adapter_roots_for("codex", &p, repo);
         assert_eq!(codex.data_dir, PathBuf::from("/home/u/.codex"));
         assert_eq!(codex.config_dir, codex.data_dir);
-        let gemini = adapter_roots_for("gemini", &p, repo, no_env);
+        let gemini = adapter_roots_for("gemini", &p, repo);
         assert_eq!(gemini.data_dir, PathBuf::from("/home/u/.gemini"));
         assert_eq!(gemini.config_dir, gemini.data_dir);
-        let opencode = adapter_roots_for("opencode", &p, repo, no_env);
+        let opencode = adapter_roots_for("opencode", &p, repo);
         assert_eq!(
             opencode.data_dir,
             PathBuf::from("/home/u/.local/share/opencode")
@@ -172,64 +173,59 @@ mod root_tests {
             opencode.config_dir,
             PathBuf::from("/home/u/.config/opencode")
         );
-        let pi = adapter_roots_for("pi", &p, repo, no_env);
+        let pi = adapter_roots_for("pi", &p, repo);
         assert_eq!(pi.data_dir, PathBuf::from("/home/u"));
         assert_eq!(pi.config_dir, PathBuf::from("/home/u"));
     }
     #[test]
     fn env_overrides() {
-        let p = paths();
         let repo = Path::new("/repo");
-        let claude = adapter_roots_for(
-            "claude-code",
-            &p,
-            repo,
-            lookup(&[("CLAUDE_CONFIG_DIR", "/c")]),
-        );
+        let p = resolved(&[("HOME", "/home/u"), ("CLAUDE_CONFIG_DIR", "/c")]);
+        let claude = adapter_roots_for("claude-code", &p, repo);
         assert_eq!(claude.data_dir, PathBuf::from("/c"));
         assert_eq!(claude.config_dir, PathBuf::from("/c"));
-        let codex = adapter_roots_for("codex", &p, repo, lookup(&[("CODEX_HOME", "/x")]));
+        let p = resolved(&[("HOME", "/home/u"), ("CODEX_HOME", "/x")]);
+        let codex = adapter_roots_for("codex", &p, repo);
         assert_eq!(codex.data_dir, PathBuf::from("/x"));
-        let opencode = adapter_roots_for(
-            "opencode",
-            &p,
-            repo,
-            lookup(&[("XDG_DATA_HOME", "/xd"), ("XDG_CONFIG_HOME", "/xc")]),
-        );
+        let p = resolved(&[
+            ("HOME", "/home/u"),
+            ("XDG_DATA_HOME", "/xd"),
+            ("XDG_CONFIG_HOME", "/xc"),
+        ]);
+        let opencode = adapter_roots_for("opencode", &p, repo);
         assert_eq!(opencode.data_dir, PathBuf::from("/xd/opencode"));
         assert_eq!(opencode.config_dir, PathBuf::from("/xc/opencode"));
     }
     #[test]
     fn starforge_home_ignores_overrides() {
-        let p = paths();
         let repo = Path::new("/repo");
-        let lk = lookup(&[
-            ("STARFORGE_HOME", "/sf"),
+        let p = resolved(&[
+            ("STARFORGE_HOME", "/home/u"),
             ("CLAUDE_CONFIG_DIR", "/c"),
             ("CODEX_HOME", "/x"),
             ("XDG_DATA_HOME", "/xd"),
             ("XDG_CONFIG_HOME", "/xc"),
         ]);
         assert_eq!(
-            adapter_roots_for("claude-code", &p, repo, &lk).data_dir,
+            adapter_roots_for("claude-code", &p, repo).data_dir,
             PathBuf::from("/home/u/.claude")
         );
         assert_eq!(
-            adapter_roots_for("codex", &p, repo, &lk).data_dir,
+            adapter_roots_for("codex", &p, repo).data_dir,
             PathBuf::from("/home/u/.codex")
         );
         assert_eq!(
-            adapter_roots_for("opencode", &p, repo, &lk).data_dir,
+            adapter_roots_for("opencode", &p, repo).data_dir,
             PathBuf::from("/home/u/.local/share/opencode")
         );
         assert_eq!(
-            adapter_roots_for("opencode", &p, repo, &lk).config_dir,
+            adapter_roots_for("opencode", &p, repo).config_dir,
             PathBuf::from("/home/u/.config/opencode")
         );
     }
     #[test]
     fn all_roots_keys() {
-        let all = all_adapter_roots(&paths(), Path::new("/repo"), |_: &str| None);
+        let all = all_adapter_roots(&paths(), Path::new("/repo"));
         assert_eq!(all.len(), 5);
         assert!(all.contains_key("pi"));
     }
@@ -329,7 +325,7 @@ pub fn enable(repo: &Path, paths: &crate::config::CliPaths, dry_run: bool) -> (S
         }
     }
     for adapter in all_adapters() {
-        let roots = adapter_roots_for(adapter.id(), paths, repo, env_lookup);
+        let roots = adapter_roots_for(adapter.id(), paths, repo);
         match adapter.install_hooks(&roots) {
             Ok(written) => {
                 tracing::debug!(
@@ -385,7 +381,7 @@ pub fn disable(repo: &Path, paths: &crate::config::CliPaths, dry_run: bool) -> (
         }
     }
     for adapter in all_adapters() {
-        let roots = adapter_roots_for(adapter.id(), paths, repo, env_lookup);
+        let roots = adapter_roots_for(adapter.id(), paths, repo);
         match adapter.remove_hooks(&roots) {
             Ok(removed) => {
                 tracing::debug!(
@@ -444,7 +440,9 @@ pub fn hook_pre_push(repo: &Path, paths: &crate::config::CliPaths) -> u8 {
 /// Full `_hook-pre-push` body (C7 carry-in 3): enqueue, then attempt the
 /// queued uploads without blocking the push.
 ///
-/// Best-effort budget is one pass with no retries
+/// Best-effort budget is one pass with no retries: the pass first
+/// reconciles the queue from spool state (changed meta, segments,
+/// `complete`, and commit links) and then makes one bounded upload attempt
 /// ([`sync_best_effort`](crate::commands::sync::sync_best_effort) caps the
 /// whole attempt at 10 s and swallows every failure). Server resolution,
 /// token, and upload failures all degrade to a `warning:` on stderr; the
@@ -474,7 +472,7 @@ fn run_ingest(
     spool
         .ensure_layout()
         .map_err(|err| format!("cannot set up spool: {err}"))?;
-    let roots = all_adapter_roots(paths, repo, env_lookup);
+    let roots = all_adapter_roots(paths, repo);
     let now = time::OffsetDateTime::now_utc();
     let stats = crate::ingest::ingest(&spool, &roots, repo, now)
         .map_err(|err| format!("ingest failed: {err}"))?;
