@@ -28,6 +28,10 @@ pub struct Repo {
     /// When the repository was deleted; a deleted repository answers like a missing one until it is restored
     /// or purged (forge-basics design §5.5).
     pub deleted_at: Option<i64>,
+    /// Whether the repository is a pull mirror (M4b D4).
+    pub mirror: bool,
+    /// The one-time import state: `none|pending|running|done|failed` (M4b D3).
+    pub import_state: String,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -72,6 +76,8 @@ pub(crate) fn to_repo(row: RepoRow) -> CoreResult<Repo> {
         description: row.description,
         visibility,
         default_branch: row.default_branch,
+        mirror: row.mirror != 0,
+        import_state: row.import_state,
         archived_at: row.archived_at,
         deleted_at: row.deleted_at,
         created_at: row.created_at,
@@ -146,6 +152,25 @@ impl Core {
         owner: &str,
         input: CreateRepo,
     ) -> CoreResult<Repo> {
+        self.create_repo_with_import(actor, owner, input, None)
+            .await
+    }
+
+    /// [`Core::create_repo`] with an optional one-time import (M4b D3).
+    /// The import URL is checked first: a policy refusal is `Invalid`
+    /// (422) before any repository exists. With an import, the repository
+    /// starts empty (no README) in `pending`; otherwise it is ordinary.
+    pub async fn create_repo_with_import(
+        &self,
+        actor: &User,
+        owner: &str,
+        input: CreateRepo,
+        import: Option<crate::remotes::ImportInput>,
+    ) -> CoreResult<Repo> {
+        let prepared = match &import {
+            Some(input) => Some(self.prepare_import(input).await?),
+            None => None,
+        };
         let name = validate::repo_name(&input.name)?;
         let description = checked_description(&input.description)?;
         let owner_row = db_orgs::owner_by_handle(self.db(), &owner.trim().to_ascii_lowercase())
@@ -190,7 +215,13 @@ impl Core {
         };
         let path = self.repo_path(id);
         if let Err(err) = self
-            .initialize(actor, &path, &name, &description, input.readme)
+            .initialize(
+                actor,
+                &path,
+                &name,
+                &description,
+                input.readme && prepared.is_none(),
+            )
             .await
         {
             db_repos::delete(self.db(), id).await?;
@@ -205,6 +236,12 @@ impl Core {
             repo.visibility.as_str(),
         )
         .await?;
+        if let Some(prepared) = prepared {
+            let _ = self
+                .create_import_for_repo(actor.id, id, &repo.full_name(), prepared)
+                .await?;
+            return self.reload_repo(id).await;
+        }
         Ok(repo)
     }
 
@@ -564,6 +601,10 @@ impl Core {
             &format!("{} -> {}", old.as_str(), visibility.as_str()),
         )
         .await?;
+        self.enqueue_index(&crate::jobs::Job::IndexRepo {
+            repo_id: access.repo.id,
+        })
+        .await;
         self.reload_repo(access.repo.id).await
     }
 
@@ -784,6 +825,10 @@ impl Core {
             "",
         )
         .await?;
+        self.enqueue_index(&crate::jobs::Job::IndexRepo {
+            repo_id: access.repo.id,
+        })
+        .await;
         self.reload_repo(access.repo.id).await
     }
 
@@ -832,6 +877,8 @@ impl Core {
             "",
         )
         .await?;
+        self.enqueue_index(&crate::jobs::Job::IndexRepo { repo_id: repo.id })
+            .await;
         self.reload_repo(repo.id).await
     }
 
@@ -893,7 +940,10 @@ impl Core {
             &format!("repo:{}", repo.full_name()),
             "",
         )
-        .await
+        .await?;
+        self.enqueue_index(&crate::jobs::Job::IndexRepo { repo_id: repo.id })
+            .await;
+        Ok(())
     }
 
     /// Purges every deleted repository of `owner_id` now, whatever its age (account deletion).

@@ -30,6 +30,7 @@ pub async fn build(config: &Config, hook_exe: PathBuf) -> anyhow::Result<App> {
         starforged_web::WebSettings {
             base_url: config.server.base_url.clone(),
             secure_cookies: config.secure_cookies(),
+            ssh_clone_base: config.ssh_clone_base(),
         },
     );
     let api = starforged_api::router(core.clone(), config.server.base_url.clone());
@@ -38,6 +39,21 @@ pub async fn build(config: &Config, hook_exe: PathBuf) -> anyhow::Result<App> {
         .nest("/api/v1", api)
         .merge(web);
     Ok(App { router, core })
+}
+/// Startup search recovery (plan D5): when opening the index recreated it
+/// (missing or corrupt), enqueue a full rebuild. The server never refuses
+/// to start because of the index, so a queue failure is only logged.
+pub async fn recover_search_index(core: &Core) -> anyhow::Result<()> {
+    if !core.search_index_was_recreated() {
+        return Ok(());
+    }
+    if let Err(err) = core
+        .enqueue(&starforged_core::jobs::Job::RebuildIndex)
+        .await
+    {
+        tracing::warn!(error = %err, "enqueueing startup search rebuild");
+    }
+    Ok(())
 }
 
 /// Serves `router` with `ConnectInfo<SocketAddr>` available to handlers until `shutdown` resolves.
@@ -57,6 +73,7 @@ pub async fn serve_on(
 pub async fn run(config: Config) -> anyhow::Result<()> {
     let (major, minor) = starforged_git::command::check_version().await?;
     let app = build(&config, std::env::current_exe()?).await?;
+    recover_search_index(&app.core).await?;
     starforged_core::jobs::start_workers(&app.core, JOB_WORKERS).await?;
     let listener = TcpListener::bind(&config.server.http_addr)
         .await
@@ -67,7 +84,29 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         git = %format!("{major}.{minor}"),
         "starforged listening"
     );
-    serve_on(listener, app.router, shutdown_signal()).await?;
+    let ssh = if config.ssh.enabled {
+        let cfg = starforged_ssh::Config {
+            listen: config.ssh.listen.clone(),
+            host_key_path: config.ssh_host_key_path(),
+            idle_timeout_secs: config.ssh.idle_timeout_secs,
+            max_connection_secs: config.ssh.max_connection_secs,
+            max_connections_per_user: config.ssh.max_connections_per_user,
+        };
+        let handle = starforged_ssh::serve(app.core.clone(), cfg, shutdown_signal()).await?;
+        tracing::info!(addr = %handle.addr(), "starforged ssh listening");
+        Some(handle)
+    } else {
+        None
+    };
+    match ssh {
+        Some(ssh) => {
+            tokio::select! {
+                result = serve_on(listener, app.router, shutdown_signal()) => result?,
+                result = ssh.wait() => result?,
+            }
+        }
+        None => serve_on(listener, app.router, shutdown_signal()).await?,
+    }
     Ok(())
 }
 

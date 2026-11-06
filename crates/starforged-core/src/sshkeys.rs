@@ -213,20 +213,8 @@ impl Core {
         let title = checked_title(title)?;
         let parsed = parse_public_key(key)?;
         let fp = fingerprint(&parsed.blob);
-        if db_keys::ssh_key_by_fingerprint(self.db(), &fp)
-            .await?
-            .is_some()
-            || db_keys::deploy_key_by_fingerprint(self.db(), &fp)
-                .await?
-                .is_some()
-        {
-            return Err(CoreError::Invalid("this key is already in use".into()));
-        }
-        if db_keys::count_ssh_keys(self.db(), user.id).await? >= MAX_KEYS_PER_USER {
-            return Err(CoreError::Invalid("too many SSH keys (maximum 100)".into()));
-        }
         let public_key = canonical_line(&parsed.algorithm, &parsed.blob, &parsed.comment);
-        let id = db_keys::insert_ssh_key(
+        let id = match db_keys::insert_ssh_key(
             self.db(),
             &db_keys::NewSshKey {
                 user_id: user.id,
@@ -235,8 +223,18 @@ impl Core {
                 fingerprint: &fp,
                 public_key: &public_key,
             },
+            MAX_KEYS_PER_USER,
         )
-        .await?;
+        .await?
+        {
+            Ok(id) => id,
+            Err(db_keys::AddKeyError::Duplicate) => {
+                return Err(CoreError::Invalid("this key is already in use".into()));
+            }
+            Err(db_keys::AddKeyError::TooMany) => {
+                return Err(CoreError::Invalid("too many SSH keys (maximum 100)".into()));
+            }
+        };
         self.audit(Some(user.id), "ssh_key.add", &format!("ssh_key:{id}"), &fp)
             .await?;
         Ok(SshKeyView {
@@ -297,23 +295,8 @@ impl Core {
         let title = checked_title(title)?;
         let parsed = parse_public_key(key)?;
         let fp = fingerprint(&parsed.blob);
-        if db_keys::ssh_key_by_fingerprint(self.db(), &fp)
-            .await?
-            .is_some()
-            || db_keys::deploy_key_by_fingerprint(self.db(), &fp)
-                .await?
-                .is_some()
-        {
-            return Err(CoreError::Invalid("this key is already in use".into()));
-        }
-        if db_keys::count_deploy_keys(self.db(), access.repo.id).await? >= MAX_DEPLOY_KEYS_PER_REPO
-        {
-            return Err(CoreError::Invalid(
-                "too many deploy keys (maximum 50)".into(),
-            ));
-        }
         let public_key = canonical_line(&parsed.algorithm, &parsed.blob, &parsed.comment);
-        let id = db_keys::insert_deploy_key(
+        let id = match db_keys::insert_deploy_key(
             self.db(),
             &db_keys::NewDeployKey {
                 repo_id: access.repo.id,
@@ -324,8 +307,20 @@ impl Core {
                 read_write,
                 created_by: user.id,
             },
+            MAX_DEPLOY_KEYS_PER_REPO,
         )
-        .await?;
+        .await?
+        {
+            Ok(id) => id,
+            Err(db_keys::AddKeyError::Duplicate) => {
+                return Err(CoreError::Invalid("this key is already in use".into()));
+            }
+            Err(db_keys::AddKeyError::TooMany) => {
+                return Err(CoreError::Invalid(
+                    "too many deploy keys (maximum 50)".into(),
+                ));
+            }
+        };
         self.audit(
             Some(user.id),
             "deploy_key.add",
@@ -636,6 +631,75 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none()
+        );
+    }
+    #[tokio::test]
+    async fn concurrent_duplicate_user_keys_give_one_success() {
+        let (core, _f) = test_core().await;
+        let alice = make_user(&core, "alice").await;
+        let bob = make_user(&core, "bob").await;
+        let line = ed25519_key();
+        let (a, b) = {
+            let c1 = core.clone();
+            let c2 = core.clone();
+            tokio::join!(
+                c1.add_ssh_key(&alice, "one", &line),
+                c2.add_ssh_key(&bob, "two", &line),
+            )
+        };
+        let oks = a.is_ok() as usize + b.is_ok() as usize;
+        assert_eq!(oks, 1, "exactly one add succeeds");
+        assert!(
+            matches!(&a, Err(CoreError::Invalid(_))) || matches!(&b, Err(CoreError::Invalid(_)))
+        );
+        assert!(
+            [
+                core.ssh_keys(&alice).await.unwrap().len(),
+                core.ssh_keys(&bob).await.unwrap().len()
+            ]
+            .into_iter()
+            .sum::<usize>()
+                == 1
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_user_and_deploy_same_key_give_one_success() {
+        let (core, _f) = test_core().await;
+        let alice = make_user(&core, "alice").await;
+        core.create_repo(
+            &alice,
+            &alice.handle,
+            CreateRepo {
+                name: "proj".into(),
+                description: String::new(),
+                visibility: Visibility::Private,
+                readme: false,
+            },
+        )
+        .await
+        .unwrap();
+        let line = ed25519_key();
+        let (a, b) = {
+            let c1 = core.clone();
+            let c2 = core.clone();
+            tokio::join!(
+                c1.add_ssh_key(&alice, "user", &line),
+                c2.add_deploy_key(&alice, "alice", "proj", "deploy", &line, false),
+            )
+        };
+        assert_eq!(a.is_ok() as usize + b.is_ok() as usize, 1);
+        assert!(
+            matches!(&a, Err(CoreError::Invalid(_))) || matches!(&b, Err(CoreError::Invalid(_)))
+        );
+        assert_eq!(
+            core.ssh_keys(&alice).await.unwrap().len()
+                + core
+                    .deploy_keys(&alice, "alice", "proj")
+                    .await
+                    .unwrap()
+                    .len(),
+            1
         );
     }
 }

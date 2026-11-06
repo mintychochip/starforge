@@ -18,6 +18,10 @@ pub struct TrailRow {
     pub state: String,
     pub ready: i64,
     pub author_id: Option<i64>,
+    /// The original GitHub login when the author matched no local user (D1);
+    /// `author_id` is then NULL. `github_id` is the GitHub issue/PR id.
+    pub imported_author: Option<String>,
+    pub github_id: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
     pub closed_at: Option<i64>,
@@ -41,6 +45,10 @@ pub struct TrailCommentRow {
     pub id: i64,
     pub trail_id: i64,
     pub author_id: Option<i64>,
+    /// The original GitHub login when the author matched no local user (D1);
+    /// `author_id` is then NULL. `github_id` is the GitHub comment id.
+    pub imported_author: Option<String>,
+    pub github_id: Option<i64>,
     pub body: String,
     pub created_at: i64,
     pub edited_at: Option<i64>,
@@ -128,7 +136,7 @@ use crate::{Db, DbResult};
 macro_rules! select_trail {
     ($tail:literal) => {
         concat!(
-            "SELECT id, repo_id, number, title, intent, state, ready, author_id, created_at, updated_at, closed_at, ",
+            "SELECT id, repo_id, number, title, intent, state, ready, author_id, imported_author, github_id, created_at, updated_at, closed_at, ",
             "merged_at FROM trails ",
             $tail
         )
@@ -138,7 +146,7 @@ macro_rules! select_trail {
 macro_rules! select_comment {
     ($tail:literal) => {
         concat!(
-            "SELECT id, trail_id, author_id, body, created_at, edited_at FROM trail_comments ",
+            "SELECT id, trail_id, author_id, imported_author, github_id, body, created_at, edited_at FROM trail_comments ",
             $tail
         )
     };
@@ -163,6 +171,8 @@ fn trail_from_row(row: &AnyRow) -> DbResult<TrailRow> {
         state: row.try_get("state")?,
         ready: row.try_get("ready")?,
         author_id: row.try_get("author_id")?,
+        imported_author: row.try_get("imported_author")?,
+        github_id: row.try_get("github_id")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
         closed_at: row.try_get("closed_at")?,
@@ -175,6 +185,8 @@ fn comment_from_row(row: &AnyRow) -> DbResult<TrailCommentRow> {
         id: row.try_get("id")?,
         trail_id: row.try_get("trail_id")?,
         author_id: row.try_get("author_id")?,
+        imported_author: row.try_get("imported_author")?,
+        github_id: row.try_get("github_id")?,
         body: row.try_get("body")?,
         created_at: row.try_get("created_at")?,
         edited_at: row.try_get("edited_at")?,
@@ -212,7 +224,7 @@ pub async fn insert_trail(db: &Db, t: &NewTrail<'_>, now: i64) -> DbResult<Trail
     let row = sqlx::query(
         "INSERT INTO trails (repo_id, number, title, intent, state, ready, author_id, created_at, updated_at) \
          VALUES ($1, $2, $3, $4, 'open', 0, $5, $6, $6) \
-         RETURNING id, repo_id, number, title, intent, state, ready, author_id, created_at, updated_at, closed_at, merged_at",
+         RETURNING id, repo_id, number, title, intent, state, ready, author_id, imported_author, github_id, created_at, updated_at, closed_at, merged_at",
     )
     .bind(t.repo_id)
     .bind(number)
@@ -225,6 +237,100 @@ pub async fn insert_trail(db: &Db, t: &NewTrail<'_>, now: i64) -> DbResult<Trail
     let trail = trail_from_row(&row)?;
     tx.commit().await?;
     Ok(trail)
+}
+/// Inserts a Trail with an explicit GitHub number (M4c D2), instead of
+/// allocating one: `number` is the GitHub issue/PR number and
+/// `trail_sequences` is advanced past it in the same transaction, so the
+/// next locally created Trail continues after the highest imported number.
+/// `author_id` is `None` exactly when `imported_author` carries the GitHub
+/// login (D1). Re-importing the same `github_id` fails on the unique index;
+/// callers check [`trail_by_github_id`] first so a resume never duplicates.
+#[allow(clippy::too_many_arguments)]
+pub async fn insert_imported_trail(
+    db: &Db,
+    repo_id: i64,
+    number: i64,
+    title: &str,
+    intent: &str,
+    state: &str,
+    author_id: Option<i64>,
+    imported_author: Option<&str>,
+    github_id: i64,
+    now: i64,
+) -> DbResult<TrailRow> {
+    let mut tx = db.pool().begin().await?;
+    sqlx::query(
+        "INSERT INTO trail_sequences (repo_id, next_number) VALUES ($1, $2) \
+         ON CONFLICT (repo_id) DO UPDATE SET next_number = CASE WHEN trail_sequences.next_number < $2 THEN $2 ELSE trail_sequences.next_number END",
+    )
+    .bind(repo_id)
+    .bind(number + 1)
+    .execute(&mut *tx)
+    .await?;
+    let row = sqlx::query(
+        "INSERT INTO trails (repo_id, number, title, intent, state, ready, author_id, imported_author, github_id, created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, $5, 0, $6, $7, $8, $9, $9) \
+         RETURNING id, repo_id, number, title, intent, state, ready, author_id, imported_author, github_id, created_at, updated_at, closed_at, merged_at",
+    )
+    .bind(repo_id)
+    .bind(number)
+    .bind(title)
+    .bind(intent)
+    .bind(state)
+    .bind(author_id)
+    .bind(imported_author)
+    .bind(github_id)
+    .bind(now)
+    .fetch_one(&mut *tx)
+    .await?;
+    let trail = trail_from_row(&row)?;
+    tx.commit().await?;
+    Ok(trail)
+}
+
+/// The imported Trail with this GitHub id, if any (idempotent resumption).
+pub async fn trail_by_github_id(db: &Db, github_id: i64) -> DbResult<Option<TrailRow>> {
+    let row = sqlx::query(select_trail!("WHERE github_id = $1"))
+        .bind(github_id)
+        .fetch_optional(db.pool())
+        .await?;
+    row.as_ref().map(trail_from_row).transpose()
+}
+
+/// Inserts a Trail comment from an import (M4c): `author_id` is `None`
+/// exactly when `imported_author` carries the GitHub login (D1).
+pub async fn insert_imported_comment(
+    db: &Db,
+    trail_id: i64,
+    author_id: Option<i64>,
+    imported_author: Option<&str>,
+    github_id: i64,
+    body: &str,
+    now: i64,
+) -> DbResult<TrailCommentRow> {
+    let row = sqlx::query(
+        "INSERT INTO trail_comments (trail_id, author_id, imported_author, github_id, body, created_at) \
+         VALUES ($1, $2, $3, $4, $5, $6) \
+         RETURNING id, trail_id, author_id, imported_author, github_id, body, created_at, edited_at",
+    )
+    .bind(trail_id)
+    .bind(author_id)
+    .bind(imported_author)
+    .bind(github_id)
+    .bind(body)
+    .bind(now)
+    .fetch_one(db.pool())
+    .await?;
+    comment_from_row(&row)
+}
+
+/// The imported Trail comment with this GitHub id, if any.
+pub async fn comment_by_github_id(db: &Db, github_id: i64) -> DbResult<Option<TrailCommentRow>> {
+    let row = sqlx::query(select_comment!("WHERE github_id = $1"))
+        .bind(github_id)
+        .fetch_optional(db.pool())
+        .await?;
+    row.as_ref().map(comment_from_row).transpose()
 }
 
 pub async fn trail_by_number(db: &Db, repo_id: i64, number: i64) -> DbResult<Option<TrailRow>> {
@@ -291,7 +397,7 @@ pub async fn trails_of_repo(db: &Db, repo_id: i64, f: &TrailFilter) -> DbResult<
          WHERE tsl.trail_id = trails.id AND {readable})"
     );
     let sql = format!(
-        "SELECT id, repo_id, number, title, intent, state, ready, author_id, created_at, updated_at, \
+        "SELECT id, repo_id, number, title, intent, state, ready, author_id, imported_author, github_id, created_at, updated_at, \
          closed_at, merged_at FROM trails \
          WHERE repo_id = $1 AND ($2 IS NULL OR number > $2) AND ($3 IS NULL OR state = $3) \
          AND ($4 IS NULL OR author_id = $4) \
@@ -382,7 +488,7 @@ async fn dashboard_trails(
     // Safe: only `$N` placeholders are interpolated alongside the asserted
     // constant table name; every value is a bound parameter.
     let sql = format!(
-        "SELECT t.id, t.repo_id, t.number, t.title, t.intent, t.state, t.ready, t.author_id, \
+        "SELECT t.id, t.repo_id, t.number, t.title, t.intent, t.state, t.ready, t.author_id, t.imported_author, t.github_id, \
          t.created_at, t.updated_at, t.closed_at, t.merged_at, o.handle AS owner, r.name AS repo \
          FROM trails t JOIN repos r ON r.id = t.repo_id JOIN owners o ON o.id = r.owner_id \
          WHERE t.state = 'open' AND r.deleted_at IS NULL \
@@ -589,7 +695,7 @@ pub async fn insert_comment(
 ) -> DbResult<TrailCommentRow> {
     let row = sqlx::query(
         "INSERT INTO trail_comments (trail_id, author_id, body, created_at) VALUES ($1, $2, $3, $4) \
-         RETURNING id, trail_id, author_id, body, created_at, edited_at",
+         RETURNING id, trail_id, author_id, imported_author, github_id, body, created_at, edited_at",
     )
     .bind(trail_id)
     .bind(author_id)

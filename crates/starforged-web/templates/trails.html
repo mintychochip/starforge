@@ -40,7 +40,7 @@
 {% for t in rows %}
 <tr><td><a href="/{{ head.owner }}/{{ head.name }}/trails/{{ t.number }}">#{{ t.number }} {{ t.title }}</a>
   <span class="badge">{{ t.state }}</span>{% if t.ready %} <span class="badge">ready</span>{% endif %}</td>
-<td>{% for l in t.labels %}<span class="badge">{{ l }}</span> {% endfor %}{% for a in t.assignees %}<a href="/{{ a }}">{{ a }}</a> {% endfor %}<span class="muted" title="{{ t.number }}">{{ t.age }}</span></td></tr>
+<td>{% if let Some(a) = t.imported_author %}{{ a }} (imported){% else if t.author_handle == "deleted user" %}deleted user{% else %}<a href="/{{ t.author_handle }}">{{ t.author_handle }}</a>{% endif %} · {% for l in t.labels %}<span class="badge">{{ l }}</span> {% endfor %}{% for a in t.assignees %}<a href="/{{ a }}">{{ a }}</a> {% endfor %}<span class="muted" title="{{ t.number }}">{{ t.age }}</span></td></tr>
 {% endfor %}
 </tbody></table>
 {% endif %}

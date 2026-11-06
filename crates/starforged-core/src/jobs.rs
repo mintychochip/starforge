@@ -54,6 +54,14 @@ pub enum Job {
     GitMaintenance { repo_id: i64 },
     /// M4 owns event indexing: the M1d arm only confirms the session still exists (stub, documented).
     IndexSessionEvents { session_id: i64 },
+    /// Replaces one Trail document from the database (plan D5).
+    IndexTrail { trail_id: i64 },
+    /// Re-indexes every document of one repository; a deleted or missing repository drops its documents.
+    IndexRepo { repo_id: i64 },
+    /// Removes every event document of one session (delete or purge, plan D5).
+    DropSessionDocs { session_id: i64, repo_id: i64 },
+    /// Wipes and rebuilds the whole search index (startup recovery, admin action).
+    RebuildIndex,
     /// Links resolve synchronously at write time (trailer scan + CLI claims);
     /// the M1d arm is a no-op marker for future layers (stub, documented).
     ResolveCommitLinks { repo_id: i64, session_ulid: String },
@@ -80,6 +88,9 @@ pub enum Job {
         #[serde(default)]
         redelivery: bool,
     },
+    /// One-time import from a git URL (M4b D3). Deduplicated per
+    /// repository: a retry/start while one is queued collapses into it.
+    ImportRepo { repo_id: i64 },
 }
 
 impl Job {
@@ -92,12 +103,17 @@ impl Job {
             Job::SendEmail { .. } => "send_email",
             Job::GitMaintenance { .. } => "git_maintenance",
             Job::IndexSessionEvents { .. } => "index_session_events",
+            Job::IndexTrail { .. } => "index_trail",
+            Job::IndexRepo { .. } => "index_repo",
+            Job::DropSessionDocs { .. } => "drop_session_docs",
+            Job::RebuildIndex => "rebuild_index",
             Job::ResolveCommitLinks { .. } => "resolve_commit_links",
             Job::UpdateSessionStats { .. } => "update_session_stats",
             Job::SessionWebhookOutbox { .. } => "session_webhook_outbox",
             Job::ChangeMergeability { .. } => "change_mergeability",
             Job::RecordRevisionCommits { .. } => "record_revision_commits",
             Job::WebhookDelivery { .. } => "webhook_delivery",
+            Job::ImportRepo { .. } => "import_repo",
         }
     }
 
@@ -110,11 +126,16 @@ impl Job {
             Job::PurgeDeletedRepos => Some(DAY),
             Job::SendEmail { .. } => None,
             Job::GitMaintenance { .. } => None,
+            Job::IndexTrail { .. } => None,
+            Job::IndexRepo { .. } => None,
+            Job::DropSessionDocs { .. } => None,
+            Job::RebuildIndex => None,
             Job::IndexSessionEvents { .. } => None,
             Job::ResolveCommitLinks { .. } => None,
             Job::UpdateSessionStats { .. } => None,
             Job::ChangeMergeability { .. } => None,
             Job::RecordRevisionCommits { .. } => None,
+            Job::ImportRepo { .. } => None,
             Job::WebhookDelivery { .. } => None,
             Job::SessionWebhookOutbox { .. } => None,
         }
@@ -127,9 +148,19 @@ impl Job {
             Job::ChangeMergeability { change_id } => {
                 Some(format!("change_mergeability:{change_id}"))
             }
+            Job::IndexSessionEvents { session_id } => {
+                Some(format!("index_session_events:{session_id}"))
+            }
+            Job::IndexTrail { trail_id } => Some(format!("index_trail:{trail_id}")),
+            Job::IndexRepo { repo_id } => Some(format!("index_repo:{repo_id}")),
+            Job::DropSessionDocs { session_id, .. } => {
+                Some(format!("drop_session_docs:{session_id}"))
+            }
+            Job::RebuildIndex => Some("rebuild_index".to_owned()),
             Job::RecordRevisionCommits { revision_id } => {
                 Some(format!("record_revision_commits:{revision_id}"))
             }
+            Job::ImportRepo { repo_id } => Some(format!("import_repo:{repo_id}")),
             _ => self.recurrence().map(|_| self.kind().to_owned()),
         }
     }
@@ -235,11 +266,11 @@ impl Core {
             }
             Job::PurgeDeletedRepos => self.purge_deleted_repos().await.map(|_| ()),
             Job::GitMaintenance { repo_id } => self.maintain_repo(*repo_id).await,
-            // M4 owns event indexing; M1d only confirms the session still exists.
-            Job::IndexSessionEvents { session_id } => {
-                let _ = db_sessions::session_by_id(self.db(), *session_id).await?;
-                Ok(())
-            }
+            Job::IndexSessionEvents { session_id } => self.index_session_events(*session_id).await,
+            Job::IndexTrail { trail_id } => self.index_trail(*trail_id).await,
+            Job::IndexRepo { repo_id } => self.index_repo_by_id(*repo_id).await,
+            Job::DropSessionDocs { session_id, .. } => self.drop_session_docs(*session_id).await,
+            Job::RebuildIndex => self.rebuild_search_index().await.map(|_| ()),
             // Links resolve synchronously at write time; nothing left to do.
             Job::ResolveCommitLinks { .. } => Ok(()),
             Job::UpdateSessionStats { session_id } => {
@@ -249,6 +280,7 @@ impl Core {
             Job::RecordRevisionCommits { revision_id } => {
                 self.backfill_revision_commits(*revision_id).await
             }
+            Job::ImportRepo { repo_id } => self.run_import(*repo_id).await,
             Job::WebhookDelivery {
                 webhook_id,
                 event,
@@ -575,6 +607,37 @@ mod tests {
         let json = serde_json::to_string(&Job::GitMaintenance { repo_id: 7 }).unwrap();
         assert_eq!(json, r#"{"kind":"git_maintenance","repo_id":7}"#);
     }
+    #[tokio::test]
+    async fn index_jobs_dedupe_by_kind_and_id() {
+        let (core, _f) = test_core().await;
+        for job in [
+            Job::IndexSessionEvents { session_id: 7 },
+            Job::IndexTrail { trail_id: 3 },
+            Job::IndexRepo { repo_id: 5 },
+            Job::DropSessionDocs {
+                session_id: 7,
+                repo_id: 5,
+            },
+            Job::RebuildIndex,
+        ] {
+            core.enqueue(&job).await.unwrap();
+            core.enqueue(&job).await.unwrap();
+        }
+        for (kind, expected) in [
+            ("index_session_events", 1),
+            ("index_trail", 1),
+            ("index_repo", 1),
+            ("drop_session_docs", 1),
+            ("rebuild_index", 1),
+        ] {
+            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM jobs WHERE kind = $1")
+                .bind(kind)
+                .fetch_one(core.db().pool())
+                .await
+                .unwrap();
+            assert_eq!(count, expected, "one pending {kind}");
+        }
+    }
 
     #[tokio::test]
     async fn maintenance_runs_once_per_repository_and_skips_deleted_ones() {
@@ -602,7 +665,11 @@ mod tests {
         core.delete_repo(&alice, "alice", "b", "alice/b")
             .await
             .unwrap();
-        assert_eq!(core.run_due_jobs().await.unwrap(), 2);
+        assert_eq!(
+            core.run_due_jobs().await.unwrap(),
+            3,
+            "two maintenance runs plus the delete's index_repo"
+        );
         let states: Vec<String> =
             sqlx::query_scalar("SELECT state FROM jobs WHERE kind = 'git_maintenance' ORDER BY id")
                 .fetch_all(core.db().pool())

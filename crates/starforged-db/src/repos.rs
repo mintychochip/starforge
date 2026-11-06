@@ -17,6 +17,8 @@ pub struct RepoRow {
     pub archived_at: Option<i64>,
     pub deleted_at: Option<i64>,
     pub created_at: i64,
+    pub mirror: i64,
+    pub import_state: String,
     pub updated_at: i64,
 }
 
@@ -32,7 +34,7 @@ macro_rules! select_repo {
     ($tail:literal) => {
         concat!(
             "SELECT r.id, r.owner_id, o.handle AS owner_handle, r.name, r.description, r.visibility, ",
-            "r.default_branch, r.archived_at, r.deleted_at, r.created_at, r.updated_at FROM repos r JOIN owners o ON o.id = r.owner_id ",
+            "r.default_branch, r.archived_at, r.deleted_at, r.mirror, r.import_state, r.created_at, r.updated_at FROM repos r JOIN owners o ON o.id = r.owner_id ",
             $tail
         )
     };
@@ -49,6 +51,8 @@ fn from_row(row: &AnyRow) -> DbResult<RepoRow> {
         default_branch: row.try_get("default_branch")?,
         archived_at: row.try_get("archived_at")?,
         deleted_at: row.try_get("deleted_at")?,
+        mirror: row.try_get("mirror")?,
+        import_state: row.try_get("import_state")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })
@@ -173,13 +177,13 @@ pub async fn list_collaborating(db: &Db, user_id: i64) -> DbResult<Vec<RepoRow>>
 pub async fn list_org_member_repos(db: &Db, user_id: i64) -> DbResult<Vec<RepoRow>> {
     let rows = sqlx::query(
         "SELECT r.id, r.owner_id, o.handle AS owner_handle, r.name, r.description, r.visibility, \
-         r.default_branch, r.archived_at, r.deleted_at, r.created_at, r.updated_at \
+         r.default_branch, r.archived_at, r.deleted_at, r.mirror, r.import_state, r.created_at, r.updated_at \
          FROM repos r JOIN owners o ON o.id = r.owner_id \
          JOIN orgs g ON g.id = r.owner_id JOIN org_members m ON m.org_id = g.id \
          WHERE m.user_id = $1 AND (m.role = 'owner' OR g.base_permission <> 'none') AND r.deleted_at IS NULL \
          UNION \
          SELECT r.id, r.owner_id, o.handle AS owner_handle, r.name, r.description, r.visibility, \
-         r.default_branch, r.archived_at, r.deleted_at, r.created_at, r.updated_at \
+         r.default_branch, r.archived_at, r.deleted_at, r.mirror, r.import_state, r.created_at, r.updated_at \
          FROM repos r JOIN owners o ON o.id = r.owner_id \
          JOIN teams t ON t.org_id = r.owner_id JOIN team_members tm ON tm.team_id = t.id \
          LEFT JOIN team_repos tr ON tr.team_id = t.id AND tr.repo_id = r.id \
@@ -468,6 +472,38 @@ pub async fn refs_for_access(db: &Db, id: i64) -> DbResult<String> {
 pub async fn set_refs_for_access(db: &Db, id: i64, value: &str) -> DbResult<()> {
     sqlx::query("UPDATE repos SET refs_for_access = $1 WHERE id = $2")
         .bind(value)
+        .bind(id)
+        .execute(db.pool())
+        .await?;
+    Ok(())
+}
+
+/// The one-time import state (`none|pending|running|done|failed`) of the
+/// repository, for the hook's push-refusal snapshot (M4b D3).
+pub async fn import_state(db: &Db, id: i64) -> DbResult<String> {
+    let value: Option<String> = sqlx::query_scalar("SELECT import_state FROM repos WHERE id = $1")
+        .bind(id)
+        .fetch_optional(db.pool())
+        .await?
+        .flatten();
+    Ok(value.unwrap_or_else(|| "none".to_owned()))
+}
+
+/// Sets the one-time import state (M4b D3); the `CHECK` constraint refuses
+/// anything outside the enum.
+pub async fn set_import_state(db: &Db, id: i64, state: &str) -> DbResult<()> {
+    sqlx::query("UPDATE repos SET import_state = $1 WHERE id = $2")
+        .bind(state)
+        .bind(id)
+        .execute(db.pool())
+        .await?;
+    Ok(())
+}
+
+/// Whether the repository is a pull mirror (M4b D4; I3 owns writing it).
+pub async fn set_mirror(db: &Db, id: i64, mirror: bool) -> DbResult<()> {
+    sqlx::query("UPDATE repos SET mirror = $1 WHERE id = $2")
+        .bind(i64::from(mirror))
         .bind(id)
         .execute(db.pool())
         .await?;

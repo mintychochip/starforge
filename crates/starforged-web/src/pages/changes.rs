@@ -69,6 +69,7 @@ pub struct ReviewItem {
     id: i64,
     revision: i64,
     author_handle: String,
+    imported_author: Option<String>,
     verdict: String,
     body_html: String,
     created: String,
@@ -79,6 +80,7 @@ pub struct ReviewItem {
 
 pub struct ThreadCommentItem {
     author_handle: String,
+    imported_author: Option<String>,
     body_html: String,
     created: String,
 }
@@ -109,6 +111,7 @@ pub struct ChangePage {
     base_branch: String,
     state: String,
     creator_handle: String,
+    creator_imported_author: Option<String>,
     current_revision: i64,
     created: String,
     updated: String,
@@ -324,6 +327,7 @@ async fn change_view(
             id: r.id,
             revision: r.revision,
             author_handle: r.author_handle.clone(),
+            imported_author: r.imported_author.clone(),
             verdict: r.verdict.clone(),
             body_html: markdown::render_prose(&r.body),
             created: format_time(r.created_at),
@@ -340,6 +344,7 @@ async fn change_view(
             .iter()
             .map(|c| ThreadCommentItem {
                 author_handle: c.author_handle.clone(),
+                imported_author: c.imported_author.clone(),
                 body_html: markdown::render_prose(&c.body),
                 created: format_time(c.created_at),
             })
@@ -383,6 +388,7 @@ async fn change_view(
                         .iter()
                         .map(|c| InlineCommentView {
                             author_handle: c.author_handle.clone(),
+                            imported_author: c.imported_author.clone(),
                             body_html: c.body_html.clone(),
                             created: c.created.clone(),
                         })
@@ -478,6 +484,7 @@ async fn change_view(
         base_branch: change.base_branch.clone(),
         state: change.state.clone(),
         creator_handle: change.creator_handle.clone(),
+        creator_imported_author: change.creator_imported_author.clone(),
         current_revision: change.current_revision,
         created: format_time(change.created_at),
         updated: format_time(change.updated_at),

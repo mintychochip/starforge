@@ -792,6 +792,35 @@ pub async fn quarantined_of_repo(db: &Db, repo_id: i64) -> DbResult<Vec<SessionR
     .await?;
     rows.iter().map(session_from_row).collect()
 }
+/// Every quarantined session across all repositories, oldest first, with the
+/// repository label (`owner/name`) and the uploader handle for the site-admin
+/// quarantine queue. The sweep is capped; callers pass a sane `limit`.
+pub async fn quarantined_all(db: &Db, limit: i64) -> DbResult<Vec<(SessionRow, String, String)>> {
+    let rows = sqlx::query(
+        "SELECT s.id, s.repo_id, s.ulid, s.uploader_id, s.agent_name, s.agent_version, s.models, s.title, s.branch, s.head_sha, \
+         s.started_at, s.ended_at, s.parent_ulid, s.usage_input, s.usage_output, s.usage_cache_read, s.usage_cache_write, \
+         s.usage_reasoning, s.files_touched, s.turn_count, s.tool_call_count, s.lifecycle, s.quarantine, s.quarantine_reason, \
+         s.quarantine_detail, s.visibility, s.raw_enabled, s.redaction_fingerprint, s.redaction_counts, s.capture_mode, \
+         s.cli_version, s.adapter_verified, s.created_at, s.updated_at, o.handle AS repo_owner, r.name AS repo_name, \
+         uo.handle AS uploader_handle \
+         FROM sessions s \
+         JOIN repos r ON r.id = s.repo_id \
+         JOIN owners o ON o.id = r.owner_id \
+         JOIN owners uo ON uo.id = s.uploader_id \
+         WHERE s.quarantine = 'quarantined' ORDER BY s.id ASC LIMIT $1",
+    )
+    .bind(limit)
+    .fetch_all(db.pool())
+    .await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let owner: String = row.try_get("repo_owner")?;
+        let name: String = row.try_get("repo_name")?;
+        let uploader: String = row.try_get("uploader_handle")?;
+        out.push((session_from_row(row)?, format!("{owner}/{name}"), uploader));
+    }
+    Ok(out)
+}
 
 /// Every commit-link row filed under `sha` for the repository, oldest first — both trailer-first rows
 /// (with a `NULL` `session_id`) and claimed rows. Used by the commit panel (M1e); callers filter by

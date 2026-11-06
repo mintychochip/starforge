@@ -310,12 +310,14 @@ impl Core {
             .ok_or_else(|| CoreError::Invalid("That code is not valid.".into()))?;
         let matched =
             i64::try_from(matched).map_err(|_| CoreError::Internal("step out of range".into()))?;
-        if state.last_step.is_some_and(|last| matched <= last) {
+        // The CAS claim is the replay guard: a concurrent request that
+        // already recorded this step (or a newer one) makes it fail here,
+        // so exactly one caller ever passes for a given step.
+        if !auth_factors::claim_totp_step(self.db(), user.id, matched).await? {
             return Err(CoreError::Invalid(
                 "That code has already been used. Wait for the next code.".into(),
             ));
         }
-        auth_factors::set_totp_last_step(self.db(), user.id, matched).await?;
         Ok(())
     }
 

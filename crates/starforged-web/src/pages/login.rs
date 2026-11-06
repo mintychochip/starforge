@@ -139,6 +139,19 @@ pub async fn submit(
             };
             Ok((StatusCode::FORBIDDEN, page).into_response())
         }
+        Err(CoreError::RateLimited) => {
+            let page = LoginPage {
+                nav_user: None,
+                csrf: form.csrf,
+                next,
+                login: form.login,
+                error: Some("Too many login attempts. Please try again later.".into()),
+                unverified: false,
+                forgot_password: state.core.mail_enabled(),
+                sign_up_open: state.core.sign_up_open(),
+            };
+            Ok((StatusCode::TOO_MANY_REQUESTS, page).into_response())
+        }
         Err(other) => Err(other.into()),
     }
 }

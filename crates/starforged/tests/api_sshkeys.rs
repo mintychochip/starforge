@@ -85,7 +85,7 @@ async fn user_keys_round_trip_and_duplicate_is_422() {
     let dir = keydir();
     let dirpath: PathBuf = dir.path().to_path_buf();
     let (publine, fingerprint) = gen_key(&dirpath, "id_ed", "ed25519", None);
-    let token = s.token(&alice, &[Scope::RepoRead]).await;
+    let token = s.token(&alice, &[Scope::RepoWrite]).await;
     let (status, body) = api(
         &s.browser(),
         "POST",
@@ -110,7 +110,7 @@ async fn user_keys_round_trip_and_duplicate_is_422() {
     assert_eq!(body["keys"].as_array().unwrap().len(), 1);
 
     // Another user cannot remove alice's key (404), and a duplicate is 422.
-    let bob_token = s.token(&bob, &[Scope::RepoRead]).await;
+    let bob_token = s.token(&bob, &[Scope::RepoWrite]).await;
     let id = body["keys"][0]["id"].as_i64().unwrap();
     let (status, _) = api(
         &s.browser(),
@@ -156,7 +156,7 @@ async fn user_keys_round_trip_and_duplicate_is_422() {
 async fn parser_rejects_and_key_types_parse() {
     let s = TestServer::start().await;
     let alice = s.user("alice").await;
-    let token = s.token(&alice, &[Scope::RepoRead]).await;
+    let token = s.token(&alice, &[Scope::RepoWrite]).await;
     let dir = keydir();
     let dirpath: PathBuf = dir.path().to_path_buf();
 
@@ -332,7 +332,7 @@ async fn deploy_keys_admin_only_archived_refused_and_audited() {
     let rw_id = body["id"].as_i64().unwrap();
 
     // Duplicate of a deploy key as a user key is 422.
-    let ro_token = s.token(&alice, &[Scope::RepoRead]).await;
+    let ro_token = s.token(&alice, &[Scope::RepoWrite]).await;
     let (status, _) = api(
         &s.browser(),
         "POST",
@@ -385,7 +385,7 @@ async fn deploy_keys_admin_only_archived_refused_and_audited() {
 async fn user_key_cap_holds() {
     let s = TestServer::start().await;
     let alice = s.user("alice").await;
-    let token = s.token(&alice, &[Scope::RepoRead]).await;
+    let token = s.token(&alice, &[Scope::RepoWrite]).await;
     // Fill the cap through Core to keep the test fast; one more via API is 422.
     let dir = keydir();
     let dirpath: PathBuf = dir.path().to_path_buf();
@@ -409,4 +409,54 @@ async fn user_key_cap_holds() {
     )
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn read_scoped_token_cannot_mutate_user_keys() {
+    let s = TestServer::start().await;
+    let alice = s.user("alice").await;
+    let write_token = s.token(&alice, &[Scope::RepoWrite]).await;
+    let read_token = s.token(&alice, &[Scope::RepoRead]).await;
+    let dir = keydir();
+    let dirpath: PathBuf = dir.path().to_path_buf();
+    let (publine, _) = gen_key(&dirpath, "id_ed", "ed25519", None);
+    // Read token may list but not POST.
+    let (status, _) = api(
+        &s.browser(),
+        "GET",
+        &s.url("/api/v1/user/keys"),
+        &read_token,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = api(
+        &s.browser(),
+        "POST",
+        &s.url("/api/v1/user/keys"),
+        &read_token,
+        Some(json!({ "title": "laptop", "key": publine })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    // Write token creates; read token may not DELETE.
+    let (status, body) = api(
+        &s.browser(),
+        "POST",
+        &s.url("/api/v1/user/keys"),
+        &write_token,
+        Some(json!({ "title": "laptop", "key": publine })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let id = body["id"].as_i64().unwrap();
+    let (status, _) = api(
+        &s.browser(),
+        "DELETE",
+        &s.url(&format!("/api/v1/user/keys/{id}")),
+        &read_token,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
 }

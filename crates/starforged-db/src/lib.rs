@@ -19,12 +19,14 @@ pub mod changes;
 pub mod checks;
 pub mod collaborators;
 pub mod email_tokens;
+pub mod github_imports;
 pub mod invites;
 pub mod jobs;
 pub mod oauth;
 pub mod orgs;
 pub mod protection;
 pub mod redirects;
+pub mod remotes;
 pub mod repos;
 pub mod sessions;
 pub mod sshkeys;
@@ -117,6 +119,16 @@ impl Db {
 
     pub fn backend(&self) -> Backend {
         self.backend
+    }
+    /// The highest applied migration version, or `None` when the migrator has
+    /// never run. Reads sqlx's own bookkeeping table, so it tracks whatever
+    /// `migrate` applied on either engine.
+    pub async fn latest_migration(&self) -> DbResult<Option<i64>> {
+        Ok(
+            sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
+                .fetch_one(self.pool())
+                .await?,
+        )
     }
 }
 

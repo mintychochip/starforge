@@ -16,6 +16,10 @@ pub enum ApiError {
     Conflict(String),
     PayloadTooLarge(String),
     Internal(String),
+    RateLimited {
+        retry_after: i64,
+        decision: starforged_core::limits::RateDecision,
+    },
 }
 
 impl From<CoreError> for ApiError {
@@ -27,6 +31,18 @@ impl From<CoreError> for ApiError {
             CoreError::Invalid(message) => ApiError::Invalid(message),
             CoreError::Conflict(message) => ApiError::Conflict(message),
             CoreError::EmailUnverified => ApiError::Forbidden("email address not verified".into()),
+            CoreError::RateLimited => ApiError::RateLimited {
+                retry_after: 60,
+                decision: starforged_core::limits::RateDecision {
+                    allowed: false,
+                    limit: 0,
+                    remaining: 0,
+                    reset_at: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64 + 60)
+                        .unwrap_or(60),
+                },
+            },
             other => ApiError::Internal(other.to_string()),
         }
     }
@@ -34,6 +50,13 @@ impl From<CoreError> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        let rate = match &self {
+            ApiError::RateLimited {
+                retry_after,
+                decision,
+            } => Some((*retry_after, *decision)),
+            _ => None,
+        };
         let (status, code, message) = match self {
             ApiError::Unauthenticated => (
                 StatusCode::UNAUTHORIZED,
@@ -56,6 +79,14 @@ impl IntoResponse for ApiError {
                     "internal error".to_owned(),
                 )
             }
+            ApiError::RateLimited {
+                retry_after: _,
+                decision: _,
+            } => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limited",
+                "rate limit exceeded".to_owned(),
+            ),
         };
         let mut response = (
             status,
@@ -67,6 +98,29 @@ impl IntoResponse for ApiError {
                 .headers_mut()
                 .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
         }
+        if let Some((retry_after, decision)) = rate {
+            insert_rate_headers(response.headers_mut(), retry_after, decision);
+        }
         response
+    }
+}
+
+/// Writes the rate-limit headers (plan M5a): `X-RateLimit-Limit`,
+/// `-Remaining`, `-Reset`, and `Retry-After` on 429s.
+pub fn insert_rate_headers(
+    headers: &mut axum::http::HeaderMap,
+    retry_after: i64,
+    decision: starforged_core::limits::RateDecision,
+) {
+    let mut set = |name: &'static str, value: i64| {
+        if let Ok(value) = value.to_string().parse::<HeaderValue>() {
+            headers.insert(axum::http::HeaderName::from_static(name), value);
+        }
+    };
+    set("x-ratelimit-limit", decision.limit as i64);
+    set("x-ratelimit-remaining", decision.remaining as i64);
+    set("x-ratelimit-reset", decision.reset_at);
+    if !decision.allowed {
+        set("retry-after", retry_after.max(1));
     }
 }

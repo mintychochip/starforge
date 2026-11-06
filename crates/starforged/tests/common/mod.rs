@@ -1,6 +1,8 @@
 //! Shared integration-test harness: an in-process server on a random port, plus git helpers.
 #![allow(dead_code)]
 
+pub mod fake_github;
+pub mod fake_oidc;
 use std::path::{Path, PathBuf};
 use std::process::Output;
 
@@ -20,6 +22,9 @@ pub struct TestServer {
     pub base: String,
     pub core: Core,
     pub data: tempfile::TempDir,
+    pub ssh_addr: std::net::SocketAddr,
+    pub ssh_base: String,
+    _ssh: Option<starforged_ssh::SshHandle>,
     _db: starforged_db::testing::TestDb,
 }
 
@@ -52,8 +57,35 @@ impl TestServer {
             webhooks: WebhooksConfig::default(),
             git: GitConfig::default(),
             remotes: starforged::config::RemotesConfig::default(),
+            github: starforged::config::GithubConfig::default(),
+            oidc: starforged::config::OidcConfig::default(),
+            // Suites log in dozens of users from 127.0.0.1; the production
+            // defaults would 429 them. Limits are off here; tests that
+            // exercise them set their own low values in `configure`.
+            limits: starforged::config::LimitsConfig {
+                login_per_ip_per_minute: 0,
+                login_per_account_per_hour: 0,
+                api_per_token_per_hour: 0,
+                refs_for_new_changes_per_hour: 0,
+            },
+            ssh: starforged::config::SshConfig {
+                listen: "127.0.0.1:0".to_owned(),
+                host_key_path: PathBuf::from("ssh_host_ed25519_key"),
+                ..Default::default()
+            },
         };
         configure(&mut config);
+        let ssh_listener = if config.ssh.enabled {
+            let listener = tokio::net::TcpListener::bind(&config.ssh.listen)
+                .await
+                .unwrap();
+            let port = listener.local_addr().unwrap().port();
+            config.ssh.public_host = "127.0.0.1".to_owned();
+            config.ssh.public_port = port;
+            Some(listener)
+        } else {
+            None
+        };
         let app =
             starforged::serve::build(&config, PathBuf::from(env!("CARGO_BIN_EXE_starforged")))
                 .await
@@ -63,12 +95,48 @@ impl TestServer {
             app.router,
             std::future::pending(),
         ));
+        let ssh = match ssh_listener {
+            Some(ssh_listener) => {
+                let cfg = starforged_ssh::Config {
+                    listen: config.ssh.listen.clone(),
+                    host_key_path: config.ssh_host_key_path(),
+                    idle_timeout_secs: config.ssh.idle_timeout_secs,
+                    max_connection_secs: config.ssh.max_connection_secs,
+                    max_connections_per_user: config.ssh.max_connections_per_user,
+                };
+                Some(
+                    starforged_ssh::serve_on(
+                        app.core.clone(),
+                        cfg,
+                        ssh_listener,
+                        std::future::pending(),
+                    )
+                    .await
+                    .unwrap(),
+                )
+            }
+            None => None,
+        };
+        let (ssh_addr, ssh_base) = match &ssh {
+            Some(ssh) => (ssh.addr(), format!("ssh://git@{}", ssh.addr())),
+            None => (
+                std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+                String::new(),
+            ),
+        };
         TestServer {
             base,
             core: app.core,
             data,
+            ssh_addr,
+            ssh_base,
+            _ssh: ssh,
             _db: db,
         }
+    }
+    /// The test database (for seeding imported rows directly, M4c G1).
+    pub fn db(&self) -> &starforged_db::Db {
+        &self._db.db
     }
 
     pub async fn start() -> TestServer {
@@ -164,6 +232,91 @@ impl TestServer {
             Some(token) => format!("http://git:{token}@{host}/{owner}/{repo}.git"),
             None => format!("http://{host}/{owner}/{repo}.git"),
         }
+    }
+
+    /// `ssh://git@host:port/owner/repo.git`.
+    pub fn ssh_url(&self, owner: &str, repo: &str) -> String {
+        format!("{base}/{owner}/{repo}.git", base = self.ssh_base)
+    }
+
+    /// [`git_with_env`] with `GIT_SSH_COMMAND` for `ssh_addr` and `key` (a
+    /// private key file; the plan's flags).
+    pub async fn ssh_git(&self, dir: &Path, key: &Path, args: &[&str]) -> Output {
+        let port = self.ssh_addr.port();
+        let ssh = format!(
+            "ssh -i {} -p {port} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o IdentityAgent=none",
+            key.display()
+        );
+        git_with_env(dir, args, &[("GIT_SSH_COMMAND", &ssh)]).await
+    }
+
+    /// [`ssh_git`](Self::ssh_git) with extra `ssh -o` options appended.
+    pub async fn ssh_git_with_opts(
+        &self,
+        dir: &Path,
+        key: &Path,
+        args: &[&str],
+        extra_opts: &[&str],
+    ) -> Output {
+        let port = self.ssh_addr.port();
+        let mut ssh = format!(
+            "ssh -i {} -p {port} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o IdentityAgent=none",
+            key.display()
+        );
+        for opt in extra_opts {
+            ssh.push_str(" -o ");
+            ssh.push_str(opt);
+        }
+        git_with_env(dir, args, &[("GIT_SSH_COMMAND", &ssh)]).await
+    }
+
+    /// [`ssh_git`](Self::ssh_git) that must succeed; returns stdout.
+    pub async fn ssh_git_ok(&self, dir: &Path, key: &Path, args: &[&str]) -> String {
+        let out = self.ssh_git(dir, key, args).await;
+        assert!(
+            out.status.success(),
+            "git ssh {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// Generates an ed25519 key in `dir/<name>`; returns `(private, public-line)`.
+    pub fn gen_key(dir: &Path, name: &str) -> (PathBuf, String) {
+        gen_key(dir, name, "ed25519", None)
+    }
+
+    /// Registers the public line as one of `user`'s SSH keys.
+    pub async fn add_key(
+        &self,
+        user: &User,
+        publine: &str,
+    ) -> starforged_core::sshkeys::SshKeyView {
+        self.core
+            .add_ssh_key(user, "test-key", publine)
+            .await
+            .unwrap()
+    }
+
+    /// Registers the public line as a deploy key on `owner/repo`.
+    pub async fn add_deploy(
+        &self,
+        owner: &User,
+        repo: &str,
+        publine: &str,
+        read_write: bool,
+    ) -> starforged_core::sshkeys::DeployKeyView {
+        self.core
+            .add_deploy_key(
+                owner,
+                &owner.handle,
+                repo,
+                "test-deploy",
+                publine,
+                read_write,
+            )
+            .await
+            .unwrap()
     }
 }
 
@@ -268,6 +421,30 @@ pub fn noise(len: usize) -> Vec<u8> {
             (x >> 24) as u8
         })
         .collect()
+}
+
+/// Generates a key of `kind` in `dir/<name>`; returns `(private path, public line)`.
+pub fn gen_key(dir: &Path, name: &str, kind: &str, bits: Option<&str>) -> (PathBuf, String) {
+    use std::process::Command;
+    let keypath = dir.join(name);
+    let mut cmd = Command::new("ssh-keygen");
+    cmd.args(["-q", "-t", kind, "-N", ""]);
+    if let Some(bits) = bits {
+        cmd.args(["-b", bits]);
+    }
+    cmd.args(["-f"]);
+    cmd.arg(&keypath);
+    let out = cmd.output().unwrap();
+    assert!(
+        out.status.success(),
+        "ssh-keygen failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let publine = std::fs::read_to_string(keypath.with_extension("pub"))
+        .unwrap()
+        .trim()
+        .to_owned();
+    (keypath, publine)
 }
 
 impl TestServer {

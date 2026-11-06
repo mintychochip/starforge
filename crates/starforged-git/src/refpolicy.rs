@@ -161,6 +161,16 @@ pub fn default_topic(handle: &str) -> String {
     trimmed
 }
 
+/// M5a `refs/for` rate limit: whether a pushed `base/topic` opens a NEW
+/// change, i.e. is not among the pusher's own open agit topics in this
+/// repository (`existing`, as `base/topic` lines from
+/// `STARFORGE_REFS_FOR_TOPICS`). Only the same user's same `base/topic`
+/// updates an existing change, so another user's identical topic is new.
+pub fn is_new_for_topic(existing: &[String], base: &str, topic: &str) -> bool {
+    let key = format!("{base}/{topic}");
+    !existing.iter().any(|t| t == &key)
+}
+
 /// Parsed `-o` push options (spec §8.2).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PushOptions {

@@ -245,13 +245,20 @@ impl SearchIndex {
     /// opened and the caller gets [`IndexError::Locked`]; the directory is
     /// left untouched in that case.
     pub fn open_or_create(dir: &Path) -> Result<Self> {
+        Self::open_or_create_fresh(dir).map(|(index, _)| index)
+    }
+
+    /// Opens the index in `dir`, reporting whether it was freshly created
+    /// (missing or corrupt) or opened healthy. The caller uses the flag to
+    /// enqueue a full rebuild at startup (plan D5).
+    pub fn open_or_create_fresh(dir: &Path) -> Result<(Self, bool)> {
         match Self::try_open(dir) {
             Err(IndexError::Locked(_)) => Err(IndexError::Locked(format!(
                 "cannot acquire the writer at {}",
                 dir.display()
             ))),
-            Err(_) => Self::create(dir),
-            Ok(index) => Ok(index),
+            Err(_) => Self::create(dir).map(|index| (index, true)),
+            Ok(index) => Ok((index, false)),
         }
     }
 

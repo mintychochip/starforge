@@ -46,6 +46,10 @@ pub struct TrailView {
     pub ready: bool,
     pub author_id: Option<i64>,
     pub author_handle: String,
+    /// The original GitHub login when the author is a placeholder (M4c
+    /// D1): `author_id` is then `None` and `author_handle` is the login.
+    /// Renderers show `"<login> (imported)"`, never a user link.
+    pub imported_author: Option<String>,
     pub labels: Vec<String>,
     pub assignees: Vec<String>,
     pub review_requests: Vec<String>,
@@ -240,6 +244,9 @@ pub struct CommentView {
     pub id: i64,
     pub author_id: Option<i64>,
     pub author_handle: String,
+    /// The original GitHub login when the author is a placeholder (M4c
+    /// D1); see [`TrailView::imported_author`].
+    pub imported_author: Option<String>,
     pub body: String,
     pub created_at: i64,
     pub edited_at: Option<i64>,
@@ -320,11 +327,14 @@ impl Core {
     }
 
     async fn trail_view(&self, row: &TrailRow) -> CoreResult<TrailView> {
-        let (author_id, author_handle) = match row.author_id {
-            None => (None, "deleted user".to_owned()),
+        let (author_id, author_handle, imported_author) = match row.author_id {
+            None => match &row.imported_author {
+                Some(login) => (None, login.clone(), Some(login.clone())),
+                None => (None, "deleted user".to_owned(), None),
+            },
             Some(id) => match self.user_by_id(id).await? {
-                Some(u) => (Some(id), u.handle),
-                None => (None, "deleted user".to_owned()),
+                Some(u) => (Some(id), u.handle, None),
+                None => (None, "deleted user".to_owned(), None),
             },
         };
         let labels = db_trails::labels_of(self.db(), row.id).await?;
@@ -348,6 +358,7 @@ impl Core {
             ready: row.ready != 0,
             author_id,
             author_handle,
+            imported_author,
             labels,
             assignees,
             review_requests,
@@ -359,17 +370,21 @@ impl Core {
     }
 
     async fn comment_view(&self, row: &TrailCommentRow) -> CoreResult<CommentView> {
-        let (author_id, author_handle) = match row.author_id {
-            None => (None, "deleted user".to_owned()),
+        let (author_id, author_handle, imported_author) = match row.author_id {
+            None => match &row.imported_author {
+                Some(login) => (None, login.clone(), Some(login.clone())),
+                None => (None, "deleted user".to_owned(), None),
+            },
             Some(id) => match self.user_by_id(id).await? {
-                Some(u) => (Some(id), u.handle),
-                None => (None, "deleted user".to_owned()),
+                Some(u) => (Some(id), u.handle, None),
+                None => (None, "deleted user".to_owned(), None),
             },
         };
         Ok(CommentView {
             id: row.id,
             author_id,
             author_handle,
+            imported_author,
             body: row.body.clone(),
             created_at: row.created_at,
             edited_at: row.edited_at,
@@ -464,6 +479,8 @@ impl Core {
             None,
         )
         .await;
+        self.enqueue_index(&crate::jobs::Job::IndexTrail { trail_id: row.id })
+            .await;
         self.trail_view(&row).await
     }
     pub async fn trail_by_number(
@@ -727,6 +744,8 @@ impl Core {
         };
         self.dispatch_trail_event(repo_id, sender, action, cause, number, None)
             .await;
+        self.enqueue_index(&crate::jobs::Job::IndexTrail { trail_id: row.id })
+            .await;
         self.trail_view(&self.trail_row(access.repo.id, number).await?)
             .await
     }
@@ -851,6 +870,8 @@ impl Core {
             )
             .await;
         }
+        self.enqueue_index(&crate::jobs::Job::IndexTrail { trail_id: row.id })
+            .await;
         self.trail_view(&self.trail_row(access.repo.id, number).await?)
             .await
     }
@@ -878,6 +899,8 @@ impl Core {
             serde_json::json!({"comment_id": saved.id}),
         )
         .await?;
+        self.enqueue_index(&crate::jobs::Job::IndexTrail { trail_id: row.id })
+            .await;
         self.comment_view(&saved).await
     }
 
@@ -913,6 +936,8 @@ impl Core {
             serde_json::json!({"comment_id": comment_id}),
         )
         .await?;
+        self.enqueue_index(&crate::jobs::Job::IndexTrail { trail_id: row.id })
+            .await;
         let updated = db_trails::comment_by_id(self.db(), comment_id)
             .await?
             .ok_or_else(|| CoreError::Internal("comment missing after update".into()))?;

@@ -7,7 +7,7 @@
 <p class="muted">current revision r{{ current_revision }}</p>
 <p class="muted">on <a href="/{{ head.owner }}/{{ head.name }}/trails/{{ trail_number }}">trail #{{ trail_number }}</a>
 {% if let Some(h) = head_branch %} · head <code>{{ h }}</code>{% endif %} · base <code>{{ base_branch }}</code>
- · opened by {% if creator_handle == "deleted user" %}deleted user{% else %}<a href="/{{ creator_handle }}">{{ creator_handle }}</a>{% endif %}
+ · opened by {% if let Some(a) = creator_imported_author %}{{ a }} (imported){% else if creator_handle == "deleted user" %}deleted user{% else %}<a href="/{{ creator_handle }}">{{ creator_handle }}</a>{% endif %}
  · <span class="muted">{{ created }} · updated {{ updated }}</span></p>
 {% if let Some(e) = error %}<p class="notice">{{ e }}</p>{% endif %}
 {% include "gate_panel.html" %}
@@ -31,7 +31,7 @@
 <p id="review-summary">Approvals: {{ approvals }} · Requesting changes: {{ request_changes }} (only reviews from writers and above count){% if !reviewers.is_empty() %} · reviewers: {% for h in reviewers %}{{ h }} {% endfor %}{% endif %}</p>
 {% for r in reviews %}
 <article id="review-{{ r.id }}" class="review">
-<p><a href="/{{ r.author_handle }}">{{ r.author_handle }}</a> <span class="badge">{{ r.verdict }}</span> <span class="muted">on r{{ r.revision }} · {{ r.created }} · {{ r.state }}</span>
+<p>{% if let Some(a) = r.imported_author %}{{ a }} (imported){% else if r.author_handle == "deleted user" %}deleted user{% else %}<a href="/{{ r.author_handle }}">{{ r.author_handle }}</a>{% endif %} <span class="badge">{{ r.verdict }}</span> <span class="muted">on r{{ r.revision }} · {{ r.created }} · {{ r.state }}</span>
 {% if r.counting %}<span class="badge">counts toward merge</span>{% else %}<span class="muted">does not count toward merge (needs write access)</span>{% endif %}</p>
 <div class="prose">{{ r.body_html|safe }}</div>
 {% if r.can_dismiss && r.state != "dismissed" %}
@@ -72,7 +72,7 @@
 {% if t.resolved %}<span class="badge">Resolved</span>{% endif %}
 {% if t.outdated %}<span class="badge">Outdated</span>{% endif %}</h4>
 {% for c in t.comments %}
-<div class="comment"><p><a href="/{{ c.author_handle }}">{{ c.author_handle }}</a> <span class="muted">{{ c.created }}</span></p>
+<div class="comment"><p>{% if let Some(a) = c.imported_author %}{{ a }} (imported){% else if c.author_handle == "deleted user" %}deleted user{% else %}<a href="/{{ c.author_handle }}">{{ c.author_handle }}</a>{% endif %} <span class="muted">{{ c.created }}</span></p>
 <div class="prose">{{ c.body_html|safe }}</div></div>
 {% endfor %}
 {% if t.can_resolve %}

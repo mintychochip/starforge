@@ -21,6 +21,7 @@ use starforged_db::sessions::{self as db_sessions, SessionRow};
 use starforged_db::trails::{self as db_trails, TrailCommentRow, TrailFilter, TrailRow};
 use starforged_index::{EventDoc, IndexStats, TrailDoc};
 
+use crate::jobs::Job;
 use crate::read::SessionPageItem;
 use crate::{Core, CoreError, CoreResult};
 
@@ -194,6 +195,104 @@ impl Core {
             stats.events += docs.len() as u64;
             index(search_index.replace_session(session.id, docs))?;
         }
+        Ok(())
+    }
+    /// Queues an indexing job; indexing never blocks or fails a mutation
+    /// (plan D5), so a queue failure is logged and swallowed.
+    pub(crate) async fn enqueue_index(&self, job: &Job) {
+        if let Err(err) = self.enqueue(job).await {
+            tracing::warn!(error = %err, "enqueueing search index job");
+        }
+    }
+
+    /// Replaces one Trail's document from the database (plan D5). A missing
+    /// Trail is a no-op (Trails are never deleted alone; a purged repository
+    /// drops all of its documents through `index_repo_by_id`); a missing or
+    /// deleted repository drops the repository's documents.
+    pub(crate) async fn index_trail(&self, trail_id: i64) -> CoreResult<()> {
+        let search_index = self.search_index();
+        let Some(trail) = db_trails::trail_by_id(self.db(), trail_id).await? else {
+            return Ok(());
+        };
+        let Some(repo) = db_repos::by_id(self.db(), trail.repo_id).await? else {
+            index(search_index.drop_repo(trail.repo_id))?;
+            index(search_index.commit())?;
+            return Ok(());
+        };
+        if repo.deleted_at.is_some() {
+            index(search_index.drop_repo(trail.repo_id))?;
+            index(search_index.commit())?;
+            return Ok(());
+        }
+        let comments = db_trails::comments_of(self.db(), trail.id).await?;
+        index(search_index.replace_trail(trail_doc(&trail, visibility_of(&repo), &comments)))?;
+        index(search_index.commit())?;
+        Ok(())
+    }
+
+    /// Replaces every event document of one session from the database and
+    /// blobs (plan D5). Missing sessions, missing or deleted repositories,
+    /// and sessions that are not `complete` drop the session's documents, so
+    /// a rebuild and the incremental path produce the same index.
+    pub(crate) async fn index_session_events(&self, session_id: i64) -> CoreResult<()> {
+        let search_index = self.search_index();
+        let Some(session) = db_sessions::session_by_id(self.db(), session_id).await? else {
+            index(search_index.drop_session(session_id))?;
+            index(search_index.commit())?;
+            return Ok(());
+        };
+        let Some(repo) = db_repos::by_id(self.db(), session.repo_id).await? else {
+            index(search_index.drop_session(session_id))?;
+            index(search_index.commit())?;
+            return Ok(());
+        };
+        if repo.deleted_at.is_some() || session.lifecycle != "complete" {
+            index(search_index.drop_session(session_id))?;
+            index(search_index.commit())?;
+            return Ok(());
+        }
+        let commits = db_sessions::links_of_session(self.db(), session_id)
+            .await?
+            .into_iter()
+            .map(|link| link.sha)
+            .collect::<Vec<_>>();
+        let items = self.load_session_items(session_id).await?;
+        let docs = event_docs(&session, visibility_of(&repo), &items, &commits);
+        index(search_index.replace_session(session_id, docs))?;
+        index(search_index.commit())?;
+        Ok(())
+    }
+
+    /// Re-indexes every document of one repository from the database (plan D5):
+    /// the repository's stale documents are dropped first, then the current
+    /// rows are indexed. A missing or deleted repository drops its documents.
+    pub(crate) async fn index_repo_by_id(&self, repo_id: i64) -> CoreResult<()> {
+        let search_index = self.search_index();
+        let Some(repo) = db_repos::by_id(self.db(), repo_id).await? else {
+            index(search_index.drop_repo(repo_id))?;
+            index(search_index.commit())?;
+            return Ok(());
+        };
+        if repo.deleted_at.is_some() {
+            index(search_index.drop_repo(repo_id))?;
+            index(search_index.commit())?;
+            return Ok(());
+        }
+        index(search_index.drop_repo(repo_id))?;
+        let mut stats = IndexStats {
+            trails: 0,
+            events: 0,
+        };
+        self.index_repo(&repo, &mut stats).await?;
+        index(search_index.commit())?;
+        Ok(())
+    }
+
+    /// Removes every event document of one session (delete or purge, plan D5).
+    pub(crate) async fn drop_session_docs(&self, session_id: i64) -> CoreResult<()> {
+        let search_index = self.search_index();
+        index(search_index.drop_session(session_id))?;
+        index(search_index.commit())?;
         Ok(())
     }
 }

@@ -3,6 +3,13 @@
 {% block content %}
 {% include "repo_head.html" %}
 <p>Clone with <code>git clone {{ clone_url }}</code></p>
+{% if let Some(ssh_url) = ssh_clone_url %}<p>Clone with <code>git clone {{ ssh_url }}</code></p>{% endif %}
+{% if import_state == "pending" %}<p class="notice">Import pending. Pushes are refused until the import finishes.</p>{% endif %}
+{% if import_state == "running" %}<p class="notice">Import in progress. Pushes are refused until the import finishes.</p>{% endif %}
+{% if import_state == "failed" %}<p class="error">Import failed.{% if let Some(e) = import_error %} {{ e }}{% endif %}</p>{% endif %}
+{% if let Some(key) = ssh_public_key %}<p>Install this public key as a deploy key on the source, then start the import:</p><pre>{{ key }}</pre>{% endif %}
+{% if can_manage_import && (import_state == "pending" || import_state == "failed") %}<form method="post" action="/{{ head.owner }}/{{ head.name }}/import/start" class="stack"><input type="hidden" name="_csrf" value="{{ csrf }}"><button type="submit">{% if import_state == "failed" %}Retry import{% else %}Start import{% endif %}</button></form>
+<form method="post" action="/{{ head.owner }}/{{ head.name }}/import/delete"><input type="hidden" name="_csrf" value="{{ csrf }}"><button type="submit">Delete import</button></form>{% endif %}
 {% if empty %}
 <p>This repository is empty. Push an existing repository to it:</p>
 <pre>git remote add origin {{ clone_url }}

@@ -14,12 +14,16 @@ pub mod email_tokens;
 pub mod error;
 pub mod gate_rules;
 pub mod gates;
+pub mod gitaccess;
+pub mod github;
 pub mod ingest;
 pub mod invites;
 pub mod jobs;
+pub mod limits;
 pub mod mail;
 pub mod merge;
 pub mod oauth;
+pub mod oidc;
 pub mod orgs;
 pub mod passwords;
 pub mod permission;
@@ -30,6 +34,7 @@ pub mod registration;
 pub mod remotes;
 pub mod repos;
 pub mod rescan;
+pub mod scan;
 pub mod search;
 pub mod sessions;
 pub mod sshkeys;
@@ -113,10 +118,33 @@ pub struct CoreConfig {
     /// receiver). Always false in production; everything else non-global is
     /// denied regardless.
     pub allow_loopback_webhooks: bool,
+    /// Base URL of the GitHub API for metadata imports (`github.api_url`,
+    /// default `https://api.github.com`; GitHub Enterprise allowed).
+    pub github_api_url: String,
     /// Ref namespaces clients may push into (`git.allowed_ref_namespaces`,
     /// e.g. `refs/notes/`), carried into every git-RPC snapshot. Empty by
     /// default: only branches, tags, and `refs/for` are accepted.
     pub allowed_ref_namespaces: Vec<String>,
+    /// The `ssh.listen` address when the SSH listener is enabled, or `None`
+    /// when it is disabled (M3c C2 wires the real address; until then and
+    /// whenever `ssh.enabled` is false this stays `None`). The admin health
+    /// page reports enabled/disabled from this read-only view of the
+    /// configuration.
+    pub ssh_addr: Option<String>,
+    /// The `[oidc]` section (spec §9, plan D4): the single configured OIDC
+    /// provider. Disabled by default; see [`oidc::OidcConfig`].
+    pub oidc: oidc::OidcConfig,
+    /// Login attempts per client IP per minute (`[limits]`, spec §11.6); `0`
+    /// disables the limit.
+    pub login_per_ip_per_minute: u64,
+    /// Failed logins per normalized login name per hour (`[limits]`, spec
+    /// §11.6); `0` disables.
+    pub login_per_account_per_hour: u64,
+    /// API requests per token per hour (`[limits]`, spec §11.6); `0` disables.
+    pub api_per_token_per_hour: u64,
+    /// New `refs/for` changes per user per hour (`[limits]`, spec §11.6); `0`
+    /// disables.
+    pub refs_for_new_changes_per_hour: u64,
 }
 
 /// The 32-byte key sealing webhook secrets at rest.
@@ -142,6 +170,9 @@ struct Inner {
     /// The search index, opened at `config.index_dir` (startup recreates a
     /// missing or corrupt index empty; see `open_search_index`).
     search_index: std::sync::Arc<starforged_index::SearchIndex>,
+    /// Whether opening the index recreated it (missing or corrupt): startup
+    /// enqueues a full rebuild in that case (plan D5).
+    search_index_recreated: bool,
     /// Wakes one idle job worker when a job is queued.
     job_wakeup: tokio::sync::Notify,
     /// Test seam for the merge CAS race (see [`merge::PreCasHook`]): `None`
@@ -154,19 +185,26 @@ struct Inner {
     /// without bound.
     ingest_locks:
         std::sync::Mutex<std::collections::HashMap<i64, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+    /// OIDC discovery/JWKS caches plus the HTTP client (plan D4).
+    oidc_cache: oidc::OidcCache,
+    /// In-memory fixed-window rate-limit counters (plan M5a D1).
+    limits: limits::Limiters,
 }
 
 impl Core {
     pub fn new(db: Db, config: CoreConfig) -> Core {
-        let search_index = open_search_index(&config);
+        let (search_index, search_index_recreated) = open_search_index(&config);
         Core {
             inner: Arc::new(Inner {
+                oidc_cache: oidc::OidcCache::new(),
                 db,
                 config,
                 search_index,
+                search_index_recreated,
                 job_wakeup: tokio::sync::Notify::new(),
                 merge_cas_hook: std::sync::Mutex::new(None),
                 ingest_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
+                limits: limits::Limiters::default(),
             }),
         }
     }
@@ -184,17 +222,17 @@ impl Core {
     pub fn search_index(&self) -> &starforged_index::SearchIndex {
         &self.inner.search_index
     }
+
+    /// Whether opening the index at startup recreated it (missing or
+    /// corrupt). Startup enqueues a full `RebuildIndex` job in that case.
+    pub fn search_index_was_recreated(&self) -> bool {
+        self.inner.search_index_recreated
+    }
 }
 
-/// Opens the search index at `config.index_dir`, recreating a missing or
-/// corrupt directory empty. The server never refuses to start because of the
-/// index (plan D5): if anything else goes wrong — the writer is held by
-/// another process, the disk is unwritable — this process serves with a
-/// throwaway index under the temp directory (writes still succeed; search
-/// just sees nothing until the next start with the real index).
-fn open_search_index(config: &CoreConfig) -> std::sync::Arc<starforged_index::SearchIndex> {
-    match starforged_index::SearchIndex::open_or_create(&config.index_dir) {
-        Ok(index) => std::sync::Arc::new(index),
+fn open_search_index(config: &CoreConfig) -> (std::sync::Arc<starforged_index::SearchIndex>, bool) {
+    match starforged_index::SearchIndex::open_or_create_fresh(&config.index_dir) {
+        Ok((index, fresh)) => (std::sync::Arc::new(index), fresh),
         Err(err) => {
             tracing::warn!(
                 error = %err,
@@ -202,9 +240,12 @@ fn open_search_index(config: &CoreConfig) -> std::sync::Arc<starforged_index::Se
                 "search index unavailable; serving with a throwaway index"
             );
             let dir = std::env::temp_dir().join(format!("starforged-index-{}", std::process::id()));
-            std::sync::Arc::new(
-                starforged_index::SearchIndex::open_or_create(&dir)
-                    .expect("a fresh index in the temp directory must open"),
+            (
+                std::sync::Arc::new(
+                    starforged_index::SearchIndex::open_or_create(&dir)
+                        .expect("a fresh index in the temp directory must open"),
+                ),
+                false,
             )
         }
     }
@@ -294,8 +335,15 @@ pub(crate) mod testing {
             webhook_key: WebhookKey([7u8; 32]),
             credential_box: crypto::CredentialBox::new(&[7_u8; 32]),
             allow_file_urls: false,
+            oidc: oidc::OidcConfig::default(),
             allow_loopback_webhooks: false,
+            github_api_url: "https://api.github.com".into(),
             allowed_ref_namespaces: Vec::new(),
+            ssh_addr: None,
+            login_per_ip_per_minute: 10,
+            login_per_account_per_hour: 20,
+            api_per_token_per_hour: 5000,
+            refs_for_new_changes_per_hour: 30,
         };
         configure(&mut config, dir.path());
         (Core::new(db.db.clone(), config), Fixture { _db: db, dir })

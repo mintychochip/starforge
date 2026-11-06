@@ -30,7 +30,7 @@
 <h3>Comments</h3>
 {% for c in comments %}
 <article id="comment-{{ c.id }}">
-  <p>{% if c.author_handle == "deleted user" %}deleted user{% else %}<a href="/{{ c.author_handle }}">{{ c.author_handle }}</a>{% endif %} · <span class="muted">{{ c.created }}</span>{% if let Some(e) = c.edited %} · <span class="muted">edited {{ e }}</span>{% endif %}</p>
+  <p>{% if let Some(a) = c.imported_author %}{{ a }} (imported){% else if c.author_handle == "deleted user" %}deleted user{% else %}<a href="/{{ c.author_handle }}">{{ c.author_handle }}</a>{% endif %} · <span class="muted">{{ c.created }}</span>{% if let Some(e) = c.edited %} · <span class="muted">edited {{ e }}</span>{% endif %}</p>
   <div class="comment-body">{{ c.body_html|safe }}</div>
 {% if c.can_edit %}
   <details>

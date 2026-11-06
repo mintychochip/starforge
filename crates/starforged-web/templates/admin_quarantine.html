@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block title %}Quarantine queue · Site administration{% endblock %}
+{% block content %}
+<h1>Site administration</h1>
+{% include "admin_nav.html" %}
+<section>
+  <h2>Quarantine queue</h2>
+  {% if sessions.is_empty() %}
+  <p>No quarantined sessions.</p>
+  {% else %}
+  <table>
+    <thead>
+      <tr><th>Repository</th><th>Session</th><th>Uploader</th><th>Reason</th><th>Time</th><th></th></tr>
+    </thead>
+    <tbody>
+      {% for session in sessions %}
+      <tr>
+        <td>{{ session.repo }}</td>
+        <td>{{ session.ulid }}</td>
+        <td>{{ session.uploader }}</td>
+        <td>{{ session.reason }}</td>
+        <td>{{ session.time }}</td>
+        <td><form method="post" action="/admin/quarantine/{{ session.id }}/release" class="inline"><input type="hidden" name="_csrf" value="{{ csrf }}"><button type="submit">Release</button></form> <form method="post" action="/admin/quarantine/{{ session.id }}/purge" class="inline"><input type="hidden" name="_csrf" value="{{ csrf }}"><button type="submit">Purge</button></form></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+</section>
+{% endblock %}

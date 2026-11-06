@@ -140,6 +140,28 @@ impl Core {
         ));
         env.push(("STARFORGE_PUSH_NONCE", nonce.to_owned()));
         env.push(("STARFORGE_PROTECTION", protection));
+        // M4b one-time import: pushes are refused while an import is
+        // pending or running (M4b D3). The hook enforces this snapshot only.
+        let importing = self.import_in_progress(access.repo.id).await?;
+        env.push((
+            "STARFORGE_IMPORT_IN_PROGRESS",
+            if importing {
+                "1".to_owned()
+            } else {
+                "0".to_owned()
+            },
+        ));
+        // M5a rate-limit snapshot: the remaining hourly new-change budget
+        // and the pusher's own open agit topics in this repo. Absent when the
+        // limit is disabled (the hook then enforces nothing); the ingest
+        // re-checks the budget independently (plan M5a D2).
+        if let Some(user) = user
+            && let Some(budget) = self.refs_for_budget(user.id).await?
+        {
+            env.push(("STARFORGE_REFS_FOR_BUDGET", budget.to_string()));
+            let topics = self.refs_for_topics(access.repo.id, user.id).await?;
+            env.push(("STARFORGE_REFS_FOR_TOPICS", topics.join("\n")));
+        }
         Ok(env)
     }
 

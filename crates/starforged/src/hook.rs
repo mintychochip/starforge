@@ -28,6 +28,17 @@ pub struct HookCtx {
     pub nonce: String,
     /// `None` when `GIT_PUSH_OPTION_COUNT` is absent (no `-o` flags).
     pub options: Option<Vec<String>>,
+    /// M5a `refs/for` rate-limit snapshot: `None` when the limit is disabled
+    /// or absent (no budget enforced), otherwise the pusher's remaining
+    /// hourly new-change budget.
+    pub refs_for_budget: Option<i64>,
+    /// The pusher's own open agit topics in this repository as
+    /// `base/topic` lines (`STARFORGE_REFS_FOR_TOPICS`); a pushed pair not
+    /// in this list opens a NEW change and counts against the budget.
+    pub refs_for_topics: Vec<String>,
+    /// M4b: a one-time import is pending/running on this repository; every
+    /// ref update is refused ("import in progress").
+    pub import_in_progress: bool,
 }
 
 fn env(name: &str) -> Option<String> {
@@ -72,6 +83,17 @@ impl HookCtx {
             branches,
             nonce: nonce.unwrap_or_else(pushsidecar::new_nonce),
             options,
+            refs_for_budget: env("STARFORGE_REFS_FOR_BUDGET").and_then(|v| v.parse().ok()),
+            refs_for_topics: env("STARFORGE_REFS_FOR_TOPICS")
+                .map(|raw| {
+                    raw.lines()
+                        .map(str::trim)
+                        .filter(|line| !line.is_empty())
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            import_in_progress: env("STARFORGE_IMPORT_IN_PROGRESS").is_some_and(|v| v == "1"),
         }
     }
 }
@@ -86,6 +108,15 @@ pub fn pre_receive(input: impl BufRead, err: impl Write) -> i32 {
 pub fn pre_receive_with(input: impl BufRead, mut err: impl Write, ctx: &HookCtx) -> i32 {
     // Orphaned sidecars (a push that never got scanned) must not accumulate.
     pushsidecar::reap(&ctx.git_dir, pushsidecar::MAX_AGE_SECS);
+    // M4b: while a one-time import is pending or running, pushes are
+    // refused outright — no ref (branch, tag, refs/for, or namespace) moves.
+    if ctx.import_in_progress {
+        let _ = writeln!(
+            err,
+            "starforge: repository import in progress; pushes are refused"
+        );
+        return 1;
+    }
     let permission = ctx.permission.as_deref();
     let mut code = 0;
     let mut accepted: Vec<(String, String, String, String, String)> = Vec::new();
@@ -103,9 +134,11 @@ pub fn pre_receive_with(input: impl BufRead, mut err: impl Write, ctx: &HookCtx)
             .as_ref()
             .map(|protection| protection.namespaces.as_slice())
             .unwrap_or(&[]);
+        // `refs/for` needs an author: deploy keys push with permission but no
+        // user (M3c D5), so they are refused here like anonymous pushes.
         match refpolicy::check_allowed(
             &update.name,
-            permission,
+            ctx.user_id.and(permission),
             ctx.is_member,
             &ctx.refs_for,
             namespaces,
@@ -246,6 +279,27 @@ pub fn pre_receive_with(input: impl BufRead, mut err: impl Write, ctx: &HookCtx)
             }
         }
     }
+    // M5a `refs/for` rate limit: refuse the NEW changes past the pusher's
+    // hourly budget; updates to the pusher's own open topics are free.
+    if let Some(budget) = ctx.refs_for_budget {
+        let mut spent = 0;
+        accepted.retain(|(refname, base, topic, _, _)| {
+            if !refpolicy::is_new_for_topic(&ctx.refs_for_topics, base, topic) {
+                return true;
+            }
+            if spent < budget {
+                spent += 1;
+                true
+            } else {
+                let _ = writeln!(
+                    err,
+                    "starforge: pushing to {refname} is not allowed: refs/for new-change hourly limit exceeded"
+                );
+                code = 1;
+                false
+            }
+        });
+    }
     let options = match &ctx.options {
         None => refpolicy::PushOptions::default(),
         Some(vars) => {
@@ -312,6 +366,9 @@ mod tests {
             branches: vec!["main".to_owned(), "release/1.x".to_owned()],
             nonce: "testnonce".to_owned(),
             options: None,
+            refs_for_budget: None,
+            refs_for_topics: Vec::new(),
+            import_in_progress: false,
         }
     }
 

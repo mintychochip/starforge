@@ -189,21 +189,25 @@ fn url_password(url: &str) -> Option<String> {
     Some(password.to_owned())
 }
 
-/// `git fetch --prune <url> <refspec>...` argv (no credentials, ever).
+/// `git fetch --prune -- <url> <refspec>...` argv (no credentials, ever).
+/// The `--` keeps a dash-leading URL/refspec positional, and
+/// [`validate_positionals`] refuses such values outright anyway.
 pub fn fetch_args(pinned: &PinnedRemote, refspecs: &[String]) -> Vec<String> {
     let mut args = pinned.config_args();
     args.push("fetch".to_owned());
     args.push("--prune".to_owned());
+    args.push("--".to_owned());
     args.push(pinned.url.clone());
     args.extend(refspecs.iter().cloned());
     args
 }
 
-/// `git push --prune <url> <refspec>...` argv (no credentials, ever).
+/// `git push --prune -- <url> <refspec>...` argv (no credentials, ever).
 pub fn push_args(pinned: &PinnedRemote, refspecs: &[String]) -> Vec<String> {
     let mut args = pinned.config_args();
     args.push("push".to_owned());
     args.push("--prune".to_owned());
+    args.push("--".to_owned());
     args.push(pinned.url.clone());
     args.extend(refspecs.iter().cloned());
     args
@@ -217,6 +221,29 @@ pub fn ls_remote_args(pinned: &PinnedRemote) -> Vec<String> {
     args.push(pinned.url.clone());
     args.push("HEAD".to_owned());
     args
+}
+
+/// Refuses a dash-leading URL or refspec before git is spawned: git would
+/// otherwise read it as an option (e.g. `--upload-pack=<cmd>`).
+fn validate_positionals(
+    pinned: &PinnedRemote,
+    refspecs: &[String],
+    args: &[String],
+) -> Result<(), GitError> {
+    let command = args.join(" ");
+    let bad = |value: &str| GitError::Failed {
+        command: command.clone(),
+        stderr: format!("remote url or refspec must not start with '-': {value}"),
+    };
+    if pinned.url.starts_with('-') {
+        return Err(bad(&pinned.url));
+    }
+    for refspec in refspecs {
+        if refspec.starts_with('-') {
+            return Err(bad(refspec));
+        }
+    }
+    Ok(())
 }
 
 /// Environment entries carrying credentials, as
@@ -256,15 +283,24 @@ pub struct LsRemoteHead {
     pub symref: Option<String>,
 }
 
+/// Stdout and scrubbed stderr of a successful remote command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RemoteOutput {
+    stdout: String,
+    stderr: String,
+}
+
 /// Runs one git command in `repo_dir` (when it exists) with the pinned
-/// config, credential env, and a timeout.
+/// config, credential env, and a timeout. The single place key-file,
+/// credential-env, and spawn/timeout handling lives: `fetch`, `push`, and
+/// `ls_remote_head` all go through here.
 async fn run_remote(
     repo_dir: &Path,
     pinned: &PinnedRemote,
     creds: &RemoteCreds,
     args: Vec<String>,
     timeout: Duration,
-) -> Result<String, GitError> {
+) -> Result<RemoteOutput, GitError> {
     // An SSH key lives in a 0600 temp file for the duration of the command
     // and is removed afterwards, including on failure and timeout.
     let key_file = match creds {
@@ -273,10 +309,19 @@ async fn run_remote(
         }
         _ => None,
     };
-    let result =
-        run_remote_inner(repo_dir, pinned, creds, &args, timeout, key_file.as_deref()).await;
-    if let Some(path) = &key_file {
-        let _ = std::fs::remove_file(path);
+    let result = run_remote_inner(
+        repo_dir,
+        pinned,
+        creds,
+        &args,
+        timeout,
+        key_file.as_ref().map(KeyFile::path),
+    )
+    .await;
+    // Removal happens here on every path (success, failure, timeout);
+    // dropping the `KeyFile` then removes the private temp dir too.
+    if let Some(key) = &key_file {
+        let _ = std::fs::remove_file(key.path());
     }
     result
 }
@@ -288,7 +333,7 @@ async fn run_remote_inner(
     args: &[String],
     timeout: Duration,
     key_file: Option<&Path>,
-) -> Result<String, GitError> {
+) -> Result<RemoteOutput, GitError> {
     let scrubbed_url = pinned.url.clone();
     let command = args.join(" ");
     let mut cmd = git();
@@ -321,32 +366,52 @@ async fn run_remote_inner(
             },
         });
     }
-    Ok(stderr)
+    Ok(RemoteOutput {
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr,
+    })
 }
 
-fn write_key_file(private_key: &str) -> Result<PathBuf, GitError> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let path = std::env::temp_dir().join(format!(
-        "starforged-ssh-key-{}-{n}-{nanos}",
-        std::process::id()
-    ));
-    std::fs::write(&path, private_key).map_err(GitError::Io)?;
+/// A 0600 SSH private-key file in a private temp dir. The dir (and the
+/// file with it) is removed when this is dropped.
+struct KeyFile {
+    _dir: tempfile::TempDir,
+    path: PathBuf,
+}
+
+impl KeyFile {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+fn write_key_file(private_key: &str) -> Result<KeyFile, GitError> {
+    use std::io::Write as _;
+    // One step, no window: `create_new` refuses a pre-existing path (and
+    // follows no symlink into it), and `mode(0o600)` applies at creation
+    // rather than in a later chmod. The temp dir itself is owner-only
+    // (0700); tempfile's default would be umask-filtered 0777.
+    let mut builder = tempfile::Builder::new();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-            .map_err(GitError::Io)?;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
     }
-    Ok(path)
+    let dir = builder.tempdir()?;
+    let path = dir.path().join("key");
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&path)?;
+    file.write_all(private_key.as_bytes())?;
+    Ok(KeyFile { _dir: dir, path })
 }
 
-/// `git fetch --prune <url> <refspec>...` with a timeout. Only the given
+/// `git fetch --prune -- <url> <refspec>...` with a timeout. Only the given
 /// refspecs are fetched (callers pass the heads/tags refspecs), so
 /// `refs/notes/*`, `refs/pull/*`, and friends never arrive.
 pub async fn fetch(
@@ -356,18 +421,15 @@ pub async fn fetch(
     refspecs: &[String],
     timeout: Duration,
 ) -> Result<FetchOutcome, GitError> {
-    let stderr = run_remote(
-        repo_dir,
-        pinned,
-        creds,
-        fetch_args(pinned, refspecs),
-        timeout,
-    )
-    .await?;
-    Ok(FetchOutcome { stderr })
+    let args = fetch_args(pinned, refspecs);
+    validate_positionals(pinned, refspecs, &args)?;
+    let output = run_remote(repo_dir, pinned, creds, args, timeout).await?;
+    Ok(FetchOutcome {
+        stderr: output.stderr,
+    })
 }
 
-/// `git push --prune <url> <refspec>...` with a timeout.
+/// `git push --prune -- <url> <refspec>...` with a timeout.
 pub async fn push(
     repo_dir: &Path,
     pinned: &PinnedRemote,
@@ -375,15 +437,12 @@ pub async fn push(
     refspecs: &[String],
     timeout: Duration,
 ) -> Result<FetchOutcome, GitError> {
-    let stderr = run_remote(
-        repo_dir,
-        pinned,
-        creds,
-        push_args(pinned, refspecs),
-        timeout,
-    )
-    .await?;
-    Ok(FetchOutcome { stderr })
+    let args = push_args(pinned, refspecs);
+    validate_positionals(pinned, refspecs, &args)?;
+    let output = run_remote(repo_dir, pinned, creds, args, timeout).await?;
+    Ok(FetchOutcome {
+        stderr: output.stderr,
+    })
 }
 
 /// `git ls-remote --symref <url> HEAD` with a timeout: the remote's `HEAD`
@@ -394,52 +453,10 @@ pub async fn ls_remote_head(
     creds: &RemoteCreds,
     timeout: Duration,
 ) -> Result<LsRemoteHead, GitError> {
-    // ls-remote writes to stdout, which run_remote does not return; run it
-    // directly here so the advertisement can be parsed.
-    let key_file = match creds {
-        RemoteCreds::SshKey { private_key } if pinned.scheme == RemoteScheme::Ssh => {
-            Some(write_key_file(private_key)?)
-        }
-        _ => None,
-    };
     let args = ls_remote_args(pinned);
-    let command = args.join(" ");
-    let mut cmd = git();
-    if repo_dir.exists() {
-        cmd.current_dir(repo_dir);
-    }
-    cmd.args(&args);
-    for (key, value) in credential_env(creds) {
-        cmd.env(key, value);
-    }
-    if let Some(ssh_command) = pinned.ssh_command(key_file.as_deref()) {
-        cmd.env("GIT_SSH_COMMAND", ssh_command);
-    }
-    let output = tokio::time::timeout(timeout, cmd.output())
-        .await
-        .map_err(|_| GitError::Failed {
-            command: command.clone(),
-            stderr: format!("git timed out after {}s", timeout.as_secs()),
-        })?;
-    if let Some(path) = &key_file {
-        let _ = std::fs::remove_file(path);
-    }
-    let output = output?;
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    if !output.status.success() {
-        let stderr = scrub(&String::from_utf8_lossy(&output.stderr), &pinned.url)
-            .trim()
-            .to_owned();
-        return Err(GitError::Failed {
-            command,
-            stderr: if stderr.is_empty() {
-                format!("git exited with {}", output.status)
-            } else {
-                stderr
-            },
-        });
-    }
-    Ok(parse_ls_remote_head(&stdout))
+    validate_positionals(pinned, &[], &args)?;
+    let output = run_remote(repo_dir, pinned, creds, args, timeout).await?;
+    Ok(parse_ls_remote_head(&output.stdout))
 }
 
 fn parse_ls_remote_head(stdout: &str) -> LsRemoteHead {
@@ -573,5 +590,89 @@ mod tests {
             head.oid.as_deref(),
             Some("0123456789abcdef0123456789abcdef01234567")
         );
+    }
+
+    #[test]
+    fn fetch_and_push_args_separate_positionals_with_dashdash() {
+        let refspecs = vec!["+refs/heads/*:refs/heads/*".to_owned()];
+        for args in [
+            fetch_args(&pinned(), &refspecs),
+            push_args(&pinned(), &refspecs),
+        ] {
+            let dashdash = args.iter().position(|a| a == "--").unwrap();
+            assert_eq!(args[dashdash + 1], pinned().url, "{args:?}");
+            assert_eq!(args[dashdash + 2], refspecs[0], "{args:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn dash_prefixed_url_or_refspec_is_refused_before_spawning() {
+        // A repo dir that does not exist: if git were spawned the error
+        // would be git's own failure, not our refusal, so the message
+        // proves nothing was spawned.
+        let dir = Path::new("/nonexistent-starforged-repo");
+        let timeout = Duration::from_secs(5);
+        // Dash-leading refspec.
+        let err = fetch(
+            dir,
+            &pinned(),
+            &RemoteCreds::None,
+            &["--upload-pack=id".to_owned()],
+            timeout,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("must not start with '-'"), "{err}");
+        let err = push(
+            dir,
+            &pinned(),
+            &RemoteCreds::None,
+            &["--receive-pack=id".to_owned()],
+            timeout,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("must not start with '-'"), "{err}");
+        // Dash-leading URL.
+        let mut bad = pinned();
+        bad.url = "--upload-pack=id".to_owned();
+        let err = fetch(
+            dir,
+            &bad,
+            &RemoteCreds::None,
+            &["+refs/heads/*:refs/heads/*".to_owned()],
+            timeout,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("must not start with '-'"), "{err}");
+        let err = ls_remote_head(dir, &bad, &RemoteCreds::None, timeout)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("must not start with '-'"), "{err}");
+    }
+
+    #[test]
+    fn key_file_is_private_and_removed_with_its_dir() {
+        let key = write_key_file("-----BEGIN TEST KEY-----").unwrap();
+        let path = key.path().to_owned();
+        assert!(path.exists());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "-----BEGIN TEST KEY-----"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "key file mode {mode:o}");
+            let dir_mode = std::fs::metadata(path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(dir_mode & 0o777, 0o700, "temp dir mode {dir_mode:o}");
+        }
+        drop(key);
+        assert!(!path.exists(), "key file must be removed with its dir");
     }
 }

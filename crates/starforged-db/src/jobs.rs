@@ -253,6 +253,30 @@ pub async fn count_by_state(db: &Db, state: &str) -> DbResult<i64> {
             .await?,
     )
 }
+/// Job counts grouped by kind and state, ordered by kind then state.
+pub async fn counts_by_kind_state(db: &Db) -> DbResult<Vec<(String, String, i64)>> {
+    let rows = sqlx::query("SELECT kind, state, COUNT(*) AS n FROM jobs GROUP BY kind, state ORDER BY kind ASC, state ASC")
+        .fetch_all(db.pool())
+        .await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in &rows {
+        out.push((
+            row.try_get("kind")?,
+            row.try_get("state")?,
+            row.try_get("n")?,
+        ));
+    }
+    Ok(out)
+}
+
+/// The `created_at` of the longest-waiting queued job, if any is queued.
+pub async fn oldest_pending_created(db: &Db) -> DbResult<Option<i64>> {
+    Ok(
+        sqlx::query_scalar("SELECT MIN(created_at) FROM jobs WHERE state = 'queued'")
+            .fetch_one(db.pool())
+            .await?,
+    )
+}
 
 #[cfg(test)]
 mod tests {

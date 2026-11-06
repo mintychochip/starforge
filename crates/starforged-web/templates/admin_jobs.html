@@ -5,6 +5,24 @@
 {% include "admin_nav.html" %}
 <section>
   <h2>Jobs</h2>
+  <p>Oldest pending job: {{ oldest_pending }}</p>
+  <form method="post" action="/admin/jobs/rebuild-index" class="inline"><input type="hidden" name="_csrf" value="{{ csrf }}"><button type="submit">Rebuild search index</button></form>
+  {% if !aggregates.is_empty() %}
+  <table>
+    <thead>
+      <tr><th>Kind</th><th>State</th><th>Count</th></tr>
+    </thead>
+    <tbody>
+      {% for aggregate in aggregates %}
+      <tr>
+        <td>{{ aggregate.kind }}</td>
+        <td>{{ aggregate.state }}</td>
+        <td>{{ aggregate.count }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
   {% if jobs.is_empty() %}
   <p>No jobs.</p>
   {% else %}

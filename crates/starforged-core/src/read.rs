@@ -456,6 +456,8 @@ mod tests {
             default_branch: "main".into(),
             archived_at: None,
             deleted_at: None,
+            mirror: false,
+            import_state: "none".to_owned(),
             created_at: 0,
             updated_at: 0,
         }

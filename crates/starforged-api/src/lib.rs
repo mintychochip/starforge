@@ -121,6 +121,14 @@ pub fn router(core: Core, base_url: String) -> Router {
         )
         .route("/repos/{owner}/{repo}/transfer", post(repos::transfer))
         .route(
+            "/repos/{owner}/{repo}/import",
+            get(repos::get_import).delete(repos::delete_import),
+        )
+        .route(
+            "/repos/{owner}/{repo}/import/start",
+            post(repos::start_import),
+        )
+        .route(
             "/repos/{owner}/{repo}/sessions/{ulid}",
             put(sessions::put_meta)
                 .get(sessions::get_session)
@@ -311,6 +319,10 @@ pub fn router(core: Core, base_url: String) -> Router {
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             moved::redirect_renamed,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::rate_limit,
         ))
         .with_state(state)
 }

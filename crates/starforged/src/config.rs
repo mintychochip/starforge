@@ -32,6 +32,22 @@ pub struct Config {
     /// file-URL flag off).
     #[serde(default)]
     pub remotes: RemotesConfig,
+    /// GitHub import tuning. Missing section defaults cleanly
+    /// (`https://api.github.com`).
+    #[serde(default)]
+    pub github: GithubConfig,
+    /// OIDC single sign-on (spec §9, plan D4). Missing section defaults
+    /// cleanly (disabled).
+    #[serde(default)]
+    pub oidc: OidcConfig,
+    /// Abuse controls (spec §11.6). Missing section defaults cleanly; `0`
+    /// disables a limit.
+    #[serde(default)]
+    pub limits: LimitsConfig,
+    /// Git over SSH (M3c). Missing section defaults cleanly (listener on
+    /// 0.0.0.0:2222, host key under the data dir).
+    #[serde(default)]
+    pub ssh: SshConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -237,6 +253,210 @@ pub struct RemotesConfig {
     pub allow_file_urls: bool,
 }
 
+fn default_login_per_ip_per_minute() -> u64 {
+    10
+}
+
+fn default_login_per_account_per_hour() -> u64 {
+    20
+}
+
+fn default_api_per_token_per_hour() -> u64 {
+    5000
+}
+
+fn default_refs_for_new_changes_per_hour() -> u64 {
+    30
+}
+
+/// Abuse controls (spec §11.6). Every limit is `0`-disables: an operator
+/// can turn any single limit off without touching the others.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LimitsConfig {
+    /// Login attempts per client IP per minute.
+    #[serde(default = "default_login_per_ip_per_minute")]
+    pub login_per_ip_per_minute: u64,
+    /// Failed logins per normalized login name per hour.
+    #[serde(default = "default_login_per_account_per_hour")]
+    pub login_per_account_per_hour: u64,
+    /// API requests per token per hour.
+    #[serde(default = "default_api_per_token_per_hour")]
+    pub api_per_token_per_hour: u64,
+    /// New `refs/for` changes per user per hour.
+    #[serde(default = "default_refs_for_new_changes_per_hour")]
+    pub refs_for_new_changes_per_hour: u64,
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        LimitsConfig {
+            login_per_ip_per_minute: default_login_per_ip_per_minute(),
+            login_per_account_per_hour: default_login_per_account_per_hour(),
+            api_per_token_per_hour: default_api_per_token_per_hour(),
+            refs_for_new_changes_per_hour: default_refs_for_new_changes_per_hour(),
+        }
+    }
+}
+
+fn default_ssh_listen() -> String {
+    "0.0.0.0:2222".into()
+}
+
+fn default_ssh_host_key() -> PathBuf {
+    PathBuf::from("ssh_host_ed25519_key")
+}
+
+/// Git over SSH (M3c, spec §8.1). Missing section defaults cleanly and every
+/// knob is overridable by `STARFORGE__SSH__*`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshConfig {
+    /// Whether the SSH listener starts (default true).
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Socket address the SSH server binds (default `0.0.0.0:2222`).
+    #[serde(default = "default_ssh_listen")]
+    pub listen: String,
+    /// Host key file; generated with mode `0600` on first start or by
+    /// `starforged init`. Relative paths resolve against `storage.data_dir`.
+    #[serde(default = "default_ssh_host_key")]
+    pub host_key_path: PathBuf,
+    /// Host for SSH clone URLs; empty takes the host from `server.base_url`.
+    #[serde(default)]
+    pub public_host: String,
+    /// Port for SSH clone URLs (default 2222).
+    #[serde(default = "default_ssh_port")]
+    pub public_port: u16,
+    /// Idle timeout in seconds (default 300).
+    #[serde(default = "default_ssh_idle_timeout_secs")]
+    pub idle_timeout_secs: u64,
+    /// Total timeout in seconds (default 3600).
+    #[serde(default = "default_ssh_max_connection_secs")]
+    pub max_connection_secs: u64,
+    /// Concurrent connections per user (per deploy key) (default 10).
+    #[serde(default = "default_ssh_max_connections_per_user")]
+    pub max_connections_per_user: usize,
+}
+
+fn default_ssh_port() -> u16 {
+    2222
+}
+
+fn default_ssh_idle_timeout_secs() -> u64 {
+    300
+}
+
+fn default_ssh_max_connection_secs() -> u64 {
+    3600
+}
+
+fn default_ssh_max_connections_per_user() -> usize {
+    10
+}
+
+impl Default for SshConfig {
+    fn default() -> Self {
+        SshConfig {
+            enabled: true,
+            listen: default_ssh_listen(),
+            host_key_path: default_ssh_host_key(),
+            public_host: String::new(),
+            public_port: default_ssh_port(),
+            idle_timeout_secs: default_ssh_idle_timeout_secs(),
+            max_connection_secs: default_ssh_max_connection_secs(),
+            max_connections_per_user: default_ssh_max_connections_per_user(),
+        }
+    }
+}
+fn default_github_api_url() -> String {
+    "https://api.github.com".into()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GithubConfig {
+    /// Base URL of the GitHub API for metadata imports (M4c, spec §8.6),
+    /// e.g. `https://api.github.com` or a GitHub Enterprise origin. The
+    /// host is checked with the webhook SSRF rules; loopback is denied
+    /// except behind the test-only flags.
+    #[serde(default = "default_github_api_url")]
+    pub api_url: String,
+}
+
+impl Default for GithubConfig {
+    fn default() -> Self {
+        GithubConfig {
+            api_url: default_github_api_url(),
+        }
+    }
+}
+
+fn default_oidc_scopes() -> Vec<String> {
+    vec!["openid".into(), "email".into(), "profile".into()]
+}
+
+fn default_oidc_button_label() -> String {
+    "Sign in with SSO".into()
+}
+
+/// The `[oidc]` section (plan D4). `client_secret` never renders in
+/// `Debug`. Overridable by `STARFORGE__OIDC__*`.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OidcConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// The provider issuer: HTTPS, or HTTP only for loopback (tests).
+    #[serde(default)]
+    pub issuer: String,
+    #[serde(default)]
+    pub client_id: String,
+    #[serde(default)]
+    pub client_secret: String,
+    #[serde(default = "default_oidc_scopes")]
+    pub scopes: Vec<String>,
+    #[serde(default = "default_oidc_button_label")]
+    pub button_label: String,
+    #[serde(default)]
+    pub auto_create: bool,
+    #[serde(default = "default_true")]
+    pub link_by_email: bool,
+}
+
+impl Default for OidcConfig {
+    fn default() -> OidcConfig {
+        OidcConfig {
+            enabled: false,
+            issuer: String::new(),
+            client_id: String::new(),
+            client_secret: String::new(),
+            scopes: default_oidc_scopes(),
+            button_label: default_oidc_button_label(),
+            auto_create: false,
+            link_by_email: true,
+        }
+    }
+}
+
+impl std::fmt::Debug for OidcConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OidcConfig")
+            .field("enabled", &self.enabled)
+            .field("issuer", &self.issuer)
+            .field("client_id", &self.client_id)
+            .field(
+                "client_secret",
+                &if self.client_secret.is_empty() {
+                    ""
+                } else {
+                    "<redacted>"
+                },
+            )
+            .field("scopes", &self.scopes)
+            .field("button_label", &self.button_label)
+            .field("auto_create", &self.auto_create)
+            .field("link_by_email", &self.link_by_email)
+            .finish()
+    }
+}
+
 impl Config {
     /// Reads `path`, applies environment overrides, and validates.
     pub fn load(path: &Path) -> anyhow::Result<Config> {
@@ -316,6 +536,7 @@ impl Config {
                 "remotes__allow_file_urls" => {
                     self.remotes.allow_file_urls = parse_bool(&key, &value)?;
                 }
+                "github__api_url" => self.github.api_url = value,
                 "git__allowed_ref_namespaces" => {
                     self.git.allowed_ref_namespaces = value
                         .split(',')
@@ -323,6 +544,65 @@ impl Config {
                         .filter(|d| !d.is_empty())
                         .map(str::to_owned)
                         .collect();
+                }
+                "limits__login_per_ip_per_minute" => {
+                    self.limits.login_per_ip_per_minute = value
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("{key} must be a non-negative count"))?;
+                }
+                "limits__login_per_account_per_hour" => {
+                    self.limits.login_per_account_per_hour = value
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("{key} must be a non-negative count"))?;
+                }
+                "limits__api_per_token_per_hour" => {
+                    self.limits.api_per_token_per_hour = value
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("{key} must be a non-negative count"))?;
+                }
+                "limits__refs_for_new_changes_per_hour" => {
+                    self.limits.refs_for_new_changes_per_hour = value
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("{key} must be a non-negative count"))?;
+                }
+                "oidc__enabled" => self.oidc.enabled = parse_bool(&key, &value)?,
+                "oidc__issuer" => self.oidc.issuer = value,
+                "oidc__client_id" => self.oidc.client_id = value,
+                "oidc__client_secret" => self.oidc.client_secret = value,
+                "oidc__scopes" => {
+                    self.oidc.scopes = value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned)
+                        .collect();
+                }
+                "oidc__button_label" => self.oidc.button_label = value,
+                "oidc__auto_create" => self.oidc.auto_create = parse_bool(&key, &value)?,
+                "oidc__link_by_email" => self.oidc.link_by_email = parse_bool(&key, &value)?,
+                "ssh__enabled" => self.ssh.enabled = parse_bool(&key, &value)?,
+                "ssh__listen" => self.ssh.listen = value,
+                "ssh__host_key_path" => self.ssh.host_key_path = PathBuf::from(value),
+                "ssh__public_host" => self.ssh.public_host = value,
+                "ssh__public_port" => {
+                    self.ssh.public_port = value
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("{key} must be a port number"))?;
+                }
+                "ssh__idle_timeout_secs" => {
+                    self.ssh.idle_timeout_secs = value
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("{key} must be a non-negative count"))?;
+                }
+                "ssh__max_connection_secs" => {
+                    self.ssh.max_connection_secs = value
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("{key} must be a non-negative count"))?;
+                }
+                "ssh__max_connections_per_user" => {
+                    self.ssh.max_connections_per_user = value
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("{key} must be a non-negative count"))?;
                 }
                 _ => bail!("unknown configuration override {key}"),
             }
@@ -342,7 +622,32 @@ impl Config {
         self.mailer()?;
         starforged_git::refpolicy::validate_allowed_namespaces(&self.git.allowed_ref_namespaces)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
+        if self.oidc.enabled {
+            if self.oidc.issuer.trim().is_empty() {
+                bail!("oidc.enabled needs oidc.issuer");
+            }
+            if !starforged_core::oidc::url_allowed(&self.oidc.issuer) {
+                bail!("oidc.issuer must be https (http is only allowed for loopback)");
+            }
+            if self.oidc.client_id.trim().is_empty() {
+                bail!("oidc.enabled needs oidc.client_id");
+            }
+        }
         Ok(())
+    }
+
+    /// The `[oidc]` section as core settings.
+    pub fn oidc_settings(&self) -> starforged_core::oidc::OidcConfig {
+        starforged_core::oidc::OidcConfig {
+            enabled: self.oidc.enabled,
+            issuer: self.oidc.issuer.clone(),
+            client_id: self.oidc.client_id.clone(),
+            client_secret: self.oidc.client_secret.clone(),
+            scopes: self.oidc.scopes.clone(),
+            button_label: self.oidc.button_label.clone(),
+            auto_create: self.oidc.auto_create,
+            link_by_email: self.oidc.link_by_email,
+        }
     }
 
     /// The `[registration]` section as core settings, with domains lowercased.
@@ -427,6 +732,39 @@ impl Config {
     pub fn mailer(&self) -> anyhow::Result<Option<Mailer>> {
         Ok(Mailer::from_config(&self.mail.url, &self.mail.from)?)
     }
+
+    /// Resolved SSH host key file: an absolute `ssh.host_key_path` is used
+    /// verbatim; a relative one resolves against `storage.data_dir`.
+    pub fn ssh_host_key_path(&self) -> PathBuf {
+        if self.ssh.host_key_path.is_absolute() {
+            self.ssh.host_key_path.clone()
+        } else {
+            self.storage.data_dir.join(&self.ssh.host_key_path)
+        }
+    }
+
+    /// The `ssh://` clone address prefix (`ssh://git@<host>:<port>`) for the
+    /// repository page (D6): `ssh.public_host` defaults to the host from
+    /// `server.base_url`. `None` when SSH is disabled.
+    pub fn ssh_clone_base(&self) -> Option<String> {
+        if !self.ssh.enabled {
+            return None;
+        }
+        let host = if self.ssh.public_host.trim().is_empty() {
+            let Ok(url) = url::Url::parse(&self.server.base_url) else {
+                return None;
+            };
+            match url.host() {
+                Some(url::Host::Domain(domain)) => domain.to_owned(),
+                Some(url::Host::Ipv4(ip)) => ip.to_string(),
+                Some(url::Host::Ipv6(ip)) => format!("[{ip}]"),
+                None => return None,
+            }
+        } else {
+            self.ssh.public_host.clone()
+        };
+        Some(format!("ssh://git@{host}:{}", self.ssh.public_port))
+    }
 }
 
 fn parse_bool(key: &str, value: &str) -> anyhow::Result<bool> {
@@ -461,6 +799,10 @@ mod tests {
             webhooks: WebhooksConfig::default(),
             git: GitConfig::default(),
             remotes: RemotesConfig::default(),
+            github: GithubConfig::default(),
+            limits: LimitsConfig::default(),
+            oidc: OidcConfig::default(),
+            ssh: SshConfig::default(),
         }
     }
 

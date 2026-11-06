@@ -1,8 +1,8 @@
 //! Upload quotas (spec §7.7): per-repository and per-uploader storage caps plus a
 //! per-uploader rolling-hour volume cap, all enforced from `segments` sums.
 //!
-//! Per-token request rate limiting is a hook only ([`check_rate_limit`]); it needs a
-//! request-log table that belongs to M5, which owns rate limits.
+//! Per-token request rate limiting lives in [`crate::limits`] (M5a), keyed by
+//! token id in memory; the API layer consults it on every request.
 
 use starforged_db::sessions as db_sessions;
 
@@ -52,8 +52,9 @@ pub async fn check_hourly_volume(core: &Core, user_id: i64, incoming_bytes: u64)
     Ok(())
 }
 
-/// Per-token request rate limiting (5 000/hr): hook only, always `Ok`.
-/// M5 implements it once the request-log table exists.
+/// Per-token request rate limiting is enforced by the API layer via
+/// [`crate::limits`] on every request; this hook stays `Ok` for the segment
+/// upload path, whose requests already counted at the API layer.
 pub fn check_rate_limit() -> CoreResult<()> {
     Ok(())
 }

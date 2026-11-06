@@ -11,7 +11,7 @@ use starforged_core::CoreError;
 use starforged_core::CoreResult;
 use starforged_core::accounts::CreateUser;
 use starforged_core::accounts::User;
-use starforged_core::admin::{AdminOverview, JobInfo, UserSummary};
+use starforged_core::admin::{AdminOverview, JobAggregate, JobInfo, UserSummary};
 use starforged_core::audit::AuditQuery;
 use starforged_core::passwords::AdminReset;
 use starforged_core::sessions::WebSession;
@@ -639,13 +639,39 @@ pub struct JobRow {
     created_at: String,
 }
 
+pub struct AggregateRow {
+    kind: String,
+    state: String,
+    count: i64,
+}
+
 #[derive(Template, WebTemplate)]
 #[template(path = "admin_jobs.html")]
 pub struct JobsPage {
     nav_user: Option<NavUser>,
     csrf: String,
     admin_tab: &'static str,
+    aggregates: Vec<AggregateRow>,
+    oldest_pending: String,
     jobs: Vec<JobRow>,
+}
+
+fn aggregate_rows(aggregates: &[JobAggregate]) -> Vec<AggregateRow> {
+    aggregates
+        .iter()
+        .map(|a| AggregateRow {
+            kind: a.kind.clone(),
+            state: a.state.clone(),
+            count: a.count,
+        })
+        .collect()
+}
+
+fn oldest_pending_label(age: Option<i64>) -> String {
+    match age {
+        Some(secs) => format!("{secs} s"),
+        None => "none".to_owned(),
+    }
 }
 
 /// Truncates the last error to 200 chars without splitting a char boundary.
@@ -663,6 +689,7 @@ pub async fn jobs(
     State(state): State<AppState>,
     RequireAdmin(session): RequireAdmin,
 ) -> Result<JobsPage, WebError> {
+    let stats = state.core.admin_job_stats(&session.user).await?;
     let jobs = state
         .core
         .admin_list_jobs(&session.user)
@@ -682,6 +709,8 @@ pub async fn jobs(
         nav_user: Some(NavUser::from_session(&session)),
         csrf: session.csrf_token.clone(),
         admin_tab: "jobs",
+        aggregates: aggregate_rows(&stats.aggregates),
+        oldest_pending: oldest_pending_label(stats.oldest_pending_age),
         jobs,
     })
 }
@@ -712,6 +741,15 @@ pub async fn delete_job(
         Err(CoreError::NotFound) => Err(WebError::NotFound),
         Err(other) => Err(other.into()),
     }
+}
+pub async fn rebuild_index(
+    State(state): State<AppState>,
+    RequireAdmin(session): RequireAdmin,
+    Form(form): Form<CsrfForm>,
+) -> Result<Response, WebError> {
+    verify_csrf(&session.csrf_token, &form.csrf)?;
+    state.core.enqueue_search_rebuild(&session.user).await?;
+    Ok(Redirect::to("/admin/jobs").into_response())
 }
 
 /// One audit row for the page: every column is rendered escaped by the template.
@@ -807,5 +845,137 @@ pub async fn audit_page(
         to,
         entries,
         next_after,
+    })
+}
+
+/// One quarantined session for the queue page: repo, ULID, uploader, reason,
+/// and time only. The detail and the content are never loaded, so they can
+/// never render here.
+pub struct QuarantineRow {
+    id: i64,
+    repo: String,
+    ulid: String,
+    uploader: String,
+    reason: String,
+    time: String,
+}
+
+#[derive(Template, WebTemplate)]
+#[template(path = "admin_quarantine.html")]
+pub struct QuarantinePage {
+    nav_user: Option<NavUser>,
+    csrf: String,
+    admin_tab: &'static str,
+    sessions: Vec<QuarantineRow>,
+}
+
+/// `/admin/quarantine`: quarantined sessions across all repositories (D4).
+pub async fn quarantine_page(
+    State(state): State<AppState>,
+    RequireAdmin(session): RequireAdmin,
+) -> Result<QuarantinePage, WebError> {
+    let sessions = state
+        .core
+        .admin_quarantined_sessions(&session.user)
+        .await?
+        .into_iter()
+        .map(|s| QuarantineRow {
+            id: s.id,
+            repo: s.repo,
+            ulid: s.ulid,
+            uploader: s.uploader,
+            reason: s.reason,
+            time: crate::views::format_time(s.created_at),
+        })
+        .collect();
+    Ok(QuarantinePage {
+        nav_user: Some(NavUser::from_session(&session)),
+        csrf: session.csrf_token.clone(),
+        admin_tab: "quarantine",
+        sessions,
+    })
+}
+
+pub async fn release_quarantine(
+    State(state): State<AppState>,
+    RequireAdmin(session): RequireAdmin,
+    Path(id): Path<i64>,
+    Form(form): Form<CsrfForm>,
+) -> Result<Response, WebError> {
+    verify_csrf(&session.csrf_token, &form.csrf)?;
+    match state.core.admin_release_session(&session.user, id).await {
+        Ok(()) => Ok(Redirect::to("/admin/quarantine").into_response()),
+        Err(CoreError::NotFound) => Err(WebError::NotFound),
+        Err(other) => Err(other.into()),
+    }
+}
+
+pub async fn purge_quarantine(
+    State(state): State<AppState>,
+    RequireAdmin(session): RequireAdmin,
+    Path(id): Path<i64>,
+    Form(form): Form<CsrfForm>,
+) -> Result<Response, WebError> {
+    verify_csrf(&session.csrf_token, &form.csrf)?;
+    match state.core.admin_purge_session(&session.user, id).await {
+        Ok(()) => Ok(Redirect::to("/admin/quarantine").into_response()),
+        Err(CoreError::NotFound) => Err(WebError::NotFound),
+        Err(other) => Err(other.into()),
+    }
+}
+
+#[derive(Template, WebTemplate)]
+#[template(path = "admin_health.html")]
+pub struct HealthPage {
+    nav_user: Option<NavUser>,
+    #[allow(dead_code)]
+    csrf: String,
+    admin_tab: &'static str,
+    version: &'static str,
+    engine: &'static str,
+    schema_version: String,
+    git_version: String,
+    free_space: String,
+    aggregates: Vec<AggregateRow>,
+    oldest_pending: String,
+    search_trails: u64,
+    search_events: u64,
+    ssh_status: String,
+}
+
+/// `/admin/health`: version, engine, schema version, git version, free
+/// space, job aggregates, search index counts, and the SSH listener's
+/// configured state (D5).
+pub async fn health_page(
+    State(state): State<AppState>,
+    RequireAdmin(session): RequireAdmin,
+) -> Result<HealthPage, WebError> {
+    let health = state.core.admin_health(&session.user).await?;
+    let (major, minor) = starforged_git::command::check_version()
+        .await
+        .map_err(|e| WebError::Internal(e.to_string()))?;
+    Ok(HealthPage {
+        nav_user: Some(NavUser::from_session(&session)),
+        csrf: session.csrf_token.clone(),
+        admin_tab: "health",
+        version: env!("CARGO_PKG_VERSION"),
+        engine: health.engine,
+        schema_version: health
+            .schema_version
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "unknown".to_owned()),
+        git_version: format!("{major}.{minor}"),
+        free_space: health
+            .data_dir_free_bytes
+            .map(|bytes| format!("{bytes} bytes"))
+            .unwrap_or_else(|| "unknown".to_owned()),
+        aggregates: aggregate_rows(&health.jobs.aggregates),
+        oldest_pending: oldest_pending_label(health.jobs.oldest_pending_age),
+        search_trails: health.search_trails,
+        search_events: health.search_events,
+        ssh_status: health
+            .ssh_addr
+            .map(|addr| format!("enabled on {addr}"))
+            .unwrap_or_else(|| "disabled".to_owned()),
     })
 }

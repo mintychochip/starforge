@@ -49,6 +49,10 @@ pub fn run(opts: &InitOptions<'_>) -> anyhow::Result<Config> {
         webhooks: WebhooksConfig::default(),
         git: GitConfig::default(),
         remotes: crate::config::RemotesConfig::default(),
+        github: crate::config::GithubConfig::default(),
+        oidc: crate::config::OidcConfig::default(),
+        limits: crate::config::LimitsConfig::default(),
+        ssh: crate::config::SshConfig::default(),
     };
     config.validate()?;
     // Document the blob_dir resolution rule in the generated file so operators
@@ -58,6 +62,7 @@ pub fn run(opts: &InitOptions<'_>) -> anyhow::Result<Config> {
     );
     text.push_str(&toml::to_string_pretty(&config)?);
     write_private(opts.config_path, &text)?;
+    starforged_ssh::ensure_host_key(&config.ssh_host_key_path())?;
     Ok(config)
 }
 

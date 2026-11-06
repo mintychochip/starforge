@@ -180,9 +180,10 @@ pub async fn create_repo(
     let visibility = Visibility::parse(&body.visibility).ok_or_else(|| {
         ApiError::Invalid("visibility must be public, internal, or private".into())
     })?;
+    let import = crate::repos::parse_import(body.import)?;
     let repo = state
         .core
-        .create_repo(
+        .create_repo_with_import(
             &auth.user,
             &org,
             CreateRepo {
@@ -191,18 +192,20 @@ pub async fn create_repo(
                 visibility,
                 readme: body.readme,
             },
+            import,
         )
         .await?;
-    Ok((
-        StatusCode::CREATED,
-        Json(repo_json(
-            &state,
-            RepoAccess {
-                repo,
-                permission: Permission::Admin,
-            },
-        )),
-    ))
+    let mut json = repo_json(
+        &state,
+        RepoAccess {
+            repo,
+            permission: Permission::Admin,
+        },
+    );
+    if let Some(view) = state.core.import_for(json.id).await? {
+        json.ssh_public_key = view.ssh_public_key;
+    }
+    Ok((StatusCode::CREATED, Json(json)))
 }
 
 /// `GET /orgs/{org}/members`: members and site admins only, 404 otherwise.

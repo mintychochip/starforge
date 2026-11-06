@@ -15,6 +15,18 @@
     <label class="check"><input type="radio" name="visibility" value="public"> Public</label>
   </fieldset>
   <label class="check"><input type="checkbox" name="readme" value="on"{% if readme %} checked{% endif %}> Initialize with a README</label>
+  <fieldset>
+    <legend>Import from URL</legend>
+    <label>Source URL <input name="import_url" value="{{ import_url }}" placeholder="https://example.com/owner/repo.git"></label>
+    <label>Credentials <select name="import_auth">
+      <option value="none"{% if import_auth == "none" || import_auth == "" %} selected{% endif %}>None</option>
+      <option value="https"{% if import_auth == "https" %} selected{% endif %}>HTTPS (username and password/token)</option>
+      <option value="ssh"{% if import_auth == "ssh" %} selected{% endif %}>SSH (generated deploy key)</option>
+    </select></label>
+    <label>Username <input name="import_username" value="{{ import_username }}"></label>
+    <label>Password/token <input type="password" name="import_password" value="" autocomplete="off"></label>
+    <p class="hint">Branches and tags are fetched from the source; pushes are refused until the import finishes.</p>
+  </fieldset>
   <button type="submit">Create repository</button>
 </form>
 {% endblock %}

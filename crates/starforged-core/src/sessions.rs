@@ -70,6 +70,9 @@ impl Core {
         ip: &str,
     ) -> CoreResult<LoginOutcome> {
         let user_agent: String = user_agent.chars().take(256).collect();
+        let normalized = login.trim().to_ascii_lowercase();
+        self.check_login_limits(&normalized, ip, &user_agent)
+            .await?;
         let user = match self.authenticate_password(login, password).await {
             Ok(user) => user,
             Err(CoreError::Unauthenticated) => {
@@ -150,6 +153,15 @@ impl Core {
     /// void the challenge. Success opens the web session and writes
     /// `auth.login`. An unknown or expired challenge is `Unauthenticated`
     /// (start again); a wrong code on a live challenge is `Invalid`.
+    ///
+    /// Single-use is enforced by claiming the challenge atomically
+    /// ([`auth_factors::claim_challenge`]) before verifying the code: the
+    /// first claimer owns it, and a concurrent duplicate submission loses
+    /// the claim and gets `Unauthenticated`. A failed code does not consume
+    /// the challenge: it is restored with its attempt count incremented,
+    /// unless that count voids it. The TOTP step and recovery-code claims
+    /// are themselves atomic, so two challenges racing one code still mint
+    /// exactly one session.
     pub async fn complete_second_factor(
         &self,
         challenge_token: &str,
@@ -181,6 +193,11 @@ impl Core {
             .await?;
             return Err(CoreError::Unauthenticated);
         }
+        // Claim before verifying: exactly one concurrent submission owns
+        // the challenge; the loser is refused here and mints nothing.
+        let claimed = auth_factors::claim_challenge(self.db(), &hash, starforged_db::now())
+            .await?
+            .ok_or(CoreError::Unauthenticated)?;
         let code = code.trim();
         let totp_ok = self.check_totp_code(&user, code).await.is_ok();
         let recovery_ok = !totp_ok
@@ -191,7 +208,7 @@ impl Core {
             )
             .await?;
         if !totp_ok && !recovery_ok {
-            let attempts = auth_factors::bump_challenge_attempts(self.db(), challenge.id).await?;
+            let attempts = claimed.attempts + 1;
             self.audit_client(
                 Some(user.id),
                 "login.2fa_failure",
@@ -201,12 +218,16 @@ impl Core {
                 &user_agent,
             )
             .await?;
-            if attempts >= MAX_SECOND_FACTOR_ATTEMPTS {
-                auth_factors::delete_challenge(self.db(), challenge.id).await?;
+            // A wrong code must not burn a challenge that still has
+            // attempts: put it back with the count incremented. At the
+            // maximum the claim stands and the challenge is void.
+            if attempts < MAX_SECOND_FACTOR_ATTEMPTS {
+                auth_factors::restore_challenge(self.db(), &claimed, attempts).await?;
             }
             return Err(CoreError::Invalid("That code is not valid.".into()));
         }
-        auth_factors::delete_challenge(self.db(), challenge.id).await?;
+        // The challenge was already claimed above; the session is the only
+        // remaining step, so exactly one submission can reach it.
         let session = self.open_session(&user, &user_agent, ip).await?;
         self.audit_client(
             Some(user.id),
@@ -341,5 +362,84 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// Enrolls TOTP for alice and returns her secret. The step+1 code is
+    /// used for login so it clears the enrollment step's replay guard.
+    async fn totp_alice(core: &Core) -> Vec<u8> {
+        let user = alice(core).await;
+        let enrollment = core.begin_totp_enrollment(&user).await.unwrap();
+        let secret = crate::totp::base32::decode(&enrollment.secret_base32).unwrap();
+        let code = code_for(&secret, 0);
+        core.confirm_totp_enrollment(&user, &code).await.unwrap();
+        secret
+    }
+
+    fn code_for(secret: &[u8], step_offset: i64) -> String {
+        let step = ((starforged_db::now() / 30) + step_offset) as u64;
+        format!("{:06}", crate::totp::code_at(secret, step))
+    }
+
+    async fn challenge_token(core: &Core) -> String {
+        match core
+            .login("alice", PASSWORD, "ua", "127.0.0.1")
+            .await
+            .unwrap()
+        {
+            LoginOutcome::NeedsSecondFactor(token) => token,
+            LoginOutcome::Session(..) => panic!("login should need a second factor"),
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_same_challenge_mints_one_session() {
+        let (core, _f) = test_core().await;
+        let secret = totp_alice(&core).await;
+        let token = challenge_token(&core).await;
+        let code = code_for(&secret, 1);
+        let (a, b) = tokio::join!(
+            core.complete_second_factor(&token, &code, "ua", "127.0.0.1"),
+            core.complete_second_factor(&token, &code, "ua", "127.0.0.1"),
+        );
+        assert_eq!(
+            [a, b].iter().filter(|r| r.is_ok()).count(),
+            1,
+            "exactly one submission may mint a session"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_two_challenges_mints_one_session() {
+        let (core, _f) = test_core().await;
+        let secret = totp_alice(&core).await;
+        let first = challenge_token(&core).await;
+        let second = challenge_token(&core).await;
+        let code = code_for(&secret, 1);
+        let (a, b) = tokio::join!(
+            core.complete_second_factor(&first, &code, "ua", "127.0.0.1"),
+            core.complete_second_factor(&second, &code, "ua", "127.0.0.1"),
+        );
+        assert_eq!(
+            [a, b].iter().filter(|r| r.is_ok()).count(),
+            1,
+            "one code may mint only one session, across challenges"
+        );
+    }
+
+    #[tokio::test]
+    async fn wrong_code_does_not_consume_challenge() {
+        let (core, _f) = test_core().await;
+        let secret = totp_alice(&core).await;
+        let token = challenge_token(&core).await;
+        let wrong = code_for(&secret, 5);
+        assert!(matches!(
+            core.complete_second_factor(&token, &wrong, "ua", "127.0.0.1")
+                .await,
+            Err(CoreError::Invalid(_))
+        ));
+        let code = code_for(&secret, 1);
+        core.complete_second_factor(&token, &code, "ua", "127.0.0.1")
+            .await
+            .unwrap();
     }
 }

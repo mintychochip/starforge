@@ -24,6 +24,8 @@ pub struct WebSettings {
     /// Public URL without a trailing slash.
     pub base_url: String,
     pub secure_cookies: bool,
+    /// `ssh://git@<host>:<port>` prefix for SSH clone URLs; `None` when SSH is disabled.
+    pub ssh_clone_base: Option<String>,
 }
 
 #[derive(Clone)]
@@ -181,8 +183,22 @@ fn page_routes() -> Router<AppState> {
         )
         .route("/admin/jobs", get(pages::admin::jobs))
         .route("/admin/audit", get(pages::admin::audit_page))
+        .route("/admin/quarantine", get(pages::admin::quarantine_page))
+        .route(
+            "/admin/quarantine/{id}/release",
+            post(pages::admin::release_quarantine),
+        )
+        .route(
+            "/admin/quarantine/{id}/purge",
+            post(pages::admin::purge_quarantine),
+        )
+        .route("/admin/health", get(pages::admin::health_page))
         .route("/admin/jobs/{id}/retry", post(pages::admin::retry_job))
         .route("/admin/jobs/{id}/delete", post(pages::admin::delete_job))
+        .route(
+            "/admin/jobs/rebuild-index",
+            post(pages::admin::rebuild_index),
+        )
         .route(
             "/orgs/{org}/settings",
             get(pages::orgs::settings).post(pages::orgs::save_general),
@@ -330,6 +346,14 @@ fn page_routes() -> Router<AppState> {
         .route(
             "/{owner}/{repo}/settings/keys/{id}/remove",
             post(pages::sshkeys::deploy_remove),
+        )
+        .route(
+            "/{owner}/{repo}/import/start",
+            post(pages::repo_new::import_start),
+        )
+        .route(
+            "/{owner}/{repo}/import/delete",
+            post(pages::repo_new::import_delete),
         )
         .route("/{owner}/{repo}", get(pages::code::repo_home))
         .route("/{owner}/{repo}/tree/{*rest}", get(pages::code::tree))

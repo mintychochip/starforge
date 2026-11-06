@@ -31,11 +31,17 @@ pub struct TreePage {
     nav_user: Option<NavUser>,
     head: RepoHead,
     clone_url: String,
+    ssh_clone_url: Option<String>,
     empty: bool,
     ref_name: String,
     crumbs: Vec<Crumb>,
     entries: Vec<EntryRow>,
     readme_html: Option<String>,
+    import_state: String,
+    import_error: Option<String>,
+    ssh_public_key: Option<String>,
+    csrf: String,
+    can_manage_import: bool,
 }
 
 #[derive(Template, WebTemplate)]
@@ -87,6 +93,7 @@ pub async fn repo_home(
             Vec::new(),
             None,
         )
+        .await
         .into_response());
     };
     let resolved = state.core.resolve(&access, &default).await?;
@@ -299,10 +306,11 @@ async fn render_tree(
         rows,
         readme_html,
     )
+    .await
     .into_response())
 }
 
-fn tree_page(
+async fn tree_page(
     state: &AppState,
     session: Option<&WebSession>,
     access: &RepoAccess,
@@ -312,6 +320,7 @@ fn tree_page(
     readme_html: Option<String>,
 ) -> TreePage {
     let repo = &access.repo;
+    let import = state.core.import_for(repo.id).await.ok().flatten();
     let current = ref_name.unwrap_or_default();
     TreePage {
         nav_user: nav(session),
@@ -320,11 +329,30 @@ fn tree_page(
             "{}/{}/{}.git",
             state.settings.base_url, repo.owner, repo.name
         ),
+        ssh_clone_url: state
+            .settings
+            .ssh_clone_base
+            .as_ref()
+            .map(|base| format!("{base}/{}/{}.git", repo.owner, repo.name)),
         empty: ref_name.is_none(),
         ref_name: current.to_owned(),
         crumbs: crumbs(&repo.owner, &repo.name, current, dir),
         entries,
         readme_html,
+        import_state: import
+            .as_ref()
+            .map(|v| v.state.clone())
+            .unwrap_or_else(|| repo.import_state.clone()),
+        import_error: import.as_ref().and_then(|v| {
+            if v.last_error.is_empty() {
+                None
+            } else {
+                Some(v.last_error.clone())
+            }
+        }),
+        ssh_public_key: import.and_then(|v| v.ssh_public_key),
+        csrf: session.map(|s| s.csrf_token.clone()).unwrap_or_default(),
+        can_manage_import: access.permission >= starforged_core::permission::Permission::Maintain,
     }
 }
 

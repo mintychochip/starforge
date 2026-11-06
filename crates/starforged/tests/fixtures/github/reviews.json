@@ -1,0 +1,18 @@
+[
+  {
+    "id": 951,
+    "state": "APPROVED",
+    "body": "Looks good.",
+    "user": {"login": "hubot", "email": null},
+    "submitted_at": "2024-02-04T00:00:00Z",
+    "html_url": "https://github.com/octo/proj/pull/4#pullrequestreview-951"
+  },
+  {
+    "id": 952,
+    "state": "CHANGES_REQUESTED",
+    "body": "Please fix this.",
+    "user": {"login": "octocat", "email": "octo@example.test"},
+    "submitted_at": "2024-02-05T00:00:00Z",
+    "html_url": "https://github.com/octo/proj/pull/4#pullrequestreview-952"
+  }
+]

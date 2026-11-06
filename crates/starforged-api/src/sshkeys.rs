@@ -89,7 +89,7 @@ pub async fn create_user_key(
     auth: ApiAuth,
     body: Result<Json<CreateKeyBody>, axum::extract::rejection::JsonRejection>,
 ) -> Result<(StatusCode, Json<KeyJson>), ApiError> {
-    let auth = auth.require(Scope::RepoRead)?;
+    let auth = auth.require(Scope::RepoWrite)?;
     let Json(body) = body.map_err(|e| ApiError::Invalid(e.body_text()))?;
     let view = state
         .core
@@ -104,7 +104,7 @@ pub async fn delete_user_key(
     auth: ApiAuth,
     Path(id): Path<i64>,
 ) -> Result<StatusCode, ApiError> {
-    let auth = auth.require(Scope::RepoRead)?;
+    let auth = auth.require(Scope::RepoWrite)?;
     state.core.remove_ssh_key(&auth.user, id).await?;
     Ok(StatusCode::NO_CONTENT)
 }

@@ -60,6 +60,10 @@ pub struct ReviewRow {
     pub change_id: i64,
     pub revision_id: i64,
     pub author_id: Option<i64>,
+    /// The original GitHub login when the author matched no local user (D1);
+    /// `author_id` is then NULL. `github_id` is the GitHub review id.
+    pub imported_author: Option<String>,
+    pub github_id: Option<i64>,
     pub verdict: String,
     pub body: String,
     pub session_ulid: Option<String>,
@@ -86,6 +90,10 @@ pub struct ReviewCommentRow {
     pub thread_id: i64,
     pub review_id: Option<i64>,
     pub author_id: Option<i64>,
+    /// The original GitHub login when the author matched no local user (D1);
+    /// `author_id` is then NULL. `github_id` is the GitHub comment id.
+    pub imported_author: Option<String>,
+    pub github_id: Option<i64>,
     pub body: String,
     pub created_at: i64,
 }
@@ -155,7 +163,7 @@ macro_rules! select_revision {
 macro_rules! select_review {
     ($tail:literal) => {
         concat!(
-            "SELECT id, change_id, revision_id, author_id, verdict, body, session_ulid, state, created_at ",
+            "SELECT id, change_id, revision_id, author_id, imported_author, github_id, verdict, body, session_ulid, state, created_at ",
             "FROM reviews ",
             $tail
         )
@@ -175,7 +183,7 @@ macro_rules! select_thread {
 macro_rules! select_comment {
     ($tail:literal) => {
         concat!(
-            "SELECT id, thread_id, review_id, author_id, body, created_at FROM review_comments ",
+            "SELECT id, thread_id, review_id, author_id, imported_author, github_id, body, created_at FROM review_comments ",
             $tail
         )
     };
@@ -224,6 +232,8 @@ fn review_from_row(row: &AnyRow) -> DbResult<ReviewRow> {
         change_id: row.try_get("change_id")?,
         revision_id: row.try_get("revision_id")?,
         author_id: row.try_get("author_id")?,
+        imported_author: row.try_get("imported_author")?,
+        github_id: row.try_get("github_id")?,
         verdict: row.try_get("verdict")?,
         body: row.try_get("body")?,
         session_ulid: row.try_get("session_ulid")?,
@@ -252,6 +262,8 @@ fn comment_from_row(row: &AnyRow) -> DbResult<ReviewCommentRow> {
         thread_id: row.try_get("thread_id")?,
         review_id: row.try_get("review_id")?,
         author_id: row.try_get("author_id")?,
+        imported_author: row.try_get("imported_author")?,
+        github_id: row.try_get("github_id")?,
         body: row.try_get("body")?,
         created_at: row.try_get("created_at")?,
     })
@@ -420,6 +432,48 @@ pub async fn open_agit_change(
     .fetch_optional(db.pool())
     .await?;
     row.as_ref().map(change_from_row).transpose()
+}
+
+/// Agit changes created by `user_id` in ANY repository at or after `since`
+/// (unix seconds). Backs the `refs/for` new-change rate limit, which is per
+/// user across all repositories (plan M5a D1).
+pub async fn count_agit_changes_since(db: &Db, user_id: i64, since: i64) -> DbResult<i64> {
+    let count = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM changes WHERE kind = 'agit' AND creator_id = $1 AND created_at >= $2",
+    )
+    .bind(user_id)
+    .bind(since)
+    .fetch_one(db.pool())
+    .await?;
+    Ok(count)
+}
+
+/// `base/topic` pairs of `user_id`'s open agit changes in `repo_id`, for the
+/// git-RPC snapshot (plan M5a D2): a pushed `refs/for` ref whose pair is not
+/// in this list opens a NEW change and counts against the budget.
+pub async fn open_agit_topics_for_repo(
+    db: &Db,
+    repo_id: i64,
+    user_id: i64,
+) -> DbResult<Vec<(String, String)>> {
+    let rows = sqlx::query(
+        "SELECT changes.base_branch, changes.topic FROM changes \
+         JOIN trails t ON t.id = changes.trail_id \
+         WHERE t.repo_id = $1 AND changes.creator_id = $2 AND changes.kind = 'agit' \
+         AND changes.state = 'open' ORDER BY changes.base_branch ASC, changes.topic ASC",
+    )
+    .bind(repo_id)
+    .bind(user_id)
+    .fetch_all(db.pool())
+    .await?;
+    rows.iter()
+        .map(|row| {
+            Ok((
+                row.try_get::<String, _>("base_branch")?,
+                row.try_get::<String, _>("topic")?,
+            ))
+        })
+        .collect()
 }
 
 pub async fn change_by_id(db: &Db, id: i64) -> DbResult<Option<ChangeRow>> {
@@ -977,7 +1031,7 @@ async fn insert_review_row(db: &Db, n: &NewReview<'_>, now: i64) -> DbResult<Rev
     let row = sqlx::query(
         "INSERT INTO reviews (change_id, revision_id, author_id, verdict, body, session_ulid, state, created_at) \
          VALUES ($1, $2, $3, $4, $5, $6, 'submitted', $7) \
-         RETURNING id, change_id, revision_id, author_id, verdict, body, session_ulid, state, created_at",
+         RETURNING id, change_id, revision_id, author_id, imported_author, github_id, verdict, body, session_ulid, state, created_at",
     )
     .bind(n.change_id)
     .bind(n.revision_id)
@@ -1018,6 +1072,46 @@ pub async fn insert_review(
         now,
     )
     .await
+}
+/// Inserts a review from an import (M4c D4): `author_id` is `None` exactly
+/// when `imported_author` carries the GitHub login (D1).
+#[allow(clippy::too_many_arguments)]
+pub async fn insert_imported_review(
+    db: &Db,
+    change_id: i64,
+    revision_id: i64,
+    author_id: Option<i64>,
+    imported_author: Option<&str>,
+    github_id: i64,
+    verdict: &str,
+    body: &str,
+    now: i64,
+) -> DbResult<ReviewRow> {
+    let row = sqlx::query(
+        "INSERT INTO reviews (change_id, revision_id, author_id, imported_author, github_id, verdict, body, session_ulid, state, created_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, 'submitted', $8) \
+         RETURNING id, change_id, revision_id, author_id, imported_author, github_id, verdict, body, session_ulid, state, created_at",
+    )
+    .bind(change_id)
+    .bind(revision_id)
+    .bind(author_id)
+    .bind(imported_author)
+    .bind(github_id)
+    .bind(verdict)
+    .bind(body)
+    .bind(now)
+    .fetch_one(db.pool())
+    .await?;
+    review_from_row(&row)
+}
+
+/// The imported review with this GitHub id, if any.
+pub async fn review_by_github_id(db: &Db, github_id: i64) -> DbResult<Option<ReviewRow>> {
+    let row = sqlx::query(select_review!("WHERE github_id = $1"))
+        .bind(github_id)
+        .fetch_optional(db.pool())
+        .await?;
+    row.as_ref().map(review_from_row).transpose()
 }
 
 /// Reviews of the change in insert order.
@@ -1074,7 +1168,7 @@ pub async fn insert_pending_review(
     let row = sqlx::query(
         "INSERT INTO reviews (change_id, revision_id, author_id, verdict, body, session_ulid, state, created_at) \
          VALUES ($1, $2, $3, 'comment', '', NULL, 'pending', $4) \
-         RETURNING id, change_id, revision_id, author_id, verdict, body, session_ulid, state, created_at",
+         RETURNING id, change_id, revision_id, author_id, imported_author, github_id, verdict, body, session_ulid, state, created_at",
     )
     .bind(change_id)
     .bind(revision_id)
@@ -1197,7 +1291,7 @@ pub async fn insert_thread_comment(
     let row = sqlx::query(
         "INSERT INTO review_comments (thread_id, review_id, author_id, body, created_at) \
          VALUES ($1, $2, $3, $4, $5) \
-         RETURNING id, thread_id, review_id, author_id, body, created_at",
+         RETURNING id, thread_id, review_id, author_id, imported_author, github_id, body, created_at",
     )
     .bind(thread_id)
     .bind(review_id)
@@ -1207,6 +1301,47 @@ pub async fn insert_thread_comment(
     .fetch_one(db.pool())
     .await?;
     comment_from_row(&row)
+}
+/// Inserts a review-thread comment from an import (M4c): `author_id` is
+/// `None` exactly when `imported_author` carries the GitHub login (D1).
+#[allow(clippy::too_many_arguments)]
+pub async fn insert_imported_thread_comment(
+    db: &Db,
+    thread_id: i64,
+    review_id: Option<i64>,
+    author_id: Option<i64>,
+    imported_author: Option<&str>,
+    github_id: i64,
+    body: &str,
+    now: i64,
+) -> DbResult<ReviewCommentRow> {
+    let row = sqlx::query(
+        "INSERT INTO review_comments (thread_id, review_id, author_id, imported_author, github_id, body, created_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7) \
+         RETURNING id, thread_id, review_id, author_id, imported_author, github_id, body, created_at",
+    )
+    .bind(thread_id)
+    .bind(review_id)
+    .bind(author_id)
+    .bind(imported_author)
+    .bind(github_id)
+    .bind(body)
+    .bind(now)
+    .fetch_one(db.pool())
+    .await?;
+    comment_from_row(&row)
+}
+
+/// The imported review-thread comment with this GitHub id, if any.
+pub async fn thread_comment_by_github_id(
+    db: &Db,
+    github_id: i64,
+) -> DbResult<Option<ReviewCommentRow>> {
+    let row = sqlx::query(select_comment!("WHERE github_id = $1"))
+        .bind(github_id)
+        .fetch_optional(db.pool())
+        .await?;
+    row.as_ref().map(comment_from_row).transpose()
 }
 
 /// Comments of the thread in insert order.

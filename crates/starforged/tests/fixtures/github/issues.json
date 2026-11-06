@@ -1,0 +1,42 @@
+[
+  {
+    "id": 501,
+    "number": 1,
+    "title": "First issue",
+    "body": "Body of the first issue.",
+    "state": "open",
+    "user": {"login": "octocat", "email": "octo@example.test"},
+    "labels": [{"name": "bug"}],
+    "assignees": [{"login": "hubot", "email": null}],
+    "created_at": "2024-01-01T00:00:00Z",
+    "updated_at": "2024-01-02T00:00:00Z",
+    "closed_at": null
+  },
+  {
+    "id": 502,
+    "number": 2,
+    "title": "A pull request in the issues listing",
+    "body": "PRs appear in the issues listing; the importer skips them (D5).",
+    "state": "open",
+    "user": {"login": "hubot", "email": null},
+    "labels": [],
+    "assignees": [],
+    "pull_request": {"url": "https://api.github.com/repos/octo/proj/pulls/2"},
+    "created_at": "2024-01-03T00:00:00Z",
+    "updated_at": "2024-01-03T00:00:00Z",
+    "closed_at": null
+  },
+  {
+    "id": 503,
+    "number": 3,
+    "title": "Closed issue",
+    "body": "Closed by its author.",
+    "state": "closed",
+    "user": {"login": "hubot", "email": "hubot@example.test"},
+    "labels": [{"name": "enhancement"}],
+    "assignees": [],
+    "created_at": "2024-01-04T00:00:00Z",
+    "updated_at": "2024-01-05T00:00:00Z",
+    "closed_at": "2024-01-05T00:00:00Z"
+  }
+]

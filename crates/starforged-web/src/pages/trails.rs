@@ -78,6 +78,8 @@ pub struct TrailRow {
     labels: Vec<String>,
     assignees: Vec<String>,
     age: String,
+    author_handle: String,
+    imported_author: Option<String>,
 }
 
 #[derive(Template, WebTemplate)]
@@ -176,6 +178,8 @@ pub async fn list(
             labels: t.labels,
             assignees: t.assignees,
             age: format_age(now, t.created_at),
+            author_handle: t.author_handle.clone(),
+            imported_author: t.imported_author.clone(),
         })
         .collect();
     let prev_href = (page_no > 1).then(|| {
@@ -402,6 +406,7 @@ pub async fn create(
 pub struct CommentItem {
     id: i64,
     author_handle: String,
+    imported_author: Option<String>,
     body_html: String,
     body_raw: String,
     created: String,
@@ -446,6 +451,7 @@ pub struct TrailHeader {
     state: String,
     ready: bool,
     author_handle: String,
+    imported_author: Option<String>,
     labels: Vec<String>,
     assignees: Vec<String>,
     review_requests: Vec<String>,
@@ -603,6 +609,7 @@ pub(crate) async fn header_data(
         state: trail.state.clone(),
         ready: trail.ready,
         author_handle: trail.author_handle.clone(),
+        imported_author: trail.imported_author.clone(),
         labels: trail.labels.clone(),
         assignees: trail.assignees.clone(),
         review_requests: trail.review_requests.clone(),
@@ -686,6 +693,15 @@ pub(crate) async fn detail_view(
                 let actor = event
                     .actor_id
                     .and_then(|id| handles.get(&id).cloned())
+                    .or_else(|| {
+                        // A `trail.imported` event on a placeholder-author
+                        // Trail names the original GitHub login (M4c D1).
+                        if event.kind == "trail.imported" {
+                            detail.trail.imported_author.clone()
+                        } else {
+                            None
+                        }
+                    })
                     .unwrap_or_else(|| "starforge".to_owned());
                 let (text, link) = stored_timeline_item(
                     &readable,
@@ -720,6 +736,7 @@ pub(crate) async fn detail_view(
         .map(|c| CommentItem {
             id: c.id,
             author_handle: c.author_handle.clone(),
+            imported_author: c.imported_author.clone(),
             body_html: markdown::render_prose(&c.body),
             body_raw: c.body.clone(),
             created: format_time(c.created_at),
@@ -1068,6 +1085,7 @@ fn timeline_text(kind: &str, payload: &str, actor: &str) -> String {
             (Some(k), None) => format!("{actor} opened a thread on change {k}"),
             _ => format!("{actor} opened a thread"),
         },
+        "trail.imported" => format!("{actor} imported this trail"),
         "thread.resolved" => {
             let resolved = value
                 .get("resolved")

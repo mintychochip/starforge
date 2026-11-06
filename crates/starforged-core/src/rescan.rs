@@ -361,6 +361,10 @@ impl Core {
             "",
         )
         .await?;
+        self.enqueue_index(&crate::jobs::Job::IndexSessionEvents {
+            session_id: session.id,
+        })
+        .await;
         db_sessions::session_by_ulid(self.db(), access.repo.id, ulid)
             .await?
             .map(SessionView::from)
@@ -457,6 +461,10 @@ impl Core {
         // means one session quarantines exactly once.
         self.dispatch_session_event(session.repo_id, None, "quarantined", &session.ulid)
             .await;
+        self.enqueue_index(&crate::jobs::Job::IndexSessionEvents {
+            session_id: fresh.id,
+        })
+        .await;
         Ok(true)
     }
 }

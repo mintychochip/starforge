@@ -11,7 +11,10 @@ use crate::repos::{RESTORE_SECS, Repo};
 use crate::{Core, CoreError, CoreResult};
 use starforged_db::audit as db_audit;
 use starforged_db::orgs as db_orgs;
-use starforged_db::{auth_factors, jobs as db_jobs, now, repos as db_repos, users, web_sessions};
+use starforged_db::{
+    auth_factors, jobs as db_jobs, now, repos as db_repos, sessions as db_sessions, users,
+    web_sessions,
+};
 
 /// A user plus how many live repositories they own, for the admin detail page.
 #[derive(Debug, Clone)]
@@ -64,6 +67,68 @@ pub struct JobInfo {
     pub last_error: String,
     pub run_at: i64,
     pub created_at: i64,
+}
+
+/// One quarantined session for the site-admin quarantine queue (D4): repo,
+/// ULID, uploader, reason, and time. The quarantine detail and the session
+/// content are never carried here, so the queue cannot leak them.
+#[derive(Debug, Clone)]
+pub struct QuarantinedSession {
+    pub id: i64,
+    pub repo: String,
+    pub ulid: String,
+    pub uploader: String,
+    pub reason: String,
+    pub created_at: i64,
+}
+
+/// One `(kind, state)` job count (D5).
+#[derive(Debug, Clone)]
+pub struct JobAggregate {
+    pub kind: String,
+    pub state: String,
+    pub count: i64,
+}
+
+/// Job queue aggregates plus the age of the oldest pending job (D5).
+#[derive(Debug, Clone)]
+pub struct JobStats {
+    pub aggregates: Vec<JobAggregate>,
+    /// Seconds since the oldest queued job was created, if any is queued.
+    pub oldest_pending_age: Option<i64>,
+}
+
+/// The health page's snapshot (D5). Version and git version stay in the web
+/// layer (the overview already fetches them there).
+#[derive(Debug, Clone)]
+pub struct HealthInfo {
+    pub engine: &'static str,
+    pub schema_version: Option<i64>,
+    pub data_dir_free_bytes: Option<u64>,
+    pub search_trails: u64,
+    pub search_events: u64,
+    pub jobs: JobStats,
+    /// The `ssh.listen` address when the SSH listener is enabled.
+    pub ssh_addr: Option<String>,
+}
+
+/// Reads the free bytes on the filesystem holding `dir` with a hermetic
+/// `df -B1` subprocess (no shell). `std::fs::Metadata` cannot report free
+/// space and no `statvfs`-style crate is available, so `df` is the portable
+/// choice; any failure degrades to `None`.
+fn free_bytes_on(dir: &std::path::Path) -> Option<u64> {
+    let output = std::process::Command::new("df")
+        .arg("-B1")
+        .arg("--output=avail")
+        .arg(dir)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    // `df -B1 --output=avail` prints the column header and one number.
+    text.lines().nth(1)?.trim().parse().ok()
 }
 
 fn forbidden_unless_admin(admin: &User) -> CoreResult<()> {
@@ -268,6 +333,127 @@ impl Core {
             .collect())
     }
 
+    /// Every quarantined session across all repositories, oldest first,
+    /// capped at 200 (D4). Reason only: the detail and the content never
+    /// leave the query.
+    pub async fn admin_quarantined_sessions(
+        &self,
+        admin: &User,
+    ) -> CoreResult<Vec<QuarantinedSession>> {
+        forbidden_unless_admin(admin)?;
+        Ok(db_sessions::quarantined_all(self.db(), 200)
+            .await?
+            .into_iter()
+            .map(|(row, repo, uploader)| QuarantinedSession {
+                id: row.id,
+                repo,
+                ulid: row.ulid,
+                uploader,
+                reason: row.quarantine_reason,
+                created_at: row.created_at,
+            })
+            .collect())
+    }
+
+    /// Loads the session and its repository for an admin quarantine action.
+    /// A missing session or repository answers `NotFound`, and an archived
+    /// repository refuses the mutation.
+    async fn admin_quarantine_access(
+        &self,
+        admin: &User,
+        session_id: i64,
+    ) -> CoreResult<(crate::repos::RepoAccess, String)> {
+        let session = db_sessions::session_by_id(self.db(), session_id)
+            .await?
+            .ok_or(CoreError::NotFound)?;
+        let repo = db_repos::by_id(self.db(), session.repo_id)
+            .await?
+            .ok_or(CoreError::NotFound)?;
+        if repo.deleted_at.is_some() {
+            return Err(CoreError::NotFound);
+        }
+        if repo.archived_at.is_some() {
+            return Err(CoreError::Invalid("repository is archived".into()));
+        }
+        let access = self
+            .repo_for(Some(admin), &repo.owner_handle, &repo.name)
+            .await?;
+        Ok((access, session.ulid))
+    }
+
+    /// Releases one quarantined session by id, as a site admin (D4). The
+    /// release state change and its audit row come from [`Core::release_session`],
+    /// which already admits site admins through `repo_for`.
+    pub async fn admin_release_session(&self, admin: &User, session_id: i64) -> CoreResult<()> {
+        forbidden_unless_admin(admin)?;
+        let (access, ulid) = self.admin_quarantine_access(admin, session_id).await?;
+        self.release_session(admin, &access, &ulid).await?;
+        Ok(())
+    }
+
+    /// Purges one quarantined session by id, as a site admin (D4).
+    pub async fn admin_purge_session(&self, admin: &User, session_id: i64) -> CoreResult<()> {
+        forbidden_unless_admin(admin)?;
+        let (access, ulid) = self.admin_quarantine_access(admin, session_id).await?;
+        self.purge_session(admin, &access, &ulid).await?;
+        Ok(())
+    }
+
+    /// Job counts by kind and state, plus the oldest pending job's age (D5).
+    pub async fn admin_job_stats(&self, admin: &User) -> CoreResult<JobStats> {
+        forbidden_unless_admin(admin)?;
+        self.job_stats().await
+    }
+
+    /// The shared job statistics without the admin check: the health page
+    /// and the jobs page read the same aggregates.
+    async fn job_stats(&self) -> CoreResult<JobStats> {
+        let aggregates = db_jobs::counts_by_kind_state(self.db())
+            .await?
+            .into_iter()
+            .map(|(kind, state, count)| JobAggregate { kind, state, count })
+            .collect();
+        let oldest_pending_age = db_jobs::oldest_pending_created(self.db())
+            .await?
+            .map(|created| (now() - created).max(0));
+        Ok(JobStats {
+            aggregates,
+            oldest_pending_age,
+        })
+    }
+
+    /// The health page's snapshot (D5): engine, applied schema version,
+    /// data-dir free space, search index document counts, job aggregates,
+    /// and the SSH listener's configured state. The data directory is the
+    /// parent of `repos_dir` (`<data_dir>/repos`).
+    pub async fn admin_health(&self, admin: &User) -> CoreResult<HealthInfo> {
+        forbidden_unless_admin(admin)?;
+        let stats = self
+            .search_index()
+            .stats()
+            .map_err(|e| CoreError::Internal(format!("search index stats: {e}")))?;
+        let config = self.config();
+        let data_dir = config.repos_dir.parent().map(|p| p.to_path_buf());
+        let data_dir_free_bytes = match data_dir {
+            Some(dir) => tokio::task::spawn_blocking(move || free_bytes_on(&dir))
+                .await
+                .unwrap_or(None),
+            None => None,
+        };
+        Ok(HealthInfo {
+            engine: match self.db().backend() {
+                starforged_db::Backend::Sqlite => "sqlite",
+                starforged_db::Backend::Postgres => "postgres",
+            },
+            schema_version: self.db().latest_migration().await?,
+            data_dir_free_bytes,
+            search_trails: stats.trails,
+            search_events: stats.events,
+            jobs: self.job_stats().await?,
+            ssh_addr: config.ssh_addr.clone(),
+        })
+    }
+
     /// Audit log entries newest first, with optional filters and keyset pagination (D3).
     /// `to` covers the whole named day; callers pass a sane `limit` (which may include
     /// one extra probe row to detect a following page).
@@ -324,6 +510,15 @@ impl Core {
             return Err(CoreError::NotFound);
         }
         self.audit(Some(admin.id), "job.delete", &format!("job:{id}"), "")
+            .await?;
+        Ok(())
+    }
+    /// Enqueues a full search index rebuild (the site-admin jobs page
+    /// action, plan D5). Deduplicated with any pending rebuild.
+    pub async fn enqueue_search_rebuild(&self, admin: &User) -> CoreResult<()> {
+        forbidden_unless_admin(admin)?;
+        self.enqueue(&crate::jobs::Job::RebuildIndex).await?;
+        self.audit(Some(admin.id), "index.rebuild", "index:search", "")
             .await?;
         Ok(())
     }
@@ -405,6 +600,8 @@ impl Core {
             default_branch: row.default_branch,
             archived_at: row.archived_at,
             deleted_at: row.deleted_at,
+            mirror: row.mirror != 0,
+            import_state: row.import_state.clone(),
             created_at: row.created_at,
             updated_at: row.updated_at,
         };

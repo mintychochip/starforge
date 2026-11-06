@@ -14,6 +14,7 @@ pub enum WebError {
     Forbidden,
     BadRequest(String),
     Unprocessable(String),
+    TooManyRequests,
     Internal(String),
 }
 
@@ -24,6 +25,7 @@ impl From<CoreError> for WebError {
             CoreError::Forbidden | CoreError::Unauthenticated | CoreError::EmailUnverified => {
                 WebError::Forbidden
             }
+            CoreError::RateLimited => WebError::TooManyRequests,
             CoreError::Invalid(message) | CoreError::Conflict(message) => {
                 WebError::BadRequest(message)
             }
@@ -57,6 +59,11 @@ impl IntoResponse for WebError {
             WebError::Unprocessable(message) => {
                 (StatusCode::UNPROCESSABLE_ENTITY, "Invalid request", message)
             }
+            WebError::TooManyRequests => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "Too many requests",
+                "Too many requests. Please wait and try again.".to_owned(),
+            ),
             WebError::Internal(message) => {
                 tracing::error!(error = %message, "request failed");
                 (

@@ -572,6 +572,10 @@ async fn invalid_namespace_entry_fails_startup() {
             allowed_ref_namespaces: vec!["refs/heads/evil/".into()],
         },
         remotes: starforged::config::RemotesConfig::default(),
+        github: starforged::config::GithubConfig::default(),
+        oidc: starforged::config::OidcConfig::default(),
+        limits: starforged::config::LimitsConfig::default(),
+        ssh: starforged::config::SshConfig::default(),
     };
     let err =
         match starforged::serve::build(&config, PathBuf::from(env!("CARGO_BIN_EXE_starforged")))

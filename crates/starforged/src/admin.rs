@@ -49,7 +49,16 @@ pub async fn open_core(config: &Config, hook_exe: PathBuf) -> anyhow::Result<Cor
             // receiver (`STARFORGE__WEBHOOKS__ALLOW_LOOPBACK=1` or
             // `[webhooks] allow_loopback = true`). Production never sets it.
             allow_loopback_webhooks: config.webhooks.allow_loopback,
+            github_api_url: config.github.api_url.clone(),
             allowed_ref_namespaces: config.git.allowed_ref_namespaces.clone(),
+            oidc: config.oidc_settings(),
+            // SSH listener: disabled until the server (M3c C2) wires
+            // `ssh.enabled`/`ssh.listen` into this read-only view.
+            ssh_addr: None,
+            login_per_ip_per_minute: config.limits.login_per_ip_per_minute,
+            login_per_account_per_hour: config.limits.login_per_account_per_hour,
+            api_per_token_per_hour: config.limits.api_per_token_per_hour,
+            refs_for_new_changes_per_hour: config.limits.refs_for_new_changes_per_hour,
         },
     ))
 }

@@ -59,14 +59,19 @@ pub async fn set_totp(
     Ok(())
 }
 
-/// Records the highest TOTP step accepted so far (replay guard).
-pub async fn set_totp_last_step(db: &Db, user_id: i64, step: i64) -> DbResult<()> {
-    sqlx::query("UPDATE users SET totp_last_step = $1 WHERE id = $2")
-        .bind(step)
-        .bind(user_id)
-        .execute(db.pool())
-        .await?;
-    Ok(())
+/// Atomically records `step` as the highest TOTP step accepted so far
+/// (replay guard). Returns `false` when the step was already recorded or a
+/// newer step won the race: the caller lost and must refuse the code.
+pub async fn claim_totp_step(db: &Db, user_id: i64, step: i64) -> DbResult<bool> {
+    let affected = sqlx::query(
+        "UPDATE users SET totp_last_step = $1 \
+         WHERE id = $2 AND (totp_last_step IS NULL OR totp_last_step < $1)",
+    )
+    .bind(step)
+    .bind(user_id)
+    .execute(db.pool())
+    .await?;
+    Ok(affected.rows_affected() > 0)
 }
 
 /// Stores fresh recovery-code hashes for `user_id` (callers delete the old ones first).
@@ -185,6 +190,11 @@ pub struct LoginChallengeRow {
     pub kind: String,
     pub user_id: Option<i64>,
     pub token_hash: String,
+    /// OIDC flow state (kind `oidc` only): the provider `state`, the
+    /// `nonce` the ID token must echo, and the PKCE verifier.
+    pub state: Option<String>,
+    pub nonce: Option<String>,
+    pub code_verifier: Option<String>,
     pub attempts: i64,
     pub expires_at: i64,
 }
@@ -192,6 +202,9 @@ pub struct LoginChallengeRow {
 fn challenge_from_row(row: &AnyRow) -> DbResult<LoginChallengeRow> {
     Ok(LoginChallengeRow {
         id: row.try_get("id")?,
+        state: row.try_get("state")?,
+        nonce: row.try_get("nonce")?,
+        code_verifier: row.try_get("code_verifier")?,
         kind: row.try_get("kind")?,
         user_id: row.try_get("user_id")?,
         token_hash: row.try_get("token_hash")?,
@@ -228,12 +241,41 @@ pub async fn challenge_by_token_hash(
     token_hash: &str,
 ) -> DbResult<Option<LoginChallengeRow>> {
     let row = sqlx::query(
-        "SELECT id, kind, user_id, token_hash, attempts, expires_at FROM login_challenges WHERE token_hash = $1",
+        "SELECT id, kind, user_id, token_hash, state, nonce, code_verifier, attempts, expires_at FROM login_challenges WHERE token_hash = $1",
     )
     .bind(token_hash)
     .fetch_optional(db.pool())
     .await?;
     row.as_ref().map(challenge_from_row).transpose()
+}
+
+/// Starts an OIDC authorization-code flow and returns its row id. The
+/// `state`, `nonce`, and PKCE verifier live on the row; the browser
+/// carries only the random token whose SHA-256 is `token_hash`.
+pub async fn insert_oidc_challenge(
+    db: &Db,
+    token_hash: &str,
+    user_id: Option<i64>,
+    state: &str,
+    nonce: &str,
+    code_verifier: &str,
+    expires_at: i64,
+) -> DbResult<i64> {
+    Ok(sqlx::query_scalar(
+        "INSERT INTO login_challenges (kind, user_id, token_hash, state, nonce, code_verifier, attempts, expires_at, created_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id",
+    )
+    .bind("oidc")
+    .bind(user_id)
+    .bind(token_hash)
+    .bind(state)
+    .bind(nonce)
+    .bind(code_verifier)
+    .bind(0_i64)
+    .bind(expires_at)
+    .bind(now())
+    .fetch_one(db.pool())
+    .await?)
 }
 
 /// Ends a challenge (completed, voided, or expired).
@@ -254,12 +296,48 @@ pub async fn delete_challenges_for_user(db: &Db, user_id: i64) -> DbResult<()> {
     Ok(())
 }
 
-/// Counts one failed second-factor attempt; returns the new attempt count.
-pub async fn bump_challenge_attempts(db: &Db, id: i64) -> DbResult<i64> {
-    Ok(sqlx::query_scalar(
-        "UPDATE login_challenges SET attempts = attempts + 1 WHERE id = $1 RETURNING attempts",
+/// Atomically claims a live challenge by deleting it; returns the claimed
+/// row, or `None` when the token is unknown, expired at `now_ts`, or a
+/// concurrent request already claimed it. The first claimer owns the
+/// challenge: single-use consumption, like `grant_device_tokens`.
+pub async fn claim_challenge(
+    db: &Db,
+    token_hash: &str,
+    now_ts: i64,
+) -> DbResult<Option<LoginChallengeRow>> {
+    let row = sqlx::query(
+        "DELETE FROM login_challenges WHERE token_hash = $1 AND expires_at > $2 \
+         RETURNING id, kind, user_id, token_hash, state, nonce, code_verifier, attempts, expires_at",
     )
-    .bind(id)
+    .bind(token_hash)
+    .bind(now_ts)
+    .fetch_optional(db.pool())
+    .await?;
+    row.as_ref().map(challenge_from_row).transpose()
+}
+
+/// Restores a challenge claimed with [`claim_challenge`] whose code failed,
+/// carrying the incremented attempt count. With fewer than the configured
+/// maximum attempts the challenge stays usable; at the maximum it is void
+/// by not being restored. Returns the restored row id.
+pub async fn restore_challenge(
+    db: &Db,
+    challenge: &LoginChallengeRow,
+    attempts: i64,
+) -> DbResult<i64> {
+    Ok(sqlx::query_scalar(
+        "INSERT INTO login_challenges (kind, user_id, token_hash, state, nonce, code_verifier, attempts, expires_at, created_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id",
+    )
+    .bind(&challenge.kind)
+    .bind(challenge.user_id)
+    .bind(&challenge.token_hash)
+    .bind(challenge.state.as_deref())
+    .bind(challenge.nonce.as_deref())
+    .bind(challenge.code_verifier.as_deref())
+    .bind(attempts)
+    .bind(challenge.expires_at)
+    .bind(now())
     .fetch_one(db.pool())
     .await?)
 }

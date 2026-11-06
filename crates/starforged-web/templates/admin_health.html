@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block title %}Health · Site administration{% endblock %}
+{% block content %}
+<h1>Site administration</h1>
+{% include "admin_nav.html" %}
+<section>
+  <h2>Health</h2>
+  <dl>
+    <dt>Starforge version</dt><dd>{{ version }}</dd>
+    <dt>Database engine</dt><dd>{{ engine }}</dd>
+    <dt>Schema version</dt><dd>{{ schema_version }}</dd>
+    <dt>Git version</dt><dd>{{ git_version }}</dd>
+    <dt>Data directory free space</dt><dd>{{ free_space }}</dd>
+    <dt>Search index trails</dt><dd>{{ search_trails }}</dd>
+    <dt>Search index events</dt><dd>{{ search_events }}</dd>
+    <dt>SSH listener</dt><dd>{{ ssh_status }}</dd>
+    <dt>Oldest pending job</dt><dd>{{ oldest_pending }}</dd>
+  </dl>
+  <h3>Jobs by kind and state</h3>
+  {% if aggregates.is_empty() %}
+  <p>No jobs.</p>
+  {% else %}
+  <table>
+    <thead>
+      <tr><th>Kind</th><th>State</th><th>Count</th></tr>
+    </thead>
+    <tbody>
+      {% for aggregate in aggregates %}
+      <tr>
+        <td>{{ aggregate.kind }}</td>
+        <td>{{ aggregate.state }}</td>
+        <td>{{ aggregate.count }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+</section>
+{% endblock %}

@@ -24,7 +24,7 @@
 <article id="inline-thread-{{ t.id }}" class="thread{% if t.resolved %} resolved{% endif %}{% if t.outdated %} outdated{% endif %}">
 <p class="muted">Inline thread{% if t.resolved %} <span class="badge">Resolved</span>{% endif %}{% if t.outdated %} <span class="badge">Outdated</span>{% endif %}</p>
 {% for c in t.comments %}
-<div class="comment"><p><a href="/{{ c.author_handle }}">{{ c.author_handle }}</a> <span class="muted">{{ c.created }}</span></p>
+<div class="comment"><p>{% if let Some(a) = c.imported_author %}{{ a }} (imported){% else if c.author_handle == "deleted user" %}deleted user{% else %}<a href="/{{ c.author_handle }}">{{ c.author_handle }}</a>{% endif %} <span class="muted">{{ c.created }}</span></p>
 <div class="prose">{{ c.body_html|safe }}</div></div>
 {% endfor %}
 {% if t.can_resolve %}

@@ -170,3 +170,24 @@ pub async fn search(db: &Db, filter: &AuditFilter) -> DbResult<Vec<AuditRow>> {
     let rows = query.fetch_all(db.pool()).await?;
     rows.iter().map(from_row).collect()
 }
+
+/// Count of rows with `action` and `target` created at or after `since`
+/// (unix seconds). Backs the per-account login rate limit, which counts
+/// `auth.login_failed` rows by the normalized login name over the last hour
+/// (plan M5a D1); the same count serves the audit filters.
+pub async fn count_action_target_since(
+    db: &Db,
+    action: &str,
+    target: &str,
+    since: i64,
+) -> DbResult<i64> {
+    let count = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM audit_log WHERE action = $1 AND target = $2 AND created_at >= $3",
+    )
+    .bind(action)
+    .bind(target)
+    .bind(since)
+    .fetch_one(db.pool())
+    .await?;
+    Ok(count)
+}

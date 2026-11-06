@@ -242,6 +242,12 @@ impl Core {
                             CoreError::Internal("session vanished after update".into())
                         })?;
                 }
+                if row.lifecycle == "complete" {
+                    self.enqueue_index(&crate::jobs::Job::IndexSessionEvents {
+                        session_id: row.id,
+                    })
+                    .await;
+                }
                 Ok((row, false))
             }
         }
@@ -415,6 +421,10 @@ impl Core {
             let sender = self.sender_of(session.uploader_id).await;
             self.dispatch_session_event(auth.access.repo.id, sender, "uploaded", ulid)
                 .await;
+            self.enqueue_index(&crate::jobs::Job::IndexSessionEvents {
+                session_id: session.id,
+            })
+            .await;
         }
         db_sessions::session_by_ulid(self.db(), auth.access.repo.id, ulid)
             .await?
@@ -490,6 +500,10 @@ impl Core {
             .collect();
         db_sessions::upsert_claim_links(self.db(), auth.access.repo.id, session.id, ulid, &batch)
             .await?;
+        self.enqueue_index(&crate::jobs::Job::IndexSessionEvents {
+            session_id: session.id,
+        })
+        .await;
         Ok(valid.len())
     }
     /// Records one trailer row per `Starforge-Session: <ULID>` trailer found in
@@ -515,6 +529,14 @@ impl Core {
                 if seen.insert((sha.clone(), ulid.clone())) {
                     db_sessions::upsert_trailer_link(self.db(), repo_id, &ulid, sha).await?;
                     recorded += 1;
+                    if let Some(session) =
+                        db_sessions::session_by_ulid(self.db(), repo_id, &ulid).await?
+                    {
+                        self.enqueue_index(&crate::jobs::Job::IndexSessionEvents {
+                            session_id: session.id,
+                        })
+                        .await;
+                    }
                 }
             }
         }
@@ -682,6 +704,10 @@ impl Core {
             .ok_or(CoreError::NotFound)?;
         if session.visibility != visibility {
             db_sessions::set_visibility(self.db(), session.id, visibility).await?;
+            self.enqueue_index(&crate::jobs::Job::IndexSessionEvents {
+                session_id: session.id,
+            })
+            .await;
         }
         self.audit(Some(actor.id), audit_action, &format!("session:{ulid}"), "")
             .await?;
@@ -751,6 +777,11 @@ impl Core {
             &format!("{} segments", removed.len()),
         )
         .await?;
+        self.enqueue_index(&crate::jobs::Job::DropSessionDocs {
+            session_id: session.id,
+            repo_id: session.repo_id,
+        })
+        .await;
         Ok(())
     }
 }

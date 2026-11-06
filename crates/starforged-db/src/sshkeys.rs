@@ -49,6 +49,15 @@ pub struct NewDeployKey<'a> {
     pub created_by: i64,
 }
 
+/// Why a transactional key insert did not add a row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddKeyError {
+    /// The fingerprint is already registered (user key or deploy key).
+    Duplicate,
+    /// The parent (user / repository) already holds the maximum keys.
+    TooMany,
+}
+
 fn ssh_from_row(row: &AnyRow) -> DbResult<SshKeyRow> {
     Ok(SshKeyRow {
         id: row.try_get("id")?,
@@ -78,8 +87,32 @@ fn deploy_from_row(row: &AnyRow) -> DbResult<DeployKeyRow> {
     })
 }
 
-pub async fn insert_ssh_key(db: &Db, key: &NewSshKey<'_>) -> DbResult<i64> {
-    let id: i64 = sqlx::query_scalar(
+/// Inserts a user key in one transaction: locks the user row, counts
+/// existing keys, inserts the key and its `ssh_fingerprints` registry row.
+/// The per-parent lock (users row) serializes concurrent adds for one
+/// user so the cap holds on Postgres READ COMMITTED; the registry primary
+/// key serializes cross-table fingerprint claims. A unique violation from
+/// either the key table or the registry maps to `Duplicate`.
+pub async fn insert_ssh_key(
+    db: &Db,
+    key: &NewSshKey<'_>,
+    max_per_user: i64,
+) -> DbResult<Result<i64, AddKeyError>> {
+    let mut tx = db.pool().begin().await?;
+    // `users` has no `updated_at`; `display_name = display_name` is a
+    // no-op update that takes the row lock (and the write lock on SQLite).
+    sqlx::query("UPDATE users SET display_name = display_name WHERE id = $1")
+        .bind(key.user_id)
+        .execute(&mut *tx)
+        .await?;
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ssh_keys WHERE user_id = $1")
+        .bind(key.user_id)
+        .fetch_one(&mut *tx)
+        .await?;
+    if count >= max_per_user {
+        return Ok(Err(AddKeyError::TooMany));
+    }
+    let inserted: Result<i64, sqlx::Error> = sqlx::query_scalar(
         "INSERT INTO ssh_keys (user_id, title, algorithm, fingerprint, public_key, created_at) \
          VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
     )
@@ -89,13 +122,57 @@ pub async fn insert_ssh_key(db: &Db, key: &NewSshKey<'_>) -> DbResult<i64> {
     .bind(key.fingerprint)
     .bind(key.public_key)
     .bind(now())
-    .fetch_one(db.pool())
-    .await?;
-    Ok(id)
+    .fetch_one(&mut *tx)
+    .await;
+    let id = match inserted {
+        Ok(id) => id,
+        Err(e)
+            if e.as_database_error()
+                .is_some_and(|d| d.is_unique_violation()) =>
+        {
+            return Ok(Err(AddKeyError::Duplicate));
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let registered =
+        sqlx::query("INSERT INTO ssh_fingerprints (fingerprint, kind, ref_id) VALUES ($1, $2, $3)")
+            .bind(key.fingerprint)
+            .bind("ssh_key")
+            .bind(id)
+            .execute(&mut *tx)
+            .await;
+    if let Err(e) = registered {
+        if e.as_database_error()
+            .is_some_and(|d| d.is_unique_violation())
+        {
+            return Ok(Err(AddKeyError::Duplicate));
+        }
+        return Err(e.into());
+    }
+    tx.commit().await?;
+    Ok(Ok(id))
 }
 
-pub async fn insert_deploy_key(db: &Db, key: &NewDeployKey<'_>) -> DbResult<i64> {
-    let id: i64 = sqlx::query_scalar(
+/// Inserts a deploy key in one transaction; see [`insert_ssh_key`]. The
+/// per-parent lock is the `repos` row (`updated_at = updated_at`).
+pub async fn insert_deploy_key(
+    db: &Db,
+    key: &NewDeployKey<'_>,
+    max_per_repo: i64,
+) -> DbResult<Result<i64, AddKeyError>> {
+    let mut tx = db.pool().begin().await?;
+    sqlx::query("UPDATE repos SET updated_at = updated_at WHERE id = $1")
+        .bind(key.repo_id)
+        .execute(&mut *tx)
+        .await?;
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM deploy_keys WHERE repo_id = $1")
+        .bind(key.repo_id)
+        .fetch_one(&mut *tx)
+        .await?;
+    if count >= max_per_repo {
+        return Ok(Err(AddKeyError::TooMany));
+    }
+    let inserted: Result<i64, sqlx::Error> = sqlx::query_scalar(
         "INSERT INTO deploy_keys (repo_id, title, algorithm, fingerprint, public_key, read_write, created_by, created_at) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id",
     )
@@ -107,9 +184,35 @@ pub async fn insert_deploy_key(db: &Db, key: &NewDeployKey<'_>) -> DbResult<i64>
     .bind(i64::from(key.read_write))
     .bind(key.created_by)
     .bind(now())
-    .fetch_one(db.pool())
-    .await?;
-    Ok(id)
+    .fetch_one(&mut *tx)
+    .await;
+    let id = match inserted {
+        Ok(id) => id,
+        Err(e)
+            if e.as_database_error()
+                .is_some_and(|d| d.is_unique_violation()) =>
+        {
+            return Ok(Err(AddKeyError::Duplicate));
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let registered =
+        sqlx::query("INSERT INTO ssh_fingerprints (fingerprint, kind, ref_id) VALUES ($1, $2, $3)")
+            .bind(key.fingerprint)
+            .bind("deploy_key")
+            .bind(id)
+            .execute(&mut *tx)
+            .await;
+    if let Err(e) = registered {
+        if e.as_database_error()
+            .is_some_and(|d| d.is_unique_violation())
+        {
+            return Ok(Err(AddKeyError::Duplicate));
+        }
+        return Err(e.into());
+    }
+    tx.commit().await?;
+    Ok(Ok(id))
 }
 
 pub async fn ssh_key_by_fingerprint(db: &Db, fingerprint: &str) -> DbResult<Option<SshKeyRow>> {
@@ -175,24 +278,62 @@ pub async fn count_deploy_keys(db: &Db, repo_id: i64) -> DbResult<i64> {
     Ok(count)
 }
 
-/// Deletes the user's key; `false` when it does not exist or belongs to someone else.
+/// Deletes the user's key and its registry row in one transaction;
+/// `false` when it does not exist or belongs to someone else.
 pub async fn remove_ssh_key(db: &Db, user_id: i64, id: i64) -> DbResult<bool> {
+    let mut tx = db.pool().begin().await?;
+    let fingerprint: Option<String> =
+        sqlx::query_scalar("SELECT fingerprint FROM ssh_keys WHERE id = $1 AND user_id = $2")
+            .bind(id)
+            .bind(user_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let Some(fingerprint) = fingerprint else {
+        return Ok(false);
+    };
+    sqlx::query("DELETE FROM ssh_fingerprints WHERE fingerprint = $1")
+        .bind(&fingerprint)
+        .execute(&mut *tx)
+        .await?;
     let result = sqlx::query("DELETE FROM ssh_keys WHERE id = $1 AND user_id = $2")
         .bind(id)
         .bind(user_id)
-        .execute(db.pool())
+        .execute(&mut *tx)
         .await?;
-    Ok(result.rows_affected() == 1)
+    let removed = result.rows_affected() == 1;
+    if removed {
+        tx.commit().await?;
+    }
+    Ok(removed)
 }
 
-/// Deletes a deploy key of one repository; `false` when absent or in another repository.
+/// Deletes a deploy key and its registry row in one transaction; `false`
+/// when absent or in another repository.
 pub async fn remove_deploy_key(db: &Db, repo_id: i64, id: i64) -> DbResult<bool> {
+    let mut tx = db.pool().begin().await?;
+    let fingerprint: Option<String> =
+        sqlx::query_scalar("SELECT fingerprint FROM deploy_keys WHERE id = $1 AND repo_id = $2")
+            .bind(id)
+            .bind(repo_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let Some(fingerprint) = fingerprint else {
+        return Ok(false);
+    };
+    sqlx::query("DELETE FROM ssh_fingerprints WHERE fingerprint = $1")
+        .bind(&fingerprint)
+        .execute(&mut *tx)
+        .await?;
     let result = sqlx::query("DELETE FROM deploy_keys WHERE id = $1 AND repo_id = $2")
         .bind(id)
         .bind(repo_id)
-        .execute(db.pool())
+        .execute(&mut *tx)
         .await?;
-    Ok(result.rows_affected() == 1)
+    let removed = result.rows_affected() == 1;
+    if removed {
+        tx.commit().await?;
+    }
+    Ok(removed)
 }
 
 /// Whether the row's `last_used_at` is at least 60 seconds old (or unset).

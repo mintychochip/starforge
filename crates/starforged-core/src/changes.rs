@@ -107,6 +107,21 @@ impl Core {
         )
         .await?;
         let is_new = existing.is_none();
+        if is_new && self.refs_for_over_budget(user_id).await? {
+            // Defense in depth (plan M5a D2): the pre-receive hook already
+            // refused over-budget pushes, but racing pushes can still land
+            // here over the hourly budget. Skip the new change; the
+            // pseudo-ref is already gone, so the pusher just re-pushes
+            // after the window.
+            tracing::warn!(
+                repo_id,
+                user_id,
+                base = sc.base.as_str(),
+                topic = sc.topic.as_str(),
+                "refs/for ingest skipped: hourly new-change budget spent"
+            );
+            return Ok(None);
+        }
         let (change, revision) = match existing {
             Some(change) => {
                 debug_assert_eq!(change.trail_id, trail_id);
@@ -1159,6 +1174,9 @@ pub struct ChangeView {
     pub current_revision: i64,
     pub state: String,
     pub creator_handle: String,
+    /// The original GitHub login when the creator is a placeholder (M4c
+    /// D1; the trail's imported author for imported changes).
+    pub creator_imported_author: Option<String>,
     pub mergeability: String,
     pub conflict_paths: Vec<String>,
     pub created_at: i64,
@@ -1184,6 +1202,9 @@ pub struct ReviewView {
     pub id: i64,
     pub revision: i64,
     pub author_handle: String,
+    /// The original GitHub login when the author is a placeholder (M4c
+    /// D1); see [`ChangeView::creator_imported_author`].
+    pub imported_author: Option<String>,
     pub verdict: String,
     pub body: String,
     pub session_ulid: Option<String>,
@@ -1211,6 +1232,9 @@ pub struct ThreadCommentView {
     pub id: i64,
     pub review_id: Option<i64>,
     pub author_handle: String,
+    /// The original GitHub login when the author is a placeholder (M4c
+    /// D1); see [`ChangeView::creator_imported_author`].
+    pub imported_author: Option<String>,
     pub body: String,
     pub created_at: i64,
 }
@@ -1328,13 +1352,18 @@ impl Core {
         let trail = db_trails::trail_by_id(self.db(), row.trail_id)
             .await?
             .ok_or_else(|| CoreError::Internal("change has no trail".into()))?;
-        let creator_handle = match row.creator_id {
-            None => "deleted user".to_owned(),
-            Some(id) => self
-                .user_by_id(id)
-                .await?
-                .map(|u| u.handle)
-                .unwrap_or_else(|| "deleted user".to_owned()),
+        let (creator_handle, creator_imported_author) = match row.creator_id {
+            None => match &trail.imported_author {
+                Some(login) => (login.clone(), Some(login.clone())),
+                None => ("deleted user".to_owned(), None),
+            },
+            Some(id) => (
+                self.user_by_id(id)
+                    .await?
+                    .map(|u| u.handle)
+                    .unwrap_or_else(|| "deleted user".to_owned()),
+                None,
+            ),
         };
         let current_revision = match row.current_revision_id {
             None => 0,
@@ -1352,6 +1381,7 @@ impl Core {
             current_revision,
             state: row.state.clone(),
             creator_handle,
+            creator_imported_author,
             mergeability: row.mergeability.clone(),
             conflict_paths: parse_paths(&row.conflict_paths),
             created_at: row.created_at,
@@ -1380,18 +1410,24 @@ impl Core {
         let revision = db_changes::revision_by_id(self.db(), row.revision_id)
             .await?
             .ok_or_else(|| CoreError::Internal("review has no revision".into()))?;
-        let author_handle = match row.author_id {
-            None => "deleted user".to_owned(),
-            Some(id) => self
-                .user_by_id(id)
-                .await?
-                .map(|u| u.handle)
-                .unwrap_or_else(|| "deleted user".to_owned()),
+        let (author_handle, imported_author) = match row.author_id {
+            None => match &row.imported_author {
+                Some(login) => (login.clone(), Some(login.clone())),
+                None => ("deleted user".to_owned(), None),
+            },
+            Some(id) => (
+                self.user_by_id(id)
+                    .await?
+                    .map(|u| u.handle)
+                    .unwrap_or_else(|| "deleted user".to_owned()),
+                None,
+            ),
         };
         Ok(ReviewView {
             id: row.id,
             revision: revision.number,
             author_handle,
+            imported_author,
             verdict: row.verdict.clone(),
             body: row.body.clone(),
             session_ulid: row.session_ulid.clone(),
@@ -1404,18 +1440,24 @@ impl Core {
         &self,
         row: &db_changes::ReviewCommentRow,
     ) -> CoreResult<ThreadCommentView> {
-        let author_handle = match row.author_id {
-            None => "deleted user".to_owned(),
-            Some(id) => self
-                .user_by_id(id)
-                .await?
-                .map(|u| u.handle)
-                .unwrap_or_else(|| "deleted user".to_owned()),
+        let (author_handle, imported_author) = match row.author_id {
+            None => match &row.imported_author {
+                Some(login) => (login.clone(), Some(login.clone())),
+                None => ("deleted user".to_owned(), None),
+            },
+            Some(id) => (
+                self.user_by_id(id)
+                    .await?
+                    .map(|u| u.handle)
+                    .unwrap_or_else(|| "deleted user".to_owned()),
+                None,
+            ),
         };
         Ok(ThreadCommentView {
             id: row.id,
             review_id: row.review_id,
             author_handle,
+            imported_author,
             body: row.body.clone(),
             created_at: row.created_at,
         })

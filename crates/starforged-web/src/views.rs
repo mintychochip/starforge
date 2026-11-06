@@ -477,6 +477,7 @@ pub struct InlineThreadView {
 
 pub struct InlineCommentView {
     pub author_handle: String,
+    pub imported_author: Option<String>,
     pub body_html: String,
     pub created: String,
 }

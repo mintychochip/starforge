@@ -1,23 +1,22 @@
-//! M4a S1: `starforged index rebuild` over a file-backed data dir.
-//!
-//! Seeds one public repository, one Trail (with a comment), and one completed
-//! session through `Core`, then exercises the real CLI both ways: while the
-//! seeding process holds the index writer the rebuild fails with the
-//! "stop the server" message; after it is dropped the rebuild succeeds and
-//! the index answers searches with the expected documents.
+//! M4a S1/S2: `starforged index rebuild` over a file-backed data dir, plus the
+//! incremental indexing pipeline (plan D5): every mutation enqueues an index
+//! job, and `run_due_jobs` makes the change observable through `search_*`.
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use common::{TestServer, get_text};
 use serde_json::{Value, json};
 use starforged::admin::open_core;
 use starforged::config::Config;
 use starforged_core::Core;
 use starforged_core::accounts::CreateUser;
 use starforged_core::ingest::IngestAuth;
-use starforged_core::permission::Visibility;
+use starforged_core::permission::{Permission, Visibility};
 use starforged_core::repos::CreateRepo;
 use starforged_core::tokens::{Scope, TokenAuth};
-use starforged_index::{EventQuery, Scope as IndexScope, SearchIndex};
+use starforged_index::{EventQuery, Scope as IndexScope, SearchIndex, TrailQuery};
 
 const ULID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FC1";
 
@@ -250,4 +249,529 @@ async fn rebuild_produces_the_expected_counts() {
     assert_eq!(search("subway"), 0, "reasoning is never indexed");
     assert_eq!(search("outputword"), 0, "tool outputs are never indexed");
     assert_eq!(search("quietly"), 0, "tool inputs are never indexed");
+}
+
+// ── S2: the indexing pipeline ──────────────────────────────────────────────
+
+fn admin_scope(repo_id: i64, viewer: i64) -> IndexScope {
+    IndexScope {
+        signed_in: true,
+        readable: vec![repo_id],
+        member: vec![repo_id],
+        admin: vec![repo_id],
+        viewer_id: Some(viewer),
+    }
+}
+
+fn anon_scope() -> IndexScope {
+    IndexScope::default()
+}
+
+fn trail_hits(server: &TestServer, q: &str, scope: &IndexScope) -> Vec<starforged_index::TrailHit> {
+    server
+        .core
+        .search_index()
+        .search_trails(
+            &TrailQuery {
+                q: q.to_owned(),
+                ..Default::default()
+            },
+            scope,
+            0,
+            20,
+        )
+        .unwrap()
+}
+
+fn event_hits(server: &TestServer, q: &str, scope: &IndexScope) -> Vec<starforged_index::EventHit> {
+    server
+        .core
+        .search_index()
+        .search_events(
+            &EventQuery {
+                q: q.to_owned(),
+                ..Default::default()
+            },
+            scope,
+            0,
+            20,
+        )
+        .unwrap()
+}
+
+async fn drain(server: &TestServer) {
+    server.core.run_due_jobs().await.unwrap();
+}
+
+/// Uploads one completed session whose single user message carries `text`.
+async fn upload_completed(
+    server: &TestServer,
+    alice: &starforged_core::accounts::User,
+    ulid: &str,
+    text: &str,
+) {
+    let secret = server.token(alice, &[Scope::SessionUpload]).await;
+    let token = server.core.authenticate_token(&secret).await.unwrap();
+    let auth: IngestAuth = server
+        .core
+        .authorize_upload(&token, "alice", "proj")
+        .await
+        .unwrap();
+    server
+        .core
+        .upsert_session_meta(&auth, ulid, &meta_body(ulid))
+        .await
+        .unwrap();
+    let line = event(0, "user_message", json!({"text": text}));
+    let bytes = starforge_format::compress(format!("{line}\n").as_bytes());
+    let hash = starforge_format::blake3_hex(&bytes);
+    server
+        .core
+        .put_segment(&auth, ulid, 0, &bytes, Some(hash))
+        .await
+        .unwrap();
+    server.core.complete_session(&auth, ulid).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn trail_create_edit_comment_state_are_indexed() {
+    let s = TestServer::start().await;
+    let alice = s.user("alice").await;
+    let repo = s.repo(&alice, "proj", Visibility::Public).await;
+    let scope = admin_scope(repo.id, alice.id);
+
+    s.core
+        .create_trail(&alice, "alice", "proj", "Zebra alpha", "intentword")
+        .await
+        .unwrap();
+    drain(&s).await;
+    let hits = trail_hits(&s, "zebra", &scope);
+    assert_eq!(hits.len(), 1, "create indexes the trail");
+    assert_eq!(hits[0].state, "open");
+
+    s.core
+        .update_trail(
+            &alice,
+            "alice",
+            "proj",
+            1,
+            Some("Zebra charlie"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    drain(&s).await;
+    assert_eq!(
+        trail_hits(&s, "charlie", &scope).len(),
+        1,
+        "edit re-indexes title"
+    );
+    assert_eq!(
+        trail_hits(&s, "alpha", &scope).len(),
+        0,
+        "old title is replaced"
+    );
+
+    let comment = s
+        .core
+        .add_comment(&alice, "alice", "proj", 1, "delta comment")
+        .await
+        .unwrap();
+    drain(&s).await;
+    assert_eq!(
+        trail_hits(&s, "delta", &scope).len(),
+        1,
+        "comment body is indexed"
+    );
+
+    s.core
+        .edit_comment(&alice, "alice", "proj", 1, comment.id, "echo edited")
+        .await
+        .unwrap();
+    drain(&s).await;
+    assert_eq!(
+        trail_hits(&s, "echo", &scope).len(),
+        1,
+        "comment edit re-indexes"
+    );
+    assert_eq!(
+        trail_hits(&s, "delta", &scope).len(),
+        0,
+        "old comment text is replaced"
+    );
+
+    s.core
+        .set_trail_state(&alice, "alice", "proj", 1, "closed")
+        .await
+        .unwrap();
+    drain(&s).await;
+    let hits = trail_hits(&s, "zebra", &scope);
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].state, "closed", "state change re-indexes state");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_complete_publish_unpublish_indexed() {
+    let s = TestServer::start().await;
+    let alice = s.user("alice").await;
+    let repo = s.repo(&alice, "proj", Visibility::Public).await;
+    let scope = admin_scope(repo.id, alice.id);
+    let access = s
+        .core
+        .require_repo(Some(&alice), "alice", "proj", Permission::Admin)
+        .await
+        .unwrap();
+
+    upload_completed(
+        &s,
+        &alice,
+        "01ARZ3NDEKTSV4RRFFQ69G5FC2",
+        "publishword hello",
+    )
+    .await;
+    drain(&s).await;
+    assert_eq!(
+        event_hits(&s, "publishword", &scope).len(),
+        1,
+        "complete indexes events"
+    );
+    assert_eq!(
+        event_hits(&s, "publishword", &anon_scope()).len(),
+        0,
+        "unpublished public event is hidden from anonymous"
+    );
+
+    s.core
+        .publish_session(&alice, &access, "01ARZ3NDEKTSV4RRFFQ69G5FC2")
+        .await
+        .unwrap();
+    drain(&s).await;
+    assert_eq!(
+        event_hits(&s, "publishword", &anon_scope()).len(),
+        1,
+        "publish re-indexes published flag"
+    );
+
+    s.core
+        .unpublish_session(&alice, &access, "01ARZ3NDEKTSV4RRFFQ69G5FC2")
+        .await
+        .unwrap();
+    drain(&s).await;
+    assert_eq!(
+        event_hits(&s, "publishword", &anon_scope()).len(),
+        0,
+        "unpublish re-indexes published flag"
+    );
+    assert_eq!(
+        event_hits(&s, "publishword", &scope).len(),
+        1,
+        "admin scope still sees unpublished"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_quarantine_and_release_are_indexed() {
+    let s = TestServer::start().await;
+    let alice = s.user("alice").await;
+    let repo = s.repo(&alice, "proj", Visibility::Public).await;
+    let scope = admin_scope(repo.id, alice.id);
+    let access = s
+        .core
+        .require_repo(Some(&alice), "alice", "proj", Permission::Admin)
+        .await
+        .unwrap();
+
+    let ulid = "01ARZ3NDEKTSV4RRFFQ69G5FC3";
+    let secret_text = "quarantineword -----BEGIN PRIVATE KEY-----\nMIIEvAIBADANBgkqhkiG9w0BAQEF\n-----END PRIVATE KEY----- done";
+    upload_completed(&s, &alice, ulid, secret_text).await;
+    s.core.publish_session(&alice, &access, ulid).await.unwrap();
+    drain(&s).await;
+    assert_eq!(
+        event_hits(&s, "quarantineword", &scope).len(),
+        1,
+        "quarantined session is indexed for admins"
+    );
+    assert_eq!(
+        event_hits(&s, "quarantineword", &anon_scope()).len(),
+        0,
+        "quarantined session is hidden from anonymous"
+    );
+
+    s.core.release_session(&alice, &access, ulid).await.unwrap();
+    drain(&s).await;
+    assert_eq!(
+        event_hits(&s, "quarantineword", &anon_scope()).len(),
+        1,
+        "release re-indexes quarantine flag"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_delete_and_purge_drop_docs() {
+    let s = TestServer::start().await;
+    let alice = s.user("alice").await;
+    let repo = s.repo(&alice, "proj", Visibility::Public).await;
+    let scope = admin_scope(repo.id, alice.id);
+    let access = s
+        .core
+        .require_repo(Some(&alice), "alice", "proj", Permission::Admin)
+        .await
+        .unwrap();
+
+    upload_completed(&s, &alice, "01ARZ3NDEKTSV4RRFFQ69G5FC4", "deleteword one").await;
+    drain(&s).await;
+    assert_eq!(event_hits(&s, "deleteword", &scope).len(), 1);
+    s.core
+        .delete_session(&alice, &access, "01ARZ3NDEKTSV4RRFFQ69G5FC4")
+        .await
+        .unwrap();
+    drain(&s).await;
+    assert_eq!(
+        event_hits(&s, "deleteword", &scope).len(),
+        0,
+        "delete drops session docs"
+    );
+
+    upload_completed(&s, &alice, "01ARZ3NDEKTSV4RRFFQ69G5FC5", "purgeword two").await;
+    drain(&s).await;
+    assert_eq!(event_hits(&s, "purgeword", &scope).len(), 1);
+    s.core
+        .purge_session(&alice, &access, "01ARZ3NDEKTSV4RRFFQ69G5FC5")
+        .await
+        .unwrap();
+    drain(&s).await;
+    assert_eq!(
+        event_hits(&s, "purgeword", &scope).len(),
+        0,
+        "purge drops session docs"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repo_visibility_change_updates_docs() {
+    let s = TestServer::start().await;
+    let alice = s.user("alice").await;
+    let repo = s.repo(&alice, "proj", Visibility::Public).await;
+    let scope = admin_scope(repo.id, alice.id);
+
+    s.core
+        .create_trail(&alice, "alice", "proj", "Visibilityword title", "intent")
+        .await
+        .unwrap();
+    drain(&s).await;
+    assert_eq!(
+        trail_hits(&s, "visibilityword", &anon_scope()).len(),
+        1,
+        "public trail visible to anonymous"
+    );
+
+    s.core
+        .set_visibility(&alice, "alice", "proj", Visibility::Private)
+        .await
+        .unwrap();
+    drain(&s).await;
+    assert_eq!(
+        trail_hits(&s, "visibilityword", &anon_scope()).len(),
+        0,
+        "private trail hidden from anonymous"
+    );
+    assert_eq!(
+        trail_hits(&s, "visibilityword", &scope).len(),
+        1,
+        "readable scope still sees private trail"
+    );
+
+    s.core
+        .set_visibility(&alice, "alice", "proj", Visibility::Public)
+        .await
+        .unwrap();
+    drain(&s).await;
+    assert_eq!(
+        trail_hits(&s, "visibilityword", &anon_scope()).len(),
+        1,
+        "public again visible to anonymous"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repo_delete_restore_and_purge_drop_docs() {
+    let s = TestServer::start().await;
+    let alice = s.user("alice").await;
+    let repo = s.repo(&alice, "proj", Visibility::Public).await;
+    let scope = admin_scope(repo.id, alice.id);
+
+    s.core
+        .create_trail(&alice, "alice", "proj", "Repoword title", "intent")
+        .await
+        .unwrap();
+    drain(&s).await;
+    assert_eq!(trail_hits(&s, "repoword", &scope).len(), 1);
+
+    s.core
+        .delete_repo(&alice, "alice", "proj", "alice/proj")
+        .await
+        .unwrap();
+    drain(&s).await;
+    assert_eq!(
+        trail_hits(&s, "repoword", &scope).len(),
+        0,
+        "delete drops repo docs"
+    );
+
+    s.core.restore_repo(&alice, repo.id).await.unwrap();
+    drain(&s).await;
+    assert_eq!(
+        trail_hits(&s, "repoword", &scope).len(),
+        1,
+        "restore re-indexes repo docs"
+    );
+
+    s.core
+        .delete_repo(&alice, "alice", "proj", "alice/proj")
+        .await
+        .unwrap();
+    let root = s
+        .core
+        .create_user(CreateUser {
+            handle: "root".into(),
+            is_admin: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    s.core.purge_repo_now(&root, repo.id).await.unwrap();
+    drain(&s).await;
+    assert_eq!(
+        trail_hits(&s, "repoword", &scope).len(),
+        0,
+        "purge drops repo docs"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn corrupt_index_at_startup_is_recreated_and_rebuild_enqueued() {
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    let config_path = write_config(dir.path(), &data_dir);
+    // A corrupt index: a directory that is not a readable tantivy index.
+    let index_dir = data_dir.join("index");
+    std::fs::create_dir_all(&index_dir).unwrap();
+    std::fs::write(index_dir.join("garbage.txt"), "not an index").unwrap();
+
+    let config = Config::load(&config_path).unwrap();
+    let app = starforged::serve::build(&config, PathBuf::from(env!("CARGO_BIN_EXE_starforged")))
+        .await
+        .unwrap();
+    assert!(
+        app.core.search_index_was_recreated(),
+        "corrupt index was recreated"
+    );
+    starforged::serve::recover_search_index(&app.core)
+        .await
+        .unwrap();
+    let queued: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM jobs WHERE kind = 'rebuild_index' AND state = 'queued'",
+    )
+    .fetch_one(app.core.db().pool())
+    .await
+    .unwrap();
+    assert_eq!(queued, 1, "startup recovery enqueues RebuildIndex");
+    app.core.run_due_jobs().await.unwrap();
+    assert!(
+        index_dir.join("meta.json").exists(),
+        "recreated index is a real index"
+    );
+    drop(app);
+
+    // A healthy index opens without a rebuild job.
+    let config = Config::load(&config_path).unwrap();
+    let app = starforged::serve::build(&config, PathBuf::from(env!("CARGO_BIN_EXE_starforged")))
+        .await
+        .unwrap();
+    assert!(
+        !app.core.search_index_was_recreated(),
+        "healthy index opens as-is"
+    );
+    starforged::serve::recover_search_index(&app.core)
+        .await
+        .unwrap();
+    let queued: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM jobs WHERE kind = 'rebuild_index' AND state = 'queued'",
+    )
+    .fetch_one(app.core.db().pool())
+    .await
+    .unwrap();
+    assert_eq!(queued, 0, "no rebuild for a healthy index");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_rebuild_action_enqueues_rebuild_index() {
+    let s = TestServer::start().await;
+    let root = s
+        .core
+        .create_user(CreateUser {
+            handle: "root".into(),
+            password: Some(common::PASSWORD.into()),
+            is_admin: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let (admin_client, csrf) = s.login("root").await;
+
+    let page = get_text(&admin_client, &s.url("/admin/jobs")).await;
+    assert!(page.contains("Rebuild search index"), "{page}");
+    assert!(page.contains("/admin/jobs/rebuild-index"), "{page}");
+
+    // A bad CSRF token is refused first and enqueues nothing.
+    let bad = admin_client
+        .post(s.url("/admin/jobs/rebuild-index"))
+        .form(&[("_csrf", "wrong")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 403, "bad CSRF is refused");
+
+    let res = admin_client
+        .post(s.url("/admin/jobs/rebuild-index"))
+        .form(&[("_csrf", csrf.as_str())])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 303);
+    assert_eq!(res.headers()["location"], "/admin/jobs");
+    let queued: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM jobs WHERE kind = 'rebuild_index' AND state = 'queued'",
+    )
+    .fetch_one(s.core.db().pool())
+    .await
+    .unwrap();
+    assert_eq!(queued, 1, "rebuild action enqueues RebuildIndex");
+
+    // Non-admins get 404.
+    let _ = root;
+    let alice = s.user("alice").await;
+    let _ = alice;
+    let (owner, _) = s.login("alice").await;
+    assert_eq!(
+        owner
+            .post(s.url("/admin/jobs/rebuild-index"))
+            .form(&[("_csrf", "x")])
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+    let anon = s.browser();
+    assert_eq!(
+        anon.post(s.url("/admin/jobs/rebuild-index"))
+            .form(&[("_csrf", "x")])
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
 }
