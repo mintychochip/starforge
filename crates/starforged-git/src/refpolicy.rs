@@ -349,9 +349,10 @@ pub struct Protection {
 
 /// Parses the hook's protection snapshot. Anything missing or malformed —
 /// bad JSON, a wrong version, a missing `branches` array, a rule without
-/// its block kinds, or mistyped `tags`/`tag_ok`/`namespaces` — is `Err`:
-/// the hook fails closed on it. Absent `tags`/`tag_ok`/`namespaces` stay at
-/// their permissive defaults so older snapshots keep parsing.
+/// its block kinds, or a missing or mistyped `tags`/`tag_ok`/`namespaces` —
+/// is `Err`: the hook fails closed on it. Each of `tags`, `tag_ok`, and
+/// `namespaces` is REQUIRED: a stripped-down snapshot that drops one must
+/// not silently weaken tag or namespace enforcement.
 pub fn parse_protection(raw: &str) -> Result<Protection, String> {
     let value: serde_json::Value =
         serde_json::from_str(raw).map_err(|e| format!("invalid protection snapshot: {e}"))?;
@@ -374,22 +375,22 @@ pub fn parse_protection(raw: &str) -> Result<Protection, String> {
             .map_err(|e| format!("invalid protection snapshot: bad branch rule: {e}"))?;
         rules.push(rule);
     }
-    let tags = match value.get("tags") {
-        None => Vec::new(),
-        Some(tags) => serde_json::from_value(tags.clone())
-            .map_err(|e| format!("invalid protection snapshot: bad tags: {e}"))?,
-    };
-    let tag_ok = match value.get("tag_ok") {
-        None => true,
-        Some(tag_ok) => tag_ok.as_bool().ok_or_else(|| {
-            "invalid protection snapshot: bad tag_ok (expected a bool)".to_owned()
-        })?,
-    };
-    let namespaces = match value.get("namespaces") {
-        None => Vec::new(),
-        Some(namespaces) => serde_json::from_value(namespaces.clone())
-            .map_err(|e| format!("invalid protection snapshot: bad namespaces: {e}"))?,
-    };
+    let tags = value
+        .get("tags")
+        .ok_or_else(|| "invalid protection snapshot: missing tags".to_owned())?;
+    let tags = serde_json::from_value(tags.clone())
+        .map_err(|e| format!("invalid protection snapshot: bad tags: {e}"))?;
+    let tag_ok = value
+        .get("tag_ok")
+        .ok_or_else(|| "invalid protection snapshot: missing tag_ok".to_owned())?;
+    let tag_ok = tag_ok
+        .as_bool()
+        .ok_or_else(|| "invalid protection snapshot: bad tag_ok (expected a bool)".to_owned())?;
+    let namespaces = value
+        .get("namespaces")
+        .ok_or_else(|| "invalid protection snapshot: missing namespaces".to_owned())?;
+    let namespaces = serde_json::from_value(namespaces.clone())
+        .map_err(|e| format!("invalid protection snapshot: bad namespaces: {e}"))?;
     Ok(Protection {
         branches: rules,
         tags,
@@ -1140,6 +1141,32 @@ mod tests {
             r#"{"v":1,"branches":[],"namespaces":"refs/notes/"}"#,
         ] {
             assert!(parse_protection(bad).is_err(), "{bad} must fail closed");
+        }
+    }
+    #[test]
+    fn stripped_snapshot_fails_closed() {
+        // A snapshot missing any one of `tags`, `tag_ok`, or `namespaces`
+        // is `Err`; the hook maps `Err` to a refusal for branch and tag
+        // pushes alike, so a stripped-down snapshot cannot weaken either.
+        for (raw, field) in [
+            (
+                r#"{"v":1,"branches":[],"tag_ok":false,"namespaces":[]}"#,
+                "tags",
+            ),
+            (
+                r#"{"v":1,"branches":[],"tags":[],"namespaces":[]}"#,
+                "tag_ok",
+            ),
+            (
+                r#"{"v":1,"branches":[],"tags":[],"tag_ok":false}"#,
+                "namespaces",
+            ),
+        ] {
+            let err = parse_protection(raw).unwrap_err();
+            assert!(
+                err.contains(field),
+                "{err} must name the missing field {field}"
+            );
         }
     }
     #[test]

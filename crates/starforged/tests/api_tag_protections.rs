@@ -1,7 +1,7 @@
 //! B2: tag-protection management API. Real HTTP against an in-process
-//! server: the maintain+ permission shape (404/403 matrix), create→list→
-//! delete round-trip, validation rejections, archived-repo behavior, and
-//! exactly one audit row per mutation.
+//! server: the reader-list / maintain-mutate permission shape (404/403
+//! matrix), create→list→delete round-trip, validation rejections,
+//! archived-repo behavior, and exactly one audit row per mutation.
 mod common;
 
 use common::*;
@@ -14,6 +14,8 @@ struct Ctx {
     s: TestServer,
     alice: starforged_core::accounts::User,
     carol_read: String,
+    dave_triage: String,
+    erin_write: String,
     bob_full: String,
     bob_read_only: String,
     alice_full: String,
@@ -29,6 +31,8 @@ impl Ctx {
         let alice = s.user("alice").await;
         let bob = s.user("bob").await;
         let carol = s.user("carol").await;
+        let dave = s.user("dave").await;
+        let erin = s.user("erin").await;
         let gus = s.user("gus").await;
         s.core
             .create_user(CreateUser {
@@ -41,6 +45,7 @@ impl Ctx {
             .unwrap();
         let frank = s.core.user_by_handle("frank").await.unwrap().unwrap();
         s.repo(&alice, "proj", Visibility::Private).await;
+        s.repo(&alice, "open", Visibility::Public).await;
         s.core
             .set_collaborator(&alice, "alice", "proj", "bob", Permission::Maintain)
             .await
@@ -49,10 +54,20 @@ impl Ctx {
             .set_collaborator(&alice, "alice", "proj", "carol", Permission::Read)
             .await
             .unwrap();
+        s.core
+            .set_collaborator(&alice, "alice", "proj", "dave", Permission::Triage)
+            .await
+            .unwrap();
+        s.core
+            .set_collaborator(&alice, "alice", "proj", "erin", Permission::Write)
+            .await
+            .unwrap();
         let read = &[Scope::RepoRead];
         let full = &[Scope::RepoRead, Scope::RepoWrite, Scope::TrailWrite];
         Ctx {
-            carol_read: s.token(&carol, read).await,
+            carol_read: s.token(&carol, full).await,
+            dave_triage: s.token(&dave, full).await,
+            erin_write: s.token(&erin, full).await,
             bob_full: s.token(&bob, full).await,
             bob_read_only: s.token(&bob, read).await,
             alice_full: s.token(&alice, full).await,
@@ -67,6 +82,10 @@ impl Ctx {
 
     fn tags(&self) -> String {
         self.s.url("/api/v1/repos/alice/proj/tag-protections")
+    }
+
+    fn tags_open(&self) -> String {
+        self.s.url("/api/v1/repos/alice/open/tag-protections")
     }
 
     fn tag(&self, id: i64) -> String {
@@ -99,13 +118,17 @@ impl Ctx {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn tag_protections_are_maintain_only() {
+async fn tag_protection_list_is_open_to_readers_mutations_maintain_only() {
     let c = Ctx::start().await;
     let client = reqwest::Client::new();
 
     // Anonymous list on a private repo: 404 (never a leak-shaped 403).
     let res = client.get(c.tags()).send().await.unwrap();
     assert_eq!(res.status(), 404);
+
+    // Anonymous list on a public repo: 200.
+    let res = client.get(c.tags_open()).send().await.unwrap();
+    assert_eq!(res.status(), 200);
 
     // Anonymous create: 401.
     let res = client
@@ -129,16 +152,16 @@ async fn tag_protections_are_maintain_only() {
     let (status, _) = c.create(&c.gus_trail_only, &json!({"pattern": "v*"})).await;
     assert_eq!(status, 403, "mutations need the repo:write scope");
 
-    // Readers read nothing and mutate nothing: reads are maintain+ too.
-    let res = client
-        .get(c.tags())
-        .bearer_auth(&c.carol_read)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(res.status(), 403, "reads need maintain");
-    let (status, _) = c.create(&c.carol_read, &json!({"pattern": "v*"})).await;
-    assert_eq!(status, 403);
+    // Every repository reader (read, triage, write) may list.
+    for token in [&c.carol_read, &c.dave_triage, &c.erin_write] {
+        let res = client
+            .get(c.tags())
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200, "any reader may list tag protections");
+    }
 
     // A maintainer holding only `repo:read` may list but not mutate.
     let res = client
@@ -150,6 +173,22 @@ async fn tag_protections_are_maintain_only() {
     assert_eq!(res.status(), 200);
     let (status, _) = c.create(&c.bob_read_only, &json!({"pattern": "v*"})).await;
     assert_eq!(status, 403);
+
+    // Below-maintain readers mutate nothing: create and delete are 403.
+    let (status, created) = c.create(&c.alice_full, &json!({"pattern": "v*"})).await;
+    assert_eq!(status, 201);
+    let id = created["id"].as_i64().unwrap();
+    for token in [&c.carol_read, &c.dave_triage, &c.erin_write] {
+        let (status, _) = c.create(token, &json!({"pattern": "r*"})).await;
+        assert_eq!(status, 403, "creates need maintain");
+        let res = client
+            .delete(c.tag(id))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 403, "deletes need maintain");
+    }
 
     // Maintain, owner, and site admin can create.
     for token in [&c.bob_full, &c.alice_full, &c.frank_full] {

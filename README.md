@@ -536,9 +536,10 @@ globs (`*` matches any run, `?` one character; empty or null means all
 branches, at most one rule per pattern); every rule matching the branch
 applies, and a push is refused when ANY matching rule blocks it. Only the
 direct-push block can be bypassed, through the rule's allow-list; force-push
-and deletion blocks stop everyone, including admins and site admins. Every refusal
-reaches the pusher as `remote: starforge: …`, naming the ref and the rule
-pattern, and the server-side ref is left untouched.
+and deletion blocks stop everyone, including admins and site admins. Protection
+refusals reach the pusher as `remote: starforge: …`, naming the ref and the
+rule pattern, and the server-side ref is left untouched; write-tier,
+namespace, and snapshot failures name only the ref.
 
 Each rule may exempt individual users (by handle) and, on org-owned
 repositories only, whole teams (by slug) from the direct-push block via
@@ -552,10 +553,10 @@ Tag protection is a separate per-repository pattern list: creating, moving,
 or deleting a tag that matches any pattern needs maintain or above, while
 non-matching tags need only write, as before. The API is
 `GET`/`POST .../repos/{owner}/{repo}/tag-protections` (body `{"pattern"}`)
-and `DELETE .../tag-protections/{id}`; reads and mutations alike need
-maintain (mutations also need the `repo:write` token scope), so readers
-below maintain get `403` and non-readers `404`. Gate-rule reads stay open
-to any repository reader; both lists answer `404` for unknown ids.
+and `DELETE .../tag-protections/{id}`; like the gate-rule list, tag-protection
+reads are open to any repository reader (non-readers `404`) and mutations
+need maintain, plus the `repo:write` token scope. Both lists answer `404`
+for unknown ids.
 
 Pushes to any other namespace are refused unless a site admin allow-lists
 it in `git.allowed_ref_namespaces` (e.g. `allowed_ref_namespaces =

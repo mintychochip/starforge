@@ -3,8 +3,8 @@
 //!
 //! Handlers authenticate and delegate; all permission, validation,
 //! per-pattern uniqueness, and timeline/audit logic lives on [`Core`].
-//! Reads and mutations both need ≥ `Maintain`, so non-readers surface as
-//! `404` and below-threshold users as `403`; mutations additionally need
+//! Reads need repository read access (non-readers surface as `404`);
+//! mutations need ≥ `Maintain` (below-threshold users get `403`) and
 //! `Scope::RepoWrite` first. `CoreError::Invalid` → `422`,
 //! `CoreError::Conflict` → `409`, all in the `{error:{code,message}}`
 //! envelope. Timestamps render as RFC 3339 (`…Z`).
@@ -42,7 +42,7 @@ fn tag_protection_json(view: &TagProtectionDto) -> TagProtectionJson {
 }
 
 /// `GET /repos/{owner}/{repo}/tag-protections` (200): the repo's tag
-/// protections in insert order. Maintain+ only.
+/// protections in insert order. Any repository reader.
 pub async fn list_tag_protections(
     State(state): State<ApiState>,
     auth: ApiAuth,

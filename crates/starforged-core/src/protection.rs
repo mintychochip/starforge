@@ -262,18 +262,16 @@ impl Core {
         Ok(PushAllowlistDto { users, teams })
     }
 
-    /// Tag protections of the repo in insert order. Reads need ≥ `Maintain`,
-    /// like writes; a missing repo or one the viewer cannot read is
-    /// `NotFound`.
+    /// Tag protections of the repo in insert order. Any repository reader
+    /// may list (like gate rules); a missing repo or one the viewer cannot
+    /// read is `NotFound`.
     pub async fn list_tag_protections(
         &self,
         viewer: Option<&User>,
         owner: &str,
         repo: &str,
     ) -> CoreResult<Vec<TagProtectionDto>> {
-        let access = self
-            .require_repo(viewer, owner, repo, Permission::Maintain)
-            .await?;
+        let access = self.repo_for(viewer, owner, repo).await?;
         let mut out = Vec::new();
         for row in db_protection::tag_protections_for_repo(self.db(), access.repo.id).await? {
             out.push(TagProtectionDto {

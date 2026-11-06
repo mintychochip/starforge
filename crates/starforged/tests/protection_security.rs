@@ -7,10 +7,10 @@
 //! second); server-side paths (Trail merges, `refs/for`, `refs/trails`);
 //! and the 404/403 access matrix on both management APIs.
 //!
-//! Tag-protection list readability currently needs maintain+ (unlike the
-//! gate-rule list, which any reader may list); that shape is pinned in one
-//! helper ([`assert_tag_list_requires_maintain`]) so a later read-shape
-//! change stays small.
+//! Tag-protection list readability matches the gate-rule list: any
+//! repository reader may list; that shape is pinned in one helper
+//! ([`assert_tag_list_open_to_readers`]) so a later read-shape change stays
+//! small. Mutations stay maintain+.
 mod common;
 
 use std::path::{Path, PathBuf};
@@ -288,7 +288,14 @@ async fn branch_push_role_matrix() {
         let before = server_rev(&work, &server, "refs/heads/main").await;
         let probe_url = writer_url(&s, "alice", "proj", &role.user, WRITE_SCOPES).await;
         let out = git(&work, &["push", &probe_url, "main"]).await;
-        assert_refused(&out, "refs/heads/main", Some("main"));
+        // Below-write roles (read, triage) fail the write tier before the
+        // snapshot, so no pattern is named; write and above hit the
+        // snapshot, whose message quotes the pattern (`rule 'main'`).
+        let want_pattern = match role.name {
+            "read" | "triage" => None,
+            _ => Some("'main'"),
+        };
+        assert_refused(&out, "refs/heads/main", want_pattern);
         assert_ref_unchanged(
             &work,
             &server,
@@ -432,7 +439,7 @@ async fn rule_combinations_all_matching_rules_apply() {
     let erin_url = writer_url(&s, "alice", "proj", &erin, WRITE_SCOPES).await;
     let before = server_rev(&work, &server, "refs/heads/main").await;
     let out = git(&work, &["push", &erin_url, "main"]).await;
-    assert_refused(&out, "refs/heads/main", Some("main"));
+    assert_refused(&out, "refs/heads/main", Some("'all branches'"));
     assert_ref_unchanged(
         &work,
         &server,
@@ -862,9 +869,9 @@ async fn server_paths_and_trail_refs_unaffected() {
     assert!(!advertised.contains("refs/for"), "{advertised}");
 }
 
-/// Pins the CURRENT tag-protection list shape: reads need maintain+,
-/// unlike the gate-rule list, which any repository reader may list.
-async fn assert_tag_list_requires_maintain(
+/// Pins the CURRENT tag-protection list shape: any repository reader may
+/// list, exactly like the gate-rule list; mutations still need maintain+.
+async fn assert_tag_list_open_to_readers(
     client: &reqwest::Client,
     tags_url: &str,
     reader_token: &str,
@@ -879,8 +886,15 @@ async fn assert_tag_list_requires_maintain(
         .unwrap();
     assert_eq!(
         res.status(),
-        403,
-        "{role} readers cannot list tag protections"
+        200,
+        "{role} readers list tag protections like gate rules"
+    );
+    assert!(
+        res.json::<Value>()
+            .await
+            .unwrap()
+            .get("tag_protections")
+            .is_some()
     );
     let res = client
         .get(tags_url)
@@ -1101,8 +1115,9 @@ async fn api_access_matrix() {
         assert_eq!(res.status(), 404, "{role} sees 404 for unknown ids");
     }
 
-    // Tag-protection lists: anonymous 404, outsiders 404, and (unlike gate
-    // rules) below-maintain readers 403 — pinned in one helper.
+    // Tag-protection lists: anonymous 404, outsiders 404, every
+    // repository reader 200 (like the gate-rule list) — pinned in one
+    // helper. Mutations stay maintain+.
     assert_eq!(client.get(&tags).send().await.unwrap().status(), 404);
     for (token, role) in [(&gus_full, "outsider"), (&gus_repo, "scoped outsider")] {
         let res = client.get(&tags).bearer_auth(token).send().await.unwrap();
@@ -1113,7 +1128,7 @@ async fn api_access_matrix() {
         (&dave_trail, "triage"),
         (&erin_trail, "write"),
     ] {
-        assert_tag_list_requires_maintain(&client, &tags, token, role, &bob_full).await;
+        assert_tag_list_open_to_readers(&client, &tags, token, role, &bob_full).await;
     }
 
     // Tag-protection mutations: below maintain 403, maintain+ 201/204.

@@ -113,6 +113,12 @@ pub async fn is_ancestor(repo: &Path, ancestor: &str, head: &str) -> Result<bool
 /// hermetic [`git`] builder strips exactly those variables, so hook
 /// ancestry checks must use this instead. Exit `0` is true, `1` is false;
 /// anything else (missing objects, timeouts) is `Err`, never a verdict.
+/// The probe is bounded by [`IS_ANCESTOR_TIMEOUT`] (same as the hermetic
+/// probe; a timeout kills the child and is `Err`, so the caller's
+/// error-means-not-an-ancestor policy fails closed) and pins the git
+/// config (`GIT_CONFIG_NOSYSTEM`/`GLOBAL`/`TERMINAL_PROMPT`) like
+/// [`crate::command::git`], while deliberately keeping the quarantine
+/// object env.
 pub fn is_ancestor_inherit_env(repo: &Path, ancestor: &str, head: &str) -> Result<bool, GitError> {
     if !refpolicy::is_oid(ancestor) || !refpolicy::is_oid(head) {
         return Err(GitError::Failed {
@@ -120,21 +126,47 @@ pub fn is_ancestor_inherit_env(repo: &Path, ancestor: &str, head: &str) -> Resul
             stderr: "merge-base needs full object ids".to_owned(),
         });
     }
-    let out = std::process::Command::new("git")
+    use std::io::Read as _;
+    use std::process::Stdio;
+    let mut child = std::process::Command::new("git")
         .arg("-C")
         .arg(repo)
         .arg("merge-base")
         .arg("--is-ancestor")
         .arg(ancestor)
         .arg(head)
-        .output()
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(GitError::Io)?;
-    match out.status.code() {
+    let deadline = std::time::Instant::now() + IS_ANCESTOR_TIMEOUT;
+    let status = loop {
+        if let Some(status) = child.try_wait().map_err(GitError::Io)? {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(GitError::Failed {
+                command: "merge-base --is-ancestor".to_owned(),
+                stderr: "merge-base --is-ancestor timed out".to_owned(),
+            });
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let mut stderr = Vec::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        let _ = pipe.read_to_end(&mut stderr);
+    }
+    match status.code() {
         Some(0) => Ok(true),
         Some(1) => Ok(false),
         _ => Err(GitError::Failed {
             command: "merge-base --is-ancestor".to_owned(),
-            stderr: String::from_utf8_lossy(&out.stderr).trim().to_owned(),
+            stderr: String::from_utf8_lossy(&stderr).trim().to_owned(),
         }),
     }
 }
