@@ -95,6 +95,56 @@ impl ApiClient {
         self.read(response).await
     }
 
+    /// `DELETE {api_base}{path}`. Any 2xx (including an empty `204`) is
+    /// success; anything else is [`parse_error`].
+    pub async fn delete(&self, path: &str) -> Result<(), ApiError> {
+        let url = format!("{}{}", self.api_base, path);
+        let response = self
+            .client
+            .delete(&url)
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|err| ApiError::Transport(err.to_string()))?;
+        let status = response.status().as_u16();
+        if (200..300).contains(&status) {
+            Ok(())
+        } else {
+            let body = response
+                .bytes()
+                .await
+                .map_err(|err| ApiError::Transport(err.to_string()))?;
+            Err(parse_error(status, &body))
+        }
+    }
+
+    /// `GET {api_base}{path}` as raw bytes (segment downloads); the body is
+    /// never parsed as JSON. Non-2xx answers [`parse_error`] like [`get`].
+    pub async fn get_bytes(
+        &self,
+        path: &str,
+        query: &[(&str, String)],
+    ) -> Result<Vec<u8>, ApiError> {
+        let url = join_query(&format!("{}{}", self.api_base, path), query);
+        let response = self
+            .client
+            .get(&url)
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|err| ApiError::Transport(err.to_string()))?;
+        let status = response.status().as_u16();
+        let body = response
+            .bytes()
+            .await
+            .map_err(|err| ApiError::Transport(err.to_string()))?;
+        if (200..300).contains(&status) {
+            Ok(body.to_vec())
+        } else {
+            Err(parse_error(status, &body))
+        }
+    }
+
     /// Render an API failure as `(message, 1)` per the CLI HTTP binding.
     /// The token never appears: only the server origin, envelope fields, and
     /// transport causes (which carry URLs but never headers) are used.

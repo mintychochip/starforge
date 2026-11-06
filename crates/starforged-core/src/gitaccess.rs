@@ -199,6 +199,9 @@ impl Core {
             }
         };
         let repo = to_repo(row)?;
+        if repo.deleted_at.is_some() {
+            return Err(CoreError::NotFound);
+        }
         Ok(RepoAccess {
             repo,
             permission: if read_write {

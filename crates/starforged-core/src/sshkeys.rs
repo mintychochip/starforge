@@ -702,4 +702,66 @@ mod tests {
             1
         );
     }
+    #[tokio::test]
+    async fn deleted_user_frees_fingerprint_for_reuse() {
+        let (core, _f) = test_core().await;
+        let alice = make_user(&core, "alice").await;
+        let bob = make_user(&core, "bob").await;
+        let line = ed25519_key();
+        core.add_ssh_key(&alice, "k", &line).await.unwrap();
+        core.delete_account(&alice, "alice").await.unwrap();
+        assert!(core.add_ssh_key(&bob, "k", &line).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn purged_repo_frees_deploy_fingerprint_for_reuse() {
+        let (core, _f) = test_core().await;
+        let alice = make_user(&core, "alice").await;
+        let admin = core
+            .create_user(CreateUser {
+                handle: "siteadmin".into(),
+                is_admin: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let repo = core
+            .create_repo(
+                &alice,
+                &alice.handle,
+                CreateRepo {
+                    name: "proj".into(),
+                    description: String::new(),
+                    visibility: Visibility::Private,
+                    readme: false,
+                },
+            )
+            .await
+            .unwrap();
+        let line = ed25519_key();
+        core.add_deploy_key(&alice, "alice", "proj", "d", &line, false)
+            .await
+            .unwrap();
+        core.delete_repo(&alice, "alice", "proj", "alice/proj")
+            .await
+            .unwrap();
+        core.purge_repo_now(&admin, repo.id).await.unwrap();
+        core.create_repo(
+            &alice,
+            &alice.handle,
+            CreateRepo {
+                name: "proj2".into(),
+                description: String::new(),
+                visibility: Visibility::Private,
+                readme: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            core.add_deploy_key(&alice, "alice", "proj2", "d", &line, false)
+                .await
+                .is_ok()
+        );
+    }
 }

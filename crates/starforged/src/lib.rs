@@ -2,6 +2,7 @@
 
 pub mod admin;
 pub mod config;
+pub mod doctor;
 pub mod hook;
 pub mod index_cmd;
 pub mod init;

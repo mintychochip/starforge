@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+{% block title %}Mirrors · {{ head.owner }}/{{ head.name }}{% endblock %}
+{% block content %}
+{% include "repo_head.html" %}
+{% include "repo_settings_nav.html" %}
+{% if let Some(e) = error %}<p class="error">{{ e }}</p>{% endif %}
+<h2>Pull mirror</h2>
+{% if let Some(m) = mirror %}
+{% if let Some(t) = m.last_success_at %}<p class="muted">Last successful sync: {{ crate::views::format_time(**t) }}</p>{% endif %}
+{% if let Some(k) = m.ssh_public_key %}<p>Install this public key upstream: <code>{{ k }}</code></p>{% endif %}
+{% if !m.last_error.is_empty() %}<p class="error">{{ m.last_error }}</p>{% endif %}
+<form method="post" action="/{{ head.owner }}/{{ head.name }}/settings/mirrors/sync" class="inline"><input type="hidden" name="_csrf" value="{{ csrf }}"><button type="submit">Sync now</button></form>
+<form method="post" action="/{{ head.owner }}/{{ head.name }}/settings/mirrors/enabled" class="inline"><input type="hidden" name="_csrf" value="{{ csrf }}">{% if m.enabled %}<button type="submit">Disable mirror</button>{% else %}<input type="hidden" name="enabled" value="1"><button type="submit">Enable mirror</button>{% endif %}</form>
+<form method="post" action="/{{ head.owner }}/{{ head.name }}/settings/mirrors/delete" class="inline"><input type="hidden" name="_csrf" value="{{ csrf }}"><button type="submit">Delete mirror</button></form>
+{% else %}
+<p class="muted">No pull mirror configured. While a mirror is enabled, branch and tag pushes are refused and merges are refused; <code>refs/for</code> stays open.</p>
+{% endif %}
+<h3>{% if mirror.is_some() %}Update{% endif %} pull mirror</h3>
+<form method="post" action="/{{ head.owner }}/{{ head.name }}/settings/mirrors" class="stack">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <label>Upstream URL <input name="url" required maxlength="2000" placeholder="https://example.com/owner/repo.git"></label>
+  <label>Auth
+    <select name="auth">
+      <option value="none">none</option>
+      <option value="https">https credentials</option>
+      <option value="ssh">ssh key</option>
+    </select>
+  </label>
+  <label>Username <input name="username" maxlength="200"></label>
+  <label>Password or token <input name="password" type="password" autocomplete="off"></label>
+  <label>Sync every (seconds, minimum 300) <input name="interval_secs" type="number" min="300" value="3600"></label>
+  <button type="submit">Save mirror</button>
+</form>
+{% endblock %}

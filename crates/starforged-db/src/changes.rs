@@ -365,6 +365,40 @@ pub async fn insert_change(
     .await
 }
 
+/// Inserts a change from an import (M4c D3): an `imported` change, k = 1
+/// on a fresh Trail, so the change number is always 1. `creator_id` is the
+/// matched local author, or `None` for a placeholder (the column is
+/// nullable; a placeholder holds no account, D1).
+pub async fn insert_imported_change(
+    db: &Db,
+    trail_id: i64,
+    head_branch: Option<&str>,
+    base_branch: &str,
+    creator_id: Option<i64>,
+    now: i64,
+) -> DbResult<ChangeRow> {
+    let mut tx = db.pool().begin().await?;
+    let number = alloc_change_number(&mut tx, trail_id).await?;
+    let row = sqlx::query(
+        "INSERT INTO changes (trail_id, number, kind, head_branch, base_branch, topic, state, creator_id, \
+         created_at, updated_at) \
+         VALUES ($1, $2, 'imported', $3, $4, '', 'open', $5, $6, $6) \
+         RETURNING id, trail_id, number, kind, head_branch, base_branch, topic, current_revision_id, \
+         state, merge_method, merge_commit, creator_id, created_at, updated_at, mergeability, conflict_paths",
+    )
+    .bind(trail_id)
+    .bind(number)
+    .bind(head_branch)
+    .bind(base_branch)
+    .bind(creator_id)
+    .bind(now)
+    .fetch_one(&mut *tx)
+    .await?;
+    let change = change_from_row(&row)?;
+    tx.commit().await?;
+    Ok(change)
+}
+
 pub async fn change_by_trail_number(db: &Db, trail_id: i64, k: i64) -> DbResult<Option<ChangeRow>> {
     let row = sqlx::query(select_change!("WHERE trail_id = $1 AND number = $2"))
         .bind(trail_id)

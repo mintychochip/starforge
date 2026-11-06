@@ -165,7 +165,13 @@ pub(crate) async fn count_votes(
     let mut approvals = 0;
     let mut request_changes = 0;
     for r in reviews {
-        let author = state.core.user_by_handle(&r.author_handle).await?;
+        // Resolve BY ID, never by handle: a placeholder review's
+        // `author_handle` is a raw GitHub login that could collide with
+        // a local writer's handle, and placeholders never count (M4c D4).
+        let author = match r.author_id {
+            Some(id) => state.core.user_by_id(id).await?,
+            None => None,
+        };
         let counting = state
             .core
             .permission_on(&access.repo, author.as_ref())
@@ -309,7 +315,13 @@ async fn change_view(
         reviewers.insert(r.author_handle.clone());
         // Only write+ reviews count toward merge gates (counted in M2c);
         // everyone at read or above may still record a verdict.
-        let author = state.core.user_by_handle(&r.author_handle).await?;
+        // Resolve BY ID, never by handle (a placeholder login could
+        // collide with a local writer's handle; placeholders never
+        // count, M4c D4).
+        let author = match r.author_id {
+            Some(id) => state.core.user_by_id(id).await?,
+            None => None,
+        };
         let counting = state
             .core
             .permission_on(&access.repo, author.as_ref())
@@ -336,7 +348,7 @@ async fn change_view(
             can_dismiss: detail.can_triage,
         });
     }
-    let viewer_handle = session.map(|s| s.user.handle.as_str());
+    let viewer_id = session.map(|s| s.user.id);
     let mut items = Vec::new();
     for t in &detail.threads {
         let comments = t
@@ -349,11 +361,13 @@ async fn change_view(
                 created: format_time(c.created_at),
             })
             .collect::<Vec<_>>();
-        // The thread author (first comment) or triage may resolve.
+        // The thread author (first comment, by author ID — never a
+        // placeholder login, which could collide with the viewer's
+        // handle) or triage may resolve.
         let can_resolve = detail.can_triage
             || t.comments
                 .first()
-                .is_some_and(|c| Some(c.author_handle.as_str()) == viewer_handle);
+                .is_some_and(|c| c.author_id.is_some() && c.author_id == viewer_id);
         items.push(ThreadItem {
             id: t.id,
             path: t.path.clone(),

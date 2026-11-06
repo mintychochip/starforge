@@ -4,7 +4,7 @@
 //! stay undiscoverable — the same convention as [`Core::repo_for`] for
 //! repositories the viewer cannot read.
 
-use starforge_format::{Event, decompress_bounded, parse_event};
+use starforge_format::{Event, EventKind, decompress_bounded, parse_event};
 use starforge_redact::redact_event;
 use starforged_db::{repos as db_repos, sessions as db_sessions, sessions::SessionRow};
 
@@ -17,6 +17,30 @@ use crate::{
 
 /// Events per session viewer page (spec §10.2, binding).
 pub const VIEWER_PER_PAGE: i64 = 200;
+
+/// Maximum hits from one in-session search (D3): at most 200 hits.
+pub const SEARCH_MAX_HITS: usize = 200;
+
+/// One in-session search hit (D3): a server-redacted event whose searched
+/// text contains the query (case-insensitive substring). `preview` is a
+/// snippet of the matched text; redaction ran before the search, so
+/// previews never carry a stored secret.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionSearchHit {
+    pub seq: u64,
+    pub page: i64,
+    pub kind: String,
+    pub preview: String,
+}
+
+/// One commit marker (D3): the session viewer renders it after the event
+/// at the link's `seq_end`, linking to the commit page and the split view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitMarker {
+    pub sha: String,
+    pub short_sha: String,
+    pub seq_end: i64,
+}
 
 /// One slot on a rendered session page: a server-redacted event, or a marker
 /// for a segment whose bytes could not be decoded. Markers render as an
@@ -127,6 +151,9 @@ pub struct SessionSummary {
 const DASHBOARD_SESSION_CANDIDATES: i64 = 100;
 /// Dashboard display cap for the sessions section (D8).
 const DASHBOARD_SESSIONS: usize = 10;
+/// Candidate cap for the readable session listing: export enumerates
+/// sessions through it, so a repository past the cap silently truncates.
+const READABLE_SESSION_LIST_LIMIT: i64 = 10_000;
 
 impl Core {
     /// The viewer's own uploads that pass the §6.4 read check for them now,
@@ -179,10 +206,7 @@ impl Core {
     /// segment bytes (missing blob, failed decompression, non-UTF-8) become
     /// [`SessionPageItem::UnreadableSegment`]; unparseable lines are skipped
     /// with a warning, never failing the page.
-    pub(crate) async fn load_session_items(
-        &self,
-        session_id: i64,
-    ) -> CoreResult<Vec<SessionPageItem>> {
+    pub async fn load_session_items(&self, session_id: i64) -> CoreResult<Vec<SessionPageItem>> {
         let session = db_sessions::session_by_id(self.db(), session_id)
             .await?
             .ok_or(CoreError::NotFound)?;
@@ -272,6 +296,70 @@ impl Core {
         Ok((1, false))
     }
 
+    /// In-session search (D3, spec §10.5 scope): case-insensitive substring
+    /// over message text (user/assistant messages), tool names, and file
+    /// paths, over the same server-redacted items the viewer renders —
+    /// tool inputs are never searched. At most [`SEARCH_MAX_HITS`] hits,
+    /// each naming the 1-based page and `turn-<seq>` anchor it lives on.
+    /// Callers authorize the session first; an empty query yields no hits.
+    pub async fn search_session(
+        &self,
+        session_id: i64,
+        query: &str,
+    ) -> CoreResult<Vec<SessionSearchHit>> {
+        let needle = query.to_lowercase();
+        if needle.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let items = self.load_session_items(session_id).await?;
+        let mut hits = Vec::new();
+        for (index, item) in items.iter().enumerate() {
+            let SessionPageItem::Event(event) = item else {
+                continue;
+            };
+            let Some((kind, text)) = searchable_text(event) else {
+                continue;
+            };
+            if !text.to_lowercase().contains(&needle) {
+                continue;
+            }
+            hits.push(SessionSearchHit {
+                seq: event.seq,
+                page: (index as i64) / VIEWER_PER_PAGE + 1,
+                kind: kind.to_owned(),
+                preview: snippet(text),
+            });
+            if hits.len() >= SEARCH_MAX_HITS {
+                break;
+            }
+        }
+        Ok(hits)
+    }
+
+    /// Commit markers (D3): one per commit-link row with a `seq_end`, oldest
+    /// first, deduplicated by (sha, seq_end). Callers authorize the session
+    /// first; links carry no content of their own.
+    pub async fn commit_markers(&self, session_id: i64) -> CoreResult<Vec<CommitMarker>> {
+        let mut out = Vec::new();
+        for link in self.session_links(session_id).await? {
+            let Some(seq_end) = link.seq_end else {
+                continue;
+            };
+            if out
+                .iter()
+                .any(|m: &CommitMarker| m.sha == link.sha && m.seq_end == seq_end)
+            {
+                continue;
+            }
+            out.push(CommitMarker {
+                short_sha: link.sha.chars().take(7).collect(),
+                sha: link.sha,
+                seq_end,
+            });
+        }
+        Ok(out)
+    }
+
     /// The full normalized transcript: every redacted event re-serialized to
     /// its canonical JSONL line (the same bytes the viewer renders, and the
     /// bytes a future export bundle will contain). Undecodable segments and
@@ -300,6 +388,46 @@ impl Core {
         session_id: i64,
     ) -> CoreResult<Vec<db_sessions::CommitLinkRow>> {
         Ok(db_sessions::links_of_session(self.db(), session_id).await?)
+    }
+
+    /// The sessions of `access.repo` that the §6.4 read rule admits for
+    /// `viewer`, oldest first. Backs the readable session listing
+    /// (`GET /repos/{owner}/{repo}/sessions`); callers keep the ULIDs
+    /// undiscoverable by stamping the same per-row check as
+    /// [`Core::authorize_session_read`].
+    pub async fn list_readable_sessions(
+        &self,
+        viewer: Option<&User>,
+        access: &RepoAccess,
+    ) -> CoreResult<Vec<SessionRow>> {
+        let rows =
+            db_sessions::sessions_of_repo(self.db(), access.repo.id, READABLE_SESSION_LIST_LIMIT)
+                .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            if self
+                .authorize_session_read(viewer, &access.repo, &row)
+                .await
+                .is_ok()
+            {
+                out.push(row);
+            }
+        }
+        Ok(out)
+    }
+
+    /// The exact stored bytes of segment `n` of `session_id` (the compressed
+    /// JSONL blob, verbatim). Callers authorize the session first; a missing
+    /// segment answers [`CoreError::NotFound`].
+    pub async fn session_segment_bytes(&self, session_id: i64, n: i64) -> CoreResult<Vec<u8>> {
+        let segment = db_sessions::segment_by_n(self.db(), session_id, n)
+            .await?
+            .ok_or(CoreError::NotFound)?;
+        self.config()
+            .blob_store
+            .get_by_hash(&segment.blob_hash)
+            .await
+            .map_err(|e| CoreError::Internal(format!("reading segment blob: {e}")))
     }
     /// Links filed under `sha` that `viewer` may read, oldest first, each
     /// paired with its session row.
@@ -378,6 +506,25 @@ impl Core {
     }
 }
 
+/// The searched text of one event under spec §10.5's scope (D3): message
+/// text (user/assistant), tool names, and file paths. Tool inputs and
+/// outputs are never searched. Returns the event's kind name with the text.
+fn searchable_text(event: &Event) -> Option<(&'static str, &str)> {
+    match &event.kind {
+        EventKind::UserMessage(message) => Some(("user_message", &message.text)),
+        EventKind::AssistantMessage(message) => Some(("assistant_message", &message.text)),
+        EventKind::ToolCall(call) => Some(("tool_call", &call.tool.name)),
+        EventKind::FileChange(change) => Some(("file_change", &change.path)),
+        _ => None,
+    }
+}
+
+/// The first 160 characters of a matched text, for search previews.
+/// The input is already server-redacted; callers escape it for HTML.
+fn snippet(text: &str) -> String {
+    text.chars().take(160).collect()
+}
+
 /// Pure read rule: may `viewer` see `session` on `repo`?
 ///
 /// `is_member` is [`Core::is_repo_member`] (explicit grant only — implicit
@@ -445,7 +592,7 @@ mod tests {
     use crate::repos::CreateRepo;
     use crate::testing::{test_core, user};
 
-    fn repo(visibility: Visibility) -> Repo {
+    pub(crate) fn repo(visibility: Visibility) -> Repo {
         Repo {
             id: 1,
             owner_id: 7,
@@ -463,7 +610,7 @@ mod tests {
         }
     }
 
-    fn session_row(uploader_id: i64, visibility: &str, quarantine: &str) -> SessionRow {
+    pub(crate) fn session_row(uploader_id: i64, visibility: &str, quarantine: &str) -> SessionRow {
         SessionRow {
             id: 1,
             repo_id: 1,
@@ -1148,5 +1295,243 @@ mod tests {
             s.core.is_repo_member(999_999, s.carol.id).await,
             Err(CoreError::NotFound)
         ));
+    }
+}
+
+#[cfg(test)]
+mod proptests {
+    //! §6.4 property tests (spec §13): [`can_read_session`] equals the
+    //! reference implementation written directly from the three numbered
+    //! rules of spec §6.4, over the whole consistent fact space (checked
+    //! exhaustively; the domains are tiny).
+    //!
+    //! Rule readings used by both, pinned here:
+    //! 1. "can read the repo" = explicit member, owner, public visibility,
+    //!    or signed-in on internal. (Effective admins reach this only
+    //!    through ownership or an explicit grant, so the fact generator
+    //!    keeps `is_admin` consistent with those.)
+    //! 2. "repo member" includes the owner (owners read everything that is
+    //!    not quarantined).
+    //! 3. Quarantined sessions: the uploader or a repo admin only — the
+    //!    truth table pins this arm as bypassing rules 1-2.
+    //!
+    //! Site admins read everything (the implementation's row 12).
+
+    use super::*;
+    use crate::permission::{Viewer, Visibility};
+
+    const OWNER: i64 = 7;
+    const UPLOADER: i64 = 42;
+    const OTHER: i64 = 9;
+
+    /// The reference rule: spec §6.4's three numbered rules, verbatim logic.
+    #[allow(clippy::too_many_arguments)]
+    fn ref_read(
+        site_admin: bool,
+        signed_in: bool,
+        is_owner: bool,
+        is_uploader: bool,
+        is_member: bool,
+        is_admin: bool,
+        visibility: Visibility,
+        published: bool,
+        quarantined: bool,
+    ) -> bool {
+        if site_admin {
+            return true;
+        }
+        // Rule 3 (quarantine gate; uploader or repo admin only).
+        if quarantined {
+            return is_uploader || is_owner || is_admin;
+        }
+        // Rule 1: the viewer can read the repository.
+        let repo_read = is_member
+            || is_owner
+            || visibility == Visibility::Public
+            || (visibility == Visibility::Internal && signed_in);
+        // Rule 2: not public, or published, or a repo member (owner counts).
+        repo_read && (visibility != Visibility::Public || published || is_member || is_owner)
+    }
+
+    /// One consistent viewer/session/repo fact combination. `viewer_id` is
+    /// `Some(OWNER)`, `Some(UPLOADER)`, `Some(OTHER)`, `Some(-1)` for the
+    /// owner-and-uploader corner, or `None` for anonymous.
+    struct Facts {
+        site_admin: bool,
+        viewer_id: Option<i64>,
+        is_member: bool,
+        admin_grant: bool,
+        visibility: Visibility,
+        published: bool,
+        quarantined: bool,
+    }
+
+    /// Every consistent fact combination. Viewer ids select owner (`OWNER`),
+    /// uploader (`UPLOADER`), a stranger, or anonymous; `is_admin` is derived
+    /// as owner, site admin, or an explicit admin grant — explicit grants
+    /// are the only other source of effective admin, and they make the
+    /// viewer a member.
+    fn facts() -> Vec<Facts> {
+        let mut out = Vec::new();
+        for site_admin in [false, true] {
+            for viewer in [None, Some(OWNER), Some(UPLOADER), Some(OTHER)] {
+                // Owner-and-uploader needs a separate id; use OWNER with
+                // `uploader = OWNER` below, covered by the dedicated case.
+                for is_member in [false, true] {
+                    for admin_grant in [false, true] {
+                        if admin_grant && !is_member {
+                            continue; // an explicit admin grant is a grant
+                        }
+                        for visibility in [
+                            Visibility::Public,
+                            Visibility::Internal,
+                            Visibility::Private,
+                        ] {
+                            for published in [false, true] {
+                                for quarantined in [false, true] {
+                                    out.push(Facts {
+                                        site_admin,
+                                        viewer_id: viewer,
+                                        is_member,
+                                        admin_grant,
+                                        visibility,
+                                        published,
+                                        quarantined,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // The owner-is-uploader corner (header ids coincide).
+        for site_admin in [false, true] {
+            for is_member in [false, true] {
+                for visibility in [
+                    Visibility::Public,
+                    Visibility::Internal,
+                    Visibility::Private,
+                ] {
+                    for published in [false, true] {
+                        for quarantined in [false, true] {
+                            out.push(Facts {
+                                site_admin,
+                                viewer_id: Some(-1), // sentinel: owner AND uploader
+                                is_member,
+                                admin_grant: false,
+                                visibility,
+                                published,
+                                quarantined,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn check_one(f: Facts) -> bool {
+        let Facts {
+            site_admin,
+            viewer_id,
+            is_member,
+            admin_grant,
+            visibility,
+            published,
+            quarantined,
+        } = f;
+        // A site admin is necessarily signed in; that combination cannot
+        // arise from the real call sites.
+        if site_admin && viewer_id.is_none() {
+            return true;
+        }
+        let uploader = match viewer_id {
+            Some(-1) => OWNER,
+            _ => UPLOADER,
+        };
+        let viewer = viewer_id.map(|id| Viewer {
+            user_id: if id == -1 { OWNER } else { id },
+            is_admin: site_admin,
+        });
+        let signed_in = viewer.is_some();
+        let is_owner = viewer.is_some_and(|v| v.user_id == OWNER);
+        let is_uploader = viewer.is_some_and(|v| v.user_id == uploader);
+        let is_admin = is_owner || site_admin || admin_grant;
+        let repo = super::tests::repo(visibility);
+        let session = super::tests::session_row(
+            uploader,
+            if published { "published" } else { "inherit" },
+            if quarantined { "quarantined" } else { "none" },
+        );
+        assert_eq!(
+            can_read_session(viewer, &repo, &session, is_member, is_admin),
+            ref_read(
+                site_admin,
+                signed_in,
+                is_owner,
+                is_uploader,
+                is_member,
+                is_admin,
+                visibility,
+                published,
+                quarantined,
+            ),
+            "site={site_admin} viewer={viewer_id:?} member={is_member} grant={admin_grant} vis={visibility:?} pub={published} quar={quarantined}",
+        );
+        true
+    }
+
+    #[test]
+    fn can_read_session_matches_spec_reference_exhaustively() {
+        let all = facts();
+        // Exact coverage: 2 site × [4 viewers × 3 grant combos (an admin
+        // grant requires membership) + 1 owner-and-uploader viewer × 2
+        // membership values] × 3 visibilities × 2 published × 2 quarantined
+        // = 336. Pinning the count so the generator cannot silently shrink.
+        assert_eq!(all.len(), 336, "fact space shrank: {}", all.len());
+        for fact in all {
+            check_one(fact);
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(256))]
+
+        /// Sampled agreement: the predicate equals the spec reference on
+        /// randomly drawn consistent facts.
+        #[test]
+        fn can_read_session_matches_spec_reference_sampled(
+            site_admin in proptest::bool::ANY,
+            viewer in proptest::prop_oneof![
+                proptest::strategy::Just(None),
+                proptest::strategy::Just(Some(-1)),
+                proptest::strategy::Just(Some(OWNER)),
+                proptest::strategy::Just(Some(UPLOADER)),
+                proptest::strategy::Just(Some(OTHER)),
+            ],
+            is_member in proptest::bool::ANY,
+            want_admin in proptest::bool::ANY,
+            visibility in proptest::prop_oneof![
+                proptest::strategy::Just(Visibility::Public),
+                proptest::strategy::Just(Visibility::Internal),
+                proptest::strategy::Just(Visibility::Private),
+            ],
+            published in proptest::bool::ANY,
+            quarantined in proptest::bool::ANY,
+        ) {
+            // An explicit admin grant exists only on top of a grant.
+            let admin_grant = is_member && want_admin;
+            check_one(Facts {
+                site_admin,
+                viewer_id: viewer,
+                is_member,
+                admin_grant,
+                visibility,
+                published,
+                quarantined,
+            });
+        }
     }
 }

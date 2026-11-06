@@ -91,6 +91,14 @@ pub enum Job {
     /// One-time import from a git URL (M4b D3). Deduplicated per
     /// repository: a retry/start while one is queued collapses into it.
     ImportRepo { repo_id: i64 },
+    /// One-time GitHub metadata import for a repository (M4c G2). Deduplicated
+    /// per repository; the run re-enqueues itself on rate limits and resumes
+    /// from the saved cursor.
+    ImportGithub { repo_id: i64 },
+    /// One pull-mirror sync (M4b D4). Deduplicated per repository; the run
+    /// re-enqueues itself at the mirror's interval (or the backoff floor
+    /// after a failure) while the mirror stays enabled.
+    PullMirror { repo_id: i64 },
 }
 
 impl Job {
@@ -114,6 +122,8 @@ impl Job {
             Job::RecordRevisionCommits { .. } => "record_revision_commits",
             Job::WebhookDelivery { .. } => "webhook_delivery",
             Job::ImportRepo { .. } => "import_repo",
+            Job::ImportGithub { .. } => "import_github",
+            Job::PullMirror { .. } => "pull_mirror",
         }
     }
 
@@ -136,6 +146,8 @@ impl Job {
             Job::ChangeMergeability { .. } => None,
             Job::RecordRevisionCommits { .. } => None,
             Job::ImportRepo { .. } => None,
+            Job::ImportGithub { .. } => None,
+            Job::PullMirror { .. } => None,
             Job::WebhookDelivery { .. } => None,
             Job::SessionWebhookOutbox { .. } => None,
         }
@@ -161,6 +173,8 @@ impl Job {
                 Some(format!("record_revision_commits:{revision_id}"))
             }
             Job::ImportRepo { repo_id } => Some(format!("import_repo:{repo_id}")),
+            Job::ImportGithub { repo_id } => Some(format!("import_github:{repo_id}")),
+            Job::PullMirror { repo_id } => Some(format!("pull_mirror:{repo_id}")),
             _ => self.recurrence().map(|_| self.kind().to_owned()),
         }
     }
@@ -175,6 +189,22 @@ impl Core {
     /// Queues `job` to run at `run_at` (unix seconds). A recurring job that is already pending is left alone.
     pub async fn enqueue_at(&self, job: &Job, run_at: i64) -> CoreResult<()> {
         self.insert_job(job, run_at).await.map(|_| ())
+    }
+
+    /// Queues `job` to run now even when a copy is already queued for the
+    /// future (pull-mirror "sync now" and reconfiguration): the insert
+    /// collides with the scheduled row, so the queued row is expedited to
+    /// `now()` instead of being left in the future. A running job already
+    /// covers the request and is untouched.
+    pub async fn enqueue_or_expedite(&self, job: &Job) -> CoreResult<()> {
+        let id = self.insert_job(job, now()).await?;
+        if id.is_none()
+            && let Some(key) = job.dedupe_key()
+        {
+            jobs::expedite(self.db(), &key, now()).await?;
+            self.inner.job_wakeup.notify_one();
+        }
+        Ok(())
     }
 
     /// Queues `job` to run now and returns its id (jobs without a dedupe
@@ -253,6 +283,14 @@ impl Core {
         {
             self.enqueue_at(job, now() + interval).await?;
         }
+        // A pull mirror is not wall-clock recurring: its next run lands at
+        // the mirror's own interval after a success, or the 300 s backoff
+        // floor after a failure. This runs after the current row is done,
+        // so the re-enqueue never collides with the dedupe key still held
+        // by the running job.
+        if finished && let Ok(Job::PullMirror { repo_id }) = &job {
+            self.reschedule_pull_mirror(*repo_id).await?;
+        }
         Ok(true)
     }
 
@@ -281,6 +319,8 @@ impl Core {
                 self.backfill_revision_commits(*revision_id).await
             }
             Job::ImportRepo { repo_id } => self.run_import(*repo_id).await,
+            Job::ImportGithub { repo_id } => self.run_github_import(*repo_id).await,
+            Job::PullMirror { repo_id } => self.run_pull_mirror(*repo_id).await,
             Job::WebhookDelivery {
                 webhook_id,
                 event,

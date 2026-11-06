@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+{% block title %}Search{% endblock %}
+{% block content %}
+<h2>Search</h2>
+<nav class="tabs">
+  <a href="/search?tab=trails"{% if tab == "trails" %} class="active"{% endif %}>Trails</a>
+  <a href="/search?tab=sessions"{% if tab == "sessions" %} class="active"{% endif %}>Sessions</a>
+</nav>
+<form method="get" action="/search" class="filters">
+  <input type="hidden" name="tab" value="{{ tab }}">
+  <label>Query <input type="text" name="q" value="{{ q }}"></label>
+  <label>Repository <input type="text" name="repo" value="{{ repo }}" placeholder="owner/name"></label>
+{% if tab == "sessions" %}
+  <label>Agent <input type="text" name="agent" value="{{ agent }}"></label>
+  <label>Model <input type="text" name="model" value="{{ model }}"></label>
+  <label>Commit <input type="text" name="commit" value="{{ commit }}"></label>
+{% endif %}
+  <label>Author <input type="text" name="author" value="{{ author }}"></label>
+  <label>From <input type="text" name="from" value="{{ from }}" placeholder="YYYY-MM-DD"></label>
+  <label>To <input type="text" name="to" value="{{ to }}" placeholder="YYYY-MM-DD"></label>
+  <label>Per page <input type="text" name="per_page" value="{{ per_page }}"></label>
+  <button type="submit">Search</button>
+</form>
+{% if tab == "trails" %}
+{% if trails.is_empty() %}
+<p class="muted">No results.</p>
+{% else %}
+<ul class="search-results">
+{% for t in trails %}
+  <li>
+    <a href="/{{ t.owner }}/{{ t.repo }}/trails/{{ t.number }}">#{{ t.number }} {{ t.title }}</a>
+    <span class="badge">{{ t.state }}</span>
+    <span class="muted">{{ t.owner }}/{{ t.repo }} · {{ t.age }}</span>
+    <p>{% for s in t.segs %}{% if s.mark %}<mark>{{ s.text }}</mark>{% else %}{{ s.text }}{% endif %}{% endfor %}</p>
+  </li>
+{% endfor %}
+</ul>
+{% endif %}
+{% else %}
+{% if sessions.is_empty() %}
+<p class="muted">No results.</p>
+{% else %}
+<ul class="search-results">
+{% for s in sessions %}
+  <li>
+    <a href="/{{ s.owner }}/{{ s.repo }}/sessions/{{ s.ulid }}">{{ s.title }}</a>
+    <span class="badge">{{ s.agent }}</span>
+    <span class="muted">{{ s.owner }}/{{ s.repo }}</span>
+    <ul>
+    {% for e in s.events %}
+      <li><a href="{{ e.href }}">{{ e.kind }}</a> {% for seg in e.segs %}{% if seg.mark %}<mark>{{ seg.text }}</mark>{% else %}{{ seg.text }}{% endif %}{% endfor %}</li>
+    {% endfor %}
+    </ul>
+  </li>
+{% endfor %}
+</ul>
+{% endif %}
+{% endif %}
+<nav class="pager muted">Page {{ page }}{% if let Some(href) = prev_href %} · <a href="{{ href }}">Previous</a>{% endif %}{% if let Some(href) = next_href %} · <a href="{{ href }}">Next</a>{% endif %}</nav>
+{% endblock %}

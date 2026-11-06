@@ -14,6 +14,9 @@ pub enum RegistrationMode {
     Open,
     /// Addresses at `allowed_domains` sign up; requires mail.
     Domains,
+    /// SSO-only: password sign-up and invite acceptance are refused; new
+    /// accounts come only from OIDC auto-create (plan D6).
+    Sso,
 }
 
 impl RegistrationMode {
@@ -22,6 +25,7 @@ impl RegistrationMode {
             "invite" => Some(RegistrationMode::Invite),
             "open" => Some(RegistrationMode::Open),
             "domains" => Some(RegistrationMode::Domains),
+            "sso" => Some(RegistrationMode::Sso),
             _ => None,
         }
     }
@@ -31,6 +35,7 @@ impl RegistrationMode {
             RegistrationMode::Invite => "invite",
             RegistrationMode::Open => "open",
             RegistrationMode::Domains => "domains",
+            RegistrationMode::Sso => "sso",
         }
     }
 }
@@ -87,7 +92,15 @@ impl Core {
 
     /// Whether `/join` accepts people without an invite link (`open` and `domains` modes).
     pub fn sign_up_open(&self) -> bool {
-        self.registration().mode != RegistrationMode::Invite
+        matches!(
+            self.registration().mode,
+            RegistrationMode::Open | RegistrationMode::Domains
+        )
+    }
+
+    /// Whether the instance only creates accounts through OIDC auto-create (plan D6).
+    pub fn sso_only(&self) -> bool {
+        self.registration().mode == RegistrationMode::Sso
     }
 
     pub async fn sign_up(&self, input: SignUp) -> CoreResult<SignedUp> {
@@ -120,6 +133,11 @@ impl Core {
         email: &str,
         invite: Option<&InviteRow>,
     ) -> CoreResult<SignedUp> {
+        if self.sso_only() {
+            return Err(CoreError::Invalid(
+                "Sign-up is disabled on this instance; sign in with single sign-on instead.".into(),
+            ));
+        }
         let verified_by_invite = match invite {
             Some(invite) => match &invite.email {
                 Some(bound) if bound != email => {
@@ -168,6 +186,9 @@ impl Core {
             RegistrationMode::Invite => {
                 Err(CoreError::Invalid("Sign-up is by invitation only.".into()))
             }
+            RegistrationMode::Sso => Err(CoreError::Invalid(
+                "Sign-up is disabled on this instance; sign in with single sign-on instead.".into(),
+            )),
             RegistrationMode::Open => Ok(()),
             RegistrationMode::Domains => {
                 let domain = email.rsplit_once('@').map(|(_, d)| d).unwrap_or("");

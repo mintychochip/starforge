@@ -59,10 +59,34 @@
   <dt>Capture mode</dt><dd>{{ capture_mode }}</dd>
   <dt>Visibility</dt><dd>{{ visibility }}</dd>
 </dl>
+<form method="get" class="session-search">
+  <label>Search in session <input type="search" name="q" value="{{ q }}"></label>
+  <button type="submit">Search</button>
+</form>
+{% if searched %}
+<section class="search-results" aria-label="Search results">
+<h3>{{ hit_count }} hits for {{ q }}</h3>
+<ul>
+{% for h in search_hits %}
+<li class="search-hit"><a href="?page={{ h.page }}&focus={{ h.seq }}#turn-{{ h.seq }}">turn {{ h.seq }}</a> <span class="muted">{{ h.preview }}</span></li>
+{% endfor %}
+</ul>
+</section>
+{% endif %}
+<div class="session-split">
+<div class="transcript-col">
 <div class="events">
 {% for ev in events %}
 <article id="{{ ev.anchor }}"{% if ev.focused %} class="focused"{% endif %}>{{ ev.html|safe }}</article>
 {% endfor %}
 </div>
 <nav class="pager muted">Page {{ page }} of {{ pages }} · {{ total }} events{% if let Some(p) = prev %} · <a href="?page={{ p }}">Previous</a>{% endif %}{% if let Some(n) = next %} · <a href="?page={{ n }}">Next</a>{% endif %} · <a href="/{{ head.owner }}/{{ head.name }}/sessions/{{ ulid }}/download">Download JSONL</a></nav>
+</div>
+{% if let Some(sha) = split_sha %}
+<aside class="split-col">
+<h3>Commit <code>{{ sha }}</code> · <a href="/{{ head.owner }}/{{ head.name }}/sessions/{{ ulid }}">Close split view</a></h3>
+{% include "diff_files.html" %}
+</aside>
+{% endif %}
+</div>
 {% endblock %}

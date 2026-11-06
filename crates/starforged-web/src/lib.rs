@@ -54,11 +54,14 @@ pub fn router(core: Core, settings: WebSettings) -> Router {
 fn page_routes() -> Router<AppState> {
     Router::new()
         .route("/", get(pages::dashboard::show))
+        .route("/search", get(pages::search::show))
         .route("/login", get(pages::login::form).post(pages::login::submit))
         .route(
             "/login/two-factor",
             get(pages::login::two_factor_form).post(pages::login::two_factor_submit),
         )
+        .route("/login/oidc", get(pages::login::oidc_begin))
+        .route("/login/oidc/callback", get(pages::login::oidc_callback))
         .route("/join", get(pages::join::form).post(pages::join::submit))
         .route("/logout", post(pages::login::logout))
         .route("/oauth/device", get(pages::device::show))
@@ -131,6 +134,12 @@ fn page_routes() -> Router<AppState> {
         .route(
             "/settings/two-factor",
             get(pages::settings_2fa::index).post(pages::settings_2fa::submit),
+        )
+        .route("/settings/identities", get(pages::identities::index))
+        .route("/settings/identities/link", post(pages::identities::link))
+        .route(
+            "/settings/identities/{id}/unlink",
+            post(pages::identities::unlink),
         )
         .route("/admin", get(pages::admin::overview))
         .route(
@@ -274,6 +283,22 @@ fn page_routes() -> Router<AppState> {
         .route(
             "/{owner}/{repo}/settings/hooks/{id}/deliveries/{row}/redeliver",
             post(pages::webhooks::redeliver),
+        )
+        .route(
+            "/{owner}/{repo}/settings/mirrors",
+            get(pages::remotes::show).post(pages::remotes::save),
+        )
+        .route(
+            "/{owner}/{repo}/settings/mirrors/sync",
+            post(pages::remotes::sync_now),
+        )
+        .route(
+            "/{owner}/{repo}/settings/mirrors/enabled",
+            post(pages::remotes::set_enabled),
+        )
+        .route(
+            "/{owner}/{repo}/settings/mirrors/delete",
+            post(pages::remotes::delete),
         )
         .route(
             "/{owner}/{repo}/settings/refs-for-access",

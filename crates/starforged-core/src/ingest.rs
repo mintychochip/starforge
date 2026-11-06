@@ -751,7 +751,7 @@ impl Core {
         {
             return Err(CoreError::NotFound);
         }
-        self.remove_session_rows(Some(actor.id), access, &session, "session.deleted")
+        self.remove_session_rows(Some(actor.id), access.repo.id, &session, "session.deleted")
             .await
     }
 
@@ -761,11 +761,11 @@ impl Core {
     pub(crate) async fn remove_session_rows(
         &self,
         actor_id: Option<i64>,
-        access: &RepoAccess,
+        repo_id: i64,
         session: &SessionRow,
         audit_action: &str,
     ) -> CoreResult<()> {
-        db_sessions::delete_session_links(self.db(), access.repo.id, &session.ulid).await?;
+        db_sessions::delete_session_links(self.db(), repo_id, &session.ulid).await?;
         let removed = db_sessions::delete_session(self.db(), session.id).await?;
         for seg in &removed {
             db_sessions::blob_decref(self.db(), &seg.blob_hash).await?;

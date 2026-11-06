@@ -5688,6 +5688,7 @@ version = "0.0.0"
 dependencies = [
  "base64 0.23.1",
  "gix",
+ "proptest",
  "serde",
  "serde_json",
  "tempfile",

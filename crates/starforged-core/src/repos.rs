@@ -7,6 +7,7 @@ use starforged_db::now;
 use starforged_db::orgs as db_orgs;
 use starforged_db::redirects;
 use starforged_db::repos::{self as db_repos, NewRepo, RepoRow};
+use starforged_db::sessions as db_sessions;
 use starforged_git::write::Identity;
 
 use crate::accounts::User;
@@ -927,6 +928,24 @@ impl Core {
             tokio::fs::rename(&path, &parked)
                 .await
                 .map_err(|e| failed("parking the directory", e))?;
+        }
+        // Sessions go through the shared delete path first: the repository
+        // row's cascade would otherwise orphan their blob references and
+        // commit links (including `NULL`-session trailer rows).
+        loop {
+            let batch = db_sessions::sessions_of_repo(
+                self.db(),
+                repo.id,
+                crate::account::ACCOUNT_DELETE_BATCH,
+            )
+            .await?;
+            if batch.is_empty() {
+                break;
+            }
+            for session in &batch {
+                self.remove_session_rows(actor_id, repo.id, session, "session.purged")
+                    .await?;
+            }
         }
         db_repos::delete(self.db(), repo.id).await?;
         match tokio::fs::remove_dir_all(&parked).await {

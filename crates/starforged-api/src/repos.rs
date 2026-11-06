@@ -360,7 +360,10 @@ pub async fn start_import(
 ) -> Result<Json<ImportJson>, ApiError> {
     let auth = auth.require(Scope::RepoWrite)?;
     let new_auth = match body {
-        Some(Json(parsed)) => Some(parse_import_auth(parsed.auth)?),
+        Some(Json(parsed)) => match parsed.auth {
+            Some(a) => Some(parse_import_auth(Some(a))?),
+            None => None,
+        },
         None => None,
     };
     let view = state
@@ -380,4 +383,144 @@ pub async fn delete_import(
     let auth = auth.require(Scope::RepoWrite)?;
     state.core.delete_import(&auth.user, &owner, &repo).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// What the API shows for a pull mirror: never a secret, only
+/// and, for SSH, the public key (mirroring the import shape).
+#[derive(Serialize)]
+pub struct PullMirrorJson {
+    repo_id: i64,
+    url: String,
+    auth: String,
+    has_credentials: bool,
+    ssh_public_key: Option<String>,
+    interval_secs: i64,
+    enabled: bool,
+    last_attempt_at: Option<i64>,
+    last_success_at: Option<i64>,
+    last_error: String,
+}
+
+fn pull_mirror_json(view: starforged_core::remotes::PullMirrorView) -> PullMirrorJson {
+    PullMirrorJson {
+        repo_id: view.repo_id,
+        url: view.url,
+        auth: view.auth,
+        has_credentials: view.has_credentials,
+        ssh_public_key: view.ssh_public_key,
+        interval_secs: view.interval_secs,
+        enabled: view.enabled,
+        last_attempt_at: view.last_attempt_at,
+        last_success_at: view.last_success_at,
+        last_error: view.last_error,
+    }
+}
+
+#[derive(Deserialize)]
+pub struct PullMirrorBody {
+    pub url: String,
+    #[serde(default)]
+    pub auth: Option<ImportAuthBody>,
+    #[serde(default = "default_interval")]
+    pub interval_secs: i64,
+}
+
+fn default_interval() -> i64 {
+    3600
+}
+
+/// `PUT /repos/{owner}/{repo}/mirror/pull` (M4b D4): configure or update
+/// the pull mirror. Maintain+ (enforced in core); the URL policy runs at
+/// save time and again before every fetch. 422 for a policy refusal or an
+/// interval below 300 seconds.
+pub async fn put_pull_mirror(
+    State(state): State<ApiState>,
+    auth: ApiAuth,
+    Path((owner, repo)): Path<(String, String)>,
+    body: Result<Json<PullMirrorBody>, JsonRejection>,
+) -> Result<Json<PullMirrorJson>, ApiError> {
+    let auth = auth.require(Scope::RepoWrite)?;
+    let Json(body) = body.map_err(|e| ApiError::Invalid(e.body_text()))?;
+    if body.url.trim().is_empty() {
+        return Err(ApiError::Invalid("mirror url is empty".into()));
+    }
+    let view = state
+        .core
+        .set_pull_mirror(
+            &auth.user,
+            &owner,
+            &repo,
+            &starforged_core::remotes::PullMirrorInput {
+                url: body.url,
+                auth: parse_import_auth(body.auth)?,
+                interval_secs: body.interval_secs,
+            },
+        )
+        .await?;
+    Ok(Json(pull_mirror_json(view)))
+}
+
+/// `GET /repos/{owner}/{repo}/mirror/pull`: readers see the configuration.
+pub async fn get_pull_mirror(
+    State(state): State<ApiState>,
+    auth: ApiAuth,
+    Path((owner, repo)): Path<(String, String)>,
+) -> Result<Json<PullMirrorJson>, ApiError> {
+    let view = state
+        .core
+        .get_pull_mirror(auth.reader()?, &owner, &repo)
+        .await?;
+    Ok(Json(pull_mirror_json(view)))
+}
+
+/// `DELETE /repos/{owner}/{repo}/mirror/pull`: deletes the mirror;
+/// pushes are restored.
+pub async fn delete_pull_mirror(
+    State(state): State<ApiState>,
+    auth: ApiAuth,
+    Path((owner, repo)): Path<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    let auth = auth.require(Scope::RepoWrite)?;
+    state
+        .core
+        .delete_pull_mirror(&auth.user, &owner, &repo)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `POST /repos/{owner}/{repo}/mirror/pull/sync`: queues an immediate
+/// sync (deduplicated per repository).
+pub async fn sync_pull_mirror(
+    State(state): State<ApiState>,
+    auth: ApiAuth,
+    Path((owner, repo)): Path<(String, String)>,
+) -> Result<Json<PullMirrorJson>, ApiError> {
+    let auth = auth.require(Scope::RepoWrite)?;
+    let view = state
+        .core
+        .sync_pull_mirror(&auth.user, &owner, &repo)
+        .await?;
+    Ok(Json(pull_mirror_json(view)))
+}
+
+/// `POST /repos/{owner}/{repo}/mirror/pull/enabled` (`{"enabled": bool}`):
+/// toggles the mirror without forgetting its configuration.
+pub async fn set_pull_mirror_enabled(
+    State(state): State<ApiState>,
+    auth: ApiAuth,
+    Path((owner, repo)): Path<(String, String)>,
+    body: Result<Json<EnableBody>, JsonRejection>,
+) -> Result<Json<PullMirrorJson>, ApiError> {
+    let auth = auth.require(Scope::RepoWrite)?;
+    let Json(body) = body.map_err(|e| ApiError::Invalid(e.body_text()))?;
+    let view = state
+        .core
+        .set_pull_mirror_enabled(&auth.user, &owner, &repo, body.enabled)
+        .await?;
+    Ok(Json(pull_mirror_json(view)))
+}
+
+#[derive(Deserialize)]
+pub struct EnableBody {
+    enabled: bool,
 }

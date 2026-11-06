@@ -121,7 +121,7 @@ impl Core {
     }
 
     /// Opens a web session for an already-authenticated user.
-    async fn open_session(
+    pub(crate) async fn open_session(
         &self,
         user: &User,
         user_agent: &str,

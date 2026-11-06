@@ -421,6 +421,11 @@ impl Core {
         if access.repo.archived_at.is_some() {
             return Err(CoreError::Invalid("repository is archived".into()));
         }
+        if access.repo.mirror {
+            return Err(CoreError::Invalid(
+                "this repository is a pull mirror".into(),
+            ));
+        }
         let trail = db_trails::trail_by_number(self.db(), access.repo.id, trail_n)
             .await?
             .ok_or(CoreError::NotFound)?;

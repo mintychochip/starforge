@@ -52,6 +52,25 @@ pub fn hook_script(hook_exe: &Path, name: &str) -> String {
     )
 }
 
+/// The expected content of the hook script for `name` when installed by
+/// `hook_exe`. Exposed for `starforged doctor`, which verifies every hosted
+/// repository carries exactly this content (modulo the hook executable
+/// path, which may move between releases — see [`is_expected_hook`]).
+pub fn expected_hook_content(hook_exe: &Path, name: &str) -> String {
+    hook_script(hook_exe, name)
+}
+
+/// Whether `content` is a hook script of the shape [`hook_script`] writes
+/// for `name`: a `/bin/sh` wrapper that execs the server binary with
+/// `hook <name>`. The executable path itself is not compared, so a binary
+/// upgrade that moved the executable does not read as drift.
+pub fn is_expected_hook(content: &str, name: &str) -> bool {
+    let Some(rest) = content.strip_prefix("#!/bin/sh\nexec ") else {
+        return false;
+    };
+    rest.ends_with(&format!(" hook {name}\n"))
+}
+
 /// Single-quotes `s` for `/bin/sh`.
 pub fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))

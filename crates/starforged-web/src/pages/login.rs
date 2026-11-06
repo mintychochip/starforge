@@ -9,13 +9,14 @@ use axum_extra::extract::Form;
 use axum_extra::extract::cookie::CookieJar;
 use serde::Deserialize;
 use starforged_core::CoreError;
+use starforged_core::oidc::{OidcIntent, OidcLoginOutcome};
 use starforged_core::sessions::LoginOutcome;
 
 use crate::AppState;
 use crate::auth::{
-    CHALLENGE_COOKIE, CsrfForm, LOGIN_CSRF_COOKIE, MaybeUser, RequireUser, SESSION_COOKIE,
-    anonymous_csrf, challenge_cookie, removal, safe_next, session_cookie, verify_anonymous_csrf,
-    verify_csrf,
+    CHALLENGE_COOKIE, CsrfForm, LOGIN_CSRF_COOKIE, MaybeUser, OIDC_COOKIE, RequireUser,
+    SESSION_COOKIE, anonymous_csrf, challenge_cookie, oidc_cookie, removal, safe_next,
+    session_cookie, verify_anonymous_csrf, verify_csrf,
 };
 use crate::error::WebError;
 use crate::views::NavUser;
@@ -47,6 +48,8 @@ struct LoginPage {
     unverified: bool,
     forgot_password: bool,
     sign_up_open: bool,
+    oidc_enabled: bool,
+    oidc_button_label: String,
 }
 
 pub async fn form(
@@ -71,6 +74,8 @@ pub async fn form(
             unverified: false,
             forgot_password: state.core.mail_enabled(),
             sign_up_open: state.core.sign_up_open(),
+            oidc_enabled: state.core.oidc_enabled(),
+            oidc_button_label: state.core.oidc_button_label(),
         },
     )
         .into_response()
@@ -123,6 +128,8 @@ pub async fn submit(
                 unverified: false,
                 forgot_password: state.core.mail_enabled(),
                 sign_up_open: state.core.sign_up_open(),
+                oidc_enabled: state.core.oidc_enabled(),
+                oidc_button_label: state.core.oidc_button_label(),
             };
             Ok((StatusCode::UNAUTHORIZED, page).into_response())
         }
@@ -136,6 +143,8 @@ pub async fn submit(
                 unverified: true,
                 forgot_password: state.core.mail_enabled(),
                 sign_up_open: state.core.sign_up_open(),
+                oidc_enabled: state.core.oidc_enabled(),
+                oidc_button_label: state.core.oidc_button_label(),
             };
             Ok((StatusCode::FORBIDDEN, page).into_response())
         }
@@ -149,6 +158,8 @@ pub async fn submit(
                 unverified: false,
                 forgot_password: state.core.mail_enabled(),
                 sign_up_open: state.core.sign_up_open(),
+                oidc_enabled: state.core.oidc_enabled(),
+                oidc_button_label: state.core.oidc_button_label(),
             };
             Ok((StatusCode::TOO_MANY_REQUESTS, page).into_response())
         }
@@ -270,4 +281,144 @@ pub async fn two_factor_submit(
         }
         Err(other) => Err(other.into()),
     }
+}
+
+#[derive(Deserialize)]
+pub struct OidcCallbackQuery {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+}
+
+/// `GET /login/oidc`: starts an authorization-code flow and redirects to
+/// the provider. The browser carries only the challenge token (plan D5).
+pub async fn oidc_begin(
+    State(state): State<AppState>,
+    MaybeUser(session): MaybeUser,
+    Query(query): Query<NextQuery>,
+) -> Response {
+    let next = safe_next(query.next.as_deref());
+    if session.is_some() {
+        return Redirect::to(&next).into_response();
+    }
+    match state.core.oidc_begin(OidcIntent::Login).await {
+        Ok((challenge, url)) => {
+            let cookie = oidc_cookie(challenge, state.settings.secure_cookies);
+            (CookieJar::new().add(cookie), Redirect::to(&url)).into_response()
+        }
+        Err(_) => oidc_failed(None).into_response(),
+    }
+}
+
+/// `GET /login/oidc/callback`: finishes the flow and resolves the
+/// identity (plan D5). A `link`-intent callback needs the signed-in
+/// session it was started from.
+pub async fn oidc_callback(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    jar: CookieJar,
+    headers: HeaderMap,
+    MaybeUser(session): MaybeUser,
+    Query(query): Query<OidcCallbackQuery>,
+) -> Result<Response, WebError> {
+    let challenge = jar
+        .get(OIDC_COOKIE)
+        .map(|c| c.value().to_owned())
+        .unwrap_or_default();
+    let jar = jar.remove(removal(OIDC_COOKIE));
+    if challenge.is_empty() {
+        return Ok(oidc_failed(None).into_response());
+    }
+    let (code, callback_state) = match (query.code, query.state, query.error) {
+        (Some(code), Some(callback_state), None) => (code, callback_state),
+        _ => return Ok(oidc_failed(None).into_response()),
+    };
+    let (claims, intent_user) = match state
+        .core
+        .oidc_finish_with_user(&challenge, &code, &callback_state)
+        .await
+    {
+        Ok(done) => done,
+        Err(_) => return Ok(oidc_failed(None).into_response()),
+    };
+    let user_agent = headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if let Some(user_id) = intent_user {
+        let Some(session) = session else {
+            return Ok(oidc_failed(None).into_response());
+        };
+        if session.user.id != user_id {
+            return Ok(oidc_failed(None).into_response());
+        }
+        match state
+            .core
+            .oidc_link(&claims, user_id, user_agent, &addr.ip().to_string())
+            .await
+        {
+            Ok(()) => Ok((jar, Redirect::to("/settings/identities")).into_response()),
+            Err(_) => Ok(oidc_failed(Some(NavUser::from_session(&session))).into_response()),
+        }
+    } else {
+        match state
+            .core
+            .oidc_login(&claims, user_agent, &addr.ip().to_string())
+            .await
+        {
+            Ok(OidcLoginOutcome::Session(_, new_session)) => {
+                let cookie = session_cookie(
+                    new_session.cookie_value,
+                    state.settings.secure_cookies,
+                    new_session.max_age_secs,
+                );
+                let jar = jar.remove(removal(LOGIN_CSRF_COOKIE)).add(cookie);
+                Ok((jar, Redirect::to("/")).into_response())
+            }
+            Ok(OidcLoginOutcome::NeedsSecondFactor(token)) => {
+                let cookie = challenge_cookie(token, state.settings.secure_cookies);
+                let jar = jar.add(cookie);
+                Ok((jar, Redirect::to("/login/two-factor")).into_response())
+            }
+            Ok(OidcLoginOutcome::NoAccount) => Ok((
+                jar,
+                (
+                    StatusCode::UNAUTHORIZED,
+                    crate::pages::message::MessagePage::new(
+                        None,
+                        "No account for this sign-in",
+                        "No account on this Starforge is linked to this sign-in, and automatic account creation is off. Ask an administrator for help.",
+                    )
+                    .with_link("/login", "Back to sign in"),
+                ),
+            )
+                .into_response()),
+            Err(CoreError::Unauthenticated) => Ok(oidc_failed(None).into_response()),
+            Err(CoreError::RateLimited) => Ok((
+                StatusCode::TOO_MANY_REQUESTS,
+                crate::pages::message::MessagePage::new(
+                    None,
+                    "Too many attempts",
+                    "Too many login attempts. Please try again later.",
+                )
+                .with_link("/login", "Back to sign in"),
+            )
+                .into_response()),
+            Err(other) => Err(other.into()),
+        }
+    }
+}
+
+/// The generic single-sign-on failure page: one message for every
+/// failure, so provider-supplied strings never reach the browser.
+fn oidc_failed(nav_user: Option<NavUser>) -> (StatusCode, crate::pages::message::MessagePage) {
+    (
+        StatusCode::UNAUTHORIZED,
+        crate::pages::message::MessagePage::new(
+            nav_user,
+            "Single sign-on failed",
+            "Single sign-on failed. Please try again, or sign in with your password.",
+        )
+        .with_link("/login", "Back to sign in"),
+    )
 }

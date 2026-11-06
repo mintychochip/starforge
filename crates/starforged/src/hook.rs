@@ -39,6 +39,10 @@ pub struct HookCtx {
     /// M4b: a one-time import is pending/running on this repository; every
     /// ref update is refused ("import in progress").
     pub import_in_progress: bool,
+    /// M4b: the repository is an enabled pull mirror; every branch/tag
+    /// push is refused ("this repository is a pull mirror"), while
+    /// `refs/for` stays open for discussion.
+    pub mirror: bool,
 }
 
 fn env(name: &str) -> Option<String> {
@@ -94,6 +98,7 @@ impl HookCtx {
                 })
                 .unwrap_or_default(),
             import_in_progress: env("STARFORGE_IMPORT_IN_PROGRESS").is_some_and(|v| v == "1"),
+            mirror: env("STARFORGE_MIRROR").is_some_and(|v| v == "1"),
         }
     }
 }
@@ -129,6 +134,17 @@ pub fn pre_receive_with(input: impl BufRead, mut err: impl Write, ctx: &HookCtx)
             let _ = writeln!(err, "starforge: malformed pre-receive input");
             return 1;
         };
+        // M4b pull mirror: branches, tags, and namespaces never move by
+        // push; `refs/for` stays open (Trails can be opened for discussion).
+        if ctx.mirror && !update.name.starts_with("refs/for/") {
+            let _ = writeln!(
+                err,
+                "starforge: pushing to {} is not allowed: this repository is a pull mirror",
+                update.name
+            );
+            code = 1;
+            continue;
+        }
         let namespaces: &[String] = ctx
             .protection
             .as_ref()
@@ -369,6 +385,7 @@ mod tests {
             refs_for_budget: None,
             refs_for_topics: Vec::new(),
             import_in_progress: false,
+            mirror: false,
         }
     }
 

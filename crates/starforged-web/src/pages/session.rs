@@ -14,13 +14,24 @@ use starforged_core::read::SessionPageItem;
 use crate::AppState;
 use crate::auth::{CsrfForm, MaybeUser, verify_csrf};
 use crate::error::WebError;
-use crate::session_render::render_event;
-use crate::views::{NavUser, RepoHead, STRICT_CSP, format_time, nav};
+use crate::session_render::{render_event, render_marker};
+use crate::views::{FileView, NavUser, RepoHead, STRICT_CSP, file_views, format_time, nav};
 
 #[derive(Deserialize)]
 pub struct SessionQuery {
     page: Option<i64>,
     focus: Option<i64>,
+    q: Option<String>,
+    split: Option<String>,
+}
+
+/// One in-session search hit (D3): a `turn-<seq>` deep link (to the page
+/// holding the event) with a server-redacted snippet. The template escapes
+/// `preview` (numeric entities); nothing here is `|safe`.
+pub struct SearchHitView {
+    seq: u64,
+    page: i64,
+    preview: String,
 }
 
 /// One rendered transcript slot: an event (`turn-<seq>`) or an undecodable
@@ -65,9 +76,22 @@ pub struct SessionPageView {
     total: i64,
     prev: Option<i64>,
     next: Option<i64>,
+    /// The echoed `?q=` (empty when absent); the template escapes it.
+    q: String,
+    searched: bool,
+    hit_count: usize,
+    search_hits: Vec<SearchHitView>,
+    /// `?split=<sha>` when active: the linked commit's sha and its diff
+    /// (`files`/`truncated` feed the shared `diff_files.html` partial).
+    split_sha: Option<String>,
+    files: Vec<FileView>,
+    truncated: bool,
 }
 
-/// `GET /{owner}/{repo}/sessions/{ulid}?page=N&focus=seq`.
+/// `GET /{owner}/{repo}/sessions/{ulid}?page=N&focus=seq&q=needle&split=<sha>`:
+/// paged transcript with in-session search (`q`) and, for a linked commit
+/// sha (`split`), the split view beside the transcript. All server-rendered;
+/// the page is complete without JS.
 pub async fn show(
     State(state): State<AppState>,
     MaybeUser(session): MaybeUser,
@@ -90,6 +114,19 @@ pub async fn show(
         None => (query.page.unwrap_or(1), None),
     };
     let view = state.core.read_session_page(session_row.id, page).await?;
+    // Commit markers (D3): group by `seq_end`; each renders immediately
+    // after the event at that seq, linking to the commit page and split view.
+    let markers = state.core.commit_markers(session_row.id).await?;
+    let mut markers_by_seq: std::collections::HashMap<
+        i64,
+        Vec<&starforged_core::read::CommitMarker>,
+    > = std::collections::HashMap::new();
+    for marker in &markers {
+        markers_by_seq
+            .entry(marker.seq_end)
+            .or_default()
+            .push(marker);
+    }
     let mut events = Vec::with_capacity(view.items.len());
     for item in &view.items {
         match item {
@@ -100,6 +137,20 @@ pub async fn show(
                     html: render_event(event),
                     focused,
                 });
+                if let Some(linked) = markers_by_seq.get(&(event.seq as i64)) {
+                    for marker in linked {
+                        events.push(EventView {
+                            anchor: format!("commit-{}", marker.short_sha),
+                            html: render_marker(
+                                &marker.sha,
+                                &marker.short_sha,
+                                &format!("/{owner}/{repo}/commit/{}", marker.sha),
+                                &format!("?split={}", marker.sha),
+                            ),
+                            focused: false,
+                        });
+                    }
+                }
             }
             SessionPageItem::UnreadableSegment { n } => events.push(EventView {
                 anchor: format!("segment-{n}"),
@@ -110,6 +161,42 @@ pub async fn show(
             }),
         }
     }
+    // In-session search (D3): server-side results over the redacted stream;
+    // the GET form works without JS. The query echo is template-escaped.
+    let q = query.q.clone().unwrap_or_default();
+    let searched = !q.trim().is_empty();
+    let search_hits = if searched {
+        state
+            .core
+            .search_session(session_row.id, &q)
+            .await?
+            .into_iter()
+            .map(|hit| SearchHitView {
+                seq: hit.seq,
+                page: hit.page,
+                preview: hit.preview,
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    // Split view (D3): `?split=<sha>` renders the linked commit's diff
+    // beside the transcript. The sha must be one of this session's linked
+    // commits in this repository (404 otherwise); the session-read
+    // authorization above already implies repository read.
+    let split_sha = query.split.clone().filter(|sha| !sha.is_empty());
+    let (split_sha, files, truncated) = match &split_sha {
+        Some(sha) => {
+            let links = state.core.session_links(session_row.id).await?;
+            if !links.iter().any(|link| link.sha == *sha) {
+                return Err(WebError::NotFound);
+            }
+            let info = state.core.commit(&access, sha).await?;
+            let diff = state.core.diff(&access, &info.id).await?;
+            (Some(sha.clone()), file_views(diff.files), diff.truncated)
+        }
+        None => (None, Vec::new(), false),
+    };
     let models = serde_json::from_str::<Vec<String>>(&session_row.models)
         .map(|models| models.join(", "))
         .unwrap_or_else(|_| session_row.models.clone());
@@ -162,6 +249,13 @@ pub async fn show(
         total: view.total,
         prev: (view.page > 1).then_some(view.page - 1),
         next: (view.page < view.pages).then_some(view.page + 1),
+        hit_count: search_hits.len(),
+        q,
+        searched,
+        search_hits,
+        split_sha,
+        files,
+        truncated,
     };
     // Sessions never reach search indexes (spec §11.1). The transcript is
     // attacker-influenced, so the viewer also carries the strict CSP (it

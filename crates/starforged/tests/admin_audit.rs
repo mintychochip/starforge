@@ -452,3 +452,95 @@ async fn hostile_values_render_escaped() {
         "escaped filter echo:\n{filtered}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn action_prefix_respects_dot_boundary() {
+    let s = TestServer::start().await;
+    let root = admin(&s).await;
+    let token = s.token(&root, &[Scope::Admin]).await;
+    let client = reqwest::Client::new();
+
+    seed(
+        &s,
+        Some(root.id),
+        "session.create",
+        "repo:a/proj",
+        "",
+        "",
+        1_700_000_100,
+    )
+    .await;
+    seed(
+        &s,
+        Some(root.id),
+        "sessions_x",
+        "repo:s/proj",
+        "",
+        "",
+        1_700_000_200,
+    )
+    .await;
+
+    // `session.` must not match the sibling action `sessions_x`.
+    let prefix = api_entries(&client, &s, &token, "?action=session.").await;
+    assert_eq!(targets(&prefix), ["repo:a/proj"], "dot boundary:\n{prefix}");
+    // The exact path still finds the sibling by its full name.
+    let exact = api_entries(&client, &s, &token, "?action=sessions_x").await;
+    assert_eq!(targets(&exact), ["repo:s/proj"], "exact sibling:\n{exact}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pager_link_round_trips_special_filter_values() {
+    let s = TestServer::start().await;
+    let root = admin(&s).await;
+    let (client, _csrf) = s.login("root").await;
+
+    // 55 rows match the substring `wid & get`, so page one has an older link.
+    for i in 1..=55 {
+        seed(
+            &s,
+            Some(root.id),
+            "test.row",
+            &format!("wid & get:{i:03}"),
+            "10.0.0.1",
+            "agent",
+            1_700_000_000 + i,
+        )
+        .await;
+    }
+
+    let page_one = get_text(&client, &s.url("/admin/audit?target=wid%20%26%20get")).await;
+    assert!(
+        page_one.contains("wid &#38; get:055"),
+        "page one newest:\n{page_one}"
+    );
+    let start = page_one.find(r#"href="/admin/audit?"#).expect("pager link");
+    let href = &page_one[start + 6..];
+    let href = &href[..href.find('"').expect("href close")];
+    assert!(
+        href.contains("%26"),
+        "the & is percent-encoded:\n{page_one}"
+    );
+    assert!(
+        !href.contains("wid &"),
+        "no raw & in the query:\n{page_one}"
+    );
+    assert!(href.contains("%20"), "spaces are encoded:\n{page_one}");
+
+    // Following the rendered href (unescaping the numeric `&#38;` param
+    // separators Askama emits) reaches page two with the filter applied.
+    let path = href.replace("&#38;", "&").replace("&amp;", "&");
+    let page_two = get_text(&client, &s.url(&path)).await;
+    assert!(
+        page_two.contains("wid &#38; get:005"),
+        "page two:\n{page_two}"
+    );
+    assert!(
+        page_two.contains("wid &#38; get:001"),
+        "page two tail:\n{page_two}"
+    );
+    assert!(
+        !page_two.contains("wid &#38; get:055"),
+        "no overlap:\n{page_two}"
+    );
+}

@@ -84,6 +84,21 @@ pub async fn insert(db: &Db, job: &NewJob<'_>) -> DbResult<Option<i64>> {
     }
 }
 
+/// Makes the queued job for `dedupe_key` due at `run_at` (a "run now"
+/// nudge while a scheduled copy is already queued). A running or absent
+/// row is untouched: a running job already covers the request.
+pub async fn expedite(db: &Db, dedupe_key: &str, run_at: i64) -> DbResult<()> {
+    sqlx::query(
+        "UPDATE jobs SET run_at = $1, updated_at = $1 \
+         WHERE dedupe_key = $2 AND state = 'queued'",
+    )
+    .bind(run_at)
+    .bind(dedupe_key)
+    .execute(db.pool())
+    .await?;
+    Ok(())
+}
+
 pub async fn by_id(db: &Db, id: i64) -> DbResult<Option<JobRow>> {
     let row = sqlx::query(select_job!("WHERE id = $1"))
         .bind(id)

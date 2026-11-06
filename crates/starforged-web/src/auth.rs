@@ -15,6 +15,7 @@ use crate::error::WebError;
 pub const SESSION_COOKIE: &str = "sf_session";
 pub const LOGIN_CSRF_COOKIE: &str = "sf_login_csrf";
 pub const CHALLENGE_COOKIE: &str = "sf_login_challenge";
+pub const OIDC_COOKIE: &str = "sf_oidc_challenge";
 
 /// The signed-in user, if any.
 pub struct MaybeUser(pub Option<WebSession>);
@@ -126,6 +127,21 @@ pub fn challenge_cookie(value: String, secure: bool) -> Cookie<'static> {
     cookie.set_secure(secure);
     cookie.set_max_age(time::Duration::seconds(
         starforged_core::sessions::SECOND_FACTOR_TTL_SECS,
+    ));
+    cookie
+}
+
+/// The OIDC challenge cookie: the random token naming the pending
+/// authorization-code-flow row. Same flags as the second-factor cookie,
+/// expiring with the OIDC challenge.
+pub fn oidc_cookie(value: String, secure: bool) -> Cookie<'static> {
+    let mut cookie = Cookie::new(OIDC_COOKIE, value);
+    cookie.set_http_only(true);
+    cookie.set_same_site(SameSite::Lax);
+    cookie.set_path("/");
+    cookie.set_secure(secure);
+    cookie.set_max_age(time::Duration::seconds(
+        starforged_core::oidc::CHALLENGE_TTL_SECS,
     ));
     cookie
 }

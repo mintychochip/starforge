@@ -151,6 +151,16 @@ impl Core {
                 "0".to_owned()
             },
         ));
+        // M4b pull mirror: every branch/tag push is refused while the
+        // mirror is enabled (M4b D4); `refs/for` stays open for discussion.
+        env.push((
+            "STARFORGE_MIRROR",
+            if access.repo.mirror {
+                "1".to_owned()
+            } else {
+                "0".to_owned()
+            },
+        ));
         // M5a rate-limit snapshot: the remaining hourly new-change budget
         // and the pusher's own open agit topics in this repo. Absent when the
         // limit is disabled (the hook then enforces nothing); the ingest

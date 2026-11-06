@@ -91,6 +91,7 @@ impl Server for ForgeServer {
             counter_key: None,
             git_protocol: None,
             channels: HashMap::new(),
+            total_timer: None,
         }
     }
 }
@@ -101,10 +102,14 @@ pub(crate) struct Connection {
     counter_key: Option<String>,
     git_protocol: Option<String>,
     channels: HashMap<ChannelId, mpsc::Sender<Bytes>>,
+    total_timer: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Drop for Connection {
     fn drop(&mut self) {
+        if let Some(timer) = self.total_timer.take() {
+            timer.abort();
+        }
         if let Some(key) = self.counter_key.take() {
             self.shared.release(&key);
         }
@@ -167,7 +172,7 @@ impl Handler for Connection {
     async fn auth_succeeded(&mut self, session: &mut Session) -> Result<(), Self::Error> {
         let handle = session.handle();
         let total = std::time::Duration::from_secs(self.shared.max_connection_secs);
-        tokio::spawn(async move {
+        self.total_timer = Some(tokio::spawn(async move {
             tokio::time::sleep(total).await;
             let _ = handle
                 .disconnect(
@@ -176,7 +181,7 @@ impl Handler for Connection {
                     String::new(),
                 )
                 .await;
-        });
+        }));
         Ok(())
     }
 

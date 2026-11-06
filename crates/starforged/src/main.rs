@@ -44,6 +44,14 @@ enum Command {
         #[command(subcommand)]
         command: IndexCommand,
     },
+    /// Check the data directory, database, and search index for problems.
+    /// Exits 0 when healthy, 1 on any failure, and 2 when only warnings occur.
+    Doctor {
+        /// Reinstall missing repository hooks and remove orphaned blob files
+        /// older than one hour. Never deletes database rows.
+        #[arg(long)]
+        fix: bool,
+    },
     /// Entry points for git hooks in hosted repositories.
     #[command(hide = true)]
     Hook {
@@ -208,6 +216,9 @@ async fn main() -> anyhow::Result<()> {
             command: IndexCommand::Rebuild,
         } => {
             starforged::index_cmd::rebuild(&Config::load(&cli.config)?).await?;
+        }
+        Command::Doctor { fix } => {
+            std::process::exit(starforged::doctor::run(&cli.config, fix).await?);
         }
         Command::Hook {
             hook: HookCommand::PreReceive,

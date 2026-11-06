@@ -9,6 +9,7 @@ mod moved;
 mod oauth;
 mod orgs;
 mod repos;
+mod search;
 mod sessions;
 mod sshkeys;
 mod statuses;
@@ -97,6 +98,8 @@ pub fn router(core: Core, base_url: String) -> Router {
             "/orgs/{org}/members/{handle}",
             put(orgs::set_member).delete(orgs::remove_member),
         )
+        .route("/search/trails", get(search::search_trails))
+        .route("/search/sessions", get(search::search_sessions))
         .route("/oauth/device/code", post(oauth::device_code))
         .route("/oauth/token", post(oauth::token))
         .route(
@@ -129,6 +132,20 @@ pub fn router(core: Core, base_url: String) -> Router {
             post(repos::start_import),
         )
         .route(
+            "/repos/{owner}/{repo}/mirror/pull",
+            put(repos::put_pull_mirror)
+                .get(repos::get_pull_mirror)
+                .delete(repos::delete_pull_mirror),
+        )
+        .route(
+            "/repos/{owner}/{repo}/mirror/pull/sync",
+            post(repos::sync_pull_mirror),
+        )
+        .route(
+            "/repos/{owner}/{repo}/mirror/pull/enabled",
+            post(repos::set_pull_mirror_enabled),
+        )
+        .route(
             "/repos/{owner}/{repo}/sessions/{ulid}",
             put(sessions::put_meta)
                 .get(sessions::get_session)
@@ -141,6 +158,7 @@ pub fn router(core: Core, base_url: String) -> Router {
         .route(
             "/repos/{owner}/{repo}/sessions/{ulid}/segments/{n}",
             put(sessions::put_segment)
+                .get(sessions::get_segment)
                 .route_layer(axum::extract::DefaultBodyLimit::max(segment_limit)),
         )
         .route(
@@ -153,7 +171,7 @@ pub fn router(core: Core, base_url: String) -> Router {
         )
         .route(
             "/repos/{owner}/{repo}/sessions/{ulid}/links",
-            post(sessions::post_links),
+            post(sessions::post_links).get(sessions::get_links),
         )
         .route(
             "/repos/{owner}/{repo}/sessions/{ulid}/release",

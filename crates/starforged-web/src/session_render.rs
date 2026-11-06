@@ -12,7 +12,8 @@
 //! fragments with `|safe`; nothing else on the page is unescaped.
 
 use starforge_format::{
-    Event, EventKind, FileChangeKind, UNTRUSTED_BEGINS, UNTRUSTED_ENDS, kind_name, wrap_untrusted,
+    Event, EventKind, FileChangeKind, UNTRUSTED_BEGINS, UNTRUSTED_ENDS, Usage, kind_name,
+    wrap_untrusted,
 };
 
 use crate::markdown;
@@ -23,13 +24,14 @@ use crate::markdown;
 pub fn render_event(event: &Event) -> String {
     match &event.kind {
         EventKind::UserMessage(message) => {
-            prose_block("user_message", "event-user", &message.text, None)
+            prose_block("user_message", "event-user", &message.text, None, None)
         }
         EventKind::AssistantMessage(message) => prose_block(
             "assistant_message",
             "event-assistant",
             &message.text,
             message.model.as_deref(),
+            Some(&message.usage),
         ),
         EventKind::Reasoning(reasoning) => collapsed_block(
             "reasoning",
@@ -116,7 +118,13 @@ pub fn render_event(event: &Event) -> String {
 /// sanitized Markdown (spec §10.2). [`wrap_untrusted`] prefixes any hostile
 /// `<<<STARFORGE-` content line with one space, so inner text can never forge
 /// a marker at line start — the first/last lines below are always genuine.
-fn prose_block(kind: &str, class: &str, text: &str, model: Option<&str>) -> String {
+fn prose_block(
+    kind: &str,
+    class: &str,
+    text: &str,
+    model: Option<&str>,
+    usage: Option<&Usage>,
+) -> String {
     let framed = wrap_untrusted(text);
     let mut lines: Vec<&str> = framed.lines().collect();
     let ends = lines.pop().unwrap_or("");
@@ -137,10 +145,39 @@ fn prose_block(kind: &str, class: &str, text: &str, model: Option<&str>) -> Stri
         }
         _ => String::new(),
     };
+    let usage_line = match usage {
+        Some(usage)
+            if usage.input > 0
+                || usage.output > 0
+                || usage.cache_read > 0
+                || usage.cache_write > 0
+                || usage.reasoning > 0 =>
+        {
+            format!(
+                "<div class=\"event-usage muted\">input {} · output {} · cache read {} · cache write {} · reasoning {}</div>",
+                usage.input, usage.output, usage.cache_read, usage.cache_write, usage.reasoning,
+            )
+        }
+        _ => String::new(),
+    };
     format!(
-        "<div class=\"event {class}\"><div class=\"event-kind\">{kind}</div>{model_line}<div class=\"untrusted-frame\"><pre class=\"marker\">{}</pre><div class=\"event-body\">{body}</div><pre class=\"marker\">{}</pre></div></div>",
+        "<div class=\"event {class}\"><div class=\"event-kind\">{kind}</div>{model_line}{usage_line}<div class=\"untrusted-frame\"><pre class=\"marker\">{}</pre><div class=\"event-body\">{body}</div><pre class=\"marker\">{}</pre></div></div>",
         esc(begins),
         esc(ends),
+    )
+}
+
+/// A commit marker (D3): rendered after the event at a commit link's
+/// `seq_end`, linking the short sha to the commit page and to the split
+/// view (`?split=<sha>`). Every input is escaped; the sha/short sha come
+/// from stored link rows and the hrefs are built server-side.
+pub fn render_marker(sha: &str, short: &str, commit_href: &str, split_href: &str) -> String {
+    format!(
+        "<div class=\"commit-marker notice\"><a href=\"{}\"><code>{}</code></a> <a href=\"{}\">split view</a> <span class=\"muted\">{}</span></div>",
+        esc(commit_href),
+        esc(short),
+        esc(split_href),
+        esc(sha),
     )
 }
 

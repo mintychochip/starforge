@@ -41,6 +41,14 @@ git push http://me:<token>@127.0.0.1:3000/me/<repository>.git main
 | `registration.allowed_domains` | Email domains that `domains` mode accepts, e.g. `["example.com"]` |
 | `mail.url` | Empty for no email; `smtp://user:pass@host:587` (STARTTLS), `smtps://user:pass@host:465`, or `file:///dir` (writes `.eml` files) |
 | `mail.from` | Sender, e.g. `Starforge <forge@example.com>` |
+| `ssh.enabled` | Whether the SSH listener starts (default `true`) |
+| `ssh.listen` | Address the SSH server binds (default `0.0.0.0:2222`) |
+| `ssh.host_key_path` | Host key file; generated with mode `0600` on first start or by `starforged init` (relative paths resolve against `storage.data_dir`) |
+| `ssh.public_host` | Host shown in SSH clone URLs; empty takes the host from `server.base_url` |
+| `ssh.public_port` | Port shown in SSH clone URLs (default `2222`) |
+| `ssh.idle_timeout_secs` | Idle timeout per SSH connection (default `300`) |
+| `ssh.max_connection_secs` | Total timeout per SSH connection (default `3600`) |
+| `ssh.max_connections_per_user` | Concurrent SSH connections per user (per deploy key) (default `10`) |
 
 Any key can be overridden with an environment variable such as `STARFORGE__SERVER__HTTP_ADDR` or
 `STARFORGE__DATABASE__URL`. `STARFORGE_CONFIG` sets the config file path.
@@ -143,6 +151,27 @@ Every `/admin` page and action answers 404 to anyone who is not a site admin, so
 indistinguishable from a missing page. Guards refuse to suspend or delete yourself, and the last active
 admin cannot be suspended, demoted, or deleted. Each admin action is recorded in the audit log.
 
+## Git over SSH
+
+Repositories are also reachable over SSH, served by an embedded server on `ssh.listen` (default `0.0.0.0:2222`, `ssh.enabled = true`). The server starts beside the HTTP listener and stops with it; `starforged init` and first start write the host key (`ssh.host_key_path`, default `<data_dir>/ssh_host_ed25519_key`) with mode `0600` when it is missing — the private key is never logged or rendered. Every knob is overridable as `STARFORGE__SSH__*`, e.g. `STARFORGE__SSH__LISTEN=127.0.0.1:2222`.
+
+Clone URLs are `ssh://git@<public_host>:<public_port>/<owner>/<repo>.git`, shown beside the HTTP URL on each repository page (`ssh.public_host` defaults to the host in `server.base_url`, `ssh.public_port` to `2222`); the scp-style `git@host:owner/repo.git` form works too:
+
+```bash
+git clone ssh://git@forge.example:2222/owner/project.git
+```
+
+Authentication is public-key only against the SSH user name `git` (password, keyboard-interactive, and `none` auth are refused). Only `git-upload-pack`, `git-receive-pack`, and `git-upload-archive` run — there is no shell, no PTY, no subsystem, and no forwarding (`direct-tcpip`, `tcpip-forward`, `x11-req`, and `auth-agent-req` are all refused with a one-line `starforge: …` message on stderr and exit code 1). Authorization is the same path smart HTTP uses, so permission, protection, and archive decisions match cell for cell; unreadable repositories answer "repository not found" so they stay undiscoverable. Git protocol v2 is passed through (`GIT_PROTOCOL` is the only `env` request honoured), so the default `git` client negotiates v2 over SSH unchanged.
+
+**User keys** are managed at **Settings → Keys** (`/settings/keys`): add a title and an OpenSSH public-key line, list fingerprints, and delete keys. Accepted algorithms are `ssh-ed25519`, `ecdsa-sha2-nistp256/384/521`, and `ssh-rsa` with at least 2048-bit moduli; options prefixes and multiple keys on one line are refused. A fingerprint is unique across all user and deploy keys (adding a duplicate answers `422`), with caps of 100 keys per user. The fingerprint shown is `SHA256:` + base64 (no padding) of the key blob, byte-identical to `ssh-keygen -lf`. Removing a key or suspending the account takes effect on the next connection.
+
+**Deploy keys** are per-repository (`/{owner}/{repo}/settings/keys`, repository admins only; archived repositories refuse new keys) and come in read-only and read-write flavours (at most 50 per repository). A read-only key clones and fetches but cannot push; a read-write key pushes branches as permission `write` with no user, so it cannot push `refs/for/*` (a change needs an author) and post-receive webhooks record `sender: null`. A deploy key is bound to one repository — any other path answers "repository not found", even for public repositories. Deleting the key revokes it on the next connection.
+
+Every add and removal writes exactly one audit row (`ssh_key.add`/`ssh_key.remove`, `deploy_key.add`/`deploy_key.remove`); authentication itself is logged with the key fingerprint only, never key material. Connections close after `ssh.idle_timeout_secs` of no channel traffic, after `ssh.max_connection_secs` in total, and a user (or deploy key) with more than `ssh.max_connections_per_user` concurrent connections is refused at authentication.
+
+Troubleshooting: `Permission denied (publickey)` means the key is unknown, removed, belongs to a suspended user, or the concurrent-connection limit is hit — check **Settings → Keys** and the server's info-level log line, which names only the fingerprint. "repository not found" means the key is fine but the path is wrong or the account cannot read that repository. A push that lands nothing with a `starforge: …` message is a protection rule (branch/tag `remote: starforge: …` names the ref and pattern; write-tier, namespace, and snapshot failures name only the ref). Set `ssh.enabled = false` to run HTTP-only.
+
+
 ## API
 
 `/api/v1` accepts `Authorization: Bearer <token>`: `GET /user`, `POST /user/repos` (with `"readme": true` for a
@@ -151,6 +180,7 @@ first commit), `GET /repos/{owner}/{repo}` (including `archived`),
 push `refs/for/*`, maintain+), and
 `GET`/`PUT`/`DELETE /repos/{owner}/{repo}/collaborators[/{handle}]`. Reads of a renamed repository answer `301`
 with the new location.
+`GET`/`POST /user/keys` and `DELETE /user/keys/{id}` manage the caller's SSH keys (the same keys as **Settings → Keys**); `GET`/`POST /repos/{owner}/{repo}/keys` (with `"read_write"`) and `DELETE /repos/{owner}/{repo}/keys/{id}` manage that repository's deploy keys (admin only; below-threshold callers get `403`, non-readers `404`; archived repositories refuse adds). Key lists carry `id`, `title`, `algorithm`, `fingerprint`, and (for deploy keys) `read_write`.
 Errors use `{"error": {"code", "message"}}`.
 
 ## Trace format and redaction

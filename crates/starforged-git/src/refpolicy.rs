@@ -262,7 +262,10 @@ pub enum RefKind {
 /// or explicit membership); `refs/trails/*` and everything else fail closed —
 /// except refs inside an allow-listed `namespaces` entry, which classify as
 /// [`RefKind::Namespace`]. Each entry starts with `refs/` and ends with `/`
-/// (validated at startup by [`validate_allowed_namespaces`]).
+/// (validated at startup by [`validate_allowed_namespaces`]): validation is
+/// what keeps an allow-list entry from covering `refs/for/` or
+/// `refs/trails/`, so `check_allowed` must only be called with validated
+/// entries.
 pub fn check_allowed(
     name: &str,
     permission: Option<&str>,
@@ -1189,5 +1192,152 @@ mod tests {
             !is_oid(&"0".repeat(40)),
             "all-zero is a deletion marker, not an oid"
         );
+    }
+}
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// A refname drawn from valid namespaces and hostile shapes alike:
+    /// `..`, control chars, `@{`, a trailing `.lock`, a leading `-` inside a
+    /// component, and arbitrary strings.
+    fn refname() -> impl Strategy<Value = String> {
+        prop_oneof![
+            prop::sample::select(vec![
+                "refs/heads/main".to_owned(),
+                "refs/heads/feature/thing-1.x".to_owned(),
+                "refs/tags/v1.2.3".to_owned(),
+                "refs/for/main/my-topic".to_owned(),
+                "refs/for/main".to_owned(),
+                "refs/trails/1/changes/1/head".to_owned(),
+                "refs/notes/commits".to_owned(),
+                "refs/heads/../evil".to_owned(),
+                "refs/heads/main.lock".to_owned(),
+                "refs/heads/-main".to_owned(),
+                "refs/heads/ma\u{7}in".to_owned(),
+                "refs/for/main/..".to_owned(),
+                "refs/for/main/t@{1}".to_owned(),
+                "refs/for/-main/t".to_owned(),
+                "refs/for/main/topic.lock".to_owned(),
+                "refs/trails/1".to_owned(),
+                "HEAD".to_owned(),
+                "".to_owned(),
+                "refs/heads/".to_owned(),
+            ]),
+            "[a-zA-Z0-9/._@{}-]{0,40}".prop_map(String::from),
+            prop::string::string_regex("refs/(heads|tags|for|trails|notes)/[a-zA-Z0-9/._-]{0,20}")
+                .unwrap(),
+        ]
+    }
+
+    /// Permission inputs, including unknown and lowercased-but-bogus levels.
+    fn permission() -> impl Strategy<Value = Option<String>> {
+        prop::sample::select(vec![
+            None,
+            Some("read".to_owned()),
+            Some("triage".to_owned()),
+            Some("write".to_owned()),
+            Some("maintain".to_owned()),
+            Some("admin".to_owned()),
+            Some("superuser".to_owned()),
+            Some("".to_owned()),
+        ])
+    }
+
+    /// Namespace allow-lists exactly as they can reach `check_allowed`:
+    /// filtered through [`validate_allowed_namespaces`], the startup check.
+    /// (Invalid entries such as `refs/` cannot exist at runtime, so the
+    /// model and the implementation only need to agree on valid lists;
+    /// validity is what forbids an entry covering `refs/for/` or trails.)
+    fn namespaces() -> impl Strategy<Value = Vec<String>> {
+        prop::collection::vec(
+            prop::sample::select(vec![
+                "refs/notes/".to_owned(),
+                "refs/for-review/x/".to_owned(),
+            ]),
+            0..=2,
+        )
+        .prop_filter("namespaces must pass startup validation", |v| {
+            validate_allowed_namespaces(v).is_ok()
+        })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        /// `check_allowed` never panics and classifies generated refnames
+        /// consistently: branches/tags always pass; trails always fail;
+        /// reviews pass only under the documented auth+membership rules;
+        /// anything else passes only as an allow-listed namespace.
+        #[test]
+        fn check_allowed_pinned_for_generated_refnames(
+            name in refname(),
+            perm in permission(),
+            is_member in any::<bool>(),
+            refs_for in prop::sample::select(vec![
+                "anyone_with_read".to_owned(),
+                "members".to_owned(),
+                "everyone".to_owned(),
+            ]),
+            ns in namespaces(),
+        ) {
+            let refs_for = refs_for.as_str();
+            let perm = perm.as_deref();
+            prop_assert!(name.len() < 10_000);
+            // Must never panic; the result must match the policy table.
+            let result = check_allowed(&name, perm, is_member, refs_for, &ns);
+            let has_ns = ns.iter().any(|entry| name.starts_with(entry.as_str()));
+            if name.starts_with("refs/heads/") {
+                prop_assert_eq!(result, Ok(RefKind::Branch));
+            } else if name.starts_with("refs/tags/") {
+                prop_assert_eq!(result, Ok(RefKind::Tag));
+            } else if name.starts_with("refs/trails/") {
+                prop_assert!(result.is_err(), "trails refused for {name:?}");
+            } else if name.starts_with("refs/for/") {
+                let authed = permission_at_least_read(perm.unwrap_or(""));
+                let allowed_parse = parse_for_ref(&name).is_some();
+                let ok = authed && allowed_parse && match refs_for {
+                    "anyone_with_read" => true,
+                    "members" => is_member,
+                    _ => false,
+                };
+                prop_assert_eq!(result.is_ok(), ok, "refs/for {:?} perm={:?} member={} mode={}", name, perm, is_member, refs_for);
+            } else if has_ns {
+                prop_assert_eq!(result, Ok(RefKind::Namespace), "allow-listed {:?}", name);
+            } else {
+                prop_assert!(result.is_err(), "non-allowed namespace refused for {:?}", name);
+            }
+        }
+
+        /// `check` accepts only branches and tags, for any generated name.
+        #[test]
+        fn check_accepts_only_branches_and_tags(name in refname()) {
+            let update = RefUpdate {
+                old: "0".repeat(40),
+                new: "1".repeat(40),
+                name: name.clone(),
+            };
+            let ok = name.starts_with("refs/heads/") || name.starts_with("refs/tags/");
+            prop_assert_eq!(check(&update).is_ok(), ok, "{:?}", name);
+        }
+
+        /// The pusher default topic is always a valid component, and
+        /// `parse_for_ref` only accepts well-formed `refs/for` targets.
+        #[test]
+        fn topics_are_always_valid(handles in "[A-Za-z0-9 \\t/\\\\._@!\\u{0}\u{1f}ü-\\u{ff}]{0,40}") {
+            let topic = default_topic(&handles);
+            prop_assert!(valid_component(&topic), "default_topic({handles:?}) = {topic:?}");
+        }
+
+        #[test]
+        fn parse_for_ref_agrees_with_components(name in refname()) {
+            if let Some(parsed) = parse_for_ref(&name) {
+                prop_assert!(name.starts_with("refs/for/"), "{name:?}");
+                prop_assert!(valid_component(&parsed.base) || parsed.base.contains('/'));
+                prop_assert!(parsed.topic.is_empty() || valid_component(&parsed.topic));
+            }
+        }
     }
 }

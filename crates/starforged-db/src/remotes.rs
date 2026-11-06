@@ -180,3 +180,61 @@ pub async fn record_attempt(db: &Db, id: i64, success: bool, error: &str) -> DbR
     }
     Ok(())
 }
+
+/// Sets `import_state` only while the repository's import remote row
+/// still exists; `false` when it was deleted mid-flight (the caller
+/// must then skip every further state write). Safe on both engines.
+pub async fn set_import_state_if_remote(db: &Db, repo_id: i64, state: &str) -> DbResult<bool> {
+    let result = sqlx::query(
+        "UPDATE repos SET import_state = $1 WHERE id = $2 \
+         AND EXISTS (SELECT 1 FROM repo_remotes WHERE repo_id = $2 AND role = 'import')",
+    )
+    .bind(state)
+    .bind(repo_id)
+    .execute(db.pool())
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// Rewrites a pull mirror's configuration (URL, credentials, interval) and
+/// enables it. Used by the pull-mirror PUT; the push-mirror PUT reuses the
+/// same shape with its own caller.
+#[allow(clippy::too_many_arguments)]
+pub async fn update_pull_config(
+    db: &Db,
+    id: i64,
+    url: &str,
+    auth: &str,
+    username: &str,
+    sealed_secret: Option<&str>,
+    ssh_public_key: Option<&str>,
+    interval_secs: i64,
+) -> DbResult<()> {
+    sqlx::query(
+        "UPDATE repo_remotes SET url = $1, auth = $2, username = $3, sealed_secret = $4, \
+         ssh_public_key = $5, interval_secs = $6, enabled = 1, updated_at = $7 WHERE id = $8",
+    )
+    .bind(url)
+    .bind(auth)
+    .bind(username)
+    .bind(sealed_secret)
+    .bind(ssh_public_key)
+    .bind(interval_secs)
+    .bind(now())
+    .bind(id)
+    .execute(db.pool())
+    .await?;
+    Ok(())
+}
+
+/// Enables or disables a remote. Disabling restores pushes on a pull mirror
+/// without forgetting its configuration.
+pub async fn set_enabled(db: &Db, id: i64, enabled: bool) -> DbResult<()> {
+    sqlx::query("UPDATE repo_remotes SET enabled = $1, updated_at = $2 WHERE id = $3")
+        .bind(i64::from(enabled))
+        .bind(now())
+        .bind(id)
+        .execute(db.pool())
+        .await?;
+    Ok(())
+}

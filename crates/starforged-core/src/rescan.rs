@@ -383,7 +383,7 @@ impl Core {
         let session = db_sessions::session_by_ulid(self.db(), access.repo.id, ulid)
             .await?
             .ok_or(CoreError::NotFound)?;
-        self.remove_session_rows(Some(actor.id), access, &session, "session.purged")
+        self.remove_session_rows(Some(actor.id), access.repo.id, &session, "session.purged")
             .await
     }
 

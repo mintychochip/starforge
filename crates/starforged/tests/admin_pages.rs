@@ -169,7 +169,7 @@ async fn quarantine_actions_require_csrf() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn health_shows_version_engine_git_and_job_aggregates() {
-    let s = TestServer::start().await;
+    let s = TestServer::start_with(|c| c.ssh.listen = "127.0.0.1:2222".to_owned()).await;
     let _root = admin(&s).await;
 
     // One failed job and one queued job, so the aggregates name both states.
@@ -213,7 +213,7 @@ async fn health_shows_version_engine_git_and_job_aggregates() {
         "Git version",
         "Data directory free space",
         "SSH listener",
-        "disabled",
+        "enabled on 127.0.0.1:2222",
         "Search index trails",
         "Oldest pending job",
         "test-health-kind",
@@ -222,6 +222,20 @@ async fn health_shows_version_engine_git_and_job_aggregates() {
     ] {
         assert!(page.contains(needle), "missing {needle}:\n{page}");
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn health_reports_disabled_ssh_listener() {
+    let s = TestServer::start_with(|c| c.ssh.enabled = false).await;
+    let _root = admin(&s).await;
+    let (client, _csrf) = s.login("root").await;
+    let page = get_text(&client, &s.url("/admin/health")).await;
+    assert!(page.contains("SSH listener"), "missing label:\n{page}");
+    assert!(page.contains("disabled"), "expected disabled:\n{page}");
+    assert!(
+        !page.contains("enabled on"),
+        "disabled listener shown enabled:\n{page}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

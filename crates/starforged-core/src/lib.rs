@@ -179,6 +179,12 @@ struct Inner {
     /// in production. Integration tests set it to move the base ref between
     /// gate evaluation and the compare-and-swap.
     merge_cas_hook: std::sync::Mutex<Option<merge::PreCasHook>>,
+    /// Test seam for the account-deletion interruption test (see
+    /// [`account::AccountDeleteHook`]): `None` in production. Fired after
+    /// each uploaded session account deletion removes; returning an error
+    /// aborts the deletion mid-way, leaving completed steps in place so a
+    /// rerun can prove idempotency.
+    account_delete_hook: std::sync::Mutex<Option<account::AccountDeleteHook>>,
     /// Per-repository post-receive ingest locks (D1): one async mutex per
     /// repo, held for a whole scan. Entries are weak: a mutex nobody holds
     /// drops out of the map on the next lookup, so the map cannot grow
@@ -203,6 +209,7 @@ impl Core {
                 search_index_recreated,
                 job_wakeup: tokio::sync::Notify::new(),
                 merge_cas_hook: std::sync::Mutex::new(None),
+                account_delete_hook: std::sync::Mutex::new(None),
                 ingest_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
                 limits: limits::Limiters::default(),
             }),

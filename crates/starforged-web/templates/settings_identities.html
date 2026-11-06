@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% block title %}Linked sign-ins · Settings · Starforge{% endblock %}
+{% block content %}
+{% include "settings_nav.html" %}
+<h1>Linked sign-ins</h1>
+{% if let Some(n) = notice %}<p class="notice">{{ n }}</p>{% endif %}
+{% if let Some(e) = error %}<p class="error">{{ e }}</p>{% endif %}
+{% if identities.is_empty() %}
+<p>No single sign-on identity is linked to this account yet.</p>
+{% else %}
+<ul>
+{% for identity in identities %}
+<li>
+  <code>{{ identity.issuer }}</code> · <code>{{ identity.subject }}</code>
+  <form method="post" action="/settings/identities/{{ identity.id }}/unlink" class="stack">
+    <input type="hidden" name="_csrf" value="{{ csrf }}">
+    <button type="submit">Unlink</button>
+  </form>
+</li>
+{% endfor %}
+</ul>
+{% endif %}
+{% if oidc_enabled %}
+<form method="post" action="/settings/identities/link" class="stack">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <button type="submit">Link this account to single sign-on</button>
+</form>
+{% endif %}
+{% endblock %}

@@ -10,6 +10,10 @@
 <body>
 <header class="site">
   <a class="brand" href="/">Starforge</a>
+  <form method="get" action="/search" class="search-box">
+    <input type="search" name="q" placeholder="Search" aria-label="Search">
+    <button type="submit">Search</button>
+  </form>
   <nav>
   {% if let Some(u) = nav_user %}
     <a href="/new">New repository</a>

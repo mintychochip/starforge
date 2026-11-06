@@ -18,6 +18,7 @@ pub mod auth_factors;
 pub mod changes;
 pub mod checks;
 pub mod collaborators;
+pub mod doctor;
 pub mod email_tokens;
 pub mod github_imports;
 pub mod invites;
@@ -129,6 +130,22 @@ impl Db {
                 .fetch_one(self.pool())
                 .await?,
         )
+    }
+
+    /// The highest migration version this binary knows about for this
+    /// backend (the newest file in the embedded migrator). `starforged
+    /// doctor` compares [`Db::latest_migration`] against this to tell
+    /// "migrations are up to date" from "run `starforged migrate`".
+    pub fn known_migration(&self) -> i64 {
+        let migrator = match self.backend {
+            Backend::Sqlite => &SQLITE_MIGRATIONS,
+            Backend::Postgres => &POSTGRES_MIGRATIONS,
+        };
+        migrator
+            .iter()
+            .map(|migration| migration.version)
+            .max()
+            .unwrap_or(0)
     }
 }
 

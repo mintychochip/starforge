@@ -646,6 +646,8 @@ impl Core {
         }
         self.change_timeline(repo_id, trail.id, "trail.open", Some(user_id), event)
             .await?;
+        self.enqueue_index(&crate::jobs::Job::IndexTrail { trail_id: trail.id })
+            .await;
         Ok(trail)
     }
 
@@ -1201,6 +1203,9 @@ pub struct RevisionView {
 pub struct ReviewView {
     pub id: i64,
     pub revision: i64,
+    /// The local author id; `None` for placeholders and deleted users.
+    /// Gate counting resolves BY ID and skips `None` (M4c D4).
+    pub author_id: Option<i64>,
     pub author_handle: String,
     /// The original GitHub login when the author is a placeholder (M4c
     /// D1); see [`ChangeView::creator_imported_author`].
@@ -1232,6 +1237,8 @@ pub struct ThreadCommentView {
     pub id: i64,
     pub review_id: Option<i64>,
     pub author_handle: String,
+    /// The local author id; `None` for placeholders and deleted users.
+    pub author_id: Option<i64>,
     /// The original GitHub login when the author is a placeholder (M4c
     /// D1); see [`ChangeView::creator_imported_author`].
     pub imported_author: Option<String>,
@@ -1427,6 +1434,7 @@ impl Core {
             id: row.id,
             revision: revision.number,
             author_handle,
+            author_id: row.author_id,
             imported_author,
             verdict: row.verdict.clone(),
             body: row.body.clone(),
@@ -1457,6 +1465,7 @@ impl Core {
             id: row.id,
             review_id: row.review_id,
             author_handle,
+            author_id: row.author_id,
             imported_author,
             body: row.body.clone(),
             created_at: row.created_at,

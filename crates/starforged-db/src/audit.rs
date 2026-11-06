@@ -130,7 +130,7 @@ pub async fn search(db: &Db, filter: &AuditFilter) -> DbResult<Vec<AuditRow>> {
                 " AND LOWER(a.action) LIKE LOWER({}) ESCAPE '\\'",
                 placeholder()
             ));
-            binds.push(Bind::Text(format!("{}%", escape_like(prefix))));
+            binds.push(Bind::Text(format!("{}.%", escape_like(prefix))));
         } else {
             sql.push_str(&format!(" AND a.action = {}", placeholder()));
             binds.push(Bind::Text(action.clone()));

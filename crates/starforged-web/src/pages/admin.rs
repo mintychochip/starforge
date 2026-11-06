@@ -776,7 +776,7 @@ pub struct AuditPage {
     from: String,
     to: String,
     entries: Vec<AuditRowView>,
-    next_after: Option<i64>,
+    next_href: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -787,6 +787,31 @@ pub struct AuditParams {
     from: Option<String>,
     to: Option<String>,
     after: Option<i64>,
+}
+
+/// The "Older entries" link with the filters percent-encoded (like the login
+/// redirect in `crate::auth`): values with `&`, `=`, or spaces must round-trip
+/// through the query string instead of breaking it. The template renders the
+/// result escaped (no `|safe`).
+fn audit_next_href(
+    actor: &str,
+    action: &str,
+    target: &str,
+    from: &str,
+    to: &str,
+    after: i64,
+) -> String {
+    use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
+    let encode = |value: &str| utf8_percent_encode(value, NON_ALPHANUMERIC).to_string();
+    format!(
+        "/admin/audit?actor={}&action={}&target={}&from={}&to={}&after={}",
+        encode(actor),
+        encode(action),
+        encode(target),
+        encode(from),
+        encode(to),
+        after
+    )
 }
 
 /// `/admin/audit`: newest first, 50 per page with a keyset cursor (D3).
@@ -828,9 +853,10 @@ pub async fn audit_page(
             user_agent: entry.user_agent,
         })
         .collect::<Vec<_>>();
-    let next_after = if entries.len() > 50 {
+    let next_href = if entries.len() > 50 {
         entries.truncate(50);
-        entries.last().map(|row| row.id)
+        let after = entries.last().map(|row| row.id).unwrap_or(0);
+        Some(audit_next_href(&actor, &action, &target, &from, &to, after))
     } else {
         None
     };
@@ -844,7 +870,7 @@ pub async fn audit_page(
         from,
         to,
         entries,
-        next_after,
+        next_href,
     })
 }
 

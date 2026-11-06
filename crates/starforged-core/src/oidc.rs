@@ -16,9 +16,12 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use serde::{Deserialize, Deserializer};
 use sha2::{Digest, Sha256};
-use starforged_db::{auth_factors, now};
+use starforged_db::{auth_factors, now, users};
 use subtle::ConstantTimeEq;
 
+use crate::accounts::{CreateUser, User};
+use crate::registration::RegistrationMode;
+use crate::sessions::SECOND_FACTOR_TTL_SECS;
 use crate::{Core, CoreError, CoreResult, crypto};
 
 /// Clock leeway applied to `exp`/`iat` (plan Global Constraints: 60 s).
@@ -75,6 +78,55 @@ pub enum OidcIntent {
     Link { user_id: i64 },
 }
 
+/// One identity linked to the signed-in user, for `/settings/identities`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkedIdentity {
+    pub id: i64,
+    pub issuer: String,
+    pub subject: String,
+}
+
+/// The outcome of resolving verified claims to a sign-in
+/// ([`Core::oidc_login`], plan D5).
+#[derive(Debug, Clone)]
+pub enum OidcLoginOutcome {
+    /// The web session was opened.
+    Session(User, crate::sessions::NewSession),
+    /// The identity resolved; the second factor must complete the login.
+    /// The inner string is the random challenge token for the browser cookie.
+    NeedsSecondFactor(String),
+    /// No linked identity, no verified-email match, and auto-create is
+    /// off or not allowed: the generic "no account" page.
+    NoAccount,
+}
+
+/// Turns provider text into handle-shaped text (plan D5 step 3): ASCII
+/// letters and digits kept (lowercased), anything else becomes `-`, runs
+/// of `-` collapse, and leading/trailing `-` are dropped. The result may
+/// still clash or be reserved; the caller deduplicates and `create_user`
+/// validates.
+pub fn sanitize_handle(raw: &str) -> String {
+    let mut out = String::new();
+    let mut last_dash = true;
+    for ch in raw.trim().chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            last_dash = false;
+        } else if !last_dash {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    out.chars()
+        .take(39)
+        .collect::<String>()
+        .trim_end_matches('-')
+        .to_owned()
+}
+
 /// The OIDC discovery document, reduced to what the flow needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Discovery {
@@ -106,6 +158,7 @@ pub struct Claims {
     pub azp: Option<String>,
     pub exp: i64,
     pub iat: i64,
+    pub nbf: Option<i64>,
     pub nonce: Option<String>,
     pub email: Option<String>,
     #[serde(default, deserialize_with = "de_bool_or_string")]
@@ -307,6 +360,9 @@ pub fn verify_id_token(token: &str, jwks: &Jwks, expect: &Expect) -> Result<Clai
     if claims.iat > expect.now + LEEWAY_SECS {
         return Err(VerifyError::NotYetValid);
     }
+    if claims.nbf.is_some_and(|nbf| nbf > expect.now + LEEWAY_SECS) {
+        return Err(VerifyError::NotYetValid);
+    }
     if let Some(want) = &expect.nonce {
         match &claims.nonce {
             Some(got) if bool::from(got.as_bytes().ct_eq(want.as_bytes())) => {}
@@ -409,6 +465,36 @@ fn generic(err: VerifyError) -> CoreError {
     oidc_error(&err.to_string())
 }
 
+/// Maximum provider response body read for any OIDC fetch (1 MiB): discovery
+/// documents, JWKS, and token responses are all small JSON; a hostile
+/// provider must not be able to OOM the server by buffering a huge body.
+pub const MAX_PROVIDER_BODY_BYTES: usize = 1024 * 1024;
+
+/// Reads a provider response body, refusing when `Content-Length` already
+/// exceeds the cap or when the streamed bytes do. Every failure is the
+/// generic single-sign-on error.
+async fn read_capped_body(response: reqwest::Response) -> CoreResult<Vec<u8>> {
+    if response
+        .content_length()
+        .is_some_and(|len| len > MAX_PROVIDER_BODY_BYTES as u64)
+    {
+        return Err(oidc_error("the oidc provider response is too large"));
+    }
+    let mut response = response;
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|err| oidc_error(&err.to_string()))?
+    {
+        if body.len() + chunk.len() > MAX_PROVIDER_BODY_BYTES {
+            return Err(oidc_error("the oidc provider response is too large"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 impl Core {
     fn oidc_config(&self) -> CoreResult<&OidcConfig> {
         let config = &self.config().oidc;
@@ -460,10 +546,8 @@ impl Core {
             #[serde(default)]
             token_endpoint_auth_methods_supported: Vec<String>,
         }
-        let doc: Doc = response
-            .json()
-            .await
-            .map_err(|err| oidc_error(&err.to_string()))?;
+        let body = read_capped_body(response).await?;
+        let doc: Doc = serde_json::from_slice(&body).map_err(|err| oidc_error(&err.to_string()))?;
         if doc.issuer != config.issuer {
             return Err(oidc_error("the oidc discovery issuer does not match"));
         }
@@ -500,15 +584,20 @@ impl Core {
         if !url_allowed(&discovery.jwks_uri) {
             return Err(oidc_error("the oidc jwks_uri is not https"));
         }
-        let text = cache
+        let response = cache
             .http
             .get(&discovery.jwks_uri)
             .send()
             .await
-            .map_err(|err| oidc_error(&err.to_string()))?
-            .text()
-            .await
             .map_err(|err| oidc_error(&err.to_string()))?;
+        if !url_allowed(response.url().as_str()) {
+            return Err(oidc_error("the oidc jwks redirect left https"));
+        }
+        if !response.status().is_success() {
+            return Err(oidc_error("the oidc jwks request failed"));
+        }
+        let body = read_capped_body(response).await?;
+        let text = String::from_utf8(body).map_err(|err| oidc_error(&err.to_string()))?;
         let jwks = Jwks::parse(&text).map_err(generic)?;
         let mut cached = cache.jwks.lock().await;
         for key in &jwks.keys {
@@ -576,11 +665,28 @@ impl Core {
         code: &str,
         state: &str,
     ) -> CoreResult<Claims> {
+        Ok(self
+            .oidc_finish_with_user(challenge_id, code, state)
+            .await?
+            .0)
+    }
+
+    /// Like [`Core::oidc_finish`], also returning the challenge's intent:
+    /// `Some(user_id)` for a link flow, `None` for a fresh sign-in. The
+    /// caller needs it before dispatching to [`Core::oidc_link`] or
+    /// [`Core::oidc_login`]; the challenge row itself is deleted on finish.
+    pub async fn oidc_finish_with_user(
+        &self,
+        challenge_id: &str,
+        code: &str,
+        state: &str,
+    ) -> CoreResult<(Claims, Option<i64>)> {
         let config = self.oidc_config()?.clone();
         let row =
             auth_factors::challenge_by_token_hash(self.db(), &crypto::sha256_hex(challenge_id))
                 .await?
                 .ok_or_else(|| oidc_error("unknown login challenge"))?;
+        let intent_user = row.user_id;
         // Single use: the challenge is gone whatever happens next.
         auth_factors::delete_challenge(self.db(), row.id).await?;
         if row.kind != "oidc" {
@@ -644,13 +750,12 @@ impl Core {
         struct TokenResponse {
             id_token: String,
         }
-        let token: TokenResponse = response
-            .json()
-            .await
-            .map_err(|err| oidc_error(&err.to_string()))?;
+        let body = read_capped_body(response).await?;
+        let token: TokenResponse =
+            serde_json::from_slice(&body).map_err(|err| oidc_error(&err.to_string()))?;
         let kid = token_header_kid(&token.id_token).map_err(generic)?;
         let jwks = self.oidc_jwks_for(&kid).await?;
-        verify_id_token(
+        let claims = verify_id_token(
             &token.id_token,
             &jwks,
             &Expect {
@@ -660,7 +765,312 @@ impl Core {
                 now: now(),
             },
         )
-        .map_err(generic)
+        .map_err(generic)?;
+        Ok((claims, intent_user))
+    }
+
+    /// Whether the login page offers the SSO button (plan D6).
+    pub fn oidc_enabled(&self) -> bool {
+        let config = &self.config().oidc;
+        config.enabled && !config.issuer.trim().is_empty() && !config.client_id.trim().is_empty()
+    }
+
+    /// The label for the SSO button on the login page.
+    pub fn oidc_button_label(&self) -> String {
+        let label = self.config().oidc.button_label.trim();
+        if label.is_empty() {
+            "Sign in with SSO".to_owned()
+        } else {
+            label.to_owned()
+        }
+    }
+
+    /// Identities linked to the user, for `/settings/identities`.
+    pub async fn linked_identities(&self, user_id: i64) -> CoreResult<Vec<LinkedIdentity>> {
+        Ok(auth_factors::identities_for_user(self.db(), user_id)
+            .await?
+            .into_iter()
+            .map(|row| LinkedIdentity {
+                id: row.id,
+                issuer: row.issuer,
+                subject: row.subject,
+            })
+            .collect())
+    }
+
+    /// Links `(issuer, sub)` to `user_id` (a `link`-intent flow). Refused
+    /// when the identity is already linked to a different account.
+    /// Audited as `account.identity_linked`, once per link.
+    pub async fn oidc_link(
+        &self,
+        claims: &Claims,
+        user_id: i64,
+        user_agent: &str,
+        ip: &str,
+    ) -> CoreResult<()> {
+        let user_agent: String = user_agent.chars().take(256).collect();
+        if let Some(existing) =
+            auth_factors::identity_by_issuer_subject(self.db(), &claims.iss, &claims.sub).await?
+        {
+            if existing.user_id != user_id {
+                return Err(CoreError::Invalid(
+                    "This sign-in is already linked to another account.".into(),
+                ));
+            }
+            return Ok(());
+        }
+        auth_factors::insert_identity(self.db(), user_id, &claims.iss, &claims.sub).await?;
+        let target = match self.user_by_id(user_id).await? {
+            Some(user) => format!("user:{}", user.handle),
+            None => format!("user:{user_id}"),
+        };
+        self.audit_client(
+            Some(user_id),
+            "account.identity_linked",
+            &target,
+            &claims.iss,
+            ip,
+            &user_agent,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Removes one of the user's identity links. Refused when it would
+    /// leave the account with no way to sign in (no password and no other
+    /// identity). Audited as `account.identity_unlinked`.
+    pub async fn unlink_identity(
+        &self,
+        user: &User,
+        identity_id: i64,
+        user_agent: &str,
+        ip: &str,
+    ) -> CoreResult<()> {
+        let user_agent: String = user_agent.chars().take(256).collect();
+        let identities = auth_factors::identities_for_user(self.db(), user.id).await?;
+        if !identities.iter().any(|row| row.id == identity_id) {
+            return Err(CoreError::NotFound);
+        }
+        let row = users::by_id(self.db(), user.id)
+            .await?
+            .ok_or(CoreError::NotFound)?;
+        if row.password_hash.is_none() && identities.len() <= 1 {
+            return Err(CoreError::Invalid(
+                "This is the only way to sign in to this account; set a password or link another sign-in first."
+                    .into(),
+            ));
+        }
+        if !auth_factors::delete_identity(self.db(), identity_id, user.id).await? {
+            return Err(CoreError::NotFound);
+        }
+        self.audit_client(
+            Some(user.id),
+            "account.identity_unlinked",
+            &format!("user:{}", user.handle),
+            "",
+            ip,
+            &user_agent,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Resolves verified claims to a login (plan D5): a linked identity,
+    /// else a verified-email match, else auto-create when allowed, else
+    /// [`OidcLoginOutcome::NoAccount`]. Suspended users are refused. A
+    /// user with TOTP enabled gets [`OidcLoginOutcome::NeedsSecondFactor`]
+    /// (plan D2), exactly like password login.
+    pub async fn oidc_login(
+        &self,
+        claims: &Claims,
+        user_agent: &str,
+        ip: &str,
+    ) -> CoreResult<OidcLoginOutcome> {
+        let user_agent: String = user_agent.chars().take(256).collect();
+        let config = self.oidc_config()?.clone();
+        let login_name = claims
+            .email
+            .as_deref()
+            .map(|e| e.trim().to_ascii_lowercase())
+            .unwrap_or_else(|| claims.sub.clone());
+        self.check_login_limits(&login_name, ip, &user_agent)
+            .await?;
+        let user = match self.resolve_identity(claims, &config).await? {
+            Some(user) => user,
+            None => {
+                self.audit_client(
+                    None,
+                    "login.failure",
+                    &format!("login:{login_name}"),
+                    "no account for this sign-in",
+                    ip,
+                    &user_agent,
+                )
+                .await?;
+                return Ok(OidcLoginOutcome::NoAccount);
+            }
+        };
+        if !user.active {
+            self.audit_client(
+                Some(user.id),
+                "login.failure",
+                &format!("user:{}", user.handle),
+                "suspended",
+                ip,
+                &user_agent,
+            )
+            .await?;
+            return Err(CoreError::Unauthenticated);
+        }
+        self.audit_client(
+            Some(user.id),
+            "login.oidc",
+            &format!("user:{}", user.handle),
+            &claims.iss,
+            ip,
+            &user_agent,
+        )
+        .await?;
+        if self.totp_enabled(user.id).await? {
+            let token = crypto::random_hex(32);
+            auth_factors::insert_challenge(
+                self.db(),
+                "totp",
+                Some(user.id),
+                &crypto::sha256_hex(&token),
+                now() + SECOND_FACTOR_TTL_SECS,
+            )
+            .await?;
+            return Ok(OidcLoginOutcome::NeedsSecondFactor(token));
+        }
+        let session = self.open_session(&user, &user_agent, ip).await?;
+        self.audit_client(
+            Some(user.id),
+            "auth.login",
+            &format!("user:{}", user.handle),
+            "",
+            ip,
+            &user_agent,
+        )
+        .await?;
+        Ok(OidcLoginOutcome::Session(user, session))
+    }
+
+    /// Steps 1–3 of plan D5 identity resolution. `None` means no account.
+    async fn resolve_identity(
+        &self,
+        claims: &Claims,
+        config: &OidcConfig,
+    ) -> CoreResult<Option<User>> {
+        if let Some(row) =
+            auth_factors::identity_by_issuer_subject(self.db(), &claims.iss, &claims.sub).await?
+        {
+            return self.user_by_id(row.user_id).await;
+        }
+        let email = claims
+            .email
+            .as_deref()
+            .map(|e| e.trim().to_ascii_lowercase())
+            .filter(|e| !e.is_empty());
+        if config.link_by_email
+            && claims.email_verified == Some(true)
+            && let Some(email) = email.as_deref()
+            && let Some(row) = users::by_email(self.db(), email).await?
+        {
+            let user = User::from(row);
+            auth_factors::insert_identity(self.db(), user.id, &claims.iss, &claims.sub).await?;
+            self.audit(
+                Some(user.id),
+                "account.identity_linked",
+                &format!("user:{}", user.handle),
+                &claims.iss,
+            )
+            .await?;
+            return Ok(Some(user));
+        }
+        if config.auto_create && self.auto_create_allowed(email.as_deref()) {
+            let user = self.auto_create_user(claims, email.as_deref()).await?;
+            auth_factors::insert_identity(self.db(), user.id, &claims.iss, &claims.sub).await?;
+            self.audit(
+                Some(user.id),
+                "account.identity_linked",
+                &format!("user:{}", user.handle),
+                &claims.iss,
+            )
+            .await?;
+            return Ok(Some(user));
+        }
+        Ok(None)
+    }
+
+    /// Whether auto-create may create an account for `email` under the
+    /// current registration mode (plan D5 step 3).
+    fn auto_create_allowed(&self, email: Option<&str>) -> bool {
+        let registration = self.registration();
+        match registration.mode {
+            RegistrationMode::Sso | RegistrationMode::Open => true,
+            RegistrationMode::Domains => match email {
+                Some(email) => {
+                    let domain = email.rsplit_once('@').map(|(_, d)| d).unwrap_or("");
+                    registration.allowed_domains.iter().any(|d| d == domain)
+                }
+                None => false,
+            },
+            RegistrationMode::Invite => false,
+        }
+    }
+
+    /// Creates an SSO-only account: a sanitized, deduplicated handle, the
+    /// provider's email marked verified when the provider verified it,
+    /// and no password.
+    async fn auto_create_user(&self, claims: &Claims, email: Option<&str>) -> CoreResult<User> {
+        let base = claims
+            .preferred_username
+            .as_deref()
+            .map(sanitize_handle)
+            .filter(|h| !h.is_empty())
+            .or_else(|| {
+                email
+                    .and_then(|e| e.split_once('@').map(|(local, _)| sanitize_handle(local)))
+                    .filter(|h| !h.is_empty())
+            })
+            .unwrap_or_else(|| "user".to_owned());
+        let mut handle = base.clone();
+        let mut n = 2_i64;
+        while self.user_by_handle(&handle).await?.is_some() {
+            let suffix = format!("-{n}");
+            let stem: String = base
+                .chars()
+                .take(39usize.saturating_sub(suffix.len()))
+                .collect();
+            handle = format!("{stem}{suffix}");
+            n += 1;
+        }
+        let display_name = claims
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .unwrap_or(&handle)
+            .to_owned();
+        let user = self
+            .create_user(CreateUser {
+                handle,
+                display_name,
+                email: email.map(str::to_owned),
+                email_verified: claims.email_verified == Some(true),
+                password: None,
+                is_admin: false,
+            })
+            .await?;
+        self.audit(
+            Some(user.id),
+            "account.sign_up",
+            &format!("user:{}", user.handle),
+            "oidc:auto_create",
+        )
+        .await?;
+        Ok(user)
     }
 }
 
@@ -986,5 +1396,31 @@ mod tests {
         assert!(!url_allowed("http://idp.example.com/"));
         assert!(!url_allowed("ftp://idp.example.com/"));
         assert!(!url_allowed("not a url"));
+    }
+
+    #[test]
+    fn future_nbf_refused_within_leeway() {
+        let key = es_key();
+        let jwks = Jwks::from_vec(vec![key.jwk.clone()]);
+        let future = es_token(&key, |_, claims| {
+            claims["nbf"] = serde_json::json!(1200);
+        });
+        assert_eq!(
+            verify_id_token(&future, &jwks, &expect(1000)),
+            Err(VerifyError::NotYetValid)
+        );
+        let leeway = es_token(&key, |_, claims| {
+            claims["nbf"] = serde_json::json!(1050);
+        });
+        assert!(verify_id_token(&leeway, &jwks, &expect(1000)).is_ok());
+    }
+
+    #[test]
+    fn sanitize_handle_shapes_text() {
+        assert_eq!(sanitize_handle("Fake User!"), "fake-user");
+        assert_eq!(sanitize_handle("--Foo__Bar--"), "foo-bar");
+        assert_eq!(sanitize_handle("user@example.com"), "user-example-com");
+        assert_eq!(sanitize_handle("!!!"), "");
+        assert_eq!(sanitize_handle(""), "");
     }
 }

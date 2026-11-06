@@ -180,28 +180,51 @@ pub async fn post_links(
     Ok(Json(json!({ "accepted": accepted })))
 }
 
-/// `GET /repos/{owner}/{repo}/sessions?quarantined=true`: the admin
-/// quarantine queue. Repo-`admin` only (visible-but-insufficient answers
-/// `403`, invisible repositories `404`); anything but `?quarantined=true`
-/// answers `422` — the full session listing lands with the M1e read path.
+/// `GET /repos/{owner}/{repo}/sessions`: the sessions the caller may read
+/// under the §6.4 rule (ULIDs of unreadable sessions stay undiscoverable),
+/// oldest first. `?quarantined=true` keeps its older meaning — the admin
+/// quarantine queue (repo `admin` only; visible-but-insufficient answers
+/// `403`, invisible repositories `404`). `?quarantined=false` answers `422`.
 pub async fn list_sessions(
     State(state): State<ApiState>,
     auth: ApiAuth,
     Path((owner, repo)): Path<(String, String)>,
     Query(query): Query<SessionListQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let token = auth.require(Scope::SessionUpload)?;
-    let access = state
-        .core
-        .require_repo(Some(&token.user), &owner, &repo, Permission::Admin)
-        .await?;
-    if query.quarantined != Some(true) {
-        return Err(ApiError::Invalid(
+    match query.quarantined {
+        Some(true) => {
+            let token = auth.require(Scope::SessionUpload)?;
+            let access = state
+                .core
+                .require_repo(Some(&token.user), &owner, &repo, Permission::Admin)
+                .await?;
+            let sessions = state.core.list_quarantined(&access).await?;
+            Ok((noindex_headers(), Json(json!({ "sessions": sessions }))).into_response())
+        }
+        Some(false) => Err(ApiError::Invalid(
             "only ?quarantined=true is supported".into(),
-        ));
+        )),
+        None => {
+            let user = auth.reader()?;
+            let access = state.core.repo_for(user, &owner, &repo).await?;
+            let sessions = state.core.list_readable_sessions(user, &access).await?;
+            let rows = sessions
+                .iter()
+                .map(|row| {
+                    json!({
+                        "ulid": row.ulid,
+                        "agent": {"name": row.agent_name, "version": row.agent_version},
+                        "title": row.title,
+                        "visibility": row.visibility,
+                        "lifecycle": row.lifecycle,
+                        "started_at": row.started_at,
+                        "ended_at": row.ended_at,
+                    })
+                })
+                .collect::<Vec<_>>();
+            Ok((noindex_headers(), Json(json!({ "sessions": rows }))).into_response())
+        }
     }
-    let sessions = state.core.list_quarantined(&access).await?;
-    Ok(Json(json!({ "sessions": sessions })))
 }
 
 /// `POST /repos/{owner}/{repo}/sessions/{ulid}/release`: clears a quarantine
@@ -446,4 +469,57 @@ pub async fn get_events(
             "total": view.total,
         })),
     ))
+}
+
+/// `GET /repos/{owner}/{repo}/sessions/{ulid}/links`: the session's commit
+/// links (the `links` array of [`get_session`], standalone for export).
+/// One [`Core::authorize_session_read_by_ulid`] check — non-readers get
+/// `404`, never `403`.
+pub async fn get_links(
+    State(state): State<ApiState>,
+    auth: ApiAuth,
+    Path((owner, repo, ulid)): Path<(String, String, String)>,
+) -> Result<impl IntoResponse, ApiError> {
+    let user = auth.reader()?;
+    let (_, row) = state
+        .core
+        .authorize_session_read_by_ulid(user, &owner, &repo, &ulid)
+        .await?;
+    let links = state.core.session_links(row.id).await?;
+    let links = links
+        .iter()
+        .map(|link| {
+            json!({
+                "sha": link.sha,
+                "confidence": link.confidence,
+                "seq_start": link.seq_start,
+                "seq_end": link.seq_end,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok((noindex_headers(), Json(json!({ "links": links }))))
+}
+
+/// `GET /repos/{owner}/{repo}/sessions/{ulid}/segments/{n}`: the exact
+/// stored bytes of segment `n` (the compressed JSONL blob, verbatim) as
+/// `application/octet-stream` — the raw segment download the export bundle
+/// carries. One [`Core::authorize_session_read_by_ulid`] check; an absent
+/// segment answers `404`.
+pub async fn get_segment(
+    State(state): State<ApiState>,
+    auth: ApiAuth,
+    Path((owner, repo, ulid, n)): Path<(String, String, String, i64)>,
+) -> Result<Response, ApiError> {
+    let user = auth.reader()?;
+    let (_, row) = state
+        .core
+        .authorize_session_read_by_ulid(user, &owner, &repo, &ulid)
+        .await?;
+    let bytes = state.core.session_segment_bytes(row.id, n).await?;
+    let mut headers = noindex_headers();
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    Ok((headers, bytes).into_response())
 }

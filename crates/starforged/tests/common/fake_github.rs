@@ -8,23 +8,35 @@
 //! array; page 2 holds the rest with no next link. Special repository
 //! names model the edge cases the client must handle:
 //!
-//! - repo `ratelimited` — every route answers 403 with
-//!   `X-RateLimit-Remaining: 0` and an `X-RateLimit-Reset`, which the
-//!   client maps to `RateLimited { reset_at }`.
-//! - repo `big` — every route answers an 11 MiB body, past the client's
-//!   10 MiB cap, which the client refuses.
-//! - repo `crossorigin` — listings link their next page off-origin,
-//!   which the client must refuse to follow.
+//! - repo `flaky` — answers the first two requests, rate-limits the third,
+//!   then answers normally again: the G2 resumption test's injected
+//!   mid-run failure.
+//! - the token `bad-token` — every route answers 401: bad credentials.
+//!
+//! [`FakeGithub::start_with_clone_url`] overrides the repository fixture's
+//! `clone_url` (the G2 tests point it at a `file://` remote holding
+//! `refs/pull/<n>/head`). Issue comments are served only for issue 1 and
+//! review comments/reviews only for pull 4; other numbers get empty
+//! listings.
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use axum::{
     Router,
-    extract::{Path, Query},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode, header},
     response::IntoResponse,
     routing::get,
 };
+
+/// Fake-API state shared by the handlers.
+#[derive(Debug, Default)]
+struct FakeState {
+    clone_url: Option<String>,
+    requests: AtomicUsize,
+}
 
 /// The running fake API. `base` is the loopback base URL (no trailing
 /// slash), suitable as `GithubClient::new`'s `api_url` (with the
@@ -105,8 +117,23 @@ async fn listing(
     repo: String,
     query: HashMap<String, String>,
     headers: HeaderMap,
-) -> impl IntoResponse {
+    state: Arc<FakeState>,
+) -> axum::response::Response {
+    let unauthorized = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        == Some("Bearer bad-token");
+    if unauthorized {
+        return (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(serde_json::json!({"message": "Bad credentials"})),
+        )
+            .into_response();
+    }
     if repo == "ratelimited" {
+        return ratelimited().into_response();
+    }
+    if repo == "flaky" && state.requests.fetch_add(1, Ordering::SeqCst) + 1 == 3 {
         return ratelimited().into_response();
     }
     if repo == "big" {
@@ -118,58 +145,109 @@ async fn listing(
 }
 
 async fn issues(
+    State(state): State<Arc<FakeState>>,
     Path((_owner, repo)): Path<(String, String)>,
     Query(query): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    listing("issues.json", "issues", repo, query, headers).await
+    listing("issues.json", "issues", repo, query, headers, state.clone()).await
 }
 
 async fn pulls(
+    State(state): State<Arc<FakeState>>,
     Path((_owner, repo)): Path<(String, String)>,
     Query(query): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    listing("pulls.json", "pulls", repo, query, headers).await
+    listing("pulls.json", "pulls", repo, query, headers, state.clone()).await
 }
 
 async fn issue_comments(
-    Path((_owner, repo, _n)): Path<(String, String, String)>,
+    State(state): State<Arc<FakeState>>,
+    Path((_owner, repo, n)): Path<(String, String, String)>,
     Query(query): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    listing("issue_comments.json", "issues", repo, query, headers).await
+    if n != "1" {
+        return axum::Json(serde_json::json!([])).into_response();
+    }
+    listing(
+        "issue_comments.json",
+        "issues",
+        repo,
+        query,
+        headers,
+        state.clone(),
+    )
+    .await
 }
 
 async fn review_comments(
-    Path((_owner, repo, _n)): Path<(String, String, String)>,
+    State(state): State<Arc<FakeState>>,
+    Path((_owner, repo, n)): Path<(String, String, String)>,
     Query(query): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    listing("review_comments.json", "pulls", repo, query, headers).await
+    if n != "4" {
+        return axum::Json(serde_json::json!([])).into_response();
+    }
+    listing(
+        "review_comments.json",
+        "pulls",
+        repo,
+        query,
+        headers,
+        state.clone(),
+    )
+    .await
 }
 
 async fn reviews(
-    Path((_owner, repo, _n)): Path<(String, String, String)>,
+    State(state): State<Arc<FakeState>>,
+    Path((_owner, repo, n)): Path<(String, String, String)>,
     Query(query): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    listing("reviews.json", "pulls", repo, query, headers).await
+    if n != "4" {
+        return axum::Json(serde_json::json!([])).into_response();
+    }
+    listing("reviews.json", "pulls", repo, query, headers, state.clone()).await
 }
 
-async fn repository(Path((_owner, repo)): Path<(String, String)>) -> impl IntoResponse {
+async fn repository(
+    State(state): State<Arc<FakeState>>,
+    Path((_owner, repo)): Path<(String, String)>,
+) -> impl IntoResponse {
     if repo == "ratelimited" {
         return ratelimited().into_response();
     }
     if repo == "big" {
         return big().into_response();
     }
-    axum::Json(fixture("repository.json")).into_response()
+    let mut repository = fixture("repository.json");
+    if let Some(clone_url) = &state.clone_url {
+        repository["clone_url"] = serde_json::Value::String(clone_url.clone());
+    }
+    axum::Json(repository).into_response()
 }
 
 impl FakeGithub {
     /// Starts the fake API on a loopback port and returns its base URL.
     pub async fn start() -> FakeGithub {
+        Self::start_with_state(FakeState::default()).await
+    }
+
+    /// Like [`FakeGithub::start`], but the repository fixture's `clone_url`
+    /// is replaced with `clone_url` (a `file://` remote in the G2 tests).
+    pub async fn start_with_clone_url(clone_url: String) -> FakeGithub {
+        Self::start_with_state(FakeState {
+            clone_url: Some(clone_url),
+            requests: AtomicUsize::new(0),
+        })
+        .await
+    }
+
+    async fn start_with_state(state: FakeState) -> FakeGithub {
         let app = Router::new()
             .route("/repos/{owner}/{repo}", get(repository))
             .route("/repos/{owner}/{repo}/issues", get(issues))
@@ -182,7 +260,8 @@ impl FakeGithub {
                 "/repos/{owner}/{repo}/pulls/{n}/comments",
                 get(review_comments),
             )
-            .route("/repos/{owner}/{repo}/pulls/{n}/reviews", get(reviews));
+            .route("/repos/{owner}/{repo}/pulls/{n}/reviews", get(reviews))
+            .with_state(Arc::new(state));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {

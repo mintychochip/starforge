@@ -458,6 +458,77 @@ pub async fn ls_remote_head(
     let output = run_remote(repo_dir, pinned, creds, args, timeout).await?;
     Ok(parse_ls_remote_head(&output.stdout))
 }
+/// `git ls-remote <url> <ref>` argv (no credentials, ever). The explicit
+/// ref argument names one ref (e.g. `refs/pull/2/head`), which GitHub and
+/// plain git remotes both answer even when the ref is not advertised for
+/// fetching. (`git ls-remote` takes no `--` separator; dash-leading values
+/// are refused by [`validate_positionals`] before git is spawned.)
+pub fn ls_remote_ref_args(pinned: &PinnedRemote, refname: &str) -> Vec<String> {
+    let mut args = pinned.config_args();
+    args.push("ls-remote".to_owned());
+    args.push(pinned.url.clone());
+    args.push(refname.to_owned());
+    args
+}
+
+/// The object id `git ls-remote` reports for `refname` on the remote, or
+/// `None` when the remote does not have that ref (e.g. a pull request whose
+/// head ref is gone, D3).
+pub async fn ls_remote_ref(
+    repo_dir: &Path,
+    pinned: &PinnedRemote,
+    creds: &RemoteCreds,
+    refname: &str,
+    timeout: Duration,
+) -> Result<Option<String>, GitError> {
+    let args = ls_remote_ref_args(pinned, refname);
+    validate_positionals(pinned, &[refname.to_owned()], &args)?;
+    let output = run_remote(repo_dir, pinned, creds, args, timeout).await?;
+    for line in output.stdout.lines() {
+        let mut parts = line.splitn(2, '\t');
+        if let (Some(oid), Some(name)) = (parts.next(), parts.next())
+            && name.trim() == refname
+        {
+            return Ok(Some(oid.trim().to_owned()));
+        }
+    }
+    Ok(None)
+}
+
+/// The fetch refspecs carrying one GitHub pull-request head into the trail
+/// refs (`refs/trails/<n>/changes/1/{head,rev/1}`), or `None` when
+/// `number` is not a positive GitHub number. The destination refs are built
+/// here, never from caller input, so a refspec cannot escape
+/// `refs/trails/`.
+pub fn pull_head_refspecs(number: i64) -> Option<Vec<String>> {
+    if number <= 0 {
+        return None;
+    }
+    Some(vec![
+        format!("+refs/pull/{number}/head:refs/trails/{number}/changes/1/head"),
+        format!("+refs/pull/{number}/head:refs/trails/{number}/changes/1/rev/1"),
+    ])
+}
+
+/// Fetches one pull-request head (`refs/pull/<n>/head`) into the trail refs
+/// of trait `number`, through the same validated [`fetch`] path (dash
+/// refusal, `--`, refspec checks, credential handling, stderr scrubbing).
+/// `Err` when the remote does not have the ref or the fetch fails; the
+/// caller (the importer, D3) treats that as an unfetchable head, not a
+/// failed import.
+pub async fn fetch_pull_head(
+    repo_dir: &Path,
+    pinned: &PinnedRemote,
+    creds: &RemoteCreds,
+    number: i64,
+    timeout: Duration,
+) -> Result<FetchOutcome, GitError> {
+    let refspecs = pull_head_refspecs(number).ok_or_else(|| GitError::Failed {
+        command: "fetch pull head".to_owned(),
+        stderr: format!("pull number must be positive: {number}"),
+    })?;
+    fetch(repo_dir, pinned, creds, &refspecs, timeout).await
+}
 
 fn parse_ls_remote_head(stdout: &str) -> LsRemoteHead {
     let mut head = LsRemoteHead {

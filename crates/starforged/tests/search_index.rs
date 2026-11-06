@@ -6,7 +6,7 @@ mod common;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use common::{TestServer, get_text};
+use common::{TestServer, commit_files, get_text, git_ok, work_repo};
 use serde_json::{Value, json};
 use starforged::admin::open_core;
 use starforged::config::Config;
@@ -774,4 +774,38 @@ async fn admin_rebuild_action_enqueues_rebuild_index() {
             .status(),
         404
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn push_created_trail_is_indexed() {
+    let s = TestServer::start().await;
+    let alice = s.user("alice").await;
+    let repo = s.repo(&alice, "proj", Visibility::Private).await;
+    let scope = admin_scope(repo.id, alice.id);
+    let token = s.token(&alice, &[Scope::RepoWrite]).await;
+    let url = s.git_url("alice", "proj", Some(&token));
+    let tmp = tempfile::tempdir().unwrap();
+    let work = work_repo(tmp.path(), "work", &[("README.md", "# proj\n")]).await;
+    git_ok(&work, &["push", "-q", &url, "main"]).await;
+    commit_files(
+        &work,
+        &[("feature.txt", b"feature\n")],
+        "pushtestword feature",
+    )
+    .await;
+    git_ok(&work, &["push", "-q", &url, "HEAD:refs/for/main"]).await;
+
+    // The post-receive scan is async: poll (bounded) until the index job runs.
+    let start = std::time::Instant::now();
+    loop {
+        s.core.run_due_jobs().await.unwrap();
+        if !trail_hits(&s, "pushtestword", &scope).is_empty() {
+            break;
+        }
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(10),
+            "pushed trail was not indexed within 10s"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 }

@@ -135,9 +135,8 @@ pub async fn insert_ssh_key(
         Err(e) => return Err(e.into()),
     };
     let registered =
-        sqlx::query("INSERT INTO ssh_fingerprints (fingerprint, kind, ref_id) VALUES ($1, $2, $3)")
+        sqlx::query("INSERT INTO ssh_fingerprints (fingerprint, ssh_key_id, deploy_key_id) VALUES ($1, $2, NULL)")
             .bind(key.fingerprint)
-            .bind("ssh_key")
             .bind(id)
             .execute(&mut *tx)
             .await;
@@ -197,9 +196,8 @@ pub async fn insert_deploy_key(
         Err(e) => return Err(e.into()),
     };
     let registered =
-        sqlx::query("INSERT INTO ssh_fingerprints (fingerprint, kind, ref_id) VALUES ($1, $2, $3)")
+        sqlx::query("INSERT INTO ssh_fingerprints (fingerprint, ssh_key_id, deploy_key_id) VALUES ($1, NULL, $2)")
             .bind(key.fingerprint)
-            .bind("deploy_key")
             .bind(id)
             .execute(&mut *tx)
             .await;
@@ -278,62 +276,26 @@ pub async fn count_deploy_keys(db: &Db, repo_id: i64) -> DbResult<i64> {
     Ok(count)
 }
 
-/// Deletes the user's key and its registry row in one transaction;
+/// Deletes the user's key; the `ssh_fingerprints` claim row cascades.
 /// `false` when it does not exist or belongs to someone else.
 pub async fn remove_ssh_key(db: &Db, user_id: i64, id: i64) -> DbResult<bool> {
-    let mut tx = db.pool().begin().await?;
-    let fingerprint: Option<String> =
-        sqlx::query_scalar("SELECT fingerprint FROM ssh_keys WHERE id = $1 AND user_id = $2")
-            .bind(id)
-            .bind(user_id)
-            .fetch_optional(&mut *tx)
-            .await?;
-    let Some(fingerprint) = fingerprint else {
-        return Ok(false);
-    };
-    sqlx::query("DELETE FROM ssh_fingerprints WHERE fingerprint = $1")
-        .bind(&fingerprint)
-        .execute(&mut *tx)
-        .await?;
     let result = sqlx::query("DELETE FROM ssh_keys WHERE id = $1 AND user_id = $2")
         .bind(id)
         .bind(user_id)
-        .execute(&mut *tx)
+        .execute(db.pool())
         .await?;
-    let removed = result.rows_affected() == 1;
-    if removed {
-        tx.commit().await?;
-    }
-    Ok(removed)
+    Ok(result.rows_affected() == 1)
 }
 
-/// Deletes a deploy key and its registry row in one transaction; `false`
-/// when absent or in another repository.
+/// Deletes a deploy key; the `ssh_fingerprints` claim row cascades.
+/// `false` when absent or in another repository.
 pub async fn remove_deploy_key(db: &Db, repo_id: i64, id: i64) -> DbResult<bool> {
-    let mut tx = db.pool().begin().await?;
-    let fingerprint: Option<String> =
-        sqlx::query_scalar("SELECT fingerprint FROM deploy_keys WHERE id = $1 AND repo_id = $2")
-            .bind(id)
-            .bind(repo_id)
-            .fetch_optional(&mut *tx)
-            .await?;
-    let Some(fingerprint) = fingerprint else {
-        return Ok(false);
-    };
-    sqlx::query("DELETE FROM ssh_fingerprints WHERE fingerprint = $1")
-        .bind(&fingerprint)
-        .execute(&mut *tx)
-        .await?;
     let result = sqlx::query("DELETE FROM deploy_keys WHERE id = $1 AND repo_id = $2")
         .bind(id)
         .bind(repo_id)
-        .execute(&mut *tx)
+        .execute(db.pool())
         .await?;
-    let removed = result.rows_affected() == 1;
-    if removed {
-        tx.commit().await?;
-    }
-    Ok(removed)
+    Ok(result.rows_affected() == 1)
 }
 
 /// Whether the row's `last_used_at` is at least 60 seconds old (or unset).

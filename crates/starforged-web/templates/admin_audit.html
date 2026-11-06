@@ -33,8 +33,8 @@
       {% endfor %}
     </tbody>
   </table>
-  {% if let Some(after) = next_after %}
-  <p><a href="/admin/audit?actor={{ actor }}&amp;action={{ action }}&amp;target={{ target }}&amp;from={{ from }}&amp;to={{ to }}&amp;after={{ after }}">Older entries</a></p>
+  {% if let Some(href) = next_href %}
+  <p><a href="{{ href }}">Older entries</a></p>
   {% endif %}
   {% endif %}
 </section>

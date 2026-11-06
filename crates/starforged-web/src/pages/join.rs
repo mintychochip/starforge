@@ -62,6 +62,14 @@ pub async fn form(
     if session.is_some() {
         return Ok(Redirect::to("/").into_response());
     }
+    if state.core.sso_only() {
+        let page = MessagePage::new(
+            None,
+            "Sign-up is disabled",
+            "This Starforge only creates accounts through single sign-on. Sign in with SSO instead.",
+        );
+        return Ok((StatusCode::FORBIDDEN, page).into_response());
+    }
     let invite = query.invite.unwrap_or_default();
     let bound_email = if invite.is_empty() {
         if !state.core.sign_up_open() {

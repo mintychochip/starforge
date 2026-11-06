@@ -391,6 +391,60 @@ pub async fn remove_member_serialized(
     }
 }
 
+/// Handles of orgs where `user_id` is the sole remaining owner, ordered by
+/// handle. Pre-check only: the authoritative check is
+/// [`delete_user_unless_sole_owner`] inside its transaction.
+pub async fn sole_owned_orgs(db: &Db, user_id: i64) -> DbResult<Vec<String>> {
+    let rows: Vec<String> = sqlx::query_scalar(
+        "SELECT o.handle FROM org_members m JOIN owners o ON o.id = m.org_id \
+         WHERE m.user_id = $1 AND m.role = 'owner' \
+         AND (SELECT COUNT(*) FROM org_members m2 \
+              WHERE m2.org_id = m.org_id AND m2.role = 'owner') <= 1 \
+         ORDER BY o.handle",
+    )
+    .bind(user_id)
+    .fetch_all(db.pool())
+    .await?;
+    Ok(rows)
+}
+
+/// Deletes the account's owner row in one transaction behind the per-org
+/// locks of every org the user owns (taken in stable id-ascending order, so
+/// concurrent account deletions cannot deadlock), re-counting owners inside
+/// the transaction like [`remove_member_serialized`]. The cascade then
+/// removes the user's org memberships without orphaning an org.
+///
+/// Returns the org ids the user is the sole owner of; when non-empty nothing
+/// is deleted (the transaction rolls back) and the caller refuses the
+/// deletion. Empty means the account row is gone.
+pub async fn delete_user_unless_sole_owner(db: &Db, user_id: i64) -> DbResult<Vec<i64>> {
+    let mut tx = db.pool().begin().await?;
+    let org_ids: Vec<i64> = sqlx::query_scalar(
+        "SELECT org_id FROM org_members WHERE user_id = $1 AND role = 'owner' ORDER BY org_id",
+    )
+    .bind(user_id)
+    .fetch_all(tx.as_mut())
+    .await?;
+    for org_id in &org_ids {
+        lock_org(&mut tx, *org_id).await?;
+    }
+    let mut sole = Vec::new();
+    for org_id in &org_ids {
+        if owner_count_in(&mut tx, *org_id).await? <= 1 {
+            sole.push(*org_id);
+        }
+    }
+    if !sole.is_empty() {
+        return Ok(sole);
+    }
+    sqlx::query("DELETE FROM owners WHERE id = $1")
+        .bind(user_id)
+        .execute(tx.as_mut())
+        .await?;
+    tx.commit().await?;
+    Ok(sole)
+}
+
 /// Deletes the membership and the org-team memberships in one transaction.
 async fn delete_member_in(
     tx: &mut sqlx::Transaction<'_, sqlx::Any>,

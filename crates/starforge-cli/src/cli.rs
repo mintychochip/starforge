@@ -44,10 +44,25 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: SessionsCmd,
     },
-    /// Export a session bundle.
-    Export,
-    /// Import a session bundle.
-    Import,
+    /// Export session bundles to a directory.
+    Export {
+        /// Source repository as `owner/repo`.
+        #[arg(long)]
+        repo: String,
+        /// Only export this session ULID (repeatable; default: all readable).
+        #[arg(long = "session")]
+        session: Vec<String>,
+        /// Bundle directory.
+        dir: PathBuf,
+    },
+    /// Import session bundles into a repository.
+    Import {
+        /// Bundle directory.
+        dir: PathBuf,
+        /// Target repository as `owner/repo`.
+        #[arg(long)]
+        repo: String,
+    },
     /// Show the session trail.
     Trail {
         #[command(subcommand)]
@@ -84,8 +99,9 @@ pub enum AuthCmd {
     Status,
 }
 
-/// `sessions` subcommands: `list`/`show`/`link`/`unlink` are real (C4/C7);
-/// `publish`/`unpublish`/`delete` remain stubs (out of scope for M1c).
+/// `sessions` subcommands: `list`/`show`/`link`/`unlink` are local (spool);
+/// `publish`/`unpublish`/`delete` are server-side administration (`--repo`
+/// overrides the discovered `owner/repo`).
 #[derive(Debug, Subcommand)]
 pub enum SessionsCmd {
     /// List local sessions.
@@ -111,20 +127,32 @@ pub enum SessionsCmd {
         #[arg(long)]
         commit: String,
     },
-    /// Publish a session (not in M1c).
+    /// Publish a server-side session (public repositories only).
     Publish {
         /// Session ULID.
         ulid: String,
+        /// Target repository as `owner/repo` (default: discovered).
+        #[arg(long)]
+        repo: Option<String>,
     },
-    /// Unpublish a session (not in M1c).
+    /// Unpublish a server-side session.
     Unpublish {
         /// Session ULID.
         ulid: String,
+        /// Target repository as `owner/repo` (default: discovered).
+        #[arg(long)]
+        repo: Option<String>,
     },
-    /// Delete a session (not in M1c).
+    /// Delete a server-side session (requires `--yes`).
     Delete {
         /// Session ULID.
         ulid: String,
+        /// Target repository as `owner/repo` (default: discovered).
+        #[arg(long)]
+        repo: Option<String>,
+        /// Confirm the deletion.
+        #[arg(long)]
+        yes: bool,
     },
 }
 /// `trail` subcommands (M2d J3–J5: list/show/create/comment/push/checkout/review/merge are real).
@@ -340,7 +368,13 @@ pub fn run(cli: Cli, paths: CliPaths) -> std::process::ExitCode {
     | Cmd::Sync
     | Cmd::Doctor
     | Cmd::HookPrePush
-    | Cmd::Trail { .. } = &cli.cmd
+    | Cmd::Trail { .. }
+    | Cmd::Sessions {
+        cmd:
+            SessionsCmd::Publish { .. } | SessionsCmd::Unpublish { .. } | SessionsCmd::Delete { .. },
+    }
+    | Cmd::Export { .. }
+    | Cmd::Import { .. } = &cli.cmd
     {
         // fall through to async dispatch below
     } else {
@@ -372,8 +406,8 @@ fn sync_stub(cli: Cli, paths: CliPaths) -> std::process::ExitCode {
         Cmd::HookPostCommit => run_hook_post_commit(paths),
         Cmd::HookPrePush => unreachable!("pre-push dispatches via run_async"),
         Cmd::Sync => unreachable!("sync dispatches via run_async"),
-        Cmd::Export => stub_err(CliError::Unimplemented("export")),
-        Cmd::Import => stub_err(CliError::Unimplemented("import")),
+        Cmd::Export { .. } => unreachable!("export dispatches via run_async"),
+        Cmd::Import { .. } => unreachable!("import dispatches via run_async"),
         Cmd::Trail { .. } => unreachable!("trail dispatches via run_async"),
     }
 }
@@ -452,7 +486,8 @@ async fn run_hook_pre_push_async(paths: CliPaths) -> std::process::ExitCode {
     std::process::ExitCode::from(code)
 }
 
-/// `sessions` subcommands: list/show/link/unlink are real; the rest are stubs.
+/// `sessions` subcommands: list/show/link/unlink are local (spool);
+/// publish/unpublish/delete dispatch via `run_async`.
 fn run_sessions(cmd: SessionsCmd, dry_run: bool) -> std::process::ExitCode {
     let repo = match std::env::current_dir() {
         Ok(dir) => dir,
@@ -470,15 +505,9 @@ fn run_sessions(cmd: SessionsCmd, dry_run: bool) -> std::process::ExitCode {
         SessionsCmd::Unlink { ulid, commit } => {
             crate::commands::sessions::unlink(&repo, &ulid, &commit, dry_run)
         }
-        SessionsCmd::Publish { .. } => {
-            return stub_err(CliError::Unimplemented("sessions publish"));
-        }
-        SessionsCmd::Unpublish { .. } => {
-            return stub_err(CliError::Unimplemented("sessions unpublish"));
-        }
-        SessionsCmd::Delete { .. } => {
-            return stub_err(CliError::Unimplemented("sessions delete"));
-        }
+        SessionsCmd::Publish { .. } => unreachable!("publish dispatches via run_async"),
+        SessionsCmd::Unpublish { .. } => unreachable!("unpublish dispatches via run_async"),
+        SessionsCmd::Delete { .. } => unreachable!("delete dispatches via run_async"),
     };
     if code == 0 {
         println!("{out}");
@@ -499,9 +528,14 @@ pub async fn run_async(cli: Cli, paths: CliPaths) -> std::process::ExitCode {
         Cmd::Status => run_status(paths, dry_run).await,
         Cmd::Doctor => run_doctor(paths, dry_run).await,
         Cmd::Sync => run_sync(paths, dry_run).await,
-        Cmd::Sessions { cmd } => run_sessions(cmd, dry_run),
-        Cmd::Export => stub_err(CliError::Unimplemented("export")),
-        Cmd::Import => stub_err(CliError::Unimplemented("import")),
+        Cmd::Sessions { cmd } => match &cmd {
+            SessionsCmd::Publish { .. }
+            | SessionsCmd::Unpublish { .. }
+            | SessionsCmd::Delete { .. } => run_session_admin(cmd, paths, dry_run).await,
+            _ => run_sessions(cmd, dry_run),
+        },
+        Cmd::Export { dir, repo, session } => run_export(dir, repo, session, paths, dry_run).await,
+        Cmd::Import { dir, repo } => run_import(dir, repo, paths, dry_run).await,
         Cmd::Trail { cmd } => run_trail(cmd, paths, dry_run).await,
         Cmd::HookPrepare { msg_file } => run_hook_prepare(paths, msg_file),
         Cmd::HookPostCommit => run_hook_post_commit(paths),
@@ -772,6 +806,151 @@ async fn run_trail(cmd: TrailCmd, paths: CliPaths, dry_run: bool) -> std::proces
     std::process::ExitCode::from(code)
 }
 
+/// `sessions publish`/`unpublish`/`delete`: resolve the server (with the
+/// `--repo` override) and issue the single API call. `--dry-run` prints the
+/// plan without resolving anything.
+async fn run_session_admin(
+    cmd: SessionsCmd,
+    paths: CliPaths,
+    dry_run: bool,
+) -> std::process::ExitCode {
+    let (ulid, repo) = match &cmd {
+        SessionsCmd::Publish { ulid, repo }
+        | SessionsCmd::Unpublish { ulid, repo }
+        | SessionsCmd::Delete { ulid, repo, .. } => (ulid.clone(), repo.clone()),
+        _ => unreachable!("run_session_admin only handles publish/unpublish/delete"),
+    };
+    if dry_run {
+        let planned = match &cmd {
+            SessionsCmd::Publish { .. } => format!("would publish session {ulid}"),
+            SessionsCmd::Unpublish { .. } => format!("would unpublish session {ulid}"),
+            SessionsCmd::Delete { .. } => format!("would delete session {ulid}"),
+            _ => unreachable!(),
+        };
+        println!("{planned} (dry run)");
+        return std::process::ExitCode::SUCCESS;
+    }
+    let Some(repo_dir) = cwd_repo() else {
+        return std::process::ExitCode::from(1);
+    };
+    let api = match crate::commands::session_admin::resolve_api(&repo_dir, &paths, repo.as_deref())
+        .await
+    {
+        Ok(api) => api,
+        Err(err) => {
+            eprintln!("error: {err}");
+            return std::process::ExitCode::from(1);
+        }
+    };
+    let (out, code) = match cmd {
+        SessionsCmd::Publish { ulid, .. } => {
+            crate::commands::session_admin::publish(&api, &ulid).await
+        }
+        SessionsCmd::Unpublish { ulid, .. } => {
+            crate::commands::session_admin::unpublish(&api, &ulid).await
+        }
+        SessionsCmd::Delete { ulid, yes, .. } => {
+            crate::commands::session_admin::delete(&api, &ulid, yes).await
+        }
+        _ => unreachable!(),
+    };
+    if code == 0 {
+        println!("{out}");
+    } else {
+        eprintln!("{out}");
+    }
+    std::process::ExitCode::from(code)
+}
+
+/// `export`: resolve the server and write the bundle. `--dry-run` prints
+/// the plan without resolving anything.
+async fn run_export(
+    dir: PathBuf,
+    repo: String,
+    session: Vec<String>,
+    paths: CliPaths,
+    dry_run: bool,
+) -> std::process::ExitCode {
+    if dry_run {
+        let scope = if session.is_empty() {
+            "all readable sessions".to_string()
+        } else {
+            format!("session(s) {}", session.join(", "))
+        };
+        println!(
+            "would export {scope} from {repo} to {} (dry run)",
+            dir.display()
+        );
+        return std::process::ExitCode::SUCCESS;
+    }
+    let Some(repo_dir) = cwd_repo() else {
+        return std::process::ExitCode::from(1);
+    };
+    let ctx =
+        match crate::commands::bundle::BundleCtx::resolve(&repo_dir, &paths, Some(&repo)).await {
+            Ok(ctx) => ctx,
+            Err(err) => {
+                eprintln!("error: {err}");
+                return std::process::ExitCode::from(1);
+            }
+        };
+    let (out, code) = crate::commands::bundle::export(&ctx, &session, &dir).await;
+    if code == 0 {
+        println!("{out}");
+    } else {
+        eprintln!("{out}");
+    }
+    std::process::ExitCode::from(code)
+}
+
+/// `import`: resolve the server and upload the bundle. `--dry-run` lists
+/// the sessions it would import (local scan only, no HTTP).
+async fn run_import(
+    dir: PathBuf,
+    repo: String,
+    paths: CliPaths,
+    dry_run: bool,
+) -> std::process::ExitCode {
+    if dry_run {
+        return match crate::commands::bundle::discover_session_dirs(&dir) {
+            Ok(dirs) => {
+                for session_dir in &dirs {
+                    println!(
+                        "would import {} (dry run)",
+                        session_dir
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_default()
+                    );
+                }
+                std::process::ExitCode::SUCCESS
+            }
+            Err(err) => {
+                eprintln!("{err}");
+                std::process::ExitCode::from(1)
+            }
+        };
+    }
+    let Some(repo_dir) = cwd_repo() else {
+        return std::process::ExitCode::from(1);
+    };
+    let ctx =
+        match crate::commands::bundle::BundleCtx::resolve(&repo_dir, &paths, Some(&repo)).await {
+            Ok(ctx) => ctx,
+            Err(err) => {
+                eprintln!("error: {err}");
+                return std::process::ExitCode::from(1);
+            }
+        };
+    let (out, code) = crate::commands::bundle::import(&ctx, &dir).await;
+    if code == 0 {
+        println!("{out}");
+    } else {
+        eprintln!("{out}");
+    }
+    std::process::ExitCode::from(code)
+}
+
 /// `create` intent: no body flags means an empty intent (the server decides);
 /// otherwise exactly one source wins.
 fn body_source(body: Option<&str>, body_file: Option<&std::path::Path>) -> Result<String, String> {
@@ -888,11 +1067,6 @@ fn run_sync_dry_run(spool: &crate::spool::Spool) -> std::process::ExitCode {
             std::process::ExitCode::from(1)
         }
     }
-}
-
-fn stub_err(err: CliError) -> std::process::ExitCode {
-    eprintln!("error: {err} (not implemented yet)");
-    std::process::ExitCode::from(err.exit_code())
 }
 
 #[cfg(test)]

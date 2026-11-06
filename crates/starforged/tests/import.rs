@@ -262,6 +262,73 @@ async fn import_over_https_with_token_and_retry() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn import_start_with_empty_body_keeps_stored_credentials() {
+    // `POST import/start {}` (body without `auth`) must not clear the
+    // stored credentials: the retry runs the stored token and succeeds.
+    let client_s = TestServer::start_with(|c| {
+        c.remotes.allow_file_urls = true;
+    })
+    .await;
+    let upstream = TestServer::start_with(|c| {
+        c.remotes.allow_file_urls = true;
+    })
+    .await;
+    let alice_u = upstream.user("alice").await;
+    upstream.repo(&alice_u, "proj", Visibility::Private).await;
+    let token = upstream.token(&alice_u, &[Scope::RepoWrite]).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let work = work_repo(dir.path(), "work", &[("README.md", "# proj\n")]).await;
+    git_ok(
+        &work,
+        &[
+            "push",
+            "-q",
+            &upstream.git_url("alice", "proj", Some(&token)),
+            "main",
+        ],
+    )
+    .await;
+
+    let bob = client_s.user("bob").await;
+    let write = client_s.token(&bob, &[Scope::RepoWrite]).await;
+    let client = reqwest::Client::new();
+    let url = upstream.git_url("alice", "proj", None);
+    let (status, _) = api_post(
+        &client,
+        &client_s.url("/api/v1/user/repos"),
+        &write,
+        &json!({
+            "name": "keep",
+            "import": {"url": url, "auth": {"kind": "https", "username": "git", "password": token}}
+        }),
+    )
+    .await;
+    assert_eq!(status, 201);
+    let before: Option<String> =
+        sqlx::query_scalar("SELECT sealed_secret FROM repo_remotes WHERE role = 'import'")
+            .fetch_one(client_s.core.db().pool())
+            .await
+            .unwrap();
+    let st = client
+        .post(client_s.url("/api/v1/repos/bob/keep/import/start"))
+        .bearer_auth(&write)
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(st.status(), 200);
+    let after: Option<String> =
+        sqlx::query_scalar("SELECT sealed_secret FROM repo_remotes WHERE role = 'import'")
+            .fetch_one(client_s.core.db().pool())
+            .await
+            .unwrap();
+    assert_eq!(before, after, "sealed credential must be unchanged");
+    let done = poll_import_done(&client_s, &write, "bob", "keep").await;
+    assert_eq!(done["state"], "done", "{done}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn import_policy_refusal_is_422() {
     // No test flag: file:// is refused at creation.
     let s = TestServer::start().await;

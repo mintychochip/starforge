@@ -301,8 +301,35 @@ impl Core {
                 "The account still owns repositories: {names}."
             )));
         }
+        let sole = db_orgs::sole_owned_orgs(self.db(), target.id).await?;
+        if !sole.is_empty() {
+            return Err(CoreError::Invalid(format!(
+                "The account is the only owner of {}: make another user an owner first.",
+                sole.join(", ")
+            )));
+        }
+        // Same deletion path as self-service account deletion: uploaded
+        // sessions leave through the session-delete path (blob refcounts,
+        // index documents), then the sole-owner re-check and the user-row
+        // delete share one locked transaction.
+        self.delete_uploaded_sessions(target.id).await?;
         self.purge_deleted_repos_of(target.id, Some(admin.id))
             .await?;
+        let still_sole = db_orgs::delete_user_unless_sole_owner(self.db(), target.id).await?;
+        if !still_sole.is_empty() {
+            let mut handles = Vec::new();
+            for org_id in still_sole {
+                if let Some(handle) = db_orgs::owner_handle_by_id(self.db(), org_id).await? {
+                    handles.push(handle);
+                }
+            }
+            return Err(CoreError::Invalid(format!(
+                "The account is the only owner of {}: make another user an owner first.",
+                handles.join(", ")
+            )));
+        }
+        // After the account goes: the admin actor survives, and a refused
+        // deletion writes no entry.
         self.audit(
             Some(admin.id),
             "user.delete",
@@ -310,7 +337,6 @@ impl Core {
             "",
         )
         .await?;
-        users::delete(self.db(), target.id).await?;
         Ok(())
     }
 

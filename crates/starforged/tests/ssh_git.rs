@@ -248,6 +248,59 @@ async fn user_refs_for_push_creates_change_and_v2_and_rename() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deploy_key_on_deleted_repo_gets_not_found() {
+    let s = TestServer::start().await;
+    let alice = s.user("alice").await;
+    s.repo(&alice, "proj", Visibility::Private).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let work = work_repo(tmp.path(), "work", &[("README.md", "# hi\n")]).await;
+    let token = s
+        .token(
+            &alice,
+            &[
+                starforged_core::tokens::Scope::RepoRead,
+                starforged_core::tokens::Scope::RepoWrite,
+            ],
+        )
+        .await;
+    git_ok(
+        &work,
+        &[
+            "remote",
+            "add",
+            "origin",
+            &s.git_url("alice", "proj", Some(&token)),
+        ],
+    )
+    .await;
+    git_ok(&work, &["push", "-q", "origin", "main"]).await;
+    waiter_tip(&s, "alice", "proj").await;
+    let dir = keydir();
+    let dir = dir.path();
+    let (ro_priv, ro_pub) = gen_key(dir, "id_ro", "ed25519", None);
+    s.add_deploy(&alice, "proj", &ro_pub, false).await;
+    s.core
+        .rename_repo(&alice, "alice", "proj", "renamed")
+        .await
+        .unwrap();
+    s.core
+        .delete_repo(&alice, "alice", "renamed", "alice/renamed")
+        .await
+        .unwrap();
+    for path in ["proj", "renamed"] {
+        let out = s
+            .ssh_git(dir, &ro_priv, &["ls-remote", &s.ssh_url("alice", path)])
+            .await;
+        assert!(!out.status.success(), "deleted deploy repo {path}");
+        assert!(
+            stderr(&out).contains("repository not found"),
+            "{}",
+            stderr(&out)
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn deploy_keys_round_trip() {
     let s = TestServer::start().await;
     let alice = s.user("alice").await;
@@ -807,5 +860,101 @@ async fn repo_page_shows_ssh_clone_url() {
         page.contains(&format!("{}&#47;alice&#47;proj.git", s.ssh_base))
             || page.contains(&format!("{}/alice/proj.git", s.ssh_base)),
         "ssh clone url missing:\n{page}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deploy_write_push_webhook_sender_null() {
+    use std::sync::{Arc, Mutex};
+    let s = TestServer::start_with(|c| c.webhooks.allow_loopback = true).await;
+    let alice = s.user("alice").await;
+    s.repo(&alice, "proj", Visibility::Private).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let work = work_repo(tmp.path(), "work", &[("README.md", "# hi\n")]).await;
+    let token = s
+        .token(
+            &alice,
+            &[
+                starforged_core::tokens::Scope::RepoRead,
+                starforged_core::tokens::Scope::RepoWrite,
+            ],
+        )
+        .await;
+    git_ok(
+        &work,
+        &[
+            "remote",
+            "add",
+            "origin",
+            &s.git_url("alice", "proj", Some(&token)),
+        ],
+    )
+    .await;
+    git_ok(&work, &["push", "-q", "origin", "main"]).await;
+    waiter_tip(&s, "alice", "proj").await;
+    let dir = keydir();
+    let dir = dir.path();
+    let (rw_priv, rw_pub) = gen_key(dir, "id_rw", "ed25519", None);
+    s.add_deploy(&alice, "proj", &rw_pub, true).await;
+    let hits: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let inner = hits.clone();
+    let app = axum::Router::new().route(
+        "/hook",
+        axum::routing::post(move |body: axum::body::Bytes| {
+            let inner = inner.clone();
+            async move {
+                inner
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::from_slice::<serde_json::Value>(&body).unwrap());
+                (axum::http::StatusCode::OK, "ok".to_string())
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(axum::serve(listener, app).into_future());
+    let client = reqwest::Client::new();
+    let res = client
+        .post(s.url("/api/v1/repos/alice/proj/hooks"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"url": format!("http://{addr}/hook"), "events": ["push"]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), reqwest::StatusCode::CREATED);
+    let clone_dir = tempfile::tempdir().unwrap();
+    s.ssh_git_ok(
+        clone_dir.path(),
+        &rw_priv,
+        &["clone", "-q", &s.ssh_url("alice", "proj"), "clone"],
+    )
+    .await;
+    let cloned = clone_dir.path().join("clone");
+    commit_files(&cloned, &[("d.txt", b"d")], "rw push").await;
+    git_ok(&cloned, &["checkout", "-q", "-b", "deployed"]).await;
+    s.ssh_git_ok(&cloned, &rw_priv, &["push", "-q", "origin", "deployed"])
+        .await;
+    let mut sender: Option<serde_json::Value> = None;
+    for _ in 0..100 {
+        s.core.run_due_jobs().await.unwrap();
+        let found = hits
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|b| b.get("event").is_some_and(|v| v == "push"))
+            .cloned();
+        if let Some(body) = found {
+            sender = body.get("sender").cloned();
+            if sender.is_some() {
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        sender,
+        Some(serde_json::Value::Null),
+        "deploy push webhook sender must be null: {sender:?}"
     );
 }

@@ -52,9 +52,7 @@ pub async fn open_core(config: &Config, hook_exe: PathBuf) -> anyhow::Result<Cor
             github_api_url: config.github.api_url.clone(),
             allowed_ref_namespaces: config.git.allowed_ref_namespaces.clone(),
             oidc: config.oidc_settings(),
-            // SSH listener: disabled until the server (M3c C2) wires
-            // `ssh.enabled`/`ssh.listen` into this read-only view.
-            ssh_addr: None,
+            ssh_addr: config.ssh.enabled.then(|| config.ssh.listen.clone()),
             login_per_ip_per_minute: config.limits.login_per_ip_per_minute,
             login_per_account_per_hour: config.limits.login_per_account_per_hour,
             api_per_token_per_hour: config.limits.api_per_token_per_hour,

@@ -40,6 +40,12 @@ struct Inner {
     /// nonce-sensitive ones by finishing a fresh flow).
     extra_claims: Mutex<serde_json::Value>,
     pending: Mutex<HashMap<String, Pending>>,
+    /// When set, `/jwks` redirects there instead of serving keys (D3
+    /// review: a JWKS redirect off HTTPS must fail the login).
+    jwks_redirect: Mutex<Option<String>>,
+    /// Extra bytes appended to the discovery document (D3 review: an
+    /// oversized provider body must fail, not be buffered whole).
+    discovery_pad: Mutex<usize>,
 }
 
 #[derive(Clone)]
@@ -130,6 +136,8 @@ impl FakeOidc {
             kid: kid.into(),
             extra_claims: Mutex::new(serde_json::json!({})),
             pending: Mutex::new(HashMap::new()),
+            jwks_redirect: Mutex::new(None),
+            discovery_pad: Mutex::new(0),
         });
         let state = AppState {
             inner: inner.clone(),
@@ -150,6 +158,16 @@ impl FakeOidc {
     /// Extra claims (e.g. `email`) merged into every issued ID token.
     pub fn set_claims(&self, extra: serde_json::Value) {
         *self.inner.extra_claims.lock().unwrap() = extra;
+    }
+
+    /// Makes `/jwks` redirect to `target` (D3 review tests).
+    pub fn set_jwks_redirect(&self, target: Option<&str>) {
+        *self.inner.jwks_redirect.lock().unwrap() = target.map(str::to_owned);
+    }
+
+    /// Appends `bytes` of padding to the discovery document (D3 review tests).
+    pub fn set_discovery_pad(&self, bytes: usize) {
+        *self.inner.discovery_pad.lock().unwrap() = bytes;
     }
 
     /// Signs `claims` as a JWS under the provider key (for unit-style
@@ -219,17 +237,32 @@ fn issue_token(inner: &Inner, issuer: &str, nonce: &str) -> String {
 }
 
 async fn discovery(State(state): State<AppState>) -> impl IntoResponse {
-    axum::Json(serde_json::json!({
+    let mut body = serde_json::to_vec(&serde_json::json!({
         "issuer": state.issuer,
         "authorization_endpoint": format!("{}/authorize", state.issuer),
         "token_endpoint": format!("{}/token", state.issuer),
         "jwks_uri": format!("{}/jwks", state.issuer),
         "token_endpoint_auth_methods_supported": ["client_secret_basic"],
     }))
+    .unwrap();
+    let pad = *state.inner.discovery_pad.lock().unwrap();
+    if pad > 0 {
+        body.push(b' ');
+        body.extend(std::iter::repeat_n(b'x', pad));
+    }
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body,
+    )
+        .into_response()
 }
 
 async fn jwks(State(state): State<AppState>) -> impl IntoResponse {
+    if let Some(target) = state.inner.jwks_redirect.lock().unwrap().clone() {
+        return Redirect::to(&target).into_response();
+    }
     axum::Json(serde_json::json!({"keys": [jwk(&state.inner.signer, &state.inner.kid)]}))
+        .into_response()
 }
 
 #[derive(serde::Deserialize)]

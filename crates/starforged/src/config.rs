@@ -654,7 +654,7 @@ impl Config {
     pub fn registration_settings(&self) -> anyhow::Result<Registration> {
         let mode = RegistrationMode::parse(&self.registration.mode).with_context(|| {
             format!(
-                "registration.mode must be \"invite\", \"open\", or \"domains\", not {:?}",
+                "registration.mode must be \"invite\", \"open\", \"domains\", or \"sso\", not {:?}",
                 self.registration.mode
             )
         })?;

@@ -361,6 +361,118 @@ pub const IMPORT_FETCH_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// Only these refs ever leave an import source (M4b D3).
 pub const IMPORT_REFSPECS: [&str; 2] = ["+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"];
 
+/// Fetch timeout for one mirror sync (M4b global constraints: 10 minutes).
+pub const PULL_MIRROR_FETCH_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// Minimum pull-mirror interval (M4b D4), in seconds.
+pub const PULL_MIRROR_MIN_INTERVAL_SECS: i64 = 300;
+
+/// The `PUT …/mirror/pull` body in core terms (M4b D4). Credentials travel
+/// exactly like an import's: HTTPS username + password/token, or SSH with a
+/// server-generated keypair.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullMirrorInput {
+    pub url: String,
+    pub auth: ImportAuth,
+    pub interval_secs: i64,
+}
+
+/// What the API and pages show for a repository's pull mirror: never a
+/// secret, only `has_credentials` and, for SSH, the public key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullMirrorView {
+    pub repo_id: i64,
+    pub url: String,
+    pub auth: String,
+    pub has_credentials: bool,
+    pub ssh_public_key: Option<String>,
+    pub interval_secs: i64,
+    pub enabled: bool,
+    pub last_attempt_at: Option<i64>,
+    pub last_success_at: Option<i64>,
+    pub last_error: String,
+}
+
+/// Inserts one pull remote row. The `repo_remotes` insert carries the
+/// default interval, so the interval is applied right after.
+async fn insert_pull_remote(
+    core: &Core,
+    actor_id: i64,
+    repo_id: i64,
+    prepared: &PreparedImport,
+    interval_secs: i64,
+) -> CoreResult<i64> {
+    let id = db_remotes::insert(
+        core.db(),
+        &db_remotes::NewRemote {
+            repo_id,
+            role: "pull",
+            url: &prepared.url,
+            auth: prepared.auth,
+            username: &prepared.username,
+            sealed_secret: prepared.sealed_secret.as_deref(),
+            ssh_public_key: prepared.ssh_public_key.as_deref(),
+            created_by: actor_id,
+        },
+    )
+    .await?;
+    db_remotes::update_pull_config(
+        core.db(),
+        id,
+        &prepared.url,
+        prepared.auth,
+        &prepared.username,
+        prepared.sealed_secret.as_deref(),
+        prepared.ssh_public_key.as_deref(),
+        interval_secs,
+    )
+    .await?;
+    Ok(id)
+}
+
+/// Opens one remote row's sealed credentials for a git command. The
+/// unreadable seal reads as "credentials unreadable; re-enter them" (the
+/// secret-key-loss case), never a panic.
+fn pull_creds(core: &Core, row: &db_remotes::RemoteRow) -> Result<RemoteCreds, String> {
+    match row.auth.as_str() {
+        "https" => {
+            let sealed = row
+                .sealed_secret
+                .clone()
+                .ok_or_else(|| "credentials unreadable; re-enter them".to_owned())?;
+            let plain = core
+                .config()
+                .credential_box
+                .open(&sealed)
+                .map_err(|_| "credentials unreadable; re-enter them".to_owned())?;
+            let password = String::from_utf8(plain)
+                .map_err(|_| "credentials unreadable; re-enter them".to_owned())?;
+            Ok(RemoteCreds::Basic {
+                username: row.username.clone(),
+                password,
+            })
+        }
+        "ssh" => {
+            let sealed = row
+                .sealed_secret
+                .clone()
+                .ok_or_else(|| "credentials unreadable; re-enter them".to_owned())?;
+            let plain = core
+                .config()
+                .credential_box
+                .open(&sealed)
+                .map_err(|_| "credentials unreadable; re-enter them".to_owned())?;
+            let private_key = String::from_utf8(plain)
+                .map_err(|_| "credentials unreadable; re-enter them".to_owned())?;
+            Ok(RemoteCreds::SshKey { private_key })
+        }
+        _ => Ok(RemoteCreds::None),
+    }
+}
+
+fn now_plus(secs: i64) -> i64 {
+    starforged_db::now() + secs
+}
+
 /// Credentials for an import source, as the API and web form express them.
 /// HTTPS carries a username and password/token; SSH asks the server to
 /// generate an ed25519 keypair whose private half is sealed and never
@@ -582,14 +694,18 @@ impl Core {
         }
         db_repos::set_import_state(self.db(), repo_id, "running").await?;
         let outcome = self.fetch_import(repo_id, &row).await;
+        // The remote row may have been deleted mid-fetch: never write a
+        // terminal state against a deleted row.
         match outcome {
             Ok(()) => {
-                db_repos::set_import_state(self.db(), repo_id, "done").await?;
-                db_remotes::record_attempt(self.db(), row.id, true, "").await?;
+                if db_remotes::set_import_state_if_remote(self.db(), repo_id, "done").await? {
+                    db_remotes::record_attempt(self.db(), row.id, true, "").await?;
+                }
             }
             Err(message) => {
-                db_repos::set_import_state(self.db(), repo_id, "failed").await?;
-                db_remotes::record_attempt(self.db(), row.id, false, &message).await?;
+                if db_remotes::set_import_state_if_remote(self.db(), repo_id, "failed").await? {
+                    db_remotes::record_attempt(self.db(), row.id, false, &message).await?;
+                }
             }
         }
         Ok(())
@@ -661,6 +777,338 @@ impl Core {
         Ok(())
     }
 
+    // --- Pull mirrors (M4b D4). -------------------------------------------
+    //
+    // A pull mirror is one `pull` remote per repository: `git fetch --prune`
+    // with the import refspecs, on a schedule (`interval_secs`, >= 300) plus
+    // "sync now". While it is enabled `repos.mirror` is true: the hook
+    // snapshot refuses every branch/tag push (refs/for still works) and
+    // `Core::merge_change` refuses with the mirror message. Every moved
+    // branch goes through the same branch-move ingest as post-receive, and
+    // push webhooks fire with `sender: null`. Disabling (or deleting) the
+    // remote restores pushes.
+
+    /// Configures (or reconfigures) the pull mirror of one repository.
+    /// Maintain+ only; archived repositories refuse. The URL passes the
+    /// outbound policy and credentials are sealed, exactly like an import.
+    /// Enabling (or re-enabling) sets `repos.mirror` and queues a sync.
+    pub async fn set_pull_mirror(
+        &self,
+        actor: &User,
+        owner: &str,
+        name: &str,
+        input: &PullMirrorInput,
+    ) -> CoreResult<PullMirrorView> {
+        let access = self
+            .require_repo(Some(actor), owner, name, Permission::Maintain)
+            .await?;
+        if access.repo.archived_at.is_some() {
+            return Err(CoreError::Invalid(
+                "archived repositories cannot mirror".into(),
+            ));
+        }
+        if input.interval_secs < 300 {
+            return Err(CoreError::Invalid(
+                "mirror interval must be at least 300 seconds".into(),
+            ));
+        }
+        let prepared = self
+            .prepare_import(&ImportInput {
+                url: input.url.clone(),
+                auth: input.auth.clone(),
+            })
+            .await?;
+        let target = format!("repo:{owner}/{name}");
+        match db_remotes::by_repo_role(self.db(), access.repo.id, "pull").await? {
+            Some(row) => {
+                let creds_changed = prepared.sealed_secret.is_some();
+                db_remotes::update_pull_config(
+                    self.db(),
+                    row.id,
+                    &prepared.url,
+                    prepared.auth,
+                    &prepared.username,
+                    prepared.sealed_secret.as_deref(),
+                    prepared.ssh_public_key.as_deref(),
+                    input.interval_secs,
+                )
+                .await?;
+                self.audit(Some(actor.id), "mirror.update", &target, &prepared.url)
+                    .await?;
+                if creds_changed {
+                    self.audit(
+                        Some(actor.id),
+                        "mirror.credentials_changed",
+                        &target,
+                        "pull",
+                    )
+                    .await?;
+                }
+            }
+            None => {
+                insert_pull_remote(
+                    self,
+                    actor.id,
+                    access.repo.id,
+                    &prepared,
+                    input.interval_secs,
+                )
+                .await?;
+                self.audit(Some(actor.id), "mirror.create", &target, &prepared.url)
+                    .await?;
+                if prepared.sealed_secret.is_some() {
+                    self.audit(
+                        Some(actor.id),
+                        "mirror.credentials_changed",
+                        &target,
+                        "pull",
+                    )
+                    .await?;
+                }
+            }
+        }
+        db_repos::set_mirror(self.db(), access.repo.id, true).await?;
+        self.enqueue_or_expedite(&crate::jobs::Job::PullMirror {
+            repo_id: access.repo.id,
+        })
+        .await?;
+        self.pull_mirror_for(access.repo.id)
+            .await?
+            .ok_or(CoreError::Internal("pull remote vanished".into()))
+    }
+
+    /// The pull mirror of one repository; readers may see it (404 otherwise).
+    pub async fn pull_mirror_for(&self, repo_id: i64) -> CoreResult<Option<PullMirrorView>> {
+        let Some(row) = db_remotes::by_repo_role(self.db(), repo_id, "pull").await? else {
+            return Ok(None);
+        };
+        Ok(Some(PullMirrorView {
+            repo_id,
+            url: row.url.clone(),
+            auth: row.auth.clone(),
+            has_credentials: row.sealed_secret.is_some(),
+            ssh_public_key: row.ssh_public_key.clone(),
+            interval_secs: row.interval_secs,
+            enabled: row.enabled != 0,
+            last_attempt_at: row.last_attempt_at,
+            last_success_at: row.last_success_at,
+            last_error: row.last_error.clone(),
+        }))
+    }
+
+    /// `GET …/mirror/pull` backing: readers see the configuration.
+    pub async fn get_pull_mirror(
+        &self,
+        actor: Option<&User>,
+        owner: &str,
+        name: &str,
+    ) -> CoreResult<PullMirrorView> {
+        let access = self.repo_for(actor, owner, name).await?;
+        self.pull_mirror_for(access.repo.id)
+            .await?
+            .ok_or(CoreError::NotFound)
+    }
+
+    /// Enables or disables the pull mirror without forgetting it.
+    /// Disabling sets `repos.mirror` back to false and restores pushes.
+    pub async fn set_pull_mirror_enabled(
+        &self,
+        actor: &User,
+        owner: &str,
+        name: &str,
+        enabled: bool,
+    ) -> CoreResult<PullMirrorView> {
+        let access = self
+            .require_repo(Some(actor), owner, name, Permission::Maintain)
+            .await?;
+        let Some(row) = db_remotes::by_repo_role(self.db(), access.repo.id, "pull").await? else {
+            return Err(CoreError::NotFound);
+        };
+        db_remotes::set_enabled(self.db(), row.id, enabled).await?;
+        db_repos::set_mirror(self.db(), access.repo.id, enabled).await?;
+        self.audit(
+            Some(actor.id),
+            "mirror.update",
+            &format!("repo:{owner}/{name}"),
+            if enabled { "enabled" } else { "disabled" },
+        )
+        .await?;
+        if enabled {
+            self.enqueue_or_expedite(&crate::jobs::Job::PullMirror {
+                repo_id: access.repo.id,
+            })
+            .await?;
+        }
+        self.pull_mirror_for(access.repo.id)
+            .await?
+            .ok_or(CoreError::Internal("pull remote vanished".into()))
+    }
+
+    /// Deletes the pull mirror, returning the repository to a normal one.
+    pub async fn delete_pull_mirror(
+        &self,
+        actor: &User,
+        owner: &str,
+        name: &str,
+    ) -> CoreResult<()> {
+        let access = self
+            .require_repo(Some(actor), owner, name, Permission::Maintain)
+            .await?;
+        let Some(row) = db_remotes::by_repo_role(self.db(), access.repo.id, "pull").await? else {
+            return Err(CoreError::NotFound);
+        };
+        db_remotes::delete(self.db(), row.id).await?;
+        db_repos::set_mirror(self.db(), access.repo.id, false).await?;
+        self.audit(
+            Some(actor.id),
+            "mirror.delete",
+            &format!("repo:{owner}/{name}"),
+            &row.url,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// "Sync now": queues an immediate sync (deduplicated per repository).
+    pub async fn sync_pull_mirror(
+        &self,
+        actor: &User,
+        owner: &str,
+        name: &str,
+    ) -> CoreResult<PullMirrorView> {
+        let access = self
+            .require_repo(Some(actor), owner, name, Permission::Maintain)
+            .await?;
+        if db_remotes::by_repo_role(self.db(), access.repo.id, "pull")
+            .await?
+            .is_none()
+        {
+            return Err(CoreError::NotFound);
+        }
+        self.enqueue_or_expedite(&crate::jobs::Job::PullMirror {
+            repo_id: access.repo.id,
+        })
+        .await?;
+        self.pull_mirror_for(access.repo.id)
+            .await?
+            .ok_or(CoreError::Internal("pull remote vanished".into()))
+    }
+
+    /// One pull-mirror sync: fetch, ingest the moves, re-enqueue at the
+    /// configured interval. Failures are recorded (scrubbed) on the remote
+    /// row and re-enqueued after the backoff floor, so a failing upstream
+    /// is never hammered and never blocks the repository.
+    pub(crate) async fn run_pull_mirror(&self, repo_id: i64) -> CoreResult<()> {
+        let Some(row) = db_remotes::by_repo_role(self.db(), repo_id, "pull").await? else {
+            return Ok(());
+        };
+        if row.enabled == 0 {
+            return Ok(());
+        }
+        let outcome = self.fetch_pull(repo_id, &row).await;
+        match outcome {
+            Ok(()) => {
+                db_remotes::record_attempt(self.db(), row.id, true, "").await?;
+            }
+            Err(message) => {
+                db_remotes::record_attempt(self.db(), row.id, false, &message).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Schedules the next pull-mirror sync after a finished run (called by
+    /// the job runner once the current row is done, so the insert never
+    /// collides with the dedupe key the running job still holds): at the
+    /// mirror's interval after a success, or the 300 s backoff floor after
+    /// a failure. A disabled or deleted mirror never reschedules.
+    pub(crate) async fn reschedule_pull_mirror(&self, repo_id: i64) -> CoreResult<()> {
+        let Some(row) = db_remotes::by_repo_role(self.db(), repo_id, "pull").await? else {
+            return Ok(());
+        };
+        if row.enabled == 0 {
+            return Ok(());
+        }
+        let delay = if row.last_error.is_empty() {
+            row.interval_secs.max(300)
+        } else {
+            300
+        };
+        self.enqueue_at(&crate::jobs::Job::PullMirror { repo_id }, now_plus(delay))
+            .await?;
+        Ok(())
+    }
+
+    async fn fetch_pull(&self, repo_id: i64, row: &db_remotes::RemoteRow) -> Result<(), String> {
+        let pinned = self
+            .check_remote_url(&row.url)
+            .map_err(|e| starforged_git::remote::scrub(&e.to_string(), &row.url))?;
+        let creds =
+            pull_creds(self, row).map_err(|e| starforged_git::remote::scrub(&e, &row.url))?;
+        let repo_dir = self.repo_path(repo_id);
+        let before = self.snapshot_refs(&repo_dir).await;
+        let refspecs: Vec<String> = IMPORT_REFSPECS.iter().map(|s| s.to_string()).collect();
+        starforged_git::remote::fetch(
+            &repo_dir,
+            &pinned,
+            &creds,
+            &refspecs,
+            PULL_MIRROR_FETCH_TIMEOUT,
+        )
+        .await
+        .map_err(|e| starforged_git::remote::scrub(&e.to_string(), &row.url))?;
+        let Some(before) = before else {
+            return Ok(());
+        };
+        let Some(after) = self.snapshot_refs(&repo_dir).await else {
+            return Ok(());
+        };
+        // Diff the tips and run the same ingest as post-receive (D4):
+        // revisions for branch changes, mergeability, push webhooks with
+        // `sender: null` (no pusher).
+        let zero = "0".repeat(40);
+        let mut moves: Vec<(String, Option<String>, String)> = Vec::new();
+        let mut updates: Vec<crate::changes::RefUpdate> = Vec::new();
+        for (name, tip) in &after {
+            if !name.starts_with("refs/heads/") && !name.starts_with("refs/tags/") {
+                continue;
+            }
+            let old = before.get(name);
+            if old == Some(tip) {
+                continue;
+            }
+            moves.push((name.clone(), old.cloned(), tip.clone()));
+            updates.push(crate::changes::RefUpdate {
+                name: name.clone(),
+                old: old.cloned().unwrap_or_else(|| zero.clone()),
+                new: tip.clone(),
+            });
+        }
+        for (name, old) in &before {
+            if !name.starts_with("refs/heads/") && !name.starts_with("refs/tags/") {
+                continue;
+            }
+            if after.contains_key(name) {
+                continue;
+            }
+            // Pruned by `--prune`: a delete still recomputes mergeability.
+            moves.push((name.clone(), Some(old.clone()), zero.clone()));
+            updates.push(crate::changes::RefUpdate {
+                name: name.clone(),
+                old: old.clone(),
+                new: zero.clone(),
+            });
+        }
+        if moves.is_empty() {
+            return Ok(());
+        }
+        let ingest = self.repo_ingest_lock(repo_id).await;
+        self.ingest_branch_moves(&ingest, repo_id, None, &moves)
+            .await;
+        self.record_push(repo_id, None, &updates).await;
+        Ok(())
+    }
+
     /// The repository's import-in-progress flag for the hook snapshot
     /// (`Core::git_rpc_env`).
     pub async fn import_in_progress(&self, repo_id: i64) -> CoreResult<bool> {
@@ -674,13 +1122,9 @@ impl Core {
 /// (the same tools the SSH remote itself needs): the private key is
 /// returned for sealing and the public line for display.
 pub async fn generate_import_key() -> CoreResult<(String, String)> {
-    let dir = std::env::temp_dir().join(format!(
-        "starforge-import-{}-{}",
-        std::process::id(),
-        crate::crypto::random_hex(8)
-    ));
-    std::fs::create_dir_all(&dir).map_err(|e| CoreError::Internal(e.to_string()))?;
-    let key_path = dir.join("import_key");
+    let dir = tempfile::TempDir::with_prefix("starforge-import-")
+        .map_err(|e| CoreError::Internal(e.to_string()))?;
+    let key_path = dir.path().join("import_key");
     let output = tokio::process::Command::new("ssh-keygen")
         .arg("-t")
         .arg("ed25519")
@@ -694,7 +1138,6 @@ pub async fn generate_import_key() -> CoreResult<(String, String)> {
         .await
         .map_err(|e| CoreError::Internal(format!("running ssh-keygen: {e}")))?;
     if !output.status.success() {
-        let _ = std::fs::remove_dir_all(&dir);
         return Err(CoreError::Internal(format!(
             "ssh-keygen failed: {}",
             String::from_utf8_lossy(&output.stderr).trim()
@@ -704,7 +1147,9 @@ pub async fn generate_import_key() -> CoreResult<(String, String)> {
         std::fs::read_to_string(&key_path).map_err(|e| CoreError::Internal(e.to_string()))?;
     let public_key = std::fs::read_to_string(key_path.with_extension("pub"))
         .map_err(|e| CoreError::Internal(e.to_string()))?;
-    let _ = std::fs::remove_dir_all(&dir);
+    // The TempDir guard removes the directory — the unsealed private key —
+    // on every return path.
+    drop(dir);
     Ok((private_key, public_key.trim().to_owned()))
 }
 
