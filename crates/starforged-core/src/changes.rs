@@ -2694,13 +2694,14 @@ impl Core {
             ));
         }
         if let Some(id) = review_id {
-            match reviews.get(&id) {
-                None => return Err(CoreError::Invalid("unknown review".into())),
-                // A draft id that is not the actor's own stays undiscoverable.
-                Some(row) if row.state == "pending" && row.author_id != Some(user.id) => {
-                    return Err(CoreError::NotFound);
-                }
-                Some(_) => {}
+            // Unknown ids, reviews on other changes (absent from this
+            // change's map), and foreign drafts all answer identically, so
+            // probing `review_id`s cannot distinguish draft ids from noise.
+            let linked = reviews
+                .get(&id)
+                .filter(|row| row.state != "pending" || row.author_id == Some(user.id));
+            if linked.is_none() {
+                return Err(CoreError::Invalid("unknown review".into()));
             }
         }
         let body = check_markdown(body, "comment body")?;

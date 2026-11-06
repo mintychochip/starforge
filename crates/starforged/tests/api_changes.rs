@@ -2144,13 +2144,15 @@ async fn pending_review_submit_converts_draft_once() {
     );
 }
 
-/// M2f F6 fix round 1 (RED): commenting on another author's pending-only
-/// thread is 404 (no 201-vs-404 oracle), and a foreign draft id as
-/// `review_id` is 404 too — while public threads still accept comments.
+/// M2f F6 fix rounds 1+2: commenting on another author's pending-only
+/// thread is 404 (no 201-vs-404 oracle), and on a visible thread a foreign
+/// draft id, an unknown id, and another change's review id all answer the
+/// identical 422 (no 404-vs-422 oracle) — while public threads still accept
+/// comments.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pending_comment_foreign_thread_and_review_id_are_404() {
+async fn pending_comment_foreign_thread_is_404_and_review_ids_indistinguishable() {
     let c = Ctx::start().await;
-    c.push_basic().await;
+    let work = c.push_basic().await;
     let n = c.trail().await;
     c.create_branch_change(n, &c.bob_rw).await;
     let client = reqwest::Client::new();
@@ -2224,14 +2226,51 @@ async fn pending_comment_foreign_thread_and_review_id_are_404() {
         .unwrap();
     assert_eq!(open.status(), 201);
     let pub_tid = open.json::<Value>().await.unwrap()["id"].as_i64().unwrap();
+    // A foreign draft id, an unknown id, and a review on another change all
+    // answer identically (same status, same body): no status oracle. The
+    // other change tracks a second branch (one head branch per change).
+    let url = c.s.git_url(
+        "alice",
+        "proj",
+        Some(&c.s.token(&c.alice, &[Scope::RepoWrite]).await),
+    );
+    git_ok(&work, &["checkout", "-q", "-b", "feature/y"]).await;
+    commit_files(&work, &[("c.txt", b"cee\n")], "add c").await;
+    git_ok(&work, &["push", "-q", &url, "feature/y"]).await;
+    let n2 = c.trail().await;
     let res = client
-        .post(format!("{threads}/{pub_tid}/comments"))
-        .bearer_auth(&c.erin_rw)
-        .json(&json!({"body": "sneaky", "review_id": draft_id}))
+        .post(c.changes(n2))
+        .bearer_auth(&c.bob_rw)
+        .json(&json!({"kind": "branch", "head_branch": "feature/y", "base_branch": "main"}))
         .send()
         .await
         .unwrap();
-    assert_eq!(res.status(), 404, "foreign draft review_id is hidden");
+    assert_eq!(res.status(), 201, "second branch change");
+    let other_review: Value = client
+        .post(format!("{}/reviews", c.change(n2, 1)))
+        .bearer_auth(&c.carol_rw)
+        .json(&json!({"verdict": "comment", "body": "elsewhere"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let other_id = other_review["id"].as_i64().unwrap();
+    let mut answers = Vec::new();
+    for review_id in [draft_id, 9999, other_id] {
+        let res = client
+            .post(format!("{threads}/{pub_tid}/comments"))
+            .bearer_auth(&c.erin_rw)
+            .json(&json!({"body": "sneaky", "review_id": review_id}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 422, "bad review_id {review_id} is invalid");
+        answers.push(res.json::<Value>().await.unwrap());
+    }
+    assert_eq!(answers[0], answers[1], "foreign draft matches unknown id");
+    assert_eq!(answers[0], answers[2], "foreign draft matches other change");
     let res = client
         .post(format!("{threads}/{pub_tid}/comments"))
         .bearer_auth(&c.erin_rw)
