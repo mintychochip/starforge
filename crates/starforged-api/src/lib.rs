@@ -10,6 +10,7 @@ mod orgs;
 mod repos;
 mod sessions;
 mod statuses;
+mod tag_protections;
 mod time;
 mod trails;
 mod user;
@@ -281,6 +282,14 @@ pub fn router(core: Core, base_url: String) -> Router {
         .route(
             "/repos/{owner}/{repo}/gate-rules/{id}",
             patch(gate_rules::patch_gate_rule).delete(gate_rules::delete_gate_rule),
+        )
+        .route(
+            "/repos/{owner}/{repo}/tag-protections",
+            get(tag_protections::list_tag_protections).post(tag_protections::create_tag_protection),
+        )
+        .route(
+            "/repos/{owner}/{repo}/tag-protections/{id}",
+            delete(tag_protections::delete_tag_protection),
         )
         .fallback(|| async { ApiError::NotFound })
         .layer(axum::middleware::from_fn_with_state(

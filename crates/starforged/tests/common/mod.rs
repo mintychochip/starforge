@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use std::process::Output;
 
 use starforged::config::{
-    Config, DatabaseConfig, MailConfig, RegistrationConfig, SecurityConfig, ServerConfig,
-    SessionsConfig, StorageConfig, WebhooksConfig,
+    Config, DatabaseConfig, GitConfig, MailConfig, RegistrationConfig, SecurityConfig,
+    ServerConfig, SessionsConfig, StorageConfig, WebhooksConfig,
 };
 use starforged_core::Core;
 use starforged_core::accounts::{CreateUser, User};
@@ -49,6 +49,7 @@ impl TestServer {
             registration: RegistrationConfig::default(),
             sessions: SessionsConfig::default(),
             webhooks: WebhooksConfig::default(),
+            git: GitConfig::default(),
         };
         configure(&mut config);
         let app =

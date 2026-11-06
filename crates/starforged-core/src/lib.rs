@@ -96,6 +96,10 @@ pub struct CoreConfig {
     /// receiver). Always false in production; everything else non-global is
     /// denied regardless.
     pub allow_loopback_webhooks: bool,
+    /// Ref namespaces clients may push into (`git.allowed_ref_namespaces`,
+    /// e.g. `refs/notes/`), carried into every git-RPC snapshot. Empty by
+    /// default: only branches, tags, and `refs/for` are accepted.
+    pub allowed_ref_namespaces: Vec<String>,
 }
 
 /// The 32-byte key sealing webhook secrets at rest.
@@ -236,6 +240,7 @@ pub(crate) mod testing {
             registration: registration::Registration::default(),
             webhook_key: WebhookKey([7u8; 32]),
             allow_loopback_webhooks: false,
+            allowed_ref_namespaces: Vec::new(),
         };
         configure(&mut config, dir.path());
         (Core::new(db.db.clone(), config), Fixture { _db: db, dir })

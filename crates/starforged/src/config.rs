@@ -25,6 +25,9 @@ pub struct Config {
     /// Webhook delivery tuning. Missing section defaults cleanly (loopback denied).
     #[serde(default)]
     pub webhooks: WebhooksConfig,
+    /// Push policy tuning. Missing section defaults cleanly (no extra namespaces).
+    #[serde(default)]
+    pub git: GitConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -199,6 +202,18 @@ pub struct WebhooksConfig {
     pub allow_loopback: bool,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitConfig {
+    /// Ref namespaces clients may push into (spec §8.2), e.g.
+    /// `allowed_ref_namespaces = ["refs/notes/"]`. Each entry must start
+    /// with `refs/` and end with `/`, and must neither equal nor overlap
+    /// `refs/heads/`, `refs/tags/`, `refs/for/`, or `refs/trails/`.
+    /// Pushes there need write plus a write-scoped token and are never
+    /// subject to branch protection. Empty by default.
+    #[serde(default)]
+    pub allowed_ref_namespaces: Vec<String>,
+}
+
 impl Config {
     /// Reads `path`, applies environment overrides, and validates.
     pub fn load(path: &Path) -> anyhow::Result<Config> {
@@ -274,6 +289,14 @@ impl Config {
                 "webhooks__allow_loopback" => {
                     self.webhooks.allow_loopback = parse_bool(&key, &value)?;
                 }
+                "git__allowed_ref_namespaces" => {
+                    self.git.allowed_ref_namespaces = value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|d| !d.is_empty())
+                        .map(str::to_owned)
+                        .collect();
+                }
                 _ => bail!("unknown configuration override {key}"),
             }
         }
@@ -290,6 +313,8 @@ impl Config {
         }
         self.registration_settings()?;
         self.mailer()?;
+        starforged_git::refpolicy::validate_allowed_namespaces(&self.git.allowed_ref_namespaces)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         Ok(())
     }
 
@@ -395,6 +420,7 @@ mod tests {
             mail: MailConfig::default(),
             sessions: SessionsConfig::default(),
             webhooks: WebhooksConfig::default(),
+            git: GitConfig::default(),
         }
     }
 
@@ -663,6 +689,68 @@ mod tests {
         let mut config = sample();
         config.sessions.blob_dir = PathBuf::from("/var/lib/blobs");
         assert_eq!(config.blob_dir(), PathBuf::from("/var/lib/blobs"));
+    }
+
+    #[test]
+    fn git_namespaces_default_empty_and_validate() {
+        let config = sample();
+        assert!(config.git.allowed_ref_namespaces.is_empty());
+        assert!(config.validate().is_ok());
+        // A config file without `[git]` keeps working with defaults.
+        let bare =
+            "[server]\nhttp_addr = \"127.0.0.1:3000\"\nbase_url = \"http://127.0.0.1:3000\"\n\
+            [storage]\ndata_dir = \"/srv/starforge\"\n\
+            [security]\nsecret_key = \""
+                .to_owned()
+                + &"ab".repeat(32)
+                + "\"\n";
+        let without: Config = toml::from_str(&bare).unwrap();
+        assert_eq!(without.git, GitConfig::default());
+        assert!(without.validate().is_ok());
+
+        // Explicit values parse and validate.
+        let explicit: Config = toml::from_str(&format!(
+            "{bare}[git]\nallowed_ref_namespaces = [\"refs/notes/\", \"refs/keys/\"]\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            explicit.git.allowed_ref_namespaces,
+            vec!["refs/notes/", "refs/keys/"]
+        );
+        assert!(explicit.validate().is_ok());
+
+        // Each entry must start with `refs/`, end with `/`, and stay clear
+        // of the reserved namespaces.
+        for bad in [
+            "notes/",
+            "refs/notes",
+            "refs/",
+            "refs/heads/",
+            "refs/tags/",
+            "refs/for/",
+            "refs/trails/",
+            "refs/heads/evil/",
+            "refs/tags/v1/",
+        ] {
+            let mut config = sample();
+            config.git.allowed_ref_namespaces = vec![bad.into()];
+            let err = config.validate().unwrap_err().to_string();
+            assert!(err.contains(bad), "{bad:?}: {err}");
+        }
+
+        // The environment override splits on commas like allowed_domains.
+        let mut config = sample();
+        config
+            .apply_env([(
+                "STARFORGE__GIT__ALLOWED_REF_NAMESPACES".to_owned(),
+                "refs/notes/, refs/keys/".to_owned(),
+            )])
+            .unwrap();
+        assert_eq!(
+            config.git.allowed_ref_namespaces,
+            vec!["refs/notes/", "refs/keys/"]
+        );
+        assert!(config.validate().is_ok());
     }
 
     #[test]

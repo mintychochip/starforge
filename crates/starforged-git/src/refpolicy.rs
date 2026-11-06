@@ -240,23 +240,34 @@ pub enum RefKind {
     Branch,
     Tag,
     For(ForRef),
+    /// A ref inside a site-admin allow-listed namespace (`refs/notes/`, …):
+    /// pushes need write plus a write-scoped token like branches, but are
+    /// never subject to branch protection.
+    Namespace,
 }
 
 /// Pure push policy (spec §8.2). Branches/tags need no identity at hook level
 /// (the RPC layer owns the write gate, so readers stay accepted here);
 /// `refs/for` needs an authenticated user with ≥ Read AND (`anyone_with_read`
-/// or explicit membership); `refs/trails/*` and everything else fail closed.
+/// or explicit membership); `refs/trails/*` and everything else fail closed —
+/// except refs inside an allow-listed `namespaces` entry, which classify as
+/// [`RefKind::Namespace`]. Each entry starts with `refs/` and ends with `/`
+/// (validated at startup by [`validate_allowed_namespaces`]).
 pub fn check_allowed(
     name: &str,
     permission: Option<&str>,
     is_member: bool,
     refs_for: &str,
+    namespaces: &[String],
 ) -> Result<RefKind, String> {
     if name.starts_with("refs/heads/") {
         return Ok(RefKind::Branch);
     }
     if name.starts_with("refs/tags/") {
         return Ok(RefKind::Tag);
+    }
+    if namespaces.iter().any(|ns| name.starts_with(ns.as_str())) {
+        return Ok(RefKind::Namespace);
     }
     if name.starts_with("refs/for/") {
         let target = parse_for_ref(name).ok_or_else(|| {
@@ -324,17 +335,23 @@ pub struct BranchRule {
     pub exempt: bool,
 }
 
-/// The parsed `STARFORGE_PROTECTION` snapshot: only `branches` is enforced
-/// here (tags and namespaces arrive with B2). Unknown fields are ignored so
-/// newer snapshots stay readable.
+/// The parsed `STARFORGE_PROTECTION` snapshot: branch rules, tag-protection
+/// globs with the pusher's `tag_ok` (true for maintain+), and the
+/// allow-listed namespaces. Unknown fields are ignored so newer snapshots
+/// stay readable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Protection {
     pub branches: Vec<BranchRule>,
+    pub tags: Vec<String>,
+    pub tag_ok: bool,
+    pub namespaces: Vec<String>,
 }
 
 /// Parses the hook's protection snapshot. Anything missing or malformed —
-/// bad JSON, a wrong version, a missing `branches` array, or a rule without
-/// its block kinds — is `Err`: the hook fails closed on it.
+/// bad JSON, a wrong version, a missing `branches` array, a rule without
+/// its block kinds, or mistyped `tags`/`tag_ok`/`namespaces` — is `Err`:
+/// the hook fails closed on it. Absent `tags`/`tag_ok`/`namespaces` stay at
+/// their permissive defaults so older snapshots keep parsing.
 pub fn parse_protection(raw: &str) -> Result<Protection, String> {
     let value: serde_json::Value =
         serde_json::from_str(raw).map_err(|e| format!("invalid protection snapshot: {e}"))?;
@@ -357,7 +374,28 @@ pub fn parse_protection(raw: &str) -> Result<Protection, String> {
             .map_err(|e| format!("invalid protection snapshot: bad branch rule: {e}"))?;
         rules.push(rule);
     }
-    Ok(Protection { branches: rules })
+    let tags = match value.get("tags") {
+        None => Vec::new(),
+        Some(tags) => serde_json::from_value(tags.clone())
+            .map_err(|e| format!("invalid protection snapshot: bad tags: {e}"))?,
+    };
+    let tag_ok = match value.get("tag_ok") {
+        None => true,
+        Some(tag_ok) => tag_ok.as_bool().ok_or_else(|| {
+            "invalid protection snapshot: bad tag_ok (expected a bool)".to_owned()
+        })?,
+    };
+    let namespaces = match value.get("namespaces") {
+        None => Vec::new(),
+        Some(namespaces) => serde_json::from_value(namespaces.clone())
+            .map_err(|e| format!("invalid protection snapshot: bad namespaces: {e}"))?,
+    };
+    Ok(Protection {
+        branches: rules,
+        tags,
+        tag_ok,
+        namespaces,
+    })
 }
 
 /// Minimal glob: `*` matches any (possibly empty) run, `?` matches exactly
@@ -446,6 +484,62 @@ pub fn check_protected_update(
                 "pushing to {} is not allowed: branch protection rule '{label}' blocks direct pushes (open a trail instead)",
                 update.name
             ));
+        }
+    }
+    Ok(())
+}
+
+/// Enforces the snapshot on one tag push. A tag matching ANY protection
+/// glob needs `tag_ok` (maintain+ at spawn) to create, move, or delete;
+/// non-matching tags pass (the hook's write-tier check already ran).
+/// Non-tag refs pass. Refusals name the ref and the pattern.
+pub fn check_tag_update(protection: &Protection, update: &RefUpdate) -> Result<(), String> {
+    let Some(tag) = update.name.strip_prefix("refs/tags/") else {
+        return Ok(());
+    };
+    let Some(pattern) = protection
+        .tags
+        .iter()
+        .find(|pattern| pattern_matches(Some(pattern.as_str()), tag))
+    else {
+        return Ok(());
+    };
+    if protection.tag_ok {
+        return Ok(());
+    }
+    Err(format!(
+        "pushing to {} is not allowed: tag protection rule '{pattern}' requires maintain access",
+        update.name
+    ))
+}
+
+/// Namespaces the hook must never admit pushes into, even allow-listed:
+/// branch, tag, review, and trail storage.
+const RESERVED_NAMESPACES: [&str; 4] = ["refs/heads/", "refs/tags/", "refs/for/", "refs/trails/"];
+
+/// Validates the site-admin namespace allow-list at startup: every entry
+/// must start with `refs/` and end with `/`, and must neither equal nor
+/// overlap a reserved namespace (either direction: `refs/heads/evil/` and a
+/// bare `refs/` are both refused). `Ok` carries nothing; `Err` names the
+/// offending entry and the rule it broke.
+pub fn validate_allowed_namespaces(entries: &[String]) -> Result<(), String> {
+    for entry in entries {
+        if !entry.starts_with("refs/") || !entry.ends_with('/') {
+            return Err(format!(
+                "git.allowed_ref_namespaces entry {entry:?} must start with \
+                 \"refs/\" and end with \"/\""
+            ));
+        }
+        for reserved in RESERVED_NAMESPACES {
+            if entry == reserved
+                || entry.starts_with(reserved)
+                || reserved.starts_with(entry.as_str())
+            {
+                return Err(format!(
+                    "git.allowed_ref_namespaces entry {entry:?} overlaps \
+                     the reserved {reserved:?} namespace"
+                ));
+            }
         }
     }
     Ok(())
@@ -681,28 +775,54 @@ mod tests {
     #[test]
     fn check_allowed_matrix() {
         // Branches and tags never need an identity at hook level (the RPC layer owns the write gate).
-        assert!(check_allowed("refs/heads/main", None, false, "anyone_with_read").is_ok());
-        assert!(check_allowed("refs/tags/v1", None, false, "members").is_ok());
+        assert!(check_allowed("refs/heads/main", None, false, "anyone_with_read", &[]).is_ok());
+        assert!(check_allowed("refs/tags/v1", None, false, "members", &[]).is_ok());
         // Readers may push reviews where the repo allows it; anonymous never may.
-        assert!(check_allowed("refs/for/main/t", Some("read"), false, "anyone_with_read").is_ok());
-        assert!(check_allowed("refs/for/main", Some("triage"), false, "anyone_with_read").is_ok());
-        assert!(check_allowed("refs/for/main/t", None, false, "anyone_with_read").is_err());
-        assert!(check_allowed("refs/for/main/t", None, true, "anyone_with_read").is_err());
+        assert!(
+            check_allowed(
+                "refs/for/main/t",
+                Some("read"),
+                false,
+                "anyone_with_read",
+                &[]
+            )
+            .is_ok()
+        );
+        assert!(
+            check_allowed(
+                "refs/for/main",
+                Some("triage"),
+                false,
+                "anyone_with_read",
+                &[]
+            )
+            .is_ok()
+        );
+        assert!(check_allowed("refs/for/main/t", None, false, "anyone_with_read", &[]).is_err());
+        assert!(check_allowed("refs/for/main/t", None, true, "anyone_with_read", &[]).is_err());
         // members-only repos need an explicit grant; read collaborators count.
-        assert!(check_allowed("refs/for/main/t", Some("read"), true, "members").is_ok());
-        assert!(check_allowed("refs/for/main/t", Some("read"), false, "members").is_err());
-        assert!(check_allowed("refs/for/main/t", Some("write"), false, "members").is_err());
+        assert!(check_allowed("refs/for/main/t", Some("read"), true, "members", &[]).is_ok());
+        assert!(check_allowed("refs/for/main/t", Some("read"), false, "members", &[]).is_err());
+        assert!(check_allowed("refs/for/main/t", Some("write"), false, "members", &[]).is_err());
         // Malformed refs and unknown modes fail closed.
         assert!(
-            check_allowed("refs/for/main/..", Some("write"), true, "anyone_with_read").is_err()
+            check_allowed(
+                "refs/for/main/..",
+                Some("write"),
+                true,
+                "anyone_with_read",
+                &[]
+            )
+            .is_err()
         );
-        assert!(check_allowed("refs/for/main/t", Some("write"), true, "everyone").is_err());
+        assert!(check_allowed("refs/for/main/t", Some("write"), true, "everyone", &[]).is_err());
         assert!(
             check_allowed(
                 "refs/for/main/t",
                 Some("superuser"),
                 true,
-                "anyone_with_read"
+                "anyone_with_read",
+                &[]
             )
             .is_err()
         );
@@ -712,7 +832,8 @@ mod tests {
                 "refs/trails/1/changes/1/head",
                 Some("admin"),
                 true,
-                "anyone_with_read"
+                "anyone_with_read",
+                &[]
             )
             .is_err()
         );
@@ -721,11 +842,14 @@ mod tests {
                 "refs/trails/1/changes/1/head",
                 None,
                 false,
-                "anyone_with_read"
+                "anyone_with_read",
+                &[]
             )
             .is_err()
         );
-        assert!(check_allowed("refs/notes/x", Some("admin"), true, "anyone_with_read").is_err());
+        assert!(
+            check_allowed("refs/notes/x", Some("admin"), true, "anyone_with_read", &[]).is_err()
+        );
     }
 
     #[test]
@@ -862,6 +986,162 @@ mod tests {
         assert!(ok.branches.is_empty());
     }
 
+    #[test]
+    fn tag_updates_need_maintain_when_matched() {
+        let update = |name: &str| RefUpdate {
+            old: "0".repeat(40),
+            new: "a".repeat(40),
+            name: name.into(),
+        };
+        let guarded = parse_protection(
+            r#"{"v":1,"branches":[],"tags":["v*"],"tag_ok":false,"namespaces":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(guarded.tags, vec!["v*".to_owned()]);
+        assert!(!guarded.tag_ok);
+        let err = check_tag_update(&guarded, &update("refs/tags/v1")).unwrap_err();
+        assert!(err.contains("refs/tags/v1"), "{err}");
+        assert!(err.contains("v*"), "{err}");
+        // Moving and deleting a protected tag refuse the same way.
+        let moved = RefUpdate {
+            old: "a".repeat(40),
+            new: "b".repeat(40),
+            name: "refs/tags/v1".into(),
+        };
+        assert!(check_tag_update(&guarded, &moved).is_err());
+        let deleted = RefUpdate {
+            old: "a".repeat(40),
+            new: "0".repeat(40),
+            name: "refs/tags/v1".into(),
+        };
+        assert!(check_tag_update(&guarded, &deleted).is_err());
+        // A maintainer snapshot passes; non-matching tags pass without it.
+        let open = parse_protection(
+            r#"{"v":1,"branches":[],"tags":["v*"],"tag_ok":true,"namespaces":[]}"#,
+        )
+        .unwrap();
+        assert!(check_tag_update(&open, &update("refs/tags/v1")).is_ok());
+        assert!(
+            check_tag_update(&guarded, &update("refs/tags/release-1")).is_ok(),
+            "non-matching tags need write only"
+        );
+        // Any matching pattern guards.
+        let multi = parse_protection(
+            r#"{"v":1,"branches":[],"tags":["release-*","v*"],"tag_ok":false,"namespaces":[]}"#,
+        )
+        .unwrap();
+        assert!(check_tag_update(&multi, &update("refs/tags/release-2")).is_err());
+        // Non-tag refs are unaffected by tag protection.
+        assert!(check_tag_update(&guarded, &update("refs/heads/main")).is_ok());
+    }
+
+    #[test]
+    fn namespaces_admit_allow_listed_refs_only() {
+        let notes = vec!["refs/notes/".to_owned()];
+        assert_eq!(
+            check_allowed(
+                "refs/notes/commits",
+                Some("admin"),
+                true,
+                "anyone_with_read",
+                &notes
+            ),
+            Ok(RefKind::Namespace)
+        );
+        // Without the allow-list the same ref is refused, as today.
+        assert!(
+            check_allowed(
+                "refs/notes/commits",
+                Some("admin"),
+                true,
+                "anyone_with_read",
+                &[]
+            )
+            .is_err()
+        );
+        assert!(
+            check_allowed(
+                "refs/keys/x",
+                Some("admin"),
+                true,
+                "anyone_with_read",
+                &notes
+            )
+            .is_err()
+        );
+        // A prefix that merely shares characters is not a namespace.
+        assert!(
+            check_allowed(
+                "refs/notesx/y",
+                Some("admin"),
+                true,
+                "anyone_with_read",
+                &notes
+            )
+            .is_err()
+        );
+        // Branches and tags are unaffected by the allow-list.
+        assert_eq!(
+            check_allowed("refs/heads/main", None, false, "anyone_with_read", &notes),
+            Ok(RefKind::Branch)
+        );
+        assert_eq!(
+            check_allowed("refs/tags/v1", None, false, "anyone_with_read", &notes),
+            Ok(RefKind::Tag)
+        );
+    }
+
+    #[test]
+    fn namespace_entries_are_validated() {
+        assert!(
+            validate_allowed_namespaces(&[
+                "refs/notes/".to_owned(),
+                "refs/for-review/x/".to_owned()
+            ])
+            .is_ok()
+        );
+        assert!(validate_allowed_namespaces(&[]).is_ok());
+        for bad in [
+            "",
+            "notes/",
+            "refs/notes",
+            "refs/",
+            "refs/heads/",
+            "refs/tags/",
+            "refs/for/",
+            "refs/trails/",
+            "refs/heads/evil/",
+            "refs/tags/v1/",
+            "refs/trails/x/",
+        ] {
+            assert!(
+                validate_allowed_namespaces(&[bad.to_owned()]).is_err(),
+                "{bad:?} must be rejected"
+            );
+        }
+        let err = validate_allowed_namespaces(&["refs/heads/evil/".to_owned()]).unwrap_err();
+        assert!(err.contains("refs/heads/evil/"), "{err}");
+        assert!(err.contains("refs/heads/"), "{err}");
+    }
+
+    #[test]
+    fn protection_snapshot_carries_tags_and_namespaces() {
+        let parsed = parse_protection(
+            r#"{"v":1,"branches":[],"tags":["v*"],"tag_ok":false,"namespaces":["refs/notes/"]}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.tags, vec!["v*".to_owned()]);
+        assert!(!parsed.tag_ok);
+        assert_eq!(parsed.namespaces, vec!["refs/notes/".to_owned()]);
+        // Present-but-malformed fields fail closed.
+        for bad in [
+            r#"{"v":1,"branches":[],"tags":[42]}"#,
+            r#"{"v":1,"branches":[],"tag_ok":"yes"}"#,
+            r#"{"v":1,"branches":[],"namespaces":"refs/notes/"}"#,
+        ] {
+            assert!(parse_protection(bad).is_err(), "{bad} must fail closed");
+        }
+    }
     #[test]
     fn oid_shapes() {
         assert!(is_oid(&"a".repeat(40)));

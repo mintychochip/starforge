@@ -98,7 +98,18 @@ pub fn pre_receive_with(input: impl BufRead, mut err: impl Write, ctx: &HookCtx)
             let _ = writeln!(err, "starforge: malformed pre-receive input");
             return 1;
         };
-        match refpolicy::check_allowed(&update.name, permission, ctx.is_member, &ctx.refs_for) {
+        let namespaces: &[String] = ctx
+            .protection
+            .as_ref()
+            .map(|protection| protection.namespaces.as_slice())
+            .unwrap_or(&[]);
+        match refpolicy::check_allowed(
+            &update.name,
+            permission,
+            ctx.is_member,
+            &ctx.refs_for,
+            namespaces,
+        ) {
             Err(message) => {
                 let _ = writeln!(err, "starforge: {message}");
                 code = 1;
@@ -177,6 +188,10 @@ pub fn pre_receive_with(input: impl BufRead, mut err: impl Write, ctx: &HookCtx)
                 }
             }
             Ok(refpolicy::RefKind::Tag) => {
+                // Tags need the write tier too; then the snapshot's tag
+                // globs: a matching pattern needs `tag_ok` (maintain+)
+                // to create, move, or delete. A missing or malformed
+                // snapshot fails closed.
                 if let Err(message) =
                     refpolicy::check_branch_push(ctx.permission.as_deref(), ctx.scope_write)
                 {
@@ -188,8 +203,38 @@ pub fn pre_receive_with(input: impl BufRead, mut err: impl Write, ctx: &HookCtx)
                     code = 1;
                     continue;
                 }
-                // Tag protection arrives with B2; until then a missing or
+                match &ctx.protection {
+                    Err(reason) => {
+                        let _ = writeln!(
+                            err,
+                            "starforge: pushing to {} is not allowed: protection snapshot {reason}",
+                            update.name
+                        );
+                        code = 1;
+                    }
+                    Ok(protection) => {
+                        if let Err(message) = refpolicy::check_tag_update(protection, &update) {
+                            let _ = writeln!(err, "starforge: {message}");
+                            code = 1;
+                        }
+                    }
+                }
+            }
+            Ok(refpolicy::RefKind::Namespace) => {
+                // Allow-listed namespaces need the write tier like branches,
+                // but are never subject to branch protection. A missing or
                 // malformed snapshot still fails closed.
+                if let Err(message) =
+                    refpolicy::check_branch_push(ctx.permission.as_deref(), ctx.scope_write)
+                {
+                    let _ = writeln!(
+                        err,
+                        "starforge: pushing to {} is not allowed: {message}",
+                        update.name
+                    );
+                    code = 1;
+                    continue;
+                }
                 if let Err(reason) = &ctx.protection {
                     let _ = writeln!(
                         err,
@@ -257,7 +302,12 @@ mod tests {
             is_member: false,
             scope_write: true,
             refs_for: "anyone_with_read".to_owned(),
-            protection: Ok(refpolicy::Protection { branches: vec![] }),
+            protection: Ok(refpolicy::Protection {
+                branches: vec![],
+                tags: vec![],
+                tag_ok: true,
+                namespaces: vec![],
+            }),
             git_dir,
             branches: vec!["main".to_owned(), "release/1.x".to_owned()],
             nonce: "testnonce".to_owned(),

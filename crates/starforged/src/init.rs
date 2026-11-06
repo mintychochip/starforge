@@ -5,8 +5,8 @@ use std::path::Path;
 use anyhow::{Context, bail};
 
 use crate::config::{
-    Config, DatabaseConfig, MailConfig, RegistrationConfig, SecurityConfig, ServerConfig,
-    SessionsConfig, StorageConfig, WebhooksConfig,
+    Config, DatabaseConfig, GitConfig, MailConfig, RegistrationConfig, SecurityConfig,
+    ServerConfig, SessionsConfig, StorageConfig, WebhooksConfig,
 };
 
 pub struct InitOptions<'a> {
@@ -44,6 +44,7 @@ pub fn run(opts: &InitOptions<'_>) -> anyhow::Result<Config> {
         registration: RegistrationConfig::default(),
         sessions: SessionsConfig::default(),
         webhooks: WebhooksConfig::default(),
+        git: GitConfig::default(),
     };
     config.validate()?;
     // Document the blob_dir resolution rule in the generated file so operators

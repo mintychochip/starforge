@@ -41,6 +41,7 @@ pub async fn open_core(config: &Config, hook_exe: PathBuf) -> anyhow::Result<Cor
             // receiver (`STARFORGE__WEBHOOKS__ALLOW_LOOPBACK=1` or
             // `[webhooks] allow_loopback = true`). Production never sets it.
             allow_loopback_webhooks: config.webhooks.allow_loopback,
+            allowed_ref_namespaces: config.git.allowed_ref_namespaces.clone(),
         },
     ))
 }

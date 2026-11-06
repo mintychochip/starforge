@@ -81,3 +81,83 @@ pub async fn is_team_member(db: &Db, team_id: i64, user_id: i64) -> DbResult<boo
             .await?;
     Ok(count > 0)
 }
+
+/// One tag-protection row: a glob; any tag it matches needs `maintain` or
+/// above to create, move, or delete (spec §8.2, M3b D3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TagProtectionRow {
+    pub id: i64,
+    pub repo_id: i64,
+    pub pattern: String,
+    pub created_at: i64,
+}
+
+fn tag_protection_from_row(row: &sqlx::any::AnyRow) -> DbResult<TagProtectionRow> {
+    Ok(TagProtectionRow {
+        id: row.try_get("id")?,
+        repo_id: row.try_get("repo_id")?,
+        pattern: row.try_get("pattern")?,
+        created_at: row.try_get("created_at")?,
+    })
+}
+
+/// Tag protections of the repo in insert order.
+pub async fn tag_protections_for_repo(db: &Db, repo_id: i64) -> DbResult<Vec<TagProtectionRow>> {
+    let rows = sqlx::query(
+        "SELECT id, repo_id, pattern, created_at FROM tag_protections \
+         WHERE repo_id = $1 ORDER BY id ASC",
+    )
+    .bind(repo_id)
+    .fetch_all(db.pool())
+    .await?;
+    rows.iter().map(tag_protection_from_row).collect()
+}
+
+/// One tag protection by id, scoped to the repo (`None` for a missing id or
+/// another repo's id).
+pub async fn tag_protection_by_id(
+    db: &Db,
+    id: i64,
+    repo_id: i64,
+) -> DbResult<Option<TagProtectionRow>> {
+    let row = sqlx::query(
+        "SELECT id, repo_id, pattern, created_at FROM tag_protections \
+         WHERE id = $1 AND repo_id = $2",
+    )
+    .bind(id)
+    .bind(repo_id)
+    .fetch_optional(db.pool())
+    .await?;
+    row.map(|row| tag_protection_from_row(&row)).transpose()
+}
+
+/// Inserts a tag-protection row; a duplicate `(repo_id, pattern)` violates
+/// the unique index (callers in `starforged-core` pre-check and report
+/// `Conflict`).
+pub async fn insert_tag_protection(
+    db: &Db,
+    repo_id: i64,
+    pattern: &str,
+    now: i64,
+) -> DbResult<TagProtectionRow> {
+    let row = sqlx::query(
+        "INSERT INTO tag_protections (repo_id, pattern, created_at) \
+         VALUES ($1, $2, $3) RETURNING id, repo_id, pattern, created_at",
+    )
+    .bind(repo_id)
+    .bind(pattern)
+    .bind(now)
+    .fetch_one(db.pool())
+    .await?;
+    tag_protection_from_row(&row)
+}
+
+/// Deletes the tag protection `id` scoped to the repo.
+pub async fn delete_tag_protection(db: &Db, id: i64, repo_id: i64) -> DbResult<bool> {
+    let done = sqlx::query("DELETE FROM tag_protections WHERE id = $1 AND repo_id = $2")
+        .bind(id)
+        .bind(repo_id)
+        .execute(db.pool())
+        .await?;
+    Ok(done.rows_affected() > 0)
+}

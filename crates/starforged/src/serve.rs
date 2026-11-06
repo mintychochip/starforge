@@ -23,6 +23,7 @@ const JOB_WORKERS: usize = 2;
 
 /// The whole application: `/healthz`, `/api/v1`, web pages, and git smart HTTP.
 pub async fn build(config: &Config, hook_exe: PathBuf) -> anyhow::Result<App> {
+    config.validate()?;
     let core = open_core(config, hook_exe).await?;
     let web = starforged_web::router(
         core.clone(),

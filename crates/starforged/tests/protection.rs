@@ -407,3 +407,179 @@ async fn trail_merge_into_protected_branch_succeeds() {
         "merge moved main"
     );
 }
+
+async fn create_tag_protection(
+    s: &TestServer,
+    token: &str,
+    owner: &str,
+    repo: &str,
+    pattern: &str,
+) -> Value {
+    let client = reqwest::Client::new();
+    let res = client
+        .post(s.url(&format!("/api/v1/repos/{owner}/{repo}/tag-protections")))
+        .bearer_auth(token)
+        .json(&json!({"pattern": pattern}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 201, "creating the tag protection");
+    res.json::<Value>().await.unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tag_protection_needs_maintain_for_matching_tags() {
+    let s = TestServer::start().await;
+    let alice = s.user("alice").await;
+    let bob = s.user("bob").await;
+    let (_, _, work, server) = setup_repo(&s, &alice, "proj").await;
+    s.core
+        .set_collaborator(&alice, "alice", "proj", "bob", Permission::Write)
+        .await
+        .unwrap();
+    let maintain = s.token(&alice, &[Scope::RepoRead, Scope::RepoWrite]).await;
+    create_tag_protection(&s, &maintain, "alice", "proj", "v*").await;
+
+    let bob_url = writer_url(&s, "alice", "proj", &bob, &[Scope::RepoWrite]).await;
+    let alice_url = writer_url(&s, "alice", "proj", &alice, &[Scope::RepoWrite]).await;
+
+    // A write user's protected tag is refused, naming the ref and the pattern.
+    git_ok(&work, &["tag", "v1"]).await;
+    let out = git(&work, &["push", &bob_url, "refs/tags/v1"]).await;
+    assert!(!out.status.success(), "protected tag push must be refused");
+    let err = String::from_utf8(out.stderr).unwrap();
+    assert!(err.contains("refs/tags/v1"), "{err}");
+    assert!(err.contains("v*"), "{err}");
+    assert!(
+        server_rev(&work, &server, "refs/tags/v1").await.is_none(),
+        "refused tag push creates nothing"
+    );
+
+    // A maintainer's push succeeds.
+    git_ok(&work, &["push", &alice_url, "refs/tags/v1"]).await;
+    server_rev_ok(&work, &server, "refs/tags/v1").await;
+
+    // A non-matching tag sails through for the write user.
+    git_ok(&work, &["tag", "release-1"]).await;
+    git_ok(&work, &["push", &bob_url, "refs/tags/release-1"]).await;
+    server_rev_ok(&work, &server, "refs/tags/release-1").await;
+
+    // Deleting a protected tag needs maintain too.
+    let out = git(&work, &["push", &bob_url, ":refs/tags/v1"]).await;
+    assert!(
+        !out.status.success(),
+        "protected tag delete must be refused"
+    );
+    let err = String::from_utf8(out.stderr).unwrap();
+    assert!(err.contains("refs/tags/v1"), "{err}");
+    assert!(err.contains("v*"), "{err}");
+    server_rev_ok(&work, &server, "refs/tags/v1").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn allow_listed_namespace_pushes_need_write() {
+    let s = TestServer::start_with(|config| {
+        config.git.allowed_ref_namespaces = vec!["refs/notes/".to_owned()];
+    })
+    .await;
+    let alice = s.user("alice").await;
+    let bob = s.user("bob").await;
+    let carol = s.user("carol").await;
+    let (_, _, work, server) = setup_repo(&s, &alice, "proj").await;
+    s.core
+        .set_collaborator(&alice, "alice", "proj", "bob", Permission::Write)
+        .await
+        .unwrap();
+    s.core
+        .set_collaborator(&alice, "alice", "proj", "carol", Permission::Read)
+        .await
+        .unwrap();
+    git_ok(&work, &["notes", "add", "-m", "a note"]).await;
+
+    // A write user pushes into the allow-listed namespace.
+    let bob_url = writer_url(&s, "alice", "proj", &bob, &[Scope::RepoWrite]).await;
+    git_ok(&work, &["push", &bob_url, "refs/notes/commits"]).await;
+    server_rev_ok(&work, &server, "refs/notes/commits").await;
+
+    // A read user is refused (with a fresh note so the push is a real update).
+    git_ok(&work, &["notes", "append", "-m", "carol note"]).await;
+    let carol_url = writer_url(&s, "alice", "proj", &carol, &[Scope::RepoRead]).await;
+    let out = git(&work, &["push", &carol_url, "refs/notes/commits"]).await;
+    assert!(
+        !out.status.success(),
+        "read push into notes must be refused"
+    );
+    let err = String::from_utf8(out.stderr).unwrap();
+    assert!(err.contains("refs/notes/commits"), "{err}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn namespace_pushes_refused_without_allow_list() {
+    let s = TestServer::start().await;
+    let alice = s.user("alice").await;
+    let bob = s.user("bob").await;
+    let (_, _, work, server) = setup_repo(&s, &alice, "proj").await;
+    s.core
+        .set_collaborator(&alice, "alice", "proj", "bob", Permission::Write)
+        .await
+        .unwrap();
+    git_ok(&work, &["notes", "add", "-m", "a note"]).await;
+
+    let bob_url = writer_url(&s, "alice", "proj", &bob, &[Scope::RepoWrite]).await;
+    let out = git(&work, &["push", &bob_url, "refs/notes/commits"]).await;
+    assert!(
+        !out.status.success(),
+        "notes push without the allow-list must be refused"
+    );
+    let err = String::from_utf8(out.stderr).unwrap();
+    assert!(err.contains("refs/notes/commits"), "{err}");
+    assert!(
+        server_rev(&work, &server, "refs/notes/commits")
+            .await
+            .is_none(),
+        "refused notes push creates nothing"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invalid_namespace_entry_fails_startup() {
+    use starforged::config::{
+        Config, DatabaseConfig, GitConfig, MailConfig, RegistrationConfig, SecurityConfig,
+        ServerConfig, SessionsConfig, StorageConfig, WebhooksConfig,
+    };
+    let data = tempfile::tempdir().unwrap();
+    let config = Config {
+        server: ServerConfig {
+            http_addr: "127.0.0.1:0".into(),
+            base_url: "http://127.0.0.1:0".into(),
+        },
+        database: DatabaseConfig {
+            url: format!("sqlite://{}?mode=rwc", data.path().join("t.db").display()),
+            auto_migrate: true,
+        },
+        storage: StorageConfig {
+            data_dir: data.path().to_path_buf(),
+        },
+        security: SecurityConfig {
+            secret_key: "0".repeat(64),
+        },
+        registration: RegistrationConfig::default(),
+        mail: MailConfig::default(),
+        sessions: SessionsConfig::default(),
+        webhooks: WebhooksConfig::default(),
+        git: GitConfig {
+            allowed_ref_namespaces: vec!["refs/heads/evil/".into()],
+        },
+    };
+    let err =
+        match starforged::serve::build(&config, PathBuf::from(env!("CARGO_BIN_EXE_starforged")))
+            .await
+        {
+            Ok(_) => panic!("build with a reserved namespace must fail"),
+            Err(err) => err,
+        };
+    assert!(
+        err.to_string().contains("refs/heads/"),
+        "startup names the offending namespace: {err:?}"
+    );
+}

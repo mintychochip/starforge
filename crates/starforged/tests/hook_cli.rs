@@ -163,3 +163,73 @@ fn snapshot_direct_push_block_names_ref_and_pattern() {
     );
     assert_eq!(out.status.code(), Some(0), "exempt snapshot passes");
 }
+
+/// Tag protection: a matching pattern needs `tag_ok`; non-matching tags
+/// follow the write tier, and refusals name the ref and the pattern.
+#[test]
+fn tag_protection_needs_maintain_for_matching_tags() {
+    fn snapshot(tags: &str, tag_ok: bool) -> String {
+        format!(
+            "{{\"v\":1,\"branches\":[],\"tags\":[{tags}],\"tag_ok\":{tag_ok},\"namespaces\":[]}}"
+        )
+    }
+    let line = "0000000000000000000000000000000000000000 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa refs/tags/v1\n";
+    let base = vec![
+        ("STARFORGE_PERMISSION", "write"),
+        ("STARFORGE_SCOPE_WRITE", "1"),
+    ];
+    // A matching pattern without `tag_ok` refuses, naming the ref and pattern.
+    let mut env = base.clone();
+    let guarded = snapshot(r#""v*""#, false);
+    env.push(("STARFORGE_PROTECTION", guarded.as_str()));
+    let out = hook_with(line, &env);
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(err.contains("refs/tags/v1"), "{err}");
+    assert!(err.contains("v*"), "{err}");
+    // A maintainer snapshot lets the same push through.
+    let mut env = base.clone();
+    let open = snapshot(r#""v*""#, true);
+    env.push(("STARFORGE_PROTECTION", open.as_str()));
+    assert!(hook_with(line, &env).status.success());
+    // A non-matching tag sails through without `tag_ok`.
+    let other = "0000000000000000000000000000000000000000 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa refs/tags/release-1\n";
+    let mut env = base.clone();
+    let guarded = snapshot(r#""v*""#, false);
+    env.push(("STARFORGE_PROTECTION", guarded.as_str()));
+    assert!(hook_with(other, &env).status.success());
+    // Deleting a protected tag needs `tag_ok` too.
+    let delete = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 0000000000000000000000000000000000000000 refs/tags/v1\n";
+    assert!(!hook_with(delete, &env).status.success());
+}
+
+/// Allow-listed namespaces push like branches; everything else stays refused.
+#[test]
+fn allow_listed_namespaces_push_like_branches() {
+    let line = "0000000000000000000000000000000000000000 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa refs/notes/commits\n";
+    let listed = r#"{"v":1,"branches":[],"tags":[],"tag_ok":false,"namespaces":["refs/notes/"]}"#;
+    let out = hook_with(
+        line,
+        &[
+            ("STARFORGE_PERMISSION", "write"),
+            ("STARFORGE_SCOPE_WRITE", "1"),
+            ("STARFORGE_PROTECTION", listed),
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "allow-listed notes push passes");
+    // Without the allow-list the same push is refused.
+    let out = hook_with(line, &write_env());
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(err.contains("refs/notes/commits"), "{err}");
+    // Readers stay refused inside the allow-list.
+    let out = hook_with(
+        line,
+        &[
+            ("STARFORGE_PERMISSION", "read"),
+            ("STARFORGE_SCOPE_WRITE", "1"),
+            ("STARFORGE_PROTECTION", listed),
+        ],
+    );
+    assert_eq!(out.status.code(), Some(1));
+}

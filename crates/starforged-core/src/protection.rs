@@ -1,6 +1,7 @@
-//! Branch protection push environment (spec §8.2, M3b B1): one [`Core`]
-//! fn builds the whole git-RPC environment, including a protection snapshot
-//! for the pusher. HTTP uses it now; SSH (M3c) will reuse it.
+//! Tag and branch protection for pushes (spec §8.2, M3b): one [`Core`] fn
+//! builds the whole git-RPC environment, including a protection snapshot
+//! for the pusher, plus tag-protection CRUD. HTTP uses it now; SSH (M3c)
+//! will reuse it.
 //!
 //! The hook process never opens the database: it enforces only this
 //! snapshot. `exempt` is computed per pusher at spawn (a direct user entry
@@ -8,11 +9,13 @@
 
 use serde::{Deserialize, Serialize};
 use starforged_db::{
-    checks as db_checks, orgs as db_orgs, protection as db_protection, users as db_users,
+    checks as db_checks, now, orgs as db_orgs, protection as db_protection, trails as db_trails,
+    users as db_users,
 };
 
 use crate::accounts::User;
 use crate::orgs::team_slug;
+use crate::permission::Permission;
 use crate::repos::RepoAccess;
 use crate::{Core, CoreError, CoreResult};
 
@@ -35,6 +38,23 @@ pub struct PushAllowlistInput {
     pub teams: Vec<String>,
 }
 
+/// One tag protection for the API: a glob; any tag it matches needs
+/// maintain+ to create, move, or delete.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TagProtectionDto {
+    pub id: i64,
+    pub pattern: String,
+    pub created_at: i64,
+}
+
+/// `POST …/tag-protections` body: exactly `{"pattern"}`. Unknown fields are
+/// 422, like every other security-control body.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TagProtectionInput {
+    pub pattern: Option<String>,
+}
+
 /// One branch rule in the hook's snapshot: the pattern, the three blocks,
 /// and whether the pusher is exempt from the direct-push block.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,8 +66,9 @@ pub struct BranchRuleSnapshot {
     pub exempt: bool,
 }
 
-/// The `STARFORGE_PROTECTION` snapshot: `tags` and `namespaces` arrive with
-/// B2; B1 writes them empty (tag pushes stay on the pre-protection policy).
+/// The `STARFORGE_PROTECTION` snapshot: branch rules, tag-protection globs
+/// with the pusher's `tag_ok` (true for maintain+), and the allow-listed
+/// namespaces from `git.allowed_ref_namespaces`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProtectionSnapshot {
     pub v: u32,
@@ -157,12 +178,16 @@ impl Core {
                 exempt,
             });
         }
+        let mut tags = Vec::new();
+        for row in db_protection::tag_protections_for_repo(self.db(), repo_id).await? {
+            tags.push(row.pattern);
+        }
         Ok(ProtectionSnapshot {
             v: 1,
             branches,
-            tags: Vec::new(),
+            tags,
             tag_ok,
-            namespaces: Vec::new(),
+            namespaces: self.config().allowed_ref_namespaces.clone(),
         })
     }
 
@@ -236,6 +261,159 @@ impl Core {
         }
         Ok(PushAllowlistDto { users, teams })
     }
+
+    /// Tag protections of the repo in insert order. Reads need ≥ `Maintain`,
+    /// like writes; a missing repo or one the viewer cannot read is
+    /// `NotFound`.
+    pub async fn list_tag_protections(
+        &self,
+        viewer: Option<&User>,
+        owner: &str,
+        repo: &str,
+    ) -> CoreResult<Vec<TagProtectionDto>> {
+        let access = self
+            .require_repo(viewer, owner, repo, Permission::Maintain)
+            .await?;
+        let mut out = Vec::new();
+        for row in db_protection::tag_protections_for_repo(self.db(), access.repo.id).await? {
+            out.push(TagProtectionDto {
+                id: row.id,
+                pattern: row.pattern,
+                created_at: row.created_at,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Creates a tag protection (≥ `Maintain`): validates the glob, refuses
+    /// archived repos and duplicate patterns, then records timeline + audit
+    /// rows.
+    pub async fn create_tag_protection(
+        &self,
+        user: &User,
+        owner: &str,
+        repo: &str,
+        input: &TagProtectionInput,
+    ) -> CoreResult<TagProtectionDto> {
+        let access = self
+            .require_repo(Some(user), owner, repo, Permission::Maintain)
+            .await?;
+        if access.repo.archived_at.is_some() {
+            return Err(CoreError::Invalid("repository is archived".into()));
+        }
+        let pattern = normalize_tag_pattern(input.pattern.clone())?;
+        for row in db_protection::tag_protections_for_repo(self.db(), access.repo.id).await? {
+            if row.pattern == pattern {
+                return Err(CoreError::Conflict(format!(
+                    "a tag protection for '{pattern}' already exists"
+                )));
+            }
+        }
+        let stamp = now();
+        let row = db_protection::insert_tag_protection(self.db(), access.repo.id, &pattern, stamp)
+            .await?;
+        let view = TagProtectionDto {
+            id: row.id,
+            pattern: row.pattern,
+            created_at: row.created_at,
+        };
+        let payload =
+            serde_json::to_string(&view).map_err(|e| CoreError::Internal(e.to_string()))?;
+        db_trails::insert_timeline(
+            self.db(),
+            access.repo.id,
+            None,
+            "tag_protection.created",
+            Some(user.id),
+            &payload,
+            now(),
+        )
+        .await?;
+        self.audit(
+            Some(user.id),
+            "tag_protection.created",
+            &tag_protection_target(owner, repo, row.id),
+            &payload,
+        )
+        .await?;
+        Ok(view)
+    }
+
+    /// Deletes a tag protection (≥ `Maintain`); a missing id or another
+    /// repo's id is `NotFound`. The timeline payload is the rule as it was.
+    pub async fn delete_tag_protection(
+        &self,
+        user: &User,
+        owner: &str,
+        repo: &str,
+        id: i64,
+    ) -> CoreResult<()> {
+        let access = self
+            .require_repo(Some(user), owner, repo, Permission::Maintain)
+            .await?;
+        if access.repo.archived_at.is_some() {
+            return Err(CoreError::Invalid("repository is archived".into()));
+        }
+        let row = db_protection::tag_protection_by_id(self.db(), id, access.repo.id)
+            .await?
+            .ok_or(CoreError::NotFound)?;
+        let view = TagProtectionDto {
+            id: row.id,
+            pattern: row.pattern,
+            created_at: row.created_at,
+        };
+        let payload =
+            serde_json::to_string(&view).map_err(|e| CoreError::Internal(e.to_string()))?;
+        if !db_protection::delete_tag_protection(self.db(), id, access.repo.id).await? {
+            return Err(CoreError::NotFound);
+        }
+        db_trails::insert_timeline(
+            self.db(),
+            access.repo.id,
+            None,
+            "tag_protection.deleted",
+            Some(user.id),
+            &payload,
+            now(),
+        )
+        .await?;
+        self.audit(
+            Some(user.id),
+            "tag_protection.deleted",
+            &tag_protection_target(owner, repo, id),
+            &payload,
+        )
+        .await?;
+        Ok(())
+    }
+}
+
+/// The single "all tags" pattern is not a thing: a tag protection always
+/// names a glob, 1–100 chars from exactly what
+/// `starforged_git::refpolicy::pattern_matches` understands. Missing, null,
+/// and blank patterns are `Invalid`.
+fn normalize_tag_pattern(raw: Option<String>) -> CoreResult<String> {
+    let Some(text) = raw else {
+        return Err(CoreError::Invalid("pattern is required".into()));
+    };
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err(CoreError::Invalid("pattern is required".into()));
+    }
+    let ok = (1..=100).contains(&trimmed.chars().count())
+        && trimmed.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'/' | b'-' | b'*' | b'?')
+        });
+    if !ok {
+        return Err(CoreError::Invalid(format!(
+            "invalid pattern '{trimmed}' (1-100 chars of A-Z a-z 0-9 . _ / - and glob * ?)"
+        )));
+    }
+    Ok(trimmed.to_owned())
+}
+
+fn tag_protection_target(owner: &str, repo: &str, id: i64) -> String {
+    format!("tag_protection:{owner}/{repo}#{id}")
 }
 
 /// The lowercase handle of the repository's owner, for org detection.
