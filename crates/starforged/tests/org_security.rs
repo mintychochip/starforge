@@ -400,6 +400,7 @@ async fn web_status(client: &reqwest::Client, url: &str) -> u16 {
 impl Ctx {
     /// The full surface check for one matrix cell: resolver facts, web page,
     /// API read, clone, branch push, and refs/for push.
+    #[allow(clippy::too_many_arguments)]
     async fn check_cell(
         &self,
         client: &reqwest::Client,
@@ -408,9 +409,46 @@ impl Ctx {
         handle: &str,
         repo: &str,
         base: &str,
+        tag: &str,
     ) {
         let (level, member) = expected(handle, repo, base);
-        let user = self.user(handle);
+        self.check_cell_for(
+            client,
+            &browsers[handle],
+            clones,
+            handle,
+            self.user(handle),
+            &self.full[handle].clone(),
+            &self.read[handle].clone(),
+            repo,
+            base,
+            tag,
+            level,
+            member,
+        )
+        .await;
+    }
+
+    /// [`Ctx::check_cell`] with explicit expectations, user, and tokens, so
+    /// revocation cells (ad-hoc users, mid-test grants) reuse the exact same
+    /// surfaces. `tag` keeps branch, topic, and clone-dir names unique per
+    /// phase.
+    #[allow(clippy::too_many_arguments)]
+    async fn check_cell_for(
+        &self,
+        client: &reqwest::Client,
+        browser: &reqwest::Client,
+        clones: &std::path::Path,
+        handle: &str,
+        user: &User,
+        full_tok: &str,
+        read_tok: &str,
+        repo: &str,
+        base: &str,
+        tag: &str,
+        level: Option<Permission>,
+        member: bool,
+    ) {
         let cell = format!("{handle} on {repo} (base={base})");
         // The one resolver is the source of truth.
         let access = self.s.core.repo_for(Some(user), "acme", repo).await;
@@ -431,14 +469,14 @@ impl Ctx {
         let writable = level.is_some_and(|p| p >= Permission::Write);
         // Web repository page: readers 200, non-readers 404.
         assert_eq!(
-            web_status(&browsers[handle], &self.web_repo(repo)).await,
+            web_status(browser, &self.web_repo(repo)).await,
             if readable { 200 } else { 404 },
             "{cell}: web page"
         );
         // API repository read: readers 200, non-readers 404.
         let res = client
             .get(self.api_repo(repo))
-            .bearer_auth(&self.full[handle])
+            .bearer_auth(full_tok)
             .send()
             .await
             .unwrap();
@@ -447,32 +485,65 @@ impl Ctx {
             if readable { 200 } else { 404 },
             "{cell}: api read"
         );
-        // `git clone`: readers succeed, non-readers fail.
-        let dir = clones.join(format!("{handle}-{repo}"));
+        // `git clone`: readers succeed and receive the `main` tip,
+        // non-readers fail without a usable checkout.
+        let dir = clones.join(format!("{tag}-{handle}-{repo}"));
         let out = git(
             clones,
             &[
                 "clone",
                 "-q",
-                &self.s.git_url("acme", repo, Some(&self.full[handle])),
+                &self.s.git_url("acme", repo, Some(full_tok)),
                 dir.to_str().unwrap(),
             ],
         )
         .await;
         assert_eq!(out.status.success(), readable, "{cell}: clone");
-        // `git push` to a branch: Write and above succeed, below fails.
-        let branch = format!("sweep/{handle}-{repo}");
+        if readable {
+            let head = git(&dir, &["rev-parse", "HEAD"]).await;
+            assert!(head.status.success(), "{cell}: clone content");
+            assert_eq!(
+                String::from_utf8(head.stdout).unwrap().trim(),
+                self.main_sha,
+                "{cell}: clone tip"
+            );
+        } else {
+            // A denied clone leaves no usable checkout behind.
+            assert!(!dir.join(".git").exists(), "{cell}: no checkout on denial");
+        }
+        // `git push` to a branch: Write and above change the ref
+        // server-side, below fails and the ref stays absent. Presence is
+        // read back with the owner's credentials, so a denied push cannot
+        // hide behind the pusher's own unreadability.
+        let branch = format!("sweep/{tag}-{handle}-{repo}");
         let out = git(
             &self.seed,
             &[
                 "push",
                 "-q",
-                &self.s.git_url("acme", repo, Some(&self.full[handle])),
+                &self.s.git_url("acme", repo, Some(full_tok)),
                 &format!("HEAD:refs/heads/{branch}"),
             ],
         )
         .await;
         assert_eq!(out.status.success(), writable, "{cell}: branch push");
+        let probe = git(
+            clones,
+            &[
+                "ls-remote",
+                &self.s.git_url("acme", repo, Some(&self.full["alice"])),
+                &format!("refs/heads/{branch}"),
+            ],
+        )
+        .await;
+        assert!(probe.status.success(), "{cell}: ls-remote");
+        assert_eq!(
+            String::from_utf8(probe.stdout)
+                .unwrap()
+                .contains(&format!("refs/heads/{branch}")),
+            writable,
+            "{cell}: pushed ref present"
+        );
         // `refs/for` with `members`: members are admitted, non-members fail,
         // through the read-tier token path.
         let out = git(
@@ -480,8 +551,8 @@ impl Ctx {
             &[
                 "push",
                 "-q",
-                &self.s.git_url("acme", repo, Some(&self.read[handle])),
-                &format!("HEAD:refs/for/main/{handle}-{repo}"),
+                &self.s.git_url("acme", repo, Some(read_tok)),
+                &format!("HEAD:refs/for/main/{tag}-{handle}-{repo}"),
             ],
         )
         .await;
@@ -518,7 +589,7 @@ async fn matrix_with_base_none() {
     let clones = tempfile::tempdir().unwrap();
     for &repo in REPOS {
         for &h in HANDLES {
-            c.check_cell(&client, &browsers, clones.path(), h, repo, "none")
+            c.check_cell(&client, &browsers, clones.path(), h, repo, "none", "m")
                 .await;
         }
         // Anonymous: implicit read on the public repository only.
@@ -547,6 +618,21 @@ async fn matrix_with_base_none() {
         )
         .await;
         assert_eq!(out.status.success(), readable, "anon on {repo}: clone");
+        let dir = clones.path().join(format!("anon-{repo}"));
+        if readable {
+            let head = git(&dir, &["rev-parse", "HEAD"]).await;
+            assert!(head.status.success(), "anon on {repo}: clone content");
+            assert_eq!(
+                String::from_utf8(head.stdout).unwrap().trim(),
+                c.main_sha,
+                "anon on {repo}: clone tip"
+            );
+        } else {
+            assert!(
+                !dir.join(".git").exists(),
+                "anon on {repo}: no checkout on denial"
+            );
+        }
         // Anonymous pushes always fail (no credentials at all).
         let out = git(
             &c.seed,
@@ -576,7 +662,7 @@ async fn matrix_with_base_none() {
             repo_id,
             c.uwrite.id,
             "main",
-            "uwrite-open",
+            "m-uwrite-open",
             None,
         )
         .await
@@ -623,29 +709,14 @@ async fn matrix_with_base_read_then_write() {
     for base in ["read", "write"] {
         c.set_base(base).await;
         let clones = tempfile::tempdir().unwrap();
+        // Full surfaces for every grant source: combined cells change push
+        // outcomes (e.g. `uread` on `shut` is `Write` under base `write`
+        // via the D4 max rule), so resolver facts alone are not enough.
         for &repo in REPOS {
-            // Resolver facts for every grant source.
             for &h in HANDLES {
-                let (level, member) = expected(h, repo, base);
-                let user = c.user(h);
-                let access = c.s.core.repo_for(Some(user), "acme", repo).await;
-                match level {
-                    Some(want) => {
-                        let got =
-                            access.unwrap_or_else(|e| panic!("{h} on {repo} (base={base}): {e:?}"));
-                        assert_eq!(got.permission, want, "{h} on {repo} (base={base})");
-                        assert_eq!(
-                            c.s.core.is_repo_member(got.repo.id, user.id).await.unwrap(),
-                            member,
-                            "{h} on {repo} (base={base}): member"
-                        );
-                    }
-                    None => assert!(access.is_err(), "{h} on {repo} (base={base}): no read"),
-                }
+                c.check_cell(&client, &browsers, clones.path(), h, repo, base, base)
+                    .await;
             }
-            // Full surfaces for the base-only member.
-            c.check_cell(&client, &browsers, clones.path(), "ubase", repo, base)
-                .await;
         }
     }
 }
@@ -828,10 +899,16 @@ async fn section_64_session_surfaces_under_org_grants() {
     assert!(c.s.core.is_repo_member(repo_id, c.uwrite.id).await.unwrap());
     assert!(!c.s.core.is_repo_member(repo_id, c.uout.id).await.unwrap());
 
-    // (viewer, sees the unpublished session).
+    // (viewer, sees the unpublished session): every grant holder, so each
+    // team level and the selected-set holder see all five surfaces.
     let cases = [
         ("alice", true),
+        ("uread", true),
+        ("utriage", true),
         ("uwrite", true),
+        ("umaintain", true),
+        ("uadmin", true),
+        ("usel", true),
         ("ubase", true),
         ("ucoll", true),
         ("uout", false),
@@ -841,71 +918,76 @@ async fn section_64_session_surfaces_under_org_grants() {
         browsers.insert(h.to_string(), c.s.login(h).await.0);
     }
     let anon = c.s.browser();
-    for (h, sees) in cases {
-        let tag = format!("{h} (member={sees})");
-        // The session page: members read, others 404.
-        assert_eq!(
-            web_status(
+    // Membership (not level) drives visibility: run every viewer under base
+    // `read` and base `write`.
+    for base in ["read", "write"] {
+        c.set_base(base).await;
+        for (h, sees) in cases {
+            let tag = format!("{h} on open (base={base}, member={sees})");
+            // The session page: members read, others 404.
+            assert_eq!(
+                web_status(
+                    &browsers[h],
+                    &c.s.url(&format!("/acme/open/sessions/{ULID_SWEEP}"))
+                )
+                .await,
+                if sees { 200 } else { 404 },
+                "{tag}: session page"
+            );
+            // The Trail Sessions API: 200 for every reader of the public repo,
+            // with the session listed only for members.
+            let res = client
+                .get(c.s.url(&format!("/api/v1/repos/acme/open/trails/{n}/sessions")))
+                .bearer_auth(&c.full[h])
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(res.status().as_u16(), 200, "{tag}: sessions api");
+            let body: Value = res.json().await.unwrap();
+            assert_eq!(
+                body.to_string().contains(ULID_SWEEP),
+                sees,
+                "{tag}: sessions api body"
+            );
+            // `has_sessions`: the SQL predicate follows the same member rule.
+            let res = client
+                .get(c.s.url("/api/v1/repos/acme/open/trails?has_sessions=true"))
+                .bearer_auth(&c.full[h])
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(res.status().as_u16(), 200, "{tag}: has_sessions");
+            let listed: Vec<i64> = res.json::<Value>().await.unwrap()["trails"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["number"].as_i64().unwrap())
+                .collect();
+            assert_eq!(listed.contains(&n), sees, "{tag}: has_sessions list");
+            // The Trail Sessions tab: no title or ULID leak for non-members.
+            let tab = get_text(
                 &browsers[h],
-                &c.s.url(&format!("/acme/open/sessions/{ULID_SWEEP}"))
+                &c.s.url(&format!("/acme/open/trails/{n}/sessions")),
             )
-            .await,
-            if sees { 200 } else { 404 },
-            "{tag}: session page"
-        );
-        // The Trail Sessions API: 200 for every reader of the public repo,
-        // with the session listed only for members.
-        let res = client
-            .get(c.s.url(&format!("/api/v1/repos/acme/open/trails/{n}/sessions")))
-            .bearer_auth(&c.full[h])
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(res.status().as_u16(), 200, "{tag}: sessions api");
-        let body: Value = res.json().await.unwrap();
-        assert_eq!(
-            body.to_string().contains(ULID_SWEEP),
-            sees,
-            "{tag}: sessions api body"
-        );
-        // `has_sessions`: the SQL predicate follows the same member rule.
-        let res = client
-            .get(c.s.url("/api/v1/repos/acme/open/trails?has_sessions=true"))
-            .bearer_auth(&c.full[h])
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(res.status().as_u16(), 200, "{tag}: has_sessions");
-        let listed: Vec<i64> = res.json::<Value>().await.unwrap()["trails"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|t| t["number"].as_i64().unwrap())
-            .collect();
-        assert_eq!(listed.contains(&n), sees, "{tag}: has_sessions list");
-        // The Trail Sessions tab: no title or ULID leak for non-members.
-        let tab = get_text(
-            &browsers[h],
-            &c.s.url(&format!("/acme/open/trails/{n}/sessions")),
-        )
-        .await;
-        assert_eq!(
-            tab.contains(ULID_SWEEP) || tab.contains("sweep session seven"),
-            sees,
-            "{tag}: sessions tab"
-        );
-        // Timeline rows and the commit panel obey the same rule.
-        let trail_page = get_text(&browsers[h], &c.s.url(&format!("/acme/open/trails/{n}"))).await;
-        assert_eq!(trail_page.contains(ULID_SWEEP), sees, "{tag}: timeline");
-        let commit_page =
-            get_text(&browsers[h], &c.s.url(&format!("/acme/open/commit/{head}"))).await;
-        assert_eq!(
-            commit_page.contains(ULID_SWEEP),
-            sees,
-            "{tag}: commit panel"
-        );
+            .await;
+            assert_eq!(
+                tab.contains(ULID_SWEEP) || tab.contains("sweep session seven"),
+                sees,
+                "{tag}: sessions tab"
+            );
+            // Timeline rows and the commit panel obey the same rule.
+            let trail_page =
+                get_text(&browsers[h], &c.s.url(&format!("/acme/open/trails/{n}"))).await;
+            assert_eq!(trail_page.contains(ULID_SWEEP), sees, "{tag}: timeline");
+            let commit_page =
+                get_text(&browsers[h], &c.s.url(&format!("/acme/open/commit/{head}"))).await;
+            assert_eq!(
+                commit_page.contains(ULID_SWEEP),
+                sees,
+                "{tag}: commit panel"
+            );
+        }
     }
-    // Anonymous and stranger-API views hide everything unpublished.
     let anon_page = get_text(&anon, &c.s.url(&format!("/acme/open/trails/{n}"))).await;
     assert!(!anon_page.contains(ULID_SWEEP), "anon: timeline");
     let anon_commit = get_text(&anon, &c.s.url(&format!("/acme/open/commit/{head}"))).await;
@@ -966,145 +1048,135 @@ async fn revocation_is_immediate_on_every_surface() {
     let rm_full = c.s.token(&rm, FULL).await;
     let rm_read = c.s.token(&rm, READ).await;
     let lb_full = c.s.token(&lb, FULL).await;
-
-    // Removing the member drops the base grant on every surface.
-    assert_eq!(
-        c.s.core
-            .repo_for(Some(&rm), "acme", "shut")
-            .await
-            .unwrap()
-            .permission,
-        Permission::Read
-    );
+    let lb_read = c.s.token(&lb, READ).await;
+    // Removing the member drops the base grant on every surface: full
+    // checks before (grant live) and after (grant gone) on every repo.
+    c.check_cell_for(
+        &client,
+        &rm_browser,
+        tmp.path(),
+        "rm",
+        &rm,
+        &rm_full,
+        &rm_read,
+        "shut",
+        "read",
+        "rm-pre",
+        Some(Permission::Read),
+        true,
+    )
+    .await;
     c.s.core
         .remove_org_member(&c.alice, "acme", "rm")
         .await
         .unwrap();
-    assert!(c.s.core.repo_for(Some(&rm), "acme", "shut").await.is_err());
-    let repo_id =
-        c.s.core
-            .repo_for(Some(&c.alice), "acme", "shut")
-            .await
-            .unwrap()
-            .repo
-            .id;
-    assert!(!c.s.core.is_repo_member(repo_id, rm.id).await.unwrap());
-    assert_eq!(
-        web_status(&rm_browser, &c.web_repo("shut")).await,
-        404,
-        "rm: web"
-    );
-    let res = client
-        .get(c.api_repo("shut"))
-        .bearer_auth(&rm_full)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(res.status().as_u16(), 404, "rm: api");
-    let out = git(
-        tmp.path(),
-        &[
-            "clone",
-            "-q",
-            &c.s.git_url("acme", "shut", Some(&rm_full)),
-            tmp.path().join("rm-shut").to_str().unwrap(),
-        ],
-    )
-    .await;
-    assert!(!out.status.success(), "rm: clone");
-    let out = git(
-        &c.seed,
-        &[
-            "push",
-            "-q",
-            &c.s.git_url("acme", "shut", Some(&rm_read)),
-            "HEAD:refs/for/main/rm-shut",
-        ],
-    )
-    .await;
-    assert!(!out.status.success(), "rm: refs/for");
+    for repo in ["open", "innie", "shut"] {
+        // Only implicit read survives, and only on non-private repos.
+        let (level, member) = match repo {
+            "shut" => (None, false),
+            _ => (Some(Permission::Read), false),
+        };
+        c.check_cell_for(
+            &client,
+            &rm_browser,
+            tmp.path(),
+            "rm",
+            &rm,
+            &rm_full,
+            &rm_read,
+            repo,
+            "read",
+            "rm-post",
+            level,
+            member,
+        )
+        .await;
+    }
 
-    // Deleting the team drops its grant (base is `none` now, so the team
-    // grant is the only one left).
+    // Deleting the team drops its grant on every surface (base is `none`,
+    // so the team grant is the only one left).
     c.set_base("none").await;
-    assert_eq!(
-        c.s.core
-            .repo_for(Some(&lb), "acme", "shut")
-            .await
-            .unwrap()
-            .permission,
-        Permission::Write
-    );
+    c.check_cell_for(
+        &client,
+        &lb_browser,
+        tmp.path(),
+        "lb",
+        &lb,
+        &lb_full,
+        &lb_read,
+        "shut",
+        "none",
+        "del-pre",
+        Some(Permission::Write),
+        true,
+    )
+    .await;
     c.s.core
         .delete_team(&c.alice, "acme", "goners")
         .await
         .unwrap();
-    assert!(c.s.core.repo_for(Some(&lb), "acme", "shut").await.is_err());
-    assert!(!c.s.core.is_repo_member(repo_id, lb.id).await.unwrap());
-    assert_eq!(
-        web_status(&lb_browser, &c.web_repo("shut")).await,
-        404,
-        "lb: web"
-    );
-    let res = client
-        .get(c.api_repo("shut"))
-        .bearer_auth(&lb_full)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(res.status().as_u16(), 404, "lb: api");
-    let out = git(
-        tmp.path(),
-        &[
-            "clone",
-            "-q",
-            &c.s.git_url("acme", "shut", Some(&lb_full)),
-            tmp.path().join("lb-shut").to_str().unwrap(),
-        ],
-    )
-    .await;
-    assert!(!out.status.success(), "lb: clone");
+    for repo in ["open", "innie", "shut"] {
+        let (level, member) = match repo {
+            "shut" => (None, false),
+            _ => (Some(Permission::Read), false),
+        };
+        c.check_cell_for(
+            &client,
+            &lb_browser,
+            tmp.path(),
+            "lb",
+            &lb,
+            &lb_full,
+            &lb_read,
+            repo,
+            "none",
+            "del-post",
+            level,
+            member,
+        )
+        .await;
+    }
 
-    // Lowering the base permission drops it (lb is base-only again now that
-    // the team is gone).
+    // Lowering the base permission drops it on every surface (lb is
+    // base-only again now that the team is gone).
     c.set_base("write").await;
-    assert_eq!(
-        c.s.core
-            .repo_for(Some(&lb), "acme", "shut")
-            .await
-            .unwrap()
-            .permission,
-        Permission::Write
-    );
-    let out = git(
-        &c.seed,
-        &[
-            "push",
-            "-q",
-            &c.s.git_url("acme", "shut", Some(&lb_full)),
-            "HEAD:refs/heads/sweep/lb-before",
-        ],
+    c.check_cell_for(
+        &client,
+        &lb_browser,
+        tmp.path(),
+        "lb",
+        &lb,
+        &lb_full,
+        &lb_read,
+        "shut",
+        "write",
+        "low-pre",
+        Some(Permission::Write),
+        true,
     )
     .await;
-    assert!(out.status.success(), "lb: push while base=write");
     c.set_base("none").await;
-    assert!(c.s.core.repo_for(Some(&lb), "acme", "shut").await.is_err());
-    assert_eq!(
-        web_status(&lb_browser, &c.web_repo("shut")).await,
-        404,
-        "lb: web after lower"
-    );
-    let out = git(
-        &c.seed,
-        &[
-            "push",
-            "-q",
-            &c.s.git_url("acme", "shut", Some(&lb_full)),
-            "HEAD:refs/heads/sweep/lb-after",
-        ],
-    )
-    .await;
-    assert!(!out.status.success(), "lb: push after lower");
+    for repo in ["open", "innie", "shut"] {
+        let (level, member) = match repo {
+            "shut" => (None, false),
+            _ => (Some(Permission::Read), false),
+        };
+        c.check_cell_for(
+            &client,
+            &lb_browser,
+            tmp.path(),
+            "lb",
+            &lb,
+            &lb_full,
+            &lb_read,
+            repo,
+            "none",
+            "low-post",
+            level,
+            member,
+        )
+        .await;
+    }
 
     // Transferring the repository away drops every org grant: the old path
     // redirects, the new path answers, and org grants are gone there.
@@ -1154,6 +1226,96 @@ async fn revocation_is_immediate_on_every_surface() {
             .unwrap();
         assert_eq!(res.status().as_u16(), 404, "{h}: no grant after transfer");
     }
+    // Git through the old path follows the redirect like a rename: the
+    // owner clones the moved tip and lands a branch on the moved repo,
+    // while grant-less users fail the clone and leave no ref behind.
+    let dir = tmp.path().join("old-shut");
+    let out = git(
+        tmp.path(),
+        &[
+            "clone",
+            "-q",
+            &c.s.git_url("acme", "shut", Some(&c.full["alice"])),
+            dir.to_str().unwrap(),
+        ],
+    )
+    .await;
+    assert!(out.status.success(), "owner clones through the old path");
+    let head = git(&dir, &["rev-parse", "HEAD"]).await;
+    assert_eq!(
+        String::from_utf8(head.stdout).unwrap().trim(),
+        c.main_sha,
+        "moved clone tip"
+    );
+    let out = git(
+        &c.seed,
+        &[
+            "push",
+            "-q",
+            &c.s.git_url("acme", "shut", Some(&c.full["alice"])),
+            "HEAD:refs/heads/sweep/xfer-alice",
+        ],
+    )
+    .await;
+    assert!(out.status.success(), "owner pushes through the old path");
+    let probe = git(
+        tmp.path(),
+        &[
+            "ls-remote",
+            &c.s.git_url("alice", "shut", Some(&c.full["alice"])),
+            "refs/heads/sweep/xfer-alice",
+        ],
+    )
+    .await;
+    assert!(
+        String::from_utf8(probe.stdout)
+            .unwrap()
+            .contains("refs/heads/sweep/xfer-alice"),
+        "pushed ref lands on the moved repo"
+    );
+    let out = git(
+        tmp.path(),
+        &[
+            "clone",
+            "-q",
+            &c.s.git_url("acme", "shut", Some(&c.full["uout"])),
+            tmp.path().join("old-shut-stranger").to_str().unwrap(),
+        ],
+    )
+    .await;
+    assert!(
+        !out.status.success(),
+        "stranger cannot clone the moved private repo"
+    );
+    let out = git(
+        &c.seed,
+        &[
+            "push",
+            "-q",
+            &c.s.git_url("acme", "shut", Some(&c.full["uwrite"])),
+            "HEAD:refs/heads/sweep/xfer-uwrite",
+        ],
+    )
+    .await;
+    assert!(
+        !out.status.success(),
+        "ex-team member cannot push after transfer"
+    );
+    let probe = git(
+        tmp.path(),
+        &[
+            "ls-remote",
+            &c.s.git_url("alice", "shut", Some(&c.full["alice"])),
+            "refs/heads/sweep/xfer-uwrite",
+        ],
+    )
+    .await;
+    assert!(
+        !String::from_utf8(probe.stdout)
+            .unwrap()
+            .contains("refs/heads/sweep/xfer-uwrite"),
+        "denied push leaves no ref on the moved repo"
+    );
     // The repositories left behind are unaffected.
     assert_eq!(
         c.s.core
@@ -1164,7 +1326,6 @@ async fn revocation_is_immediate_on_every_surface() {
         Permission::Admin
     );
 }
-
 /// Every user-only path (D1) refuses an org handle; hostile org and team
 /// descriptions render escaped (there is no mentions feature to refuse).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1214,6 +1375,11 @@ async fn org_only_paths_and_rendering() {
     // An org is not a user row at all: no token can be minted for it, and it
     // cannot sign in.
     assert!(c.s.core.user_by_handle("acme").await.unwrap().is_none());
+    // Password authentication as the org handle fails explicitly: orgs hold
+    // no credentials, so no session — and no token minted from one — is
+    // possible.
+    let auth = c.s.core.authenticate_password("acme", PASSWORD).await;
+    assert!(auth.is_err(), "org cannot authenticate");
     let (_, response) = c.s.try_login("acme", PASSWORD).await;
     assert_ne!(response.status().as_u16(), 303, "org cannot sign in");
 
