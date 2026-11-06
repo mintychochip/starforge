@@ -84,7 +84,7 @@ async fn browsing_trees_files_raw_and_readme() {
     for missing in [
         "/alice/proj/blob/main/missing.rs",
         "/alice/proj/tree/nope",
-        "/alice/proj/tree/main/README.md",
+        "/alice/proj/tree/main/missing",
     ] {
         assert_eq!(
             client.get(s.url(missing)).send().await.unwrap().status(),
@@ -92,6 +92,26 @@ async fn browsing_trees_files_raw_and_readme() {
             "{missing}"
         );
     }
+    let file_as_tree = client
+        .get(s.url("/alice/proj/tree/main/README.md"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(file_as_tree.status(), 303);
+    assert_eq!(
+        file_as_tree.headers()["location"],
+        "/alice/proj/blob/main/README.md"
+    );
+    let dir_as_blob = client
+        .get(s.url("/alice/proj/blob/main/docs"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(dir_as_blob.status(), 303);
+    assert_eq!(
+        dir_as_blob.headers()["location"],
+        "/alice/proj/tree/main/docs"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -48,10 +48,18 @@ async fn open_sign_up_verifies_email_through_the_real_binary() {
     );
 
     let mail_dir = tmp.path().join("mail");
+    // SSH on a free port, not the default 2222, which a real Starforge on
+    // this machine may already hold.
+    let ssh_port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
     let child = Command::new(bin)
         .arg("--config")
         .arg(&config)
         .arg("serve")
+        .env("STARFORGE__SSH__LISTEN", format!("127.0.0.1:{ssh_port}"))
         .env("STARFORGE__REGISTRATION__MODE", "open")
         .env(
             "STARFORGE__MAIL__URL",

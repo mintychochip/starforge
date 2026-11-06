@@ -169,7 +169,16 @@ async fn quarantine_actions_require_csrf() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn health_shows_version_engine_git_and_job_aggregates() {
-    let s = TestServer::start_with(|c| c.ssh.listen = "127.0.0.1:2222".to_owned()).await;
+    // A free port, not the default 2222: a real Starforge (or another test
+    // run) on this machine may already hold 2222.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let listen = format!("127.0.0.1:{port}");
+    let configured = listen.clone();
+    let s = TestServer::start_with(move |c| c.ssh.listen = configured).await;
     let _root = admin(&s).await;
 
     // One failed job and one queued job, so the aggregates name both states.
@@ -205,6 +214,7 @@ async fn health_shows_version_engine_git_and_job_aggregates() {
         starforged_db::Backend::Sqlite => "sqlite",
         starforged_db::Backend::Postgres => "postgres",
     };
+    let ssh_line = format!("enabled on {listen}");
     for needle in [
         "Starforge version",
         "Database engine",
@@ -213,7 +223,7 @@ async fn health_shows_version_engine_git_and_job_aggregates() {
         "Git version",
         "Data directory free space",
         "SSH listener",
-        "enabled on 127.0.0.1:2222",
+        ssh_line.as_str(),
         "Search index trails",
         "Oldest pending job",
         "test-health-kind",

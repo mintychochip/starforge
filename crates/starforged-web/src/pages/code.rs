@@ -3,7 +3,8 @@ use askama_web::WebTemplate;
 use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::{HeaderValue, header};
-use axum::response::{IntoResponse, Response};
+use axum::response::{IntoResponse, Redirect, Response};
+use starforged_core::CoreError;
 use starforged_core::repos::RepoAccess;
 use starforged_core::sessions::WebSession;
 use starforged_git::read::{Blob, EntryKind, TreeEntry, classify};
@@ -14,7 +15,7 @@ use crate::auth::MaybeUser;
 use crate::error::WebError;
 use crate::highlight;
 use crate::markdown;
-use crate::views::{Crumb, NavUser, RepoHead, content_href, crumbs, nav};
+use crate::views::{Crumb, NavUser, RepoHead, content_href, crumbs, encode_path, nav};
 
 const README_NAMES: [&str; 3] = ["readme.md", "readme.markdown", "readme"];
 
@@ -54,6 +55,7 @@ pub struct BlobPage {
     file_name: String,
     crumbs: Vec<Crumb>,
     raw_href: String,
+    blame_href: String,
     size: usize,
     lines: Vec<String>,
     highlighted: bool,
@@ -118,7 +120,7 @@ pub async fn tree(
         .repo_for(session.as_ref().map(|s| &s.user), &owner, &repo)
         .await?;
     let resolved = state.core.resolve(&access, &rest).await?;
-    render_tree(
+    match render_tree(
         &state,
         session.as_ref(),
         &access,
@@ -127,22 +129,67 @@ pub async fn tree(
         &resolved.path,
     )
     .await
+    {
+        Ok(response) => Ok(response),
+        Err(WebError::NotFound) => {
+            if state
+                .core
+                .blob(&access, &resolved.commit_id, &resolved.path)
+                .await
+                .is_ok()
+            {
+                let href = content_href(
+                    &access.repo.owner,
+                    &access.repo.name,
+                    "blob",
+                    &resolved.ref_name,
+                    &resolved.path,
+                );
+                Ok(Redirect::to(&href).into_response())
+            } else {
+                Err(WebError::NotFound)
+            }
+        }
+        Err(e) => Err(e),
+    }
 }
 
 pub async fn blob(
     State(state): State<AppState>,
     MaybeUser(session): MaybeUser,
     Path((owner, repo, rest)): Path<(String, String, String)>,
-) -> Result<BlobPage, WebError> {
+) -> Result<Response, WebError> {
     let access = state
         .core
         .repo_for(session.as_ref().map(|s| &s.user), &owner, &repo)
         .await?;
     let resolved = state.core.resolve(&access, &rest).await?;
-    let file = state
+    let file = match state
         .core
         .blob(&access, &resolved.commit_id, &resolved.path)
-        .await?;
+        .await
+    {
+        Ok(file) => file,
+        Err(CoreError::NotFound) => {
+            if state
+                .core
+                .tree(&access, &resolved.commit_id, &resolved.path)
+                .await
+                .is_ok()
+            {
+                let href = content_href(
+                    &access.repo.owner,
+                    &access.repo.name,
+                    "tree",
+                    &resolved.ref_name,
+                    &resolved.path,
+                );
+                return Ok(Redirect::to(&href).into_response());
+            }
+            return Err(WebError::NotFound);
+        }
+        Err(e) => return Err(WebError::from(e)),
+    };
     let size = usize::try_from(file.size).unwrap_or(usize::MAX);
     let (dir, file_name) = resolved
         .path
@@ -163,6 +210,16 @@ pub async fn blob(
         },
     };
     let repo = &access.repo;
+    let blame_href = format!(
+        "/{}/{}/blame/{}?at={}",
+        repo.owner,
+        repo.name,
+        encode_path(&resolved.path),
+        percent_encoding::utf8_percent_encode(
+            &resolved.ref_name,
+            percent_encoding::NON_ALPHANUMERIC,
+        )
+    );
     Ok(BlobPage {
         nav_user: nav(session.as_ref()),
         head: RepoHead::new(&access, "code", Some(&resolved.ref_name)),
@@ -176,12 +233,14 @@ pub async fn blob(
             &resolved.ref_name,
             &resolved.path,
         ),
+        blame_href,
         path: resolved.path.clone(),
         size,
         lines,
         highlighted,
         notice,
-    })
+    }
+    .into_response())
 }
 
 /// The file's lines as highlighted HTML (`true`), or as plain text when highlighting does not apply
@@ -273,7 +332,7 @@ async fn render_tree(
     dir: &str,
 ) -> Result<Response, WebError> {
     let entries = state.core.tree(access, commit_id, dir).await?;
-    let readme_html = readme(state, access, commit_id, dir, &entries).await?;
+    let readme_html = readme(state, access, ref_name, commit_id, dir, &entries).await?;
     let repo = &access.repo;
     let rows = entries
         .into_iter()
@@ -360,6 +419,7 @@ async fn tree_page(
 async fn readme(
     state: &AppState,
     access: &RepoAccess,
+    ref_name: &str,
     commit_id: &str,
     dir: &str,
     entries: &[TreeEntry],
@@ -383,7 +443,15 @@ async fn readme(
     let lower = entry.name.to_ascii_lowercase();
     Ok(match classify(bytes) {
         Blob::Text(text) if lower.ends_with(".md") || lower.ends_with(".markdown") => {
-            Some(markdown::render(&text))
+            Some(markdown::render_repo_document(
+                &text,
+                &markdown::RepoDocContext {
+                    owner: &access.repo.owner,
+                    repo: &access.repo.name,
+                    ref_name,
+                    dir,
+                },
+            ))
         }
         Blob::Text(text) => Some(markdown::plain(&text)),
         Blob::Binary => None,
