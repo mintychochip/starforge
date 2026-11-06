@@ -527,6 +527,61 @@ moves the ref only when the head already contains the base; every commit carries
 trail closes once no open change remains. Conflicts and CAS races answer `409` with the
 fresh SHAs; failing gates answer `422` with the reasons.
 
+## Branch and tag protection
+
+Gate rules double as branch protection. Each rule carries three push
+restrictions alongside its merge gates: `block_direct_push` (changes must go
+through a Trail), `block_force_push`, and `block_deletion`. Patterns are
+globs (`*` matches any run, `?` one character; empty or null means all
+branches, at most one rule per pattern); every rule matching the branch
+applies, and a push is refused when ANY matching rule blocks it. Only the
+direct-push block can be bypassed, through the rule's allow-list; force-push
+and deletion blocks stop everyone, including admins and site admins. Every refusal
+reaches the pusher as `remote: starforge: …`, naming the ref and the rule
+pattern, and the server-side ref is left untouched.
+
+Each rule may exempt individual users (by handle) and, on org-owned
+repositories only, whole teams (by slug) from the direct-push block via
+`push_allowlist: {"users": [...], "teams": [...]}`. The exemption covers
+only direct pushes on that rule: an allow-listed writer still cannot force
+push or delete, and allow-listed users still need write access to push at
+all. Unknown handles, unknown teams, and team entries on a user-owned
+repository answer `422`.
+
+Tag protection is a separate per-repository pattern list: creating, moving,
+or deleting a tag that matches any pattern needs maintain or above, while
+non-matching tags need only write, as before. The API is
+`GET`/`POST .../repos/{owner}/{repo}/tag-protections` (body `{"pattern"}`)
+and `DELETE .../tag-protections/{id}`; reads and mutations alike need
+maintain (mutations also need the `repo:write` token scope), so readers
+below maintain get `403` and non-readers `404`. Gate-rule reads stay open
+to any repository reader; both lists answer `404` for unknown ids.
+
+Pushes to any other namespace are refused unless a site admin allow-lists
+it in `git.allowed_ref_namespaces` (e.g. `allowed_ref_namespaces =
+["refs/notes/"]`, overridable as
+`STARFORGE__GIT__ALLOWED_REF_NAMESPACES`). Each entry must start with
+`refs/` and end with `/`, and must neither equal nor overlap `refs/heads/`,
+`refs/tags/`, `refs/for/`, or `refs/trails/` — a bad entry fails startup
+naming the entry. Allow-listed namespaces need write access plus a
+write-scoped token and are never subject to branch protection. Server-side
+writes bypass all of this: Trail merges move protected branches, and
+`refs/trails/*` stays server-only (clients cannot push it, and fetches hide
+it).
+
+The repository settings **Branch protection** page
+(`/{owner}/{repo}/settings/protection`, maintain and up) lists the rules by
+pattern with their gates and push restrictions, with create, edit, and
+delete forms covering every gate field, every push field, and the
+allow-list, plus the tag-protection list with add and remove forms. All
+forms carry CSRF and answer `303` or a `422` re-render.
+
+Every protection change writes exactly one audit row —
+`gate_rule.created`/`gate_rule.updated`/`gate_rule.deleted` and
+`tag_protection.created`/`tag_protection.deleted` — while no-op updates
+write nothing. Branch protection lives in migration `0022`, tag protection
+in `0023`.
+
 ## Webhooks
 
 Repository webhooks (`/{owner}/{repo}/settings/hooks`, maintain access and
@@ -618,7 +673,7 @@ ranges are refused, nothing is redirected, bodies cap at 64 KiB under a
 10 s timeout, and failures retry on a 1m/5m/30m/2h ladder before the hook
 is marked failed.
 
-Not yet: gate-rule management screens, per-context soft gates, check retries, deployments, and mirrors.
+Not yet: per-context soft gates, check retries, deployments, and mirrors.
 
 ## Development
 
