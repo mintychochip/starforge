@@ -23,11 +23,25 @@ printf 'a long password\n' | ./target/release/starforged admin user create --han
 ./target/release/starforged serve
 ```
 
-Open http://127.0.0.1:3000, sign in, create a token under **Settings → Tokens**
-and a repository under **New repository**, then:
+Open http://127.0.0.1:3000, sign in (user `me` with the password from the
+previous step), create a repository under **New repository** and a personal
+access token at `/settings/tokens`, then:
 
 ```bash
 git push http://me:<token>@127.0.0.1:3000/me/<repository>.git main
+```
+
+Log the `starforge` CLI in with the device flow (it prints a code; approve
+it in the browser at the printed `/oauth/device` page), then push a Trail
+change from a clone:
+
+```bash
+starforge auth login http://127.0.0.1:3000
+git clone http://me:<token>@127.0.0.1:3000/me/<repository>.git
+cd <repository>
+git checkout -b smoke
+echo change > change.txt && git add change.txt && git commit -m "smoke change"
+starforge trail push --title "smoke change"
 ```
 
 ### Static binary
@@ -62,6 +76,23 @@ scripts/check.sh                      # fmt, clippy, tests on SQLite
 STARFORGE_TEST_PG=1 scripts/check.sh  # also on Postgres 17 via podman or docker
 scripts/docs-smoke.sh                 # run the documented quick start end to end
 ```
+
+## Known gaps
+
+Explicit v0.1.0 non-goals (program rulings):
+
+- **Fluent message catalog (§10.6):** English strings stay in templates.
+  Moving every template string into Fluent is a large retrofit with no
+  user-visible change for an English-only release. Cost: translation later
+  needs the retrofit.
+- **htmx (§3 D12):** pages are plain server-rendered forms with the one JS
+  module. Nothing in the spec's behavior requires htmx. Cost: none
+  functional.
+- **Per-response CSP nonce (§11.1):** the CSP forbids inline scripts entirely
+  and serves scripts only from the origin, which is stricter than a nonce
+  allowance. Cost: none.
+
+
 
 ## License
 

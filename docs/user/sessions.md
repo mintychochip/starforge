@@ -65,8 +65,7 @@ and answers `401` without one.
 
 The viewer, download, and blame pages (the three surfaces rendered from
 attacker-influenced content) carry a strict Content-Security-Policy
-(`default-src 'none'; img-src 'self'; style-src 'self'; script-src 'self';
-frame-ancestors 'none'; base-uri 'none'; form-action 'self'`) as defense in
+(`default-src 'none'; img-src 'self'; style-src 'self'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'`) as defense in
 depth; other pages use the site default.
 
 Not yet: a repository session index (commit panels and direct ULID links are the discovery

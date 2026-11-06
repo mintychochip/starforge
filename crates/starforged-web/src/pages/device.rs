@@ -33,6 +33,7 @@ pub struct DevicePage {
     user_code: String,
     approved: Option<String>,
     error: Option<String>,
+    scope: Option<String>,
 }
 
 /// `GET /oauth/device`: the CLI prints this URI; the signed-in user types or
@@ -42,13 +43,14 @@ pub async fn show(
     RequireUser(session): RequireUser,
     Query(query): Query<DeviceQuery>,
 ) -> DevicePage {
-    page(
-        &state,
-        &session,
-        query.user_code.unwrap_or_default(),
-        None,
-        None,
-    )
+    let user_code = query.user_code.unwrap_or_default();
+    let scope = state
+        .core
+        .device_code_scope(&user_code)
+        .await
+        .ok()
+        .flatten();
+    page(&state, &session, user_code, None, None, scope)
 }
 
 /// `POST /oauth/device/approve`: binds the signed-in user to the pending code
@@ -72,6 +74,7 @@ pub async fn approve(
                     form.user_code,
                     None,
                     Some("Choose Approve or Deny.".to_owned()),
+                    None,
                 ),
             )
                 .into_response());
@@ -94,13 +97,14 @@ pub async fn approve(
                 String::new(),
                 Some(banner.to_owned()),
                 None,
+                None,
             )
             .into_response())
         }
         Err(CoreError::NotFound) => Err(WebError::NotFound),
         Err(CoreError::Invalid(message)) => Ok((
             StatusCode::UNPROCESSABLE_ENTITY,
-            page(&state, &session, form.user_code, None, Some(message)),
+            page(&state, &session, form.user_code, None, Some(message), None),
         )
             .into_response()),
         Err(other) => Err(other.into()),
@@ -113,6 +117,7 @@ fn page(
     user_code: String,
     approved: Option<String>,
     error: Option<String>,
+    scope: Option<String>,
 ) -> DevicePage {
     DevicePage {
         nav_user: Some(NavUser::from_session(session)),
@@ -120,5 +125,6 @@ fn page(
         user_code,
         approved,
         error,
+        scope,
     }
 }

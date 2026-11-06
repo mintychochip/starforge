@@ -97,6 +97,20 @@ pub async fn revoke(db: &Db, user_id: i64, token_id: i64) -> DbResult<bool> {
     Ok(result.rows_affected() == 1)
 }
 
+/// Revokes every token of the user (account deletion and suspension end
+/// credentials rather than delete the rows; `revoked_at` keeps the audit
+/// trail). Returns how many were revoked.
+pub async fn revoke_for_user(db: &Db, user_id: i64) -> DbResult<u64> {
+    let result = sqlx::query(
+        "UPDATE access_tokens SET revoked_at = $1 WHERE user_id = $2 AND revoked_at IS NULL",
+    )
+    .bind(now())
+    .bind(user_id)
+    .execute(db.pool())
+    .await?;
+    Ok(result.rows_affected())
+}
+
 pub async fn touch(db: &Db, token_id: i64) -> DbResult<()> {
     sqlx::query("UPDATE access_tokens SET last_used_at = $1 WHERE id = $2")
         .bind(now())

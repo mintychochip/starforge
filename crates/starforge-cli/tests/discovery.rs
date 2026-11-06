@@ -17,7 +17,7 @@ use std::{
 
 use axum::{Router, response::IntoResponse, routing::get};
 use starforge_cli::{
-    discovery::{DiscoveryError, parse_well_known, resolve_server},
+    discovery::{DiscoveryError, parse_well_known, remote_name_for_chosen, resolve_server},
     git::{config_get, pick_remote, remotes},
 };
 use tempfile::TempDir;
@@ -142,6 +142,41 @@ fn parse_well_known_rejects_missing_api_url() {
     assert!(parse_well_known(missing).is_err());
     assert!(parse_well_known(b"{not json").is_err());
     assert!(parse_well_known(b"").is_err());
+}
+// (a) parse accepts a missing or empty `ssh_url` (SSH-disabled servers send
+// `""`; older servers may omit the field) and stores it as `""`.
+#[test]
+fn parse_well_known_accepts_missing_or_empty_ssh_url() {
+    let missing = br#"{"starforge": "0.1.0", "api_url": "https://api.example.com"}"#;
+    let info = parse_well_known(missing).expect("missing ssh_url must parse");
+    assert_eq!(info.ssh_url, "");
+    let empty = br#"{"starforge": "0.1.0", "api_url": "https://api.example.com", "ssh_url": ""}"#;
+    let info = parse_well_known(empty).expect("empty ssh_url must parse");
+    assert_eq!(info.ssh_url, "");
+}
+// Git ops must use the remote NAME behind the resolved (sanitized, display-
+// only) URL: a credential-bearing remote keeps its userinfo, `pushurl`, and
+// remote-scoped config when git runs against the name, never a bare URL.
+#[test]
+fn remote_name_for_chosen_maps_sanitized_url_back_to_name() {
+    let remotes = vec![
+        (
+            "origin".to_string(),
+            "http://me:tok@host/o/r.git".to_string(),
+        ),
+        ("backup".to_string(), "http://host2/o/r.git".to_string()),
+    ];
+    assert_eq!(
+        remote_name_for_chosen(&remotes, "http://host/o/r.git").as_deref(),
+        Some("origin")
+    );
+    // The `starforge.server`-wins win returns the server base, which is never
+    // a remote URL: fall back to pick_remote's preferred name.
+    assert_eq!(
+        remote_name_for_chosen(&remotes, "http://host").as_deref(),
+        Some("origin")
+    );
+    assert_eq!(remote_name_for_chosen(&[], "http://host"), None);
 }
 
 // (e) `.git/config` parsing: `starforge.repo` + absent keys.

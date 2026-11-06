@@ -59,8 +59,9 @@ impl From<crate::git::GitError> for DiscoveryError {
 }
 
 /// Parse a `{"starforge": "<version>", "api_url": "<url>", "ssh_url": "<url>"}`
-/// body; all three fields are required (missing `api_url` is the classic
-/// shape error, but a document missing any field cannot be used either).
+/// body. `starforge` and `api_url` are required (missing `api_url` is the
+/// classic shape error); `ssh_url` is optional — servers with SSH disabled
+/// send `""` or omit the field, and that is stored as `""`.
 pub fn parse_well_known(body: &[u8]) -> Result<ServerInfo, DiscoveryError> {
     #[derive(serde::Deserialize)]
     struct Raw {
@@ -73,17 +74,15 @@ pub fn parse_well_known(body: &[u8]) -> Result<ServerInfo, DiscoveryError> {
     }
     let raw: Raw = serde_json::from_slice(body)
         .map_err(|err| DiscoveryError::Invalid(format!("not valid JSON: {err}")))?;
-    match (raw.starforge, raw.api_url, raw.ssh_url) {
-        (Some(version), Some(api_url), Some(ssh_url))
-            if !version.is_empty() && !api_url.is_empty() && !ssh_url.is_empty() =>
-        {
+    match (raw.starforge, raw.api_url) {
+        (Some(version), Some(api_url)) if !version.is_empty() && !api_url.is_empty() => {
             Ok(ServerInfo {
                 api_url,
-                ssh_url,
+                ssh_url: raw.ssh_url.unwrap_or_default(),
                 version,
             })
         }
-        (version, api_url, ssh_url) => {
+        (version, api_url) => {
             let mut missing = Vec::new();
             if version.as_deref().is_none_or(str::is_empty) {
                 missing.push("starforge");
@@ -91,15 +90,26 @@ pub fn parse_well_known(body: &[u8]) -> Result<ServerInfo, DiscoveryError> {
             if api_url.as_deref().is_none_or(str::is_empty) {
                 missing.push("api_url");
             }
-            if ssh_url.as_deref().is_none_or(str::is_empty) {
-                missing.push("ssh_url");
-            }
             Err(DiscoveryError::Invalid(format!(
                 "missing field(s): {}",
                 missing.join(", ")
             )))
         }
     }
+}
+/// The git remote NAME behind a resolved `chosen` URL (see [`resolve_server`]):
+/// the first remote whose userinfo-stripped URL equals `chosen`, so credential-
+/// bearing URLs (embedded token, `pushurl`, remote-scoped config) stay intact
+/// and the CLI never hands its API token to git. When no remote matches — the
+/// `starforge.server`-config win returns the sanitized server base, which is
+/// never a remote URL — falls back to [`crate::git::pick_remote`]'s preferred
+/// name. The chosen URL itself remains for display only.
+pub fn remote_name_for_chosen(remotes: &[(String, String)], chosen: &str) -> Option<String> {
+    remotes
+        .iter()
+        .find(|(_, url)| sanitize_remote_url(url) == chosen)
+        .map(|(name, _)| name.clone())
+        .or_else(|| crate::git::pick_remote(remotes, None).map(|(name, _)| name))
 }
 
 /// The probe base (`scheme://authority`, no trailing slash) for a remote URL,

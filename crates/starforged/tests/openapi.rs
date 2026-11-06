@@ -405,3 +405,74 @@ async fn openapi_document_is_valid_complete_and_stable() {
         assert!(schemas.contains_key(name), "schema {name} in components");
     }
 }
+
+/// Routes whose handler authenticates with `auth.reader()` (anonymous
+/// callers allowed) must declare optional security (`security((), …)`);
+/// every other authenticated route must require the bearer token.
+/// Mechanically scanned from the handler bodies and their `#[utoipa::path]`
+/// annotations in `starforged-api`'s sources.
+#[test]
+fn security_optionality_matches_auth() {
+    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../starforged-api/src");
+    let mut checked = Vec::new();
+    for entry in std::fs::read_dir(&dir).expect("api sources") {
+        let path = entry.expect("dir entry").path();
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let src = std::fs::read_to_string(&path).expect("read source");
+        if !src.contains("utoipa::path") {
+            continue;
+        }
+        let file = path
+            .file_name()
+            .expect("file name")
+            .to_string_lossy()
+            .into_owned();
+        let fns: Vec<usize> = src.match_indices("pub async fn ").map(|(i, _)| i).collect();
+        for (k, &start) in fns.iter().enumerate() {
+            let body_end = fns
+                .get(k + 1)
+                .copied()
+                .or_else(|| {
+                    ["\nfn ", "\nasync fn "]
+                        .iter()
+                        .filter_map(|m| src[start + 1..].find(m).map(|i| start + 1 + i))
+                        .min()
+                })
+                .unwrap_or(src.len());
+            let name = src[start + "pub async fn ".len()..]
+                .split('(')
+                .next()
+                .expect("handler name");
+            let region_start = if k == 0 { 0 } else { fns[k - 1] };
+            let annotation = src[region_start..start].rfind("#[utoipa::path(");
+            let Some(attr) = annotation else {
+                panic!("{file}::{name} has no #[utoipa::path]");
+            };
+            let annotation = &src[region_start + attr..start];
+            let optional = annotation.contains("security((),");
+            let required = annotation.contains("security((\"bearer_auth\"");
+            let uses_reader = src[start..body_end].contains(".reader()");
+            // Public endpoints (OAuth device flow, the spec itself) declare
+            // no security requirement at all.
+            if !optional && !required {
+                assert!(
+                    matches!(name, "device_code" | "token" | "openapi_json"),
+                    "{file}::{name} declares no security requirement"
+                );
+                assert!(
+                    !uses_reader,
+                    "{file}::{name} uses reader() but declares no security"
+                );
+                continue;
+            }
+            assert_eq!(
+                optional, uses_reader,
+                "{file}::{name}: reader()={uses_reader} must match optional={optional}"
+            );
+            checked.push((file.clone(), name.to_string()));
+        }
+    }
+    assert!(!checked.is_empty(), "sweep checked handlers");
+}

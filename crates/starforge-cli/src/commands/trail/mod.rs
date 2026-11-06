@@ -28,7 +28,7 @@ impl TrailCtx {
     /// Discover the server and resolve the token for `repo_dir`. `git_env` is
     /// empty: production git inherits its own environment.
     pub async fn resolve(repo_dir: &Path, paths: &CliPaths) -> Result<TrailCtx, String> {
-        let (server, owner_repo, remote) = crate::commands::status::resolve_server(repo_dir, paths)
+        let (server, owner_repo, chosen) = crate::commands::status::resolve_server(repo_dir, paths)
             .await
             .map_err(|err| err.to_string())?;
         let host = crate::cli::sync_host_key(&server.api_url)
@@ -37,6 +37,10 @@ impl TrailCtx {
             .map_err(|err| err.to_string())?;
         let api = ApiClient::new(&server.api_url, &owner_repo, token.token())
             .map_err(|err| err.to_string())?;
+        // Git ops use the remote NAME, never the sanitized display URL: the
+        // name preserves the user's own credentials and remote config.
+        let remotes = crate::git::remotes(repo_dir).unwrap_or_default();
+        let remote = crate::discovery::remote_name_for_chosen(&remotes, &chosen).unwrap_or(chosen);
         Ok(TrailCtx {
             api,
             repo_dir: repo_dir.to_path_buf(),

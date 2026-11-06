@@ -122,6 +122,8 @@ Every command honors `--dry-run` (print, don't write) and `--verbose`.
 Exit codes: `0` ok, `1` operational error, `2` `sync` finished with items
 still queued. Hidden `_hook-prepare-commit-msg`, `_hook-post-commit`, and
 `_hook-pre-push` entry points back the installed git hooks.
+The CLI finds a server through `GET /.well-known/starforge.json` on the remote's host (or `git config starforge.server` / `starforge.repo`).
+`starforge auth login` requests the scopes `repo:read trail:write session:upload`.
 
 ### Command reference
 
@@ -158,7 +160,7 @@ the required target repository (imports never upload without a confirmed
 target). A user who cannot read a session cannot export it: the API answers
 `404` and the CLI reports `cannot export <ulid>: session not found or not readable`.
 
-**Bundle format.** `export` writes exactly what the API returns to the caller:
+**Bundle format.** `export` writes exactly what the API returns to the caller. Round-trip fidelity is at the normalized-event level: bundles are not byte-faithful, and non-normalized uploads gain default fields on round-trip such as `model: null` and zero `usage`:
 
 ```text
 <dir>/

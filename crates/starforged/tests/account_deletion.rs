@@ -215,7 +215,7 @@ async fn interrupted_account_deletion_completes_on_rerun() {
     // Fail the deletion after the first session removal.
     s.core
         .set_account_delete_hook(Some(AccountDeleteHook::new(|| {
-            Err(CoreError::Internal("boom".into()))
+            Box::pin(async { Err(CoreError::Internal("boom".into())) })
         })));
     let interrupted = s.core.delete_account(&alice, "alice").await;
     assert!(interrupted.is_err(), "deletion aborted: {interrupted:?}");
@@ -357,5 +357,130 @@ async fn owner_removal_and_account_deletion_race_keeps_an_owner() {
         let members = s.core.org_members(&alice, "acme").await.unwrap();
         assert_eq!(members.len(), 1);
         assert_eq!(members[0].handle, "alice");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_arriving_after_the_drain_is_removed_through_the_session_path() {
+    let s = TestServer::start().await;
+    let alice = s.user("alice").await;
+    let (one, _two) = two_repos_with_alice_write(&s).await;
+    let first_hash = upload_completed(&s, "bob", "one", ULID_A, "plumbline").await;
+    let alice_id = alice.id;
+    let repo_id = one.id;
+    // The hook fires after the drain removed the first session; it inserts a
+    // fresh session with its own blob row. A silent cascade would leave the
+    // new blob's refcount at 1.
+    let db = s.db().clone();
+    let inserted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    s.core
+        .set_account_delete_hook(Some(AccountDeleteHook::new(move || {
+            let db = db.clone();
+            let inserted = inserted.clone();
+            Box::pin(async move {
+                if inserted.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    return Ok(());
+                }
+                let session_id = starforged_db::sessions::insert_session(
+                    &db,
+                    &starforged_db::sessions::NewSession {
+                        repo_id,
+                        ulid: ULID_B,
+                        uploader_id: alice_id,
+                        agent_name: "pi",
+                        agent_version: "2.1",
+                        models: "m1",
+                        title: "late arrival",
+                        branch: "main",
+                        head_sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                        started_at: 0,
+                        ended_at: None,
+                        parent_ulid: None,
+                        usage_input: 0,
+                        usage_output: 0,
+                        usage_cache_read: 0,
+                        usage_cache_write: 0,
+                        usage_reasoning: 0,
+                        files_touched: "",
+                        turn_count: 0,
+                        tool_call_count: 0,
+                        lifecycle: "complete",
+                        quarantine: "none",
+                        quarantine_reason: "",
+                        quarantine_detail: "",
+                        visibility: "inherit",
+                        raw_enabled: 0,
+                        redaction_fingerprint: "",
+                        redaction_counts: "{}",
+                        capture_mode: "discovery",
+                        cli_version: "9.9.9",
+                        adapter_verified: 0,
+                    },
+                )
+                .await
+                .map_err(|e| CoreError::Internal(e.to_string()))?;
+                let hash = "ab".repeat(32);
+                starforged_db::sessions::blob_incref(&db, &hash, 10, &hash)
+                    .await
+                    .map_err(|e| CoreError::Internal(e.to_string()))?;
+                starforged_db::sessions::insert_segment(&db, session_id, 0, 0, 0, &hash, 10)
+                    .await
+                    .map_err(|e| CoreError::Internal(e.to_string()))?;
+                Ok(())
+            })
+        })));
+    s.core.delete_account(&alice, "alice").await.unwrap();
+    assert!(s.core.user_by_handle("alice").await.unwrap().is_none());
+    // Both blobs went through the session path: refcounts back to zero.
+    for hash in [first_hash.as_str(), "ab".repeat(32).as_str()] {
+        let blob = starforged_db::sessions::blob_by_hash(s.db(), hash)
+            .await
+            .unwrap()
+            .expect("blob row");
+        assert_eq!(blob.refcount, 0, "no blob leaked through the cascade");
+    }
+    assert!(
+        starforged_db::sessions::sessions_uploaded_by(s.db(), alice.id, 100)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let _ = one;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deleting_an_admin_racing_a_demotion_keeps_an_active_admin() {
+    use starforged_core::accounts::CreateUser;
+    for _round in 0..10 {
+        let s = TestServer::start().await;
+        async fn make_admin(s: &TestServer, handle: &str) -> starforged_core::accounts::User {
+            s.core
+                .create_user(CreateUser {
+                    handle: handle.into(),
+                    password: Some(common::PASSWORD.into()),
+                    is_admin: true,
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+        }
+        let a = make_admin(&s, "admina").await;
+        let b = make_admin(&s, "adminb").await;
+        let core_a = s.core.clone();
+        let core_b = s.core.clone();
+        let a_clone = a.clone();
+        let b_id = b.id;
+        let (deleted, demoted) = tokio::join!(
+            async move { core_a.delete_account(&a_clone, "admina").await },
+            async move { core_b.revoke_admin(&a.clone(), b_id).await },
+        );
+        let _ = (deleted, demoted);
+        let active: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM users WHERE is_admin = 1 AND state = 'active'",
+        )
+        .fetch_one(s.db().pool())
+        .await
+        .unwrap();
+        assert!(active >= 1, "at least one active admin remains");
     }
 }

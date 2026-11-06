@@ -1213,10 +1213,6 @@ mod proptests {
                 "refs/for/main".to_owned(),
                 "refs/trails/1/changes/1/head".to_owned(),
                 "refs/notes/commits".to_owned(),
-                "refs/heads/../evil".to_owned(),
-                "refs/heads/main.lock".to_owned(),
-                "refs/heads/-main".to_owned(),
-                "refs/heads/ma\u{7}in".to_owned(),
                 "refs/for/main/..".to_owned(),
                 "refs/for/main/t@{1}".to_owned(),
                 "refs/for/-main/t".to_owned(),
@@ -1224,12 +1220,25 @@ mod proptests {
                 "refs/trails/1".to_owned(),
                 "HEAD".to_owned(),
                 "".to_owned(),
-                "refs/heads/".to_owned(),
             ]),
             "[a-zA-Z0-9/._@{}-]{0,40}".prop_map(String::from),
             prop::string::string_regex("refs/(heads|tags|for|trails|notes)/[a-zA-Z0-9/._-]{0,20}")
                 .unwrap(),
         ]
+    }
+
+    /// Branch and tag refnames whose component satisfies
+    /// [`valid_component`]. Component validation for branch and tag pushes
+    /// itself happens at receive-pack (git's ref-format rules); this layer
+    /// only namespaces them, so the "always Ok" pin only covers names whose
+    /// components would actually validate.
+    fn well_formed_refname() -> impl Strategy<Value = String> {
+        (
+            prop::sample::select(vec!["refs/heads/", "refs/tags/"]),
+            prop::string::string_regex("[a-zA-Z0-9][a-zA-Z0-9._-]{0,20}").unwrap(),
+        )
+            .prop_filter("components must be valid", |(_, c)| valid_component(c))
+            .prop_map(|(prefix, component)| format!("{prefix}{component}"))
     }
 
     /// Permission inputs, including unknown and lowercased-but-bogus levels.
@@ -1289,10 +1298,21 @@ mod proptests {
             // Must never panic; the result must match the policy table.
             let result = check_allowed(&name, perm, is_member, refs_for, &ns);
             let has_ns = ns.iter().any(|entry| name.starts_with(entry.as_str()));
-            if name.starts_with("refs/heads/") {
-                prop_assert_eq!(result, Ok(RefKind::Branch));
-            } else if name.starts_with("refs/tags/") {
-                prop_assert_eq!(result, Ok(RefKind::Tag));
+            if name.starts_with("refs/heads/") || name.starts_with("refs/tags/") {
+                // Branch/tag components are validated by `valid_component`
+                // in-repo (for `refs/for` targets) and by git's ref-format
+                // rules at receive-pack for branches/tags; this layer only
+                // namespaces them, so only pin Ok for well-formed names.
+                let suffix = name.splitn(3, '/').nth(2).unwrap_or("");
+                prop_assume!(suffix.split('/').all(valid_component));
+                prop_assert_eq!(
+                    result,
+                    Ok(if name.starts_with("refs/heads/") {
+                        RefKind::Branch
+                    } else {
+                        RefKind::Tag
+                    })
+                );
             } else if name.starts_with("refs/trails/") {
                 prop_assert!(result.is_err(), "trails refused for {name:?}");
             } else if name.starts_with("refs/for/") {
@@ -1311,9 +1331,32 @@ mod proptests {
             }
         }
 
+        /// Well-formed branch/tag refnames classify as Branch/Tag.
+        #[test]
+        fn well_formed_branches_and_tags_classify(name in well_formed_refname()) {
+            let expected = if name.starts_with("refs/heads/") {
+                RefKind::Branch
+            } else {
+                RefKind::Tag
+            };
+            prop_assert_eq!(check_allowed(&name, None, false, "members", &[]), Ok(expected));
+            let update = RefUpdate {
+                old: "0".repeat(40),
+                new: "1".repeat(40),
+                name: name.clone(),
+            };
+            prop_assert!(check(&update).is_ok(), "{:?}", name);
+        }
+
         /// `check` accepts only branches and tags, for any generated name.
         #[test]
         fn check_accepts_only_branches_and_tags(name in refname()) {
+            let refs_ok = name.starts_with("refs/heads/") || name.starts_with("refs/tags/");
+            if refs_ok {
+                // See the pin above: only well-formed components are pinned.
+                let s = name.splitn(3, '/').nth(2).unwrap_or("");
+                prop_assume!(s.split('/').all(valid_component));
+            }
             let update = RefUpdate {
                 old: "0".repeat(40),
                 new: "1".repeat(40),

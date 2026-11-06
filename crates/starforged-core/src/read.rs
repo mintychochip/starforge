@@ -435,9 +435,26 @@ impl Core {
         viewer: Option<&User>,
         access: &RepoAccess,
     ) -> CoreResult<Vec<SessionRow>> {
+        Ok(self
+            .list_readable_sessions_capped(viewer, access, READABLE_SESSION_LIST_LIMIT)
+            .await?
+            .0)
+    }
+
+    /// [`Core::list_readable_sessions`] with an explicit candidate cap.
+    /// One candidate past the cap is fetched so truncation is honest: the
+    /// flag is `true` whenever the cap cut the *candidate* list (the
+    /// unreadable tail could hide readable sessions), not only when the
+    /// readable count itself hit the cap.
+    pub async fn list_readable_sessions_capped(
+        &self,
+        viewer: Option<&User>,
+        access: &RepoAccess,
+        cap: i64,
+    ) -> CoreResult<(Vec<SessionRow>, bool)> {
         let rows =
-            db_sessions::sessions_of_repo(self.db(), access.repo.id, READABLE_SESSION_LIST_LIMIT)
-                .await?;
+            db_sessions::sessions_of_repo(self.db(), access.repo.id, cap.saturating_add(1)).await?;
+        let truncated = (rows.len() as i64) > cap;
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
             if self
@@ -448,7 +465,7 @@ impl Core {
                 out.push(row);
             }
         }
-        Ok(out)
+        Ok((out, truncated))
     }
 
     /// The exact stored bytes of segment `n` of `session_id` (the compressed
@@ -1332,6 +1349,71 @@ mod tests {
             s.core.is_repo_member(999_999, s.carol.id).await,
             Err(CoreError::NotFound)
         ));
+    }
+
+    #[tokio::test]
+    async fn candidate_cap_truncation_is_reported() {
+        let s = seed().await;
+        // Cap 3 over 4 candidates where one is unreadable to anonymous
+        // viewers: the readable count (3) never reaches the cap, but the
+        // candidate list was cut, and the tail could hide readable sessions.
+        s.session(
+            &s.pub_repo,
+            "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            &s.alice,
+            "published",
+            "none",
+        )
+        .await;
+        s.session(
+            &s.pub_repo,
+            "01ARZ3NDEKTSV4RRFFQ69G5FAW",
+            &s.alice,
+            "inherit",
+            "none",
+        )
+        .await;
+        s.session(
+            &s.pub_repo,
+            "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+            &s.alice,
+            "published",
+            "none",
+        )
+        .await;
+        s.session(
+            &s.pub_repo,
+            "01ARZ3NDEKTSV4RRFFQ69G5FAY",
+            &s.alice,
+            "published",
+            "none",
+        )
+        .await;
+        let access = s.core.repo_for(None, "alice", "open").await.unwrap();
+        let (readable, truncated) = s
+            .core
+            .list_readable_sessions_capped(None, &access, 3)
+            .await
+            .unwrap();
+        assert!(truncated, "cap cut the candidates; must report it");
+        let ulids: Vec<&str> = readable.iter().map(|row| row.ulid.as_str()).collect();
+        assert_eq!(
+            ulids,
+            vec![
+                "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+                "01ARZ3NDEKTSV4RRFFQ69G5FAY"
+            ],
+            "the unreadable session is filtered, the rest oldest-first"
+        );
+        // A cap past the candidate count reports no truncation.
+        let (all, truncated) = s
+            .core
+            .list_readable_sessions_capped(None, &access, 10)
+            .await
+            .unwrap();
+        assert!(!truncated);
+        assert_eq!(all.len(), 3);
     }
 }
 

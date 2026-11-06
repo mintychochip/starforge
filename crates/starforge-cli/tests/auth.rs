@@ -154,8 +154,8 @@ async fn device_flow_polls_then_returns_tokens() {
     );
     assert_eq!(
         params.get("scope").map(String::as_str),
-        Some("session:upload"),
-        "scope must be the server's Scope::SessionUpload string, body: {}",
+        Some(starforge_cli::auth::CLI_SCOPES),
+        "scope must be the CLI's full scope set, body: {}",
         bodies[0]
     );
 

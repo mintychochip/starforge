@@ -23,5 +23,3 @@ for log aggregation), and `log.level` is an `EnvFilter` string (default
 `info`). Both are overridable as `STARFORGE__LOG__FORMAT` /
 `STARFORGE__LOG__LEVEL`. Secrets are never logged.
 
-
-Logs: `log.format` selects `text` or `json`; override with `STARFORGE__LOG__FORMAT` / `STARFORGE__LOG__LEVEL`.

@@ -408,17 +408,46 @@ pub async fn sole_owned_orgs(db: &Db, user_id: i64) -> DbResult<Vec<String>> {
     Ok(rows)
 }
 
-/// Deletes the account's owner row in one transaction behind the per-org
-/// locks of every org the user owns (taken in stable id-ascending order, so
+/// The outcome of [`delete_user_unless_sole_owner`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccountDelete {
+    /// The account row is gone.
+    Deleted,
+    /// The user is the last active site admin; nothing was deleted.
+    SoleAdmin,
+    /// The user is the sole owner of these orgs; nothing was deleted.
+    SoleOwner(Vec<i64>),
+    /// The user owns non-deleted repositories (names); callers must not
+    /// treat the account as deleted.
+    OwnedRepos(Vec<String>),
+    /// The user still has uploaded sessions; the caller re-drains and
+    /// retries (a session arrived after the drain).
+    SessionsRemain(i64),
+}
+
+/// Deletes the account's owner row in one transaction behind the
+/// active-admin lock (`users::lock_active_admins`) and the per-org locks of
+/// every org the user owns (taken in stable id-ascending order, so
 /// concurrent account deletions cannot deadlock), re-counting owners inside
 /// the transaction like [`remove_member_serialized`]. The cascade then
 /// removes the user's org memberships without orphaning an org.
 ///
-/// Returns the org ids the user is the sole owner of; when non-empty nothing
-/// is deleted (the transaction rolls back) and the caller refuses the
-/// deletion. Empty means the account row is gone.
-pub async fn delete_user_unless_sole_owner(db: &Db, user_id: i64) -> DbResult<Vec<i64>> {
+/// Every refusal the caller pre-checked is re-checked here, so a change
+/// that lands after the caller's checks cannot slip through: the
+/// last-active-admin rule (serialized against admin revocation/suspension,
+/// which take the same lock), the sole-org-owner rule, and that the user
+/// owns no live repositories and has no uploaded sessions `ON DELETE
+/// CASCADE` would otherwise silently drop (blob refcounts and index
+/// documents would leak). A non-`Deleted` outcome deletes nothing and
+/// rolls back.
+pub async fn delete_user_unless_sole_owner(db: &Db, user_id: i64) -> DbResult<AccountDelete> {
     let mut tx = db.pool().begin().await?;
+    crate::users::lock_active_admins(&mut tx).await?;
+    if crate::users::is_active_admin_in(&mut tx, user_id).await?
+        && crate::users::count_active_admins_except_in(&mut tx, user_id).await? == 0
+    {
+        return Ok(AccountDelete::SoleAdmin);
+    }
     let org_ids: Vec<i64> = sqlx::query_scalar(
         "SELECT org_id FROM org_members WHERE user_id = $1 AND role = 'owner' ORDER BY org_id",
     )
@@ -435,14 +464,33 @@ pub async fn delete_user_unless_sole_owner(db: &Db, user_id: i64) -> DbResult<Ve
         }
     }
     if !sole.is_empty() {
-        return Ok(sole);
+        return Ok(AccountDelete::SoleOwner(sole));
+    }
+    let owned: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM repos WHERE owner_id = $1 AND deleted_at IS NULL ORDER BY lower_name",
+    )
+    .bind(user_id)
+    .fetch_all(tx.as_mut())
+    .await?;
+    if !owned.is_empty() {
+        return Ok(AccountDelete::OwnedRepos(owned));
+    }
+    let sessions: Option<i64> =
+        sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE uploader_id = $1")
+            .bind(user_id)
+            .fetch_optional(tx.as_mut())
+            .await?
+            .flatten();
+    let sessions = sessions.unwrap_or(0);
+    if sessions > 0 {
+        return Ok(AccountDelete::SessionsRemain(sessions));
     }
     sqlx::query("DELETE FROM owners WHERE id = $1")
         .bind(user_id)
         .execute(tx.as_mut())
         .await?;
     tx.commit().await?;
-    Ok(sole)
+    Ok(AccountDelete::Deleted)
 }
 
 /// Deletes the membership and the org-team memberships in one transaction.

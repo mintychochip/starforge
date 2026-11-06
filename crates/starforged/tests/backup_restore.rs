@@ -254,6 +254,29 @@ async fn backup_sets_0700_on_a_preexisting_empty_target() {
     );
 }
 
+/// A symlink under a repository directory makes the backup fail (matching
+/// restore's `check_tree`): the error names the path and no manifest is
+/// written, so a backup never reports success unless restore accepts it.
+#[cfg(unix)]
+#[tokio::test]
+async fn backup_refuses_a_symlink_under_a_repository() {
+    let fixture = fixture().await;
+    let link = fixture.repo_path.join("sneaky-link");
+    std::os::unix::fs::symlink("HEAD", &link).unwrap();
+    let target = fixture._tmp.path().join("backup");
+    let out = backup(&fixture, &target, &[]);
+    assert!(!out.status.success(), "backup over a symlink succeeded");
+    let text = combined(&out);
+    assert!(
+        text.contains("sneaky-link"),
+        "the error must name the offending path: {text}"
+    );
+    assert!(
+        !target.join("manifest.json").exists(),
+        "a refused backup must not write a manifest"
+    );
+}
+
 #[tokio::test]
 async fn backup_no_config_omits_the_config_copy() {
     let fixture = fixture().await;

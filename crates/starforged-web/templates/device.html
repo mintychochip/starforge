@@ -9,6 +9,7 @@
 <p>Your terminal is waiting to log in. Enter the code it shows, then choose
 Approve to finish signing in or Deny to reject the attempt. Codes expire after
 15 minutes and work only once.</p>
+{% if let Some(requested) = scope %}<p>Requested access: {{ requested }}</p>{% endif %}
 <form method="post" action="/oauth/device/approve" class="stack">
   <input type="hidden" name="_csrf" value="{{ csrf }}">
   <label>Device code <input name="user_code" value="{{ user_code }}" required maxlength="9" autocomplete="off" spellcheck="false"></label>

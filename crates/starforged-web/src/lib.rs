@@ -543,6 +543,7 @@ fn page_routes() -> Router<AppState> {
         .route("/static/starforge.css", get(stylesheet))
         .route("/static/highlight.css", get(highlight_stylesheet))
         .route("/static/session-viewer.js", get(session_viewer_js))
+        .route("/.well-known/starforge.json", get(pages::well_known::show))
 }
 
 /// Smart HTTP. Pushes can be arbitrarily large, so the request body limit is disabled here.

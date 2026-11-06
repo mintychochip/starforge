@@ -6,13 +6,6 @@
 ./target/release/starforged restore <backup-dir> --config <target-config>
 ```
 
-
-```bash
-./target/release/starforged backup <dir>            # see below; --no-config omits the config copy
-./target/release/starforged restore <backup-dir> --data-dir <fresh-dir>
-./target/release/starforged restore <backup-dir> --config <target-config>
-```
-
 `backup` writes a consistent snapshot into an empty or absent directory:
 `manifest.json` (format version 1, Starforge version, creation time, engine,
 latest migration, repository and blob counts), `database/`, `repos/` (the

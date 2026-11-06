@@ -317,9 +317,14 @@ pub async fn list_sessions(
         None => {
             let user = auth.reader()?;
             let access = state.core.repo_for(user, &owner, &repo).await?;
-            let sessions = state.core.list_readable_sessions(user, &access).await?;
-            let truncated =
-                sessions.len() >= starforged_core::read::READABLE_SESSION_LIST_LIMIT as usize;
+            let (sessions, truncated) = state
+                .core
+                .list_readable_sessions_capped(
+                    user,
+                    &access,
+                    starforged_core::read::READABLE_SESSION_LIST_LIMIT,
+                )
+                .await?;
             let rows = sessions
                 .iter()
                 .map(|row| {

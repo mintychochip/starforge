@@ -338,3 +338,78 @@ async fn segment_streaming_cap_is_413() {
         .unwrap();
     assert_eq!(big.status(), 413);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn device_flow_cli_scopes_grant_reader_trail_and_upload() {
+    let s = TestServer::start().await;
+    let alice = s.user("alice").await;
+    s.repo(&alice, "proj", Visibility::Private).await;
+    let client = reqwest::Client::new();
+
+    // The CLI requests its full scope set; the server accepts it for
+    // client `starforge-cli` (parse_scopes knows all three names).
+    let response = client
+        .post(s.url("/api/v1/oauth/device/code"))
+        .form(&[
+            ("client_id", "starforge-cli"),
+            ("scope", starforge_cli::auth::CLI_SCOPES),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let code = response.json::<Value>().await.unwrap();
+    let device_code = code["device_code"].as_str().unwrap().to_owned();
+    let user_code = code["user_code"].as_str().unwrap().to_owned();
+
+    // The approval page shows the requested access to the user.
+    let (browser, _) = s.login("alice").await;
+    let page = get_text(&browser, code["verification_uri"].as_str().unwrap()).await;
+    assert!(
+        page.contains("Requested access") && page.contains("repo:read"),
+        "approval page does not show the requested scopes"
+    );
+    let approved = approve(&browser, &s, &user_code, "approve").await;
+    assert_eq!(approved.status(), 200);
+
+    let (status, body) = poll(&client, &s, &device_code).await;
+    assert_eq!(status, 200, "token poll failed: {body}");
+    let access = body["access_token"].as_str().unwrap().to_owned();
+
+    // Reader routes: listing trails needs repo:read.
+    let list = client
+        .get(s.url("/api/v1/repos/alice/proj/trails"))
+        .bearer_auth(&access)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(list.status(), 200, "trail list with device token failed");
+
+    // Trail writes need trail:write.
+    let create = client
+        .post(s.url("/api/v1/repos/alice/proj/trails"))
+        .bearer_auth(&access)
+        .json(&serde_json::json!({"title": "cli trail", "intent": "do the thing"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        create.status(),
+        201,
+        "trail create with device token failed"
+    );
+
+    // Session uploads need session:upload.
+    let upload = client
+        .put(s.url(&format!("/api/v1/repos/alice/proj/sessions/{ULID_OAUTH}")))
+        .bearer_auth(&access)
+        .json(&meta_body(ULID_OAUTH))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        upload.status().is_success(),
+        "session upload with device token failed: {}",
+        upload.status()
+    );
+}

@@ -38,9 +38,14 @@ pub async fn status(repo: &Path, paths: &CliPaths, dry_run: bool) -> (String, u8
         Ok(resolved) => resolved,
         Err(err) => return (format!("error: {err}"), 1),
     };
+    let ssh = if server.ssh_url.is_empty() {
+        "disabled".to_owned()
+    } else {
+        server.ssh_url.clone()
+    };
     let mut out = format!(
         "server: {}\nversion: {}\nssh: {}\nrepo: {}\nremote: {}\n",
-        server.api_url, server.version, server.ssh_url, owner_repo, chosen
+        server.api_url, server.version, ssh, owner_repo, chosen
     );
     out.push_str(&spool_lines(repo));
     out.push_str(&credential_line(paths));

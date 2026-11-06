@@ -122,6 +122,14 @@ impl Core {
             interval: DEVICE_INTERVAL_SECS,
         })
     }
+    /// The scopes a device code requests, for the web approval page to show
+    /// the user what they are granting. `None` when the code is unknown.
+    pub async fn device_code_scope(&self, user_code: &str) -> CoreResult<Option<String>> {
+        let normalized = normalize_user_code(user_code);
+        Ok(db_oauth::device_code_by_user_code(self.db(), &normalized)
+            .await?
+            .map(|row| row.scope))
+    }
 
     /// Binds the signed-in web user to a pending code (approve) or marks it
     /// denied. Wrong codes are `NotFound`; spent or expired codes are `Invalid`.

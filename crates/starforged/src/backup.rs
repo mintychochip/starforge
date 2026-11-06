@@ -208,7 +208,9 @@ fn repository_dirs(repos_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
 
 /// Recursively copies `src` to `dest` (creating `dest`), skipping the
 /// root-level `skip` entry when given. Returns the number of files copied.
-/// File contents and permissions, and symlinks, are preserved.
+/// File contents and permissions are preserved. Symlinks and other
+/// non-regular entries are refused (matching restore's `check_tree`):
+/// a backup never reports success unless restore will accept it.
 pub(crate) fn copy_tree(src: &Path, dest: &Path, skip: Option<&str>) -> anyhow::Result<u64> {
     std::fs::create_dir_all(dest).with_context(|| format!("creating {}", dest.display()))?;
     let mut files = 0_u64;
@@ -229,20 +231,21 @@ pub(crate) fn copy_tree(src: &Path, dest: &Path, skip: Option<&str>) -> anyhow::
         let meta = std::fs::symlink_metadata(&entry)
             .with_context(|| format!("reading {}", entry.display()))?;
         if meta.file_type().is_symlink() {
-            let link = std::fs::read_link(&entry)
-                .with_context(|| format!("reading link {}", entry.display()))?;
-            #[cfg(unix)]
-            std::os::unix::fs::symlink(&link, &dest_entry)
-                .with_context(|| format!("linking {}", dest_entry.display()))?;
-            #[cfg(not(unix))]
-            std::fs::copy(&entry, &dest_entry)
-                .with_context(|| format!("copying {}", entry.display()))?;
+            bail!(
+                "refusing to back up {}: symlinks are not restorable; remove it and retry",
+                entry.display()
+            );
         } else if meta.is_dir() {
             files += copy_tree(&entry, &dest_entry, None)?;
         } else if meta.is_file() {
             std::fs::copy(&entry, &dest_entry)
                 .with_context(|| format!("copying {}", entry.display()))?;
             files += 1;
+        } else {
+            bail!(
+                "refusing to back up {}: not a regular file or directory; remove it and retry",
+                entry.display()
+            );
         }
     }
     Ok(files)

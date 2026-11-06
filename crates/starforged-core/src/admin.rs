@@ -204,8 +204,9 @@ impl Core {
                 "The account is already suspended.".into(),
             ));
         }
-        ensure_not_last_admin(self, &target).await?;
-        users::set_state(self.db(), target.id, "suspended").await?;
+        if !users::suspend_serialized(self.db(), target.id).await? {
+            return Err(last_admin_error());
+        }
         web_sessions::delete_for_user(self.db(), target.id).await?;
         self.audit(
             Some(admin.id),
@@ -257,8 +258,9 @@ impl Core {
         if !target.is_admin {
             return refresh(self, target.id).await;
         }
-        ensure_not_last_admin(self, &target).await?;
-        users::set_is_admin(self.db(), target.id, false).await?;
+        if !users::revoke_admin_serialized(self.db(), target.id).await? {
+            return Err(last_admin_error());
+        }
         self.audit(
             Some(admin.id),
             "user.revoke_admin",
@@ -310,23 +312,40 @@ impl Core {
         }
         // Same deletion path as self-service account deletion: uploaded
         // sessions leave through the session-delete path (blob refcounts,
-        // index documents), then the sole-owner re-check and the user-row
-        // delete share one locked transaction.
-        self.delete_uploaded_sessions(target.id).await?;
-        self.purge_deleted_repos_of(target.id, Some(admin.id))
-            .await?;
-        let still_sole = db_orgs::delete_user_unless_sole_owner(self.db(), target.id).await?;
-        if !still_sole.is_empty() {
-            let mut handles = Vec::new();
-            for org_id in still_sole {
-                if let Some(handle) = db_orgs::owner_handle_by_id(self.db(), org_id).await? {
-                    handles.push(handle);
+        // index documents), and every refusal is re-checked inside the final
+        // locked transaction (bounded drain/final retries).
+        starforged_db::tokens::revoke_for_user(self.db(), target.id).await?;
+        web_sessions::delete_for_user(self.db(), target.id).await?;
+        for attempt in 0..3 {
+            self.delete_uploaded_sessions(target.id).await?;
+            self.purge_deleted_repos_of(target.id, Some(admin.id))
+                .await?;
+            match db_orgs::delete_user_unless_sole_owner(self.db(), target.id).await? {
+                db_orgs::AccountDelete::Deleted => break,
+                db_orgs::AccountDelete::SessionsRemain(_)
+                | db_orgs::AccountDelete::OwnedRepos(_) => {
+                    if attempt == 2 {
+                        return Err(CoreError::Invalid(
+                            "Account deletion did not finish: new activity arrived; try again."
+                                .into(),
+                        ));
+                    }
+                }
+                db_orgs::AccountDelete::SoleAdmin => return Err(last_admin_error()),
+                db_orgs::AccountDelete::SoleOwner(ids) => {
+                    let mut handles = Vec::new();
+                    for org_id in ids {
+                        if let Some(handle) = db_orgs::owner_handle_by_id(self.db(), org_id).await?
+                        {
+                            handles.push(handle);
+                        }
+                    }
+                    return Err(CoreError::Invalid(format!(
+                        "The account is the only owner of {}: make another user an owner first.",
+                        handles.join(", ")
+                    )));
                 }
             }
-            return Err(CoreError::Invalid(format!(
-                "The account is the only owner of {}: make another user an owner first.",
-                handles.join(", ")
-            )));
         }
         // After the account goes: the admin actor survives, and a refused
         // deletion writes no entry.

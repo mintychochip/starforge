@@ -193,6 +193,89 @@ pub async fn count_active_admins_except(db: &Db, id: i64) -> DbResult<i64> {
     Ok(count)
 }
 
+/// Takes the active-admin serialization lock: a no-op self-assignment that
+/// writes every active-admin row (`users` has no `updated_at` to bump, so
+/// `display_name` stands in). Must be the first statement of a transaction
+/// that checks and then changes the active-admin set: on Postgres it takes
+/// the row locks, on SQLite the write lock. Serializes directory changes
+/// against account deletion and other directory changes so two removals
+/// cannot each leave zero active admins (write skew under READ COMMITTED).
+pub(crate) async fn lock_active_admins(tx: &mut sqlx::Transaction<'_, sqlx::Any>) -> DbResult<()> {
+    sqlx::query(
+        "UPDATE users SET display_name = display_name \
+         WHERE is_admin = 1 AND state = 'active'",
+    )
+    .execute(tx.as_mut())
+    .await?;
+    Ok(())
+}
+
+/// [`count_active_admins_except`] inside the caller's transaction.
+pub(crate) async fn count_active_admins_except_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    id: i64,
+) -> DbResult<i64> {
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM users WHERE is_admin = 1 AND state = 'active' AND id <> $1",
+    )
+    .bind(id)
+    .fetch_one(tx.as_mut())
+    .await?;
+    Ok(count)
+}
+
+/// Revokes the site-admin flag behind the active-admin lock, re-checking
+/// the sole-admin rule inside the transaction. Returns `false` (and changes
+/// nothing) when the target is the last active admin.
+pub async fn revoke_admin_serialized(db: &Db, id: i64) -> DbResult<bool> {
+    let mut tx = db.pool().begin().await?;
+    lock_active_admins(&mut tx).await?;
+    if is_active_admin_in(&mut tx, id).await?
+        && count_active_admins_except_in(&mut tx, id).await? == 0
+    {
+        return Ok(false);
+    }
+    sqlx::query("UPDATE users SET is_admin = 0 WHERE id = $1")
+        .bind(id)
+        .execute(tx.as_mut())
+        .await?;
+    tx.commit().await?;
+    Ok(true)
+}
+
+/// Suspends the account behind the active-admin lock like
+/// [`revoke_admin_serialized`]. Returns `false` when the target is the last
+/// active admin.
+pub async fn suspend_serialized(db: &Db, id: i64) -> DbResult<bool> {
+    let mut tx = db.pool().begin().await?;
+    lock_active_admins(&mut tx).await?;
+    if is_active_admin_in(&mut tx, id).await?
+        && count_active_admins_except_in(&mut tx, id).await? == 0
+    {
+        return Ok(false);
+    }
+    sqlx::query("UPDATE users SET state = 'suspended' WHERE id = $1")
+        .bind(id)
+        .execute(tx.as_mut())
+        .await?;
+    tx.commit().await?;
+    Ok(true)
+}
+
+pub(crate) async fn is_active_admin_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    id: i64,
+) -> DbResult<bool> {
+    let active: Option<i64> = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM users WHERE id = $1 AND is_admin = 1 AND state = 'active'",
+    )
+    .bind(id)
+    .fetch_optional(tx.as_mut())
+    .await?
+    .flatten();
+    Ok(active.unwrap_or(0) > 0)
+}
+
 /// Deletes the account's owner row. The user row, web sessions, access tokens, email links, collaborator
 /// grants, repository redirects, and any repository rows cascade; invites and audit entries keep their rows
 /// with the user cleared.

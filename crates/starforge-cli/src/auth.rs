@@ -257,8 +257,15 @@ pub fn logout_host(paths: &CliPaths, host: &str, dry_run: bool) -> Result<bool, 
     Ok(true)
 }
 
+/// The scopes `starforge auth login` requests: the least privilege covering
+/// every CLI command — `repo:read` (trail list/show, export, change lookup),
+/// `trail:write` (trail create/comment/review/merge), and `session:upload`
+/// (sync, sessions publish/unpublish/delete, import). Never `repo:write` or
+/// `admin`.
+pub const CLI_SCOPES: &str = "repo:read trail:write session:upload";
+
 /// OAuth device flow against `{base_url}/api/v1/oauth/device/code` and
-/// `/api/v1/oauth/token` (RFC 8628 grant).
+/// `/api/v1/oauth/token` (RFC 8628 grant), requesting [`CLI_SCOPES`].
 ///
 /// `base_url` is the api base with no trailing slash.
 pub struct DeviceFlow {
@@ -328,7 +335,7 @@ impl DeviceFlow {
         let resp = self
             .client
             .post(&url)
-            .form(&[("client_id", "starforge-cli"), ("scope", "session:upload")])
+            .form(&[("client_id", "starforge-cli"), ("scope", CLI_SCOPES)])
             .send()
             .await
             .map_err(|err| AuthError::Http(err.to_string()))?;

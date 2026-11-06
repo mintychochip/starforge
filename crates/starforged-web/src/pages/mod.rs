@@ -31,3 +31,4 @@ pub mod tokens;
 pub mod trails;
 pub mod verify;
 pub mod webhooks;
+pub mod well_known;

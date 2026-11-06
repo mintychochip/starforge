@@ -1,5 +1,7 @@
 //! Account settings (forge-basics design §4.6): profile, email address, password, and web sessions.
 
+use std::pin::Pin;
+
 use starforged_db::orgs as db_orgs;
 use starforged_db::repos as db_repos;
 use starforged_db::sessions as db_sessions;
@@ -12,14 +14,18 @@ use crate::{Core, CoreError, CoreResult, mail, validate};
 /// Bounded batch size for account deletion's per-session removal (D4).
 pub(crate) const ACCOUNT_DELETE_BATCH: i64 = 100;
 
+/// The future an [`AccountDeleteHook`] returns.
+pub type AccountDeleteHookFuture = Pin<Box<dyn Future<Output = CoreResult<()>> + Send>>;
+
 /// Test seam for the account-deletion interruption test (mirrors
 /// [`crate::merge::PreCasHook`]): fired after each uploaded session
 /// [`Core::delete_uploaded_sessions`] removes, while the account row still
 /// exists. Returning an error aborts the deletion mid-way, keeping the
-/// already-removed sessions gone — a rerun must then finish the job.
+/// already-removed sessions gone — a rerun must then finish the job. The
+/// hook is async so tests can insert work mid-deletion (e.g. a session
+/// arriving after the drain).
 #[derive(Clone)]
-pub struct AccountDeleteHook(std::sync::Arc<dyn Fn() -> CoreResult<()> + Send + Sync>);
-
+pub struct AccountDeleteHook(std::sync::Arc<dyn Fn() -> AccountDeleteHookFuture + Send + Sync>);
 impl std::fmt::Debug for AccountDeleteHook {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("AccountDeleteHook(..)")
@@ -27,11 +33,13 @@ impl std::fmt::Debug for AccountDeleteHook {
 }
 
 impl AccountDeleteHook {
-    pub fn new(hook: impl Fn() -> CoreResult<()> + Send + Sync + 'static) -> AccountDeleteHook {
+    pub fn new(
+        hook: impl Fn() -> AccountDeleteHookFuture + Send + Sync + 'static,
+    ) -> AccountDeleteHook {
         AccountDeleteHook(std::sync::Arc::new(hook))
     }
 
-    // The hook runs through `(hook.0)()` at the call site.
+    // The hook runs through `(hook.0)` at the call site.
 }
 
 /// One signed-in browser, for the sessions page.
@@ -196,7 +204,7 @@ impl Core {
     }
 
     /// Fires the interruption test hook, if one is installed.
-    fn fire_account_delete_hook(&self) -> CoreResult<()> {
+    async fn fire_account_delete_hook(&self) -> CoreResult<()> {
         let hook = self
             .inner
             .account_delete_hook
@@ -204,7 +212,7 @@ impl Core {
             .ok()
             .and_then(|guard| guard.clone());
         match hook {
-            Some(hook) => (hook.0)(),
+            Some(hook) => (hook.0)().await,
             None => Ok(()),
         }
     }
@@ -231,18 +239,21 @@ impl Core {
                 )
                 .await?;
                 removed_total += 1;
-                self.fire_account_delete_hook()?;
+                self.fire_account_delete_hook().await?;
             }
         }
     }
 
     /// Deletes the account once the user typed their handle (forge-basics design §4.6). Refused while the user
     /// owns repositories that are not deleted, is the only active site admin, or is the only owner of an
-    /// organization (the last refusal is re-checked atomically with the user-row delete, so a concurrent
-    /// owner removal cannot orphan the org). Their uploaded sessions go through the session-delete path
+    /// organization — every refusal is re-checked inside the final locked transaction that deletes the
+    /// user row (see `delete_user_unless_sole_owner`), so a concurrent demotion, owner removal, repo
+    /// creation, or session upload cannot produce a state the row-delete cascade would silently
+    /// destroy. Access tokens and web sessions are revoked after the pre-checks, so a deleting
+    /// account can no longer act. Their uploaded sessions go through the session-delete path
     /// (blob refcounts, index documents) before the user row, in bounded batches, so an interrupted
-    /// deletion finishes on rerun (D4). Their deleted repositories are purged at once; tokens and
-    /// collaborator grants go with the account; audit entries stay with the actor cleared.
+    /// deletion finishes on rerun (D4). Their deleted repositories are purged at once; collaborator
+    /// grants go with the account; audit entries stay with the actor cleared.
     pub async fn delete_account(&self, user: &User, confirm: &str) -> CoreResult<()> {
         if confirm.trim().to_ascii_lowercase() != user.handle {
             return Err(CoreError::Invalid(format!(
@@ -274,24 +285,48 @@ impl Core {
                 sole.join(", ")
             )));
         }
-        self.delete_uploaded_sessions(user.id).await?;
-        self.purge_deleted_repos_of(user.id, Some(user.id)).await?;
-        // The sole-owner re-check and the user-row delete share one
-        // transaction behind the org locks (see
-        // `delete_user_unless_sole_owner`). A concurrent owner removal that
-        // made this account the last owner refuses the deletion here.
-        let still_sole = db_orgs::delete_user_unless_sole_owner(self.db(), user.id).await?;
-        if !still_sole.is_empty() {
-            let mut handles = Vec::new();
-            for org_id in still_sole {
-                if let Some(handle) = db_orgs::owner_handle_by_id(self.db(), org_id).await? {
-                    handles.push(handle);
+        // Credentials end before the drain: the user can no longer act
+        // while their sessions are being removed.
+        starforged_db::tokens::revoke_for_user(self.db(), user.id).await?;
+        web_sessions::delete_for_user(self.db(), user.id).await?;
+        // Drain, purge, and the atomic final step — bounded retries when
+        // sessions or repositories arrive after the drain (the final step
+        // re-checks every refusal inside its transaction, so nothing the
+        // cascade would silently drop is ever lost).
+        for attempt in 0..3 {
+            self.delete_uploaded_sessions(user.id).await?;
+            self.purge_deleted_repos_of(user.id, Some(user.id)).await?;
+            match db_orgs::delete_user_unless_sole_owner(self.db(), user.id).await? {
+                db_orgs::AccountDelete::Deleted => break,
+                db_orgs::AccountDelete::SessionsRemain(_)
+                | db_orgs::AccountDelete::OwnedRepos(_) => {
+                    if attempt == 2 {
+                        return Err(CoreError::Invalid(
+                            "Account deletion did not finish: new activity arrived; try again."
+                                .into(),
+                        ));
+                    }
+                }
+                db_orgs::AccountDelete::SoleAdmin => {
+                    return Err(CoreError::Invalid(
+                        "You are the only site administrator; make another user an administrator first."
+                            .into(),
+                    ));
+                }
+                db_orgs::AccountDelete::SoleOwner(ids) => {
+                    let mut handles = Vec::new();
+                    for org_id in ids {
+                        if let Some(handle) = db_orgs::owner_handle_by_id(self.db(), org_id).await?
+                        {
+                            handles.push(handle);
+                        }
+                    }
+                    return Err(CoreError::Invalid(format!(
+                        "You are the only owner of {}: make another user an owner first.",
+                        handles.join(", ")
+                    )));
                 }
             }
-            return Err(CoreError::Invalid(format!(
-                "You are the only owner of {}: make another user an owner first.",
-                handles.join(", ")
-            )));
         }
         // Recorded after the account goes, with no actor: the same final row
         // as clearing the actor over the user-row delete, without writing an
