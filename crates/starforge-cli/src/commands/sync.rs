@@ -68,13 +68,17 @@ impl SyncSummary {
 /// v0.1: complete only when the spool session's meta has ended_at set, else
 /// leave uncompleted and succeed). Failures bump attempts + not_before
 /// (`2^attempts` s, cap 300) via injected now; exit 0 drained / 2 remainder.
-/// Drain due queue entries, deriving missing work from spool state first:
-/// every session with no recorded metadata PUT gets `Meta`, every segment on
-/// disk whose hash is not in `upload.json` gets `Segment`, `Complete` when
-/// `meta.ended_at` is set and `upload.json.complete` is false, and `Links`
-/// for links not yet recorded as sent. The queue stays the retry record:
-/// reconcile only appends entries no queued entry already covers, failures
-/// keep their bumped entries and backoff, and `sync_best_effort` (pre-push)
+/// Drain due queue entries, deriving missing work from spool state first
+/// (verify depth: recorded segments are blake3-checked against disk, so a
+/// segment whose bytes no longer match the recorded hash is re-enqueued,
+/// while hook passes at trust depth skip recorded segments without reading
+/// them): every session with no recorded metadata PUT gets `Meta`, every
+/// segment whose disk bytes hash differently from the recorded
+/// `upload.json` hash gets `Segment`, `Complete` when `meta.ended_at` is
+/// set and `upload.json.complete` is false, and `Links` for links not yet
+/// recorded as sent. The queue stays the retry record: reconcile only
+/// appends entries no queued entry already covers, failures keep their
+/// bumped entries and backoff, and `sync_best_effort` (pre-push)
 /// reconciles first too, then drains.
 pub async fn sync(
     spool: &Spool,
@@ -165,8 +169,24 @@ fn present_segments(spool: &Spool, ulid: &str) -> Vec<u64> {
 /// The full canonical upload list for every spooled session, in upload order
 /// (`Meta` → segments → `Complete` → `Links` per session, sessions sorted):
 /// entries whose work `upload.json` already records are omitted.
-fn desired_entries(spool: &Spool, now_rfc3339: &str) -> Result<Vec<QueueEntry>, UploadError> {
+///
+/// `verify_uploaded_segments` selects the depth. Verify (the `sync` and
+/// dry-run path): every present segment is read and blake3-hashed and
+/// compared against `uploaded_segments`, re-enqueueing segments whose bytes
+/// no longer match the recorded hash. Trust (the hook path): a segment
+/// whose number is already a key in `uploaded_segments` is skipped WITHOUT
+/// reading the file (segments are immutable, so the record means exactly
+/// those bytes were uploaded), and an unrecorded segment is enqueued
+/// without hashing (a missing record already means not uploaded). Trust
+/// passes are O(sessions + link lines); `links.jsonl` is read once per
+/// reconcile either way.
+fn desired_entries(
+    spool: &Spool,
+    now_rfc3339: &str,
+    verify_uploaded_segments: bool,
+) -> Result<Vec<QueueEntry>, UploadError> {
     let mut out = Vec::new();
+    let link_hashes = spool.link_line_hashes_by_ulid()?;
     for ulid in session_ulids(spool) {
         let meta = match spool.read_meta(&ulid) {
             Ok(meta) => meta,
@@ -188,24 +208,30 @@ fn desired_entries(spool: &Spool, now_rfc3339: &str) -> Result<Vec<QueueEntry>, 
             });
         }
         for n in present_segments(spool, &ulid) {
-            let bytes = match spool.segment_bytes(&ulid, n) {
-                Ok(bytes) => bytes,
-                Err(err) => {
-                    tracing::warn!("sync: cannot read segment {n} for `{ulid}`: {err}");
+            if !verify_uploaded_segments && state.uploaded_segments.contains_key(&n) {
+                continue;
+            }
+            if verify_uploaded_segments {
+                let bytes = match spool.segment_bytes(&ulid, n) {
+                    Ok(bytes) => bytes,
+                    Err(err) => {
+                        tracing::warn!("sync: cannot read segment {n} for `{ulid}`: {err}");
+                        continue;
+                    }
+                };
+                let hash = starforge_format::blake3_hex(&bytes);
+                if state.uploaded_segments.get(&n) == Some(&hash) {
                     continue;
                 }
-            };
-            let hash = starforge_format::blake3_hex(&bytes);
-            if state.uploaded_segments.get(&n) != Some(&hash) {
-                out.push(QueueEntry {
-                    op: QueueOp::Segment,
-                    ulid: ulid.clone(),
-                    repo: String::new(),
-                    segment: Some(n),
-                    attempts: 0,
-                    not_before: now_rfc3339.to_string(),
-                });
             }
+            out.push(QueueEntry {
+                op: QueueOp::Segment,
+                ulid: ulid.clone(),
+                repo: String::new(),
+                segment: Some(n),
+                attempts: 0,
+                not_before: now_rfc3339.to_string(),
+            });
         }
         if meta.ended_at.is_some() && !state.complete {
             out.push(QueueEntry {
@@ -217,11 +243,11 @@ fn desired_entries(spool: &Spool, now_rfc3339: &str) -> Result<Vec<QueueEntry>, 
                 not_before: now_rfc3339.to_string(),
             });
         }
-        let pairs = spool.link_line_hashes(&ulid)?;
-        if pairs
-            .iter()
-            .any(|(hash, _)| !state.sent_links.contains(hash))
-        {
+        if link_hashes.get(&ulid).is_some_and(|pairs| {
+            pairs
+                .iter()
+                .any(|(hash, _)| !state.sent_links.contains(hash))
+        }) {
             out.push(QueueEntry {
                 op: QueueOp::Links,
                 ulid: ulid.clone(),
@@ -235,17 +261,32 @@ fn desired_entries(spool: &Spool, now_rfc3339: &str) -> Result<Vec<QueueEntry>, 
     Ok(out)
 }
 
-/// Append every [`desired_entries`] row no queued entry already covers.
-/// Returns the number of entries added. The queue file is only appended to,
-/// never rewritten, so existing attempts/backoff survive a reconcile.
+/// Append every [`desired_entries`] row (verify depth) no queued entry
+/// already covers. Returns the number of entries added. The queue file is
+/// only appended to, never rewritten, so existing attempts/backoff survive
+/// a reconcile. Verify depth: recorded segments are blake3-checked against
+/// disk, so a segment whose bytes no longer match the recorded hash is
+/// re-enqueued.
 pub fn reconcile_queue(spool: &Spool, now_rfc3339: &str) -> Result<usize, UploadError> {
+    reconcile_queue_with(spool, now_rfc3339, true)
+}
+
+/// Core reconcile with a selectable depth: `verify_uploaded_segments` true
+/// verifies recorded segments against disk (deep, for `sync`); false trusts
+/// the `uploaded_segments` record and never reads uploaded segment files
+/// (hook passes, so the reconcile cost stays O(sessions + link lines)).
+fn reconcile_queue_with(
+    spool: &Spool,
+    now_rfc3339: &str,
+    verify_uploaded_segments: bool,
+) -> Result<usize, UploadError> {
     use std::collections::HashSet;
     let have: HashSet<(u8, String, Option<u64>)> = read_queue(spool)?
         .iter()
         .map(|e| entry_key(e.op, &e.ulid, e.segment))
         .collect();
     let mut added = 0;
-    for entry in desired_entries(spool, now_rfc3339)? {
+    for entry in desired_entries(spool, now_rfc3339, verify_uploaded_segments)? {
         if !have.contains(&entry_key(entry.op, &entry.ulid, entry.segment)) {
             enqueue(spool, entry)?;
             added += 1;
@@ -271,7 +312,7 @@ pub fn dry_run_plan(spool: &Spool, now_rfc3339: &str) -> Result<Vec<String>, Upl
         .iter()
         .map(|e| entry_key(e.op, &e.ulid, e.segment))
         .collect();
-    for entry in desired_entries(spool, now_rfc3339)? {
+    for entry in desired_entries(spool, now_rfc3339, true)? {
         if !have.contains(&entry_key(entry.op, &entry.ulid, entry.segment)) {
             planned.push(describe(&entry));
         }
@@ -288,10 +329,13 @@ fn dry_run_summary(spool: &Spool, now_rfc3339: &str) -> Result<SyncSummary, Uplo
 }
 
 /// Best-effort upload for the `pre-push` path: reconcile the queue from spool
-/// state first (a reconcile failure is logged and ignored, so the hook never
-/// fails), then at most one attempt per entry, a 10 s overall deadline, every
-/// failure swallowed. Always returns (never fails the push); the queue keeps
-/// whatever did not make it.
+/// state first at trust depth (a reconcile failure is logged and ignored, so
+/// the hook never fails), then at most one attempt per entry, a 10 s overall
+/// deadline, every failure swallowed. Trust-depth reconcile is O(sessions +
+/// link lines) and never reads uploaded segment files, which keeps the
+/// pre-reconcile cost small for the life of the repository; the 10 s
+/// deadline still applies only to the network drain. Always returns (never
+/// fails the push); the queue keeps whatever did not make it.
 pub async fn sync_best_effort(
     spool: &Spool,
     server: &ServerInfo,
@@ -300,7 +344,7 @@ pub async fn sync_best_effort(
     sleeper: &impl Sleeper,
     now_rfc3339: &str,
 ) -> SyncSummary {
-    if let Err(err) = reconcile_queue(spool, now_rfc3339) {
+    if let Err(err) = reconcile_queue_with(spool, now_rfc3339, false) {
         tracing::debug!("sync_best_effort: reconcile failed, draining queue as-is: {err}");
     }
     let run = sync_with_retries(

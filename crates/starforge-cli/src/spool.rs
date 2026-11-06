@@ -22,7 +22,7 @@
 //! is updated; `meta.json`, `cursors.json`, `queue.jsonl`, and `upload.json`
 //! are replaced atomically (temp file + rename). `links.jsonl` is append-only.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::str::FromStr as _;
@@ -569,6 +569,33 @@ impl Spool {
             if entry.ulid == ulid {
                 out.push((blake3_hex(line.as_bytes()), entry));
             }
+        }
+        Ok(out)
+    }
+
+    /// All raw `links.jsonl` lines grouped by session ULID, each with the
+    /// blake3 hash of the raw line (exactly as [`Spool::link_line_hashes`]
+    /// hashes). Reads and parses `links.jsonl` once for every session, so
+    /// reconciles stay O(sessions + link lines) instead of re-reading the
+    /// whole file per session.
+    pub fn link_line_hashes_by_ulid(
+        &self,
+    ) -> Result<HashMap<String, Vec<(String, LinkEntry)>>, SpoolError> {
+        let text = match std::fs::read_to_string(self.root.join("links.jsonl")) {
+            Ok(text) => text,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(HashMap::new()),
+            Err(e) => return Err(SpoolError::Io(e)),
+        };
+        let mut out: HashMap<String, Vec<(String, LinkEntry)>> = HashMap::new();
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let entry: LinkEntry = serde_json::from_str(line).map_err(SpoolError::Json)?;
+            out.entry(entry.ulid.clone())
+                .or_default()
+                .push((blake3_hex(line.as_bytes()), entry));
         }
         Ok(out)
     }

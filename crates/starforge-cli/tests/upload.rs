@@ -881,3 +881,145 @@ async fn best_effort_reconciles_changed_meta_complete_and_links() {
     assert!(state.complete, "complete recorded");
     assert_eq!(state.sent_links.len(), 1, "one links line recorded as sent");
 }
+// ---------------------------------------------------------------------------
+// Trust depth: the hook pass trusts a recorded segment number without
+// reading the file, even if the bytes on disk have since changed.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn best_effort_trusts_recorded_segment_without_reading_it() {
+    let (_tmp, spool) = open_spool();
+    let (meta, bytes) = seed_session(&spool, false, 1);
+    let ulid = meta.id.to_string();
+    let old_hash = starforge_format::blake3_hex(
+        &serde_json::to_vec(&spool.read_meta(&ulid).unwrap()).unwrap(),
+    );
+    spool.mark_meta_uploaded(&ulid, old_hash).unwrap();
+    spool.mark_segment_uploaded(&ulid, 0).unwrap();
+    assert_eq!(
+        spool.read_upload(&ulid).unwrap().uploaded_segments[&0],
+        starforge_format::blake3_hex(&bytes[0])
+    );
+    let mut ended = spool.read_meta(&ulid).unwrap();
+    ended.ended_at = Some("2026-11-02T00:00:00Z".to_string());
+    spool.put_session(&ended).unwrap();
+    seed_link(&spool, &ulid);
+    // Corrupt the recorded segment file: trust must not notice or upload it.
+    let seg_path = spool
+        .root
+        .join("sessions")
+        .join(&ulid)
+        .join("segments")
+        .join("0.jsonl.zst");
+    std::fs::write(&seg_path, b"completely different bytes").unwrap();
+    assert!(
+        read_queue(&spool).unwrap().is_empty(),
+        "no queue entries seeded"
+    );
+
+    let stub = start_stub(StubConfig::ok()).await;
+    let server = stub.server_info();
+    let sleeper = FakeSleeper::default();
+    let summary = starforge_cli::commands::sync::sync_best_effort(
+        &spool, &server, OWNER_REPO, TOKEN, &sleeper, NOW,
+    )
+    .await;
+
+    let session = format!("/api/v1/repos/{OWNER_REPO}/sessions/{ulid}");
+    let reqs = stub.requests();
+    assert!(
+        reqs.iter().all(|r| !r.path.contains("/segments/")),
+        "no segment PUT in the hook pass: {reqs:?}"
+    );
+    assert_eq!(
+        reqs.iter().map(|r| r.path.as_str()).collect::<Vec<_>>(),
+        vec![
+            session.as_str(),
+            format!("{session}/complete").as_str(),
+            format!("{session}/links").as_str(),
+        ],
+        "PUT meta, POST complete, POST links: no segment read or upload"
+    );
+    assert_eq!(summary.exit_code(), 0, "drained");
+    assert!(read_queue(&spool).unwrap().is_empty(), "queue drained");
+}
+
+// ---------------------------------------------------------------------------
+// Contrast: a deep (`sync`) reconcile verifies recorded segments and
+// re-enqueues the one whose bytes changed.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn deep_reconcile_reenqueues_recorded_segment_with_changed_bytes() {
+    let (_tmp, spool) = open_spool();
+    let (meta, bytes) = seed_session(&spool, false, 1);
+    let ulid = meta.id.to_string();
+    let meta_hash = starforge_format::blake3_hex(&serde_json::to_vec(&meta).unwrap());
+    spool.mark_meta_uploaded(&ulid, meta_hash).unwrap();
+    spool.mark_segment_uploaded(&ulid, 0).unwrap();
+    assert_eq!(
+        spool.read_upload(&ulid).unwrap().uploaded_segments[&0],
+        starforge_format::blake3_hex(&bytes[0])
+    );
+    let seg_path = spool
+        .root
+        .join("sessions")
+        .join(&ulid)
+        .join("segments")
+        .join("0.jsonl.zst");
+    std::fs::write(&seg_path, b"completely different bytes").unwrap();
+    assert!(
+        read_queue(&spool).unwrap().is_empty(),
+        "no queue entries seeded"
+    );
+
+    let added = starforge_cli::commands::sync::reconcile_queue(&spool, NOW).unwrap();
+    assert_eq!(added, 1, "only the changed segment is re-enqueued");
+    let queued = read_queue(&spool).unwrap();
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].op, QueueOp::Segment);
+    assert_eq!(queued[0].ulid, ulid);
+    assert_eq!(queued[0].segment, Some(0));
+}
+
+// ---------------------------------------------------------------------------
+// Links grouping: `links.jsonl` is parsed once per reconcile. With link
+// lines for two sessions (one already recorded as sent), only the session
+// with an unsent line gets a `Links` entry.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn reconcile_enqueues_links_only_for_session_with_unsent_line() {
+    let (_tmp, spool) = open_spool();
+    let (meta_a, bytes_a) = seed_session(&spool, false, 1);
+    let ulid_a = meta_a.id.to_string();
+    let (meta_b, bytes_b) = seed_session(&spool, false, 1);
+    let ulid_b = meta_b.id.to_string();
+    for (ulid, meta, bytes) in [(&ulid_a, &meta_a, &bytes_a), (&ulid_b, &meta_b, &bytes_b)] {
+        let meta_hash = starforge_format::blake3_hex(&serde_json::to_vec(meta).unwrap());
+        spool.mark_meta_uploaded(ulid, meta_hash).unwrap();
+        spool.mark_segment_uploaded(ulid, 0).unwrap();
+        assert_eq!(
+            spool.read_upload(ulid).unwrap().uploaded_segments[&0],
+            starforge_format::blake3_hex(&bytes[0])
+        );
+    }
+    seed_link(&spool, &ulid_a);
+    seed_link(&spool, &ulid_b);
+    // B's link line is already recorded as sent; A's is not.
+    let sent = spool.link_line_hashes(&ulid_b).unwrap();
+    assert_eq!(sent.len(), 1, "one links line for B");
+    let hashes: Vec<String> = sent.iter().map(|(hash, _)| hash.clone()).collect();
+    spool.mark_links_sent(&ulid_b, &hashes).unwrap();
+    assert!(
+        read_queue(&spool).unwrap().is_empty(),
+        "no queue entries seeded"
+    );
+
+    let added = starforge_cli::commands::sync::reconcile_queue(&spool, NOW).unwrap();
+    assert_eq!(added, 1, "only the session with an unsent link line");
+    let queued = read_queue(&spool).unwrap();
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].op, QueueOp::Links);
+    assert_eq!(queued[0].ulid, ulid_a);
+}
