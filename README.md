@@ -230,6 +230,52 @@ state; `merged` is refused — only the merge path may set it), `GET`/`POST
 mutation needs `trail:write` on top, so a curator token carries `"repo:read trail:write"`.
 Errors use the shared `{"error": {"code", "message"}}` envelope.
 
+### Trail page
+
+Every Trail page shares three tabs — Conversation (`.../trails/{n}`),
+Changes (`.../trails/{n}/changes`, one row per change with its state and a
+gate summary), and Sessions (`.../trails/{n}/sessions`, with the count of
+sessions the viewer may read) — plus a header with the intent, labels,
+assignees, reviewers, and a gate panel per open change. The panel shows
+approvals (have/need), the required checks with their states, conflicts
+(mergeability and conflicting paths), and session evidence; viewers with
+merge permission also get the merge button with a method selector limited
+to the allowed methods, posting to the existing change merge route. The
+panel reuses the gate evaluation — there is no separate gate logic — and
+the merge re-checks everything server-side, so a stale page authorizes
+nothing.
+
+The Conversation timeline merges stored events with derived rows in time
+order: linked sessions (one row per readable session linked through a
+commit, timed at the later of the upload and the first revision containing
+its commit), checks (one row per status posted on a revision head, with
+context, state, description, and an `http(s)` target link), and readable
+sentences for every stored `change.*`, `review.*`, and
+`trail.session_linked/unlinked` kind. Derived rows are computed per request
+and filtered for the viewer.
+
+The Sessions tab groups one section per Trail commit that has a readable
+session (newest first), then a "Linked by hand" group, each row showing the
+agent name and version, models, title as prompt preview (escaped, 120
+characters), token totals, link confidence (`exact`/`heuristic`/`explicit`),
+uploader, start time, and a `#turn-<seq_start>` deep link when the commit
+link carries a start sequence, with per-group and Trail-wide totals. The
+JSON API mirrors it at `GET
+/api/v1/repos/{owner}/{repo}/trails/{n}/sessions`. Sessions link two ways:
+through commits (a `Starforge-Session: <ULID>` trailer or a CLI commit
+claim joins an uploaded session to a commit in the Trail's changes,
+whichever side arrives first) or by hand — triage and up may link any
+readable same-repo session, and the Trail author may link sessions they
+uploaded themselves (at most 50 explicit links per Trail; linking is
+idempotent). The API is `POST .../trails/{n}/sessions` with `{"session":
+"<ulid>"}` and `DELETE .../trails/{n}/sessions/{ulid}` (both answer the
+Sessions JSON); the tab carries link/unlink forms. Every link and unlink
+writes a `trail.session_linked`/`trail.session_unlinked` timeline row and
+a matching webhook. Every session surface — the tab, the API,
+`has_sessions`, the timeline, and the commit Sessions panel — applies the
+session read rules for the current viewer, so no title, ULID, or total of
+an unreadable session ever reaches them.
+
 Not yet: trail deletion (close covers M2a).
 
 ### Trails from the command line (M2d)
@@ -303,15 +349,18 @@ Every add and remove writes exactly one `trail.review_requested` /
 `updated` webhook with the matching `cause`.
 
 The Trail list filters compose: `?state=open|closed|merged`, `?label=`,
-`?assignee=`, `?author=`, `?has_changes=true|false`, and
-`?review_requested=<handle>` (an unknown handle lists nothing, never `404`),
-30 per page with pager links that keep the filters. The API mirrors them as
+`?assignee=`, `?author=`, `?has_changes=true|false`,
+`?has_sessions=true|false`, and `?review_requested=<handle>` (an unknown
+handle lists nothing, never `404`), 30 per page with pager links that keep
+the filters. `has_sessions=true` keeps Trails with at least one linked
+session the viewer may read (through commits or by hand); `false` keeps
+the rest; anything else is `422`. The API mirrors them as
 keyset filters — `GET .../trails?state=&label=&assignee=&author=&
-has_changes=&review_requested=&after=&limit=` with a `next_after` cursor
-(`has_changes=maybe` is `422`) — and the CLI as
+has_changes=&has_sessions=&review_requested=&after=&limit=` with a `next_after` cursor
+(`has_changes=maybe` and `has_sessions=maybe` are `422`) — and the CLI as
 `starforge trail list [--state open|closed|merged|all] [--label=…]
 [--assignee=…] [--author=…] [--has-changes true|false]
-[--review-requested <handle>]`.
+[--has-sessions true|false] [--review-requested <handle>]`.
 
 The dashboard (`/`, signed in) adds three sections above the repository
 list — "Assigned to you" and "Awaiting your review" (open Trails, newest
@@ -319,10 +368,6 @@ updated first, at most 20 each) and "Your recent sessions" (your uploads you
 may still read, newest first, at most 10). Every row is re-checked against
 your current permission, so losing access hides it immediately; anonymous
 visitors see the marketing page with no sections.
-
-Not yet (M2f): the `has-sessions` filter, a repository Sessions tab,
-sessions and checks on the timeline, a Trail-header gate panel,
-revision-to-revision diffs, viewed state, and pending reviews.
 
 ## Changes and reviews
 
@@ -353,12 +398,44 @@ selects the revision) shows all of this with role-gated controls. The merge form
 offers the methods the matching gate rules allow and stays disabled until every gate
 passes; the server re-checks gates, permission, and method at merge time, so a stale
 page authorizes nothing. Gate and conflict failures re-render the change page with `422`.
+The page's compare picker (or `?from=<r1>&to=<r2>`, two distinct revisions of the
+change) shows the tree diff between those revisions' heads, labeled as such with a
+note that it includes base changes when the change was rebased; an unknown revision
+is `404`, `from == to` is `422`. In the default revision view, threads anchored on
+that revision render inline under their `(path, side, end_line)` diff line; threads
+anchored elsewhere — or whose line is absent from the displayed hunks — list below,
+marked outdated where they are. Signed-in readers may mark files viewed
+(`viewed=1|0`); the mark stores the file's blob at the displayed head, so a later
+revision that changes the file resets it while one that leaves it alone keeps it
+viewed, and viewed files render collapsed. The viewed toggle, like every other
+change form, carries a `_csrf` token; anonymous viewers see no toggles, and archived
+repos refuse with `422`.
 
 The JSON API mirrors the page: `GET`/`POST .../trails/{n}/changes` (triage to track a
 branch), `GET`/`PATCH .../changes/{k}` (close/reopen; `merged` is refused), `.../state`,
-`.../diff`, `.../revisions[/{r}]`, `.../reviews` (`POST .../{id}/dismiss` for triage),
+`.../diff[?from=&to=]`, `.../revisions[/{r}]`, `.../reviews` (`POST .../{id}/dismiss` for triage),
 and `.../threads` (`POST .../{t}/resolve`, `.../{t}/comments`). Reads need `repo:read`,
 mutations need `trail:write`; strangers get `404` so change numbers stay undiscoverable.
+
+### Pending reviews
+
+A signed-in reader holds at most one pending (draft) review per change. Posting a
+thread or a thread comment with `"pending": true` attaches the comment to the
+actor's draft — created on demand on the change's current revision — instead of
+opening a public thread; pending comments, and threads whose only comments are
+pending, are visible only to their author (web, API, and therefore CLI). Pending
+reviews never count toward gates, never appear in the timeline, and dispatch
+nothing. Posting a review converts the actor's draft: the review takes the given
+verdict and body at the change's current revision with the draft's comments
+attached, writing exactly one `review.submitted` timeline row and one
+`review`/`submitted` webhook, clearing the review request and counting toward
+gates; without a draft the submit behaves as before. `GET
+.../changes/{k}/reviews/pending` returns the actor's draft or `404`;
+`DELETE .../changes/{k}/reviews/pending` discards the draft's comments plus the
+threads left empty, with no timeline row. Dismissing a pending review is `422`.
+On the web the inline comment form offers "Comment" and "Add to review", and a
+"Finish your review" panel shows the draft comment count with verdict, body,
+Submit, and Discard.
 
 ## Commit statuses, gates, and merging
 
@@ -449,7 +526,7 @@ The five events, with their subjects:
   (`edited`, `ready_cleared`, `reopened`, `labeled`, `unlabeled`,
   `assigned`, `unassigned`, `review_requested`, `review_request_removed`,
   `change_opened`, `revision_pushed`, `change_merged`, `change_closed`,
-  `change_reopened`). The subject carries `number`, `title`, `state`,
+  `change_reopened`, `session_linked`, `session_unlinked`). The subject carries `number`, `title`, `state`,
   `ready`, `author`, and `url`, plus `change` (`k`, `revision`) when a
   change caused the event.
 - `review`: `submitted` on every review, `dismissed` on explicit dismissal
