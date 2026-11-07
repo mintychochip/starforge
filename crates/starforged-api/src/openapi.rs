@@ -167,6 +167,10 @@ impl Modify for SecurityAddon {
         crate::tag_protections::list_tag_protections,
         crate::tag_protections::create_tag_protection,
         crate::tag_protections::delete_tag_protection,
+        crate::ci::create_registration_token,
+        crate::ci::register_runner,
+        crate::ci::list_runners,
+        crate::ci::revoke_runner,
         crate::openapi::openapi_json,
     ),
     components(schemas(
@@ -240,6 +244,11 @@ impl Modify for SecurityAddon {
         crate::webhooks::WebhookJson,
         crate::webhooks::CreateHookBody,
         crate::webhooks::PatchHookBody,
+        crate::ci::RegistrationTokenJson,
+        crate::ci::CreateRegistrationTokenBody,
+        crate::ci::RegisterRunnerBody,
+        crate::ci::RegisteredRunnerJson,
+        crate::ci::RunnerJson,
     )),
     modifiers(&SecurityAddon),
 )]

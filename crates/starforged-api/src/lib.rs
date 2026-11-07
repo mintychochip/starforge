@@ -3,6 +3,7 @@
 mod admin;
 pub mod auth;
 mod changes;
+pub mod ci;
 pub mod ci_auth;
 pub mod error;
 mod gate_rules;
@@ -358,6 +359,13 @@ pub fn router(core: Core, base_url: String) -> Router {
             "/repos/{owner}/{repo}/tag-protections/{id}",
             delete(tag_protections::delete_tag_protection),
         )
+        .route(
+            "/repos/{owner}/{repo}/runners/registration-token",
+            post(ci::create_registration_token),
+        )
+        .route("/repos/{owner}/{repo}/runners", get(ci::list_runners))
+        .route("/runners/register", post(ci::register_runner))
+        .route("/runners/{id}", delete(ci::revoke_runner))
         .fallback(|| async { ApiError::NotFound })
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),

@@ -1,0 +1,19 @@
+[package]
+name = "starforge-sandbox-protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "MIT OR Apache-2.0"
+publish = true
+description = "Starforge sandbox provider wire types shared by the server and sandbox daemons (plan M6b B1)"
+readme = "../../README.md"
+keywords = ["starforge", "sandbox", "protocol"]
+categories = ["data-structures"]
+
+[lints]
+workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

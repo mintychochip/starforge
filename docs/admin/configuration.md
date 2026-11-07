@@ -38,11 +38,23 @@
 | `limits.api_per_token_per_hour` | API requests per token per hour (default `5000`; `0` disables) |
 | `limits.refs_for_new_changes_per_hour` | New `refs/for` changes per user per hour (default `30`; `0` disables) |
 | `remotes.allow_file_urls` | Test-only: admit `file://`/local-path remotes and loopback hosts for the import/mirror URL policy (default `false`; never set in production) |
+| `sandbox.provider` | Sandbox provider: `local` (rootless containers via `starforge-sandboxd`, default) or `e2b` (remote cloud) |
+| `sandbox.local.socket` | Unix socket the local sandbox daemon listens on (default `/run/starforge/sandboxd.sock`) |
+| `sandbox.local.token_file` | Daemon auth token file, mode `0600`; rotates on restart (default `/run/starforge/sandboxd.token`) |
+| `sandbox.local.egress.proxy_listen` | Address the egress proxy listens on (default `127.0.0.1:8888`) |
+| `sandbox.local.egress.ca_dir` | Directory holding per-sandbox CA keys, destroyed with the sandbox (default `/run/starforge/sandbox-ca`) |
+| `sandbox.local.egress.allowlist` | Hosts the egress proxy (and therefore the sandbox) may reach (default `[]`) |
+| `sandbox.e2b.api_url` | Base URL of the E2B API (default `https://api.e2b.dev`) |
+| `sandbox.e2b.api_key` | E2B API key (never logged or rendered) |
+| `sandbox.limits.max_concurrent_per_user` | Concurrent sandboxes per user (default `0`; `0` disables) |
+| `sandbox.limits.max_concurrent_per_repo` | Concurrent sandboxes per repository (default `0`; `0` disables) |
+| `sandbox.limits.sandbox_seconds_per_hour` | Sandbox-seconds per user per hour (default `0`; `0` disables) |
+| `sandbox.default_ttl_secs` | Default sandbox lifetime cap in seconds when a request does not carry `timeout_s` (default `3600`) |
 
 Any key can be overridden with an environment variable such as `STARFORGE__SERVER__HTTP_ADDR` or
 `STARFORGE__DATABASE__URL`. `STARFORGE_CONFIG` sets the config file path.
 
-Every key above is overridable as `STARFORGE__<SECTION>__<KEY>` (upper-cased, e.g. `STARFORGE__SERVER__HTTP_ADDR`). `STARFORGE_CONFIG` sets the config file path. Full key list also includes the sections below: `sessions.*`, `webhooks.allow_loopback`, `git.allowed_ref_namespaces`, `github.api_url`, `storage.index_dir`, `log.*`, `metrics.token`, `limits.*`.
+Every key above is overridable as `STARFORGE__<SECTION>__<KEY>` (upper-cased, e.g. `STARFORGE__SERVER__HTTP_ADDR`). `STARFORGE_CONFIG` sets the config file path. Full key list also includes the sections below: `sessions.*`, `webhooks.allow_loopback`, `git.allowed_ref_namespaces`, `github.api_url`, `storage.index_dir`, `log.*`, `metrics.token`, `limits.*`, `sandbox.*` (nested keys use one `__` per level, e.g. `STARFORGE__SANDBOX__LOCAL__SOCKET`).
 
 Abuse controls (spec §11.6) are all configurable under `[limits]`; every key is
 also overridable as `STARFORGE__LIMITS__*`. Setting any limit to `0` disables it.

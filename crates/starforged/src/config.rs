@@ -55,6 +55,10 @@ pub struct Config {
     /// (no token: `/metrics` answers 404).
     #[serde(default)]
     pub metrics: MetricsConfig,
+    /// Sandbox provider (plan M6b B1). Missing section defaults cleanly
+    /// (`local`, 3600 s default TTL).
+    #[serde(default)]
+    pub sandbox: starforged_core::sandboxes::SandboxConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -664,6 +668,55 @@ impl Config {
                         Some(value)
                     };
                 }
+                "sandbox__provider" => {
+                    self.sandbox.provider = match value.to_ascii_lowercase().as_str() {
+                        "local" => starforged_core::sandboxes::SandboxProviderKind::Local,
+                        "e2b" => starforged_core::sandboxes::SandboxProviderKind::E2b,
+                        _ => bail!("{key} must be \"local\" or \"e2b\""),
+                    };
+                }
+                "sandbox__default_ttl_secs" => {
+                    self.sandbox.default_ttl_secs = value
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("{key} must be a non-negative count"))?;
+                }
+                "sandbox__local__socket" => {
+                    self.sandbox.local.socket = PathBuf::from(value);
+                }
+                "sandbox__local__token_file" => {
+                    self.sandbox.local.token_file = PathBuf::from(value);
+                }
+                "sandbox__local__egress__proxy_listen" => {
+                    self.sandbox.local.egress.proxy_listen = value;
+                }
+                "sandbox__local__egress__ca_dir" => {
+                    self.sandbox.local.egress.ca_dir = PathBuf::from(value);
+                }
+                "sandbox__local__egress__allowlist" => {
+                    self.sandbox.local.egress.allowlist = value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|h| !h.is_empty())
+                        .map(str::to_owned)
+                        .collect();
+                }
+                "sandbox__e2b__api_url" => self.sandbox.e2b.api_url = value,
+                "sandbox__e2b__api_key" => self.sandbox.e2b.api_key = value,
+                "sandbox__limits__max_concurrent_per_user" => {
+                    self.sandbox.limits.max_concurrent_per_user = value
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("{key} must be a non-negative count"))?;
+                }
+                "sandbox__limits__max_concurrent_per_repo" => {
+                    self.sandbox.limits.max_concurrent_per_repo = value
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("{key} must be a non-negative count"))?;
+                }
+                "sandbox__limits__sandbox_seconds_per_hour" => {
+                    self.sandbox.limits.sandbox_seconds_per_hour = value
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("{key} must be a non-negative count"))?;
+                }
                 _ => bail!("unknown configuration override {key}"),
             }
         }
@@ -886,6 +939,7 @@ mod tests {
             ssh: SshConfig::default(),
             log: LogConfig::default(),
             metrics: MetricsConfig::default(),
+            sandbox: starforged_core::sandboxes::SandboxConfig::default(),
         }
     }
 
@@ -1265,5 +1319,79 @@ mod tests {
         assert_eq!(loaded.storage.data_dir, returned.storage.data_dir);
         assert!(loaded.blob_dir().starts_with(&loaded.storage.data_dir));
         assert_eq!(loaded.blob_dir(), returned.blob_dir());
+    }
+
+    #[test]
+    fn sandbox_defaults_and_empty_section() {
+        use starforged_core::sandboxes::SandboxProviderKind;
+        let config = sample();
+        assert_eq!(config.sandbox.provider, SandboxProviderKind::Local);
+        assert_eq!(config.sandbox.default_ttl_secs, 3600);
+        assert_eq!(
+            config.sandbox.local.socket,
+            PathBuf::from("/run/starforge/sandboxd.sock")
+        );
+        // An empty `[sandbox]` section deserializes to the same defaults.
+        let text = r#"
+server.http_addr = "127.0.0.1:3000"
+server.base_url = "http://127.0.0.1:3000"
+storage.data_dir = "/srv/starforge"
+security.secret_key = "abababababababababababababababababababababababababababababababababab"
+
+[sandbox]
+"#;
+        let loaded: Config = toml::from_str(text).unwrap();
+        assert_eq!(loaded.sandbox, config.sandbox);
+    }
+
+    #[test]
+    fn sandbox_env_overrides_apply() {
+        use starforged_core::sandboxes::SandboxProviderKind;
+        let mut config = sample();
+        config
+            .apply_env([
+                ("STARFORGE__SANDBOX__PROVIDER".to_owned(), "e2b".to_owned()),
+                (
+                    "STARFORGE__SANDBOX__DEFAULT_TTL_SECS".to_owned(),
+                    "600".to_owned(),
+                ),
+                (
+                    "STARFORGE__SANDBOX__LOCAL__SOCKET".to_owned(),
+                    "/tmp/sbx.sock".to_owned(),
+                ),
+                (
+                    "STARFORGE__SANDBOX__LOCAL__EGRESS__ALLOWLIST".to_owned(),
+                    "crates.io, docs.rs".to_owned(),
+                ),
+                (
+                    "STARFORGE__SANDBOX__E2B__API_URL".to_owned(),
+                    "https://api.e2b.example".to_owned(),
+                ),
+                (
+                    "STARFORGE__SANDBOX__LIMITS__MAX_CONCURRENT_PER_USER".to_owned(),
+                    "3".to_owned(),
+                ),
+            ])
+            .unwrap();
+        assert_eq!(config.sandbox.provider, SandboxProviderKind::E2b);
+        assert_eq!(config.sandbox.default_ttl_secs, 600);
+        assert_eq!(config.sandbox.local.socket, PathBuf::from("/tmp/sbx.sock"));
+        assert_eq!(
+            config.sandbox.local.egress.allowlist,
+            vec!["crates.io".to_owned(), "docs.rs".to_owned()]
+        );
+        assert_eq!(config.sandbox.e2b.api_url, "https://api.e2b.example");
+        assert_eq!(config.sandbox.limits.max_concurrent_per_user, 3);
+    }
+
+    #[test]
+    fn sandbox_provider_env_rejects_unknown_values() {
+        let err = sample()
+            .apply_env([(
+                "STARFORGE__SANDBOX__PROVIDER".to_owned(),
+                "firecracker".to_owned(),
+            )])
+            .unwrap_err();
+        assert!(err.to_string().contains("STARFORGE__SANDBOX__PROVIDER"));
     }
 }

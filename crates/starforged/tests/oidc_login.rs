@@ -204,6 +204,7 @@ fn oidc_config_validation() {
         oidc: std::mem::take(&mut oidc),
         log: starforged::config::LogConfig::default(),
         metrics: starforged::config::MetricsConfig::default(),
+        sandbox: starforged_core::sandboxes::SandboxConfig::default(),
     };
     // Disabled OIDC needs nothing.
     assert!(config(OidcConfig::default()).validate().is_ok());

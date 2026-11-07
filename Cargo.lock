@@ -5582,6 +5582,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "starforge-sandbox-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "starforged"
 version = "0.1.0"
 dependencies = [
@@ -5661,6 +5670,7 @@ dependencies = [
  "sqlx",
  "starforge-format",
  "starforge-redact",
+ "starforge-sandbox-protocol",
  "starforged-blob",
  "starforged-db",
  "starforged-git",
@@ -5670,6 +5680,7 @@ dependencies = [
  "thiserror",
  "time",
  "tokio",
+ "toml",
  "tracing",
  "ulid",
  "url",

@@ -381,6 +381,14 @@ pub async fn runner_by_token_hash(db: &Db, token_hash: &str) -> DbResult<Option<
     .await?;
     row.as_ref().map(runner_from_row).transpose()
 }
+/// One runner by id, including revoked ones (callers check `revoked_at`).
+pub async fn runner_by_id(db: &Db, id: i64) -> DbResult<Option<RunnerRow>> {
+    let row = sqlx::query(select_runner!("WHERE id = $1"))
+        .bind(id)
+        .fetch_optional(db.read_pool())
+        .await?;
+    row.as_ref().map(runner_from_row).transpose()
+}
 
 /// Non-revoked runners of the repo in insert order.
 pub async fn runners_for_repo(db: &Db, repo_id: i64) -> DbResult<Vec<RunnerRow>> {

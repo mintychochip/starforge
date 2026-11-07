@@ -76,6 +76,7 @@ impl TestServer {
             },
             log: starforged::config::LogConfig::default(),
             metrics: starforged::config::MetricsConfig::default(),
+            sandbox: starforged_core::sandboxes::SandboxConfig::default(),
         };
         configure(&mut config);
         let ssh_listener = if config.ssh.enabled {

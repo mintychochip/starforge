@@ -34,6 +34,10 @@ use crate::{Core, CoreError, CoreResult, crypto};
 pub const RUNNER_TOKEN_PREFIX: &str = "sfr_";
 /// Bearer prefix of a per-job token (stored only as SHA-256).
 pub const JOB_TOKEN_PREFIX: &str = "sfj_";
+/// Bearer prefix of a registration token (stored only as SHA-256).
+pub const REGISTRATION_TOKEN_PREFIX: &str = "sfrt_";
+/// Lifetime of a registration token: one hour.
+pub const REGISTRATION_TOKEN_TTL_SECS: i64 = 3600;
 
 /// Who a per-job token acts for: one job on one repo at one commit, on behalf
 /// of the user who triggered it. Every CI path takes this, so no request
@@ -62,6 +66,85 @@ pub struct MintedGitCredential {
     pub secret: String,
     /// The `access_tokens` row id (also stored in `ci_jobs.git_token_id`).
     pub token_id: i64,
+}
+/// A registration token minted for one repo ([`Core::create_runner_registration_token`]).
+/// The `sfrt_…` secret is returned once; only its hash is stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MintedRegistrationToken {
+    /// The registration-token secret, shown once.
+    pub secret: String,
+    /// Unix seconds at which the token expires (one hour after minting).
+    pub expires_at: i64,
+}
+
+/// The result of a successful runner registration ([`Core::register_runner`]):
+/// the new runner's id and its `sfr_…` auth token, shown once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegisteredRunner {
+    pub runner_id: i64,
+    /// The runner auth-token secret, shown once; only its hash is stored.
+    pub auth_secret: String,
+}
+
+/// A runner as listed to repository users: never carries token material.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunnerView {
+    pub id: i64,
+    pub repo_id: i64,
+    pub name: String,
+    pub labels: Vec<String>,
+    pub ephemeral: bool,
+    pub version: String,
+    pub last_seen_at: Option<i64>,
+    pub created_at: i64,
+}
+
+impl From<starforged_db::ci::RunnerRow> for RunnerView {
+    fn from(row: starforged_db::ci::RunnerRow) -> Self {
+        RunnerView {
+            id: row.id,
+            repo_id: row.repo_id,
+            name: row.name,
+            labels: serde_json::from_str(&row.labels).unwrap_or_default(),
+            ephemeral: row.ephemeral != 0,
+            version: row.version,
+            last_seen_at: row.last_seen_at,
+            created_at: row.created_at,
+        }
+    }
+}
+
+/// The label rules shared with CI job specs ([`crate::ci_spec`]): 1–64 chars
+/// of `[A-Za-z0-9_-]`, at most 16 per runner, no duplicates.
+fn validate_runner_labels(labels: &[String]) -> CoreResult<()> {
+    if labels.len() > 16 {
+        return Err(CoreError::Invalid(format!(
+            "{} labels, over the 16-label limit",
+            labels.len()
+        )));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for label in labels {
+        if label.is_empty() || label.len() > 64 {
+            return Err(CoreError::Invalid(format!(
+                "runner label `{label}` must be 1-64 characters"
+            )));
+        }
+        if !label
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            return Err(CoreError::Invalid(format!(
+                "runner label `{label}` may only contain [A-Za-z0-9_-]"
+            )));
+        }
+        if !seen.insert(label.as_str()) {
+            return Err(CoreError::Invalid(format!(
+                "duplicate runner label `{label}`"
+            )));
+        }
+    }
+    Ok(())
 }
 
 impl Core {
@@ -280,6 +363,178 @@ impl Core {
         {
             db_tokens::revoke(self.db(), user_id, token_id).await?;
         }
+        Ok(())
+    }
+
+    /// Mints a one-time runner registration token for the repository
+    /// (decision: registration tokens are hashed, one-time, 1 h TTL). The
+    /// caller must hold at least `Admin` on the repo; `labels` scope the
+    /// token (a runner may later claim only a subset of them), and
+    /// `ephemeral` records the intended runner kind at mint time. Only the
+    /// SHA-256 of the `sfrt_…` secret is stored; the secret is returned once.
+    pub async fn create_runner_registration_token(
+        &self,
+        user: &crate::accounts::User,
+        owner: &str,
+        repo: &str,
+        labels: &[String],
+        ephemeral: bool,
+    ) -> CoreResult<MintedRegistrationToken> {
+        let access = self
+            .require_repo(Some(user), owner, repo, Permission::Admin)
+            .await?;
+        validate_runner_labels(labels)?;
+        let now_ts = now();
+        let expires_at = now_ts + REGISTRATION_TOKEN_TTL_SECS;
+        let secret = format!("{}{}", REGISTRATION_TOKEN_PREFIX, crypto::random_hex(32));
+        let labels_json = serde_json::to_string(labels).unwrap_or_else(|_| "[]".into());
+        let row = db_ci::insert_registration_token(
+            self.db(),
+            &db_ci::NewRegistrationToken {
+                repo_id: access.repo.id,
+                token_hash: &crypto::sha256_hex(&secret),
+                labels: &labels_json,
+                created_by: Some(user.id),
+                expires_at,
+                now: now_ts,
+            },
+        )
+        .await?;
+        self.audit(
+            Some(user.id),
+            "ci.runner_registration_token.create",
+            &format!("runner_registration_token:{}", row.id),
+            &format!(
+                "repo={} labels={} ephemeral={}",
+                access.repo.full_name(),
+                labels_json,
+                ephemeral
+            ),
+        )
+        .await?;
+        Ok(MintedRegistrationToken { secret, expires_at })
+    }
+
+    /// Registers a runner against a registration token: the token is
+    /// consumed exactly once (unknown, used, and expired tokens are
+    /// indistinguishable `Unauthenticated`), and a runner is created on
+    /// the token's repository with a fresh `sfr_…` auth token shown once.
+    /// The runner's `labels` must be a subset of the token's labels, so a
+    /// runner can never widen its own scope.
+    pub async fn register_runner(
+        &self,
+        secret: &str,
+        name: &str,
+        labels: &[String],
+        version: &str,
+        ephemeral: bool,
+    ) -> CoreResult<RegisteredRunner> {
+        if !secret.starts_with(REGISTRATION_TOKEN_PREFIX) {
+            return Err(CoreError::Unauthenticated);
+        }
+        if name.trim().is_empty() {
+            return Err(CoreError::Invalid("runner name must not be empty".into()));
+        }
+        validate_runner_labels(labels)?;
+        let now_ts = now();
+        let token =
+            db_ci::consume_registration_token(self.db(), &crypto::sha256_hex(secret), now_ts)
+                .await?
+                .ok_or(CoreError::Unauthenticated)?;
+        let token_labels: Vec<String> = serde_json::from_str(&token.labels).unwrap_or_default();
+        if !labels.iter().all(|label| token_labels.contains(label)) {
+            return Err(CoreError::Invalid(
+                "runner labels exceed the registration token's labels".into(),
+            ));
+        }
+        let label_set: Vec<String> = if labels.is_empty() {
+            token_labels
+        } else {
+            labels.to_vec()
+        };
+        let labels_json = serde_json::to_string(&label_set).unwrap_or_else(|_| "[]".into());
+        let auth_secret = format!("{}{}", RUNNER_TOKEN_PREFIX, crypto::random_hex(32));
+        let hint = &auth_secret[auth_secret.len() - 4..];
+        let runner = db_ci::insert_runner(
+            self.db(),
+            &db_ci::NewRunner {
+                repo_id: token.repo_id,
+                name: name.trim(),
+                token_hash: &crypto::sha256_hex(&auth_secret),
+                token_hint: hint,
+                labels: &labels_json,
+                ephemeral,
+                max_concurrent: 1,
+                version,
+                now: now_ts,
+            },
+        )
+        .await?;
+        self.audit(
+            None,
+            "ci.runner.register",
+            &format!("runner:{}", runner.id),
+            &format!("repo_id={} labels={}", token.repo_id, labels_json),
+        )
+        .await?;
+        Ok(RegisteredRunner {
+            runner_id: runner.id,
+            auth_secret,
+        })
+    }
+
+    /// Lists the repo's live runners (callers need at least `Maintain`).
+    /// Views never carry token hashes or secrets.
+    pub async fn list_runners(
+        &self,
+        viewer: Option<&crate::accounts::User>,
+        owner: &str,
+        repo: &str,
+    ) -> CoreResult<Vec<RunnerView>> {
+        let access = self
+            .require_repo(viewer, owner, repo, Permission::Maintain)
+            .await?;
+        Ok(db_ci::runners_for_repo(self.db(), access.repo.id)
+            .await?
+            .into_iter()
+            .map(RunnerView::from)
+            .collect())
+    }
+
+    /// Revokes a runner: the caller must hold at least `Admin` on the
+    /// runner's repository. A revoked runner stops authenticating
+    /// immediately ([`Core::authenticate_runner`]).
+    pub async fn revoke_runner(
+        &self,
+        user: &crate::accounts::User,
+        runner_id: i64,
+    ) -> CoreResult<()> {
+        let runner = db_ci::runner_by_id(self.db(), runner_id)
+            .await?
+            .ok_or(CoreError::NotFound)?;
+        if runner.revoked_at.is_some() {
+            return Err(CoreError::NotFound);
+        }
+        let repo_row = db_repos::by_id(self.db(), runner.repo_id)
+            .await?
+            .ok_or(CoreError::NotFound)?;
+        self.require_repo(
+            Some(user),
+            &repo_row.owner_handle,
+            &repo_row.name,
+            Permission::Admin,
+        )
+        .await?;
+        if !db_ci::revoke_runner(self.db(), runner_id, now()).await? {
+            return Err(CoreError::NotFound);
+        }
+        self.audit(
+            Some(user.id),
+            "ci.runner.revoke",
+            &format!("runner:{runner_id}"),
+            &format!("repo_id={}", runner.repo_id),
+        )
+        .await?;
         Ok(())
     }
 }

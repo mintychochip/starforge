@@ -274,6 +274,13 @@ const ROUTES: &[(&str, &str)] = &[
         "delete",
         "/api/v1/repos/{owner}/{repo}/tag-protections/{id}",
     ),
+    (
+        "post",
+        "/api/v1/repos/{owner}/{repo}/runners/registration-token",
+    ),
+    ("get", "/api/v1/repos/{owner}/{repo}/runners"),
+    ("post", "/api/v1/runners/register"),
+    ("delete", "/api/v1/runners/{id}"),
 ];
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -459,7 +466,10 @@ fn security_optionality_matches_auth() {
             // no security requirement at all.
             if !optional && !required {
                 assert!(
-                    matches!(name, "device_code" | "token" | "revoke" | "openapi_json"),
+                    matches!(
+                        name,
+                        "device_code" | "token" | "revoke" | "openapi_json" | "register_runner"
+                    ),
                     "{file}::{name} declares no security requirement"
                 );
                 assert!(
