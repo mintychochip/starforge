@@ -4,7 +4,7 @@
 
 **Goal:** Add opt-in self-hosted CI and sandboxed coding-agent execution to Starforge, built on the existing commit statuses, checks/gates, webhooks, job queue, and session capture. This is additive: external CI keeps reporting through the GitHub-compatible status API and webhooks, and no server-side agent or LLM call is introduced.
 
-**Scope:** M6a runner control plane; M6b sandbox provider API; M6c CI triggers, artifacts, secrets; M6d agent-in-sandbox capture and the E2B adapter; M6e hardening, docs, and release.
+**Scope:** M6-0 foundations; M6a runner control plane; M6b sandbox runtime matrix and API; M6c CI triggers, artifacts, secrets, session redaction; M6d agent-in-sandbox capture and the E2B adapter; M6e hardening, docs, and release.
 
 **Depends on:** v0.1.0 at `9106a5b` (statuses `crates/starforged-api/src/statuses.rs`, checks `crates/starforged-core/src/checks.rs`, gates `gates.rs`, webhooks `webhooks.rs`, jobs `jobs.rs`, session ingest `crates/starforged-api/src/sessions.rs`, CLI sync `crates/starforge-cli/src/commands/sync.rs`).
 
@@ -15,7 +15,7 @@
 1. **Additive supersession of D13.** Runners are opt-in per repository. A repository with no runner and no `.starforge/ci.toml` behaves exactly as v0.1.0. External CI keeps using `POST /repos/{owner}/{repo}/statuses/{sha}` and webhooks.
 2. **No workflow engine.** The job spec is a typed `.starforge/ci.toml` read at the commit SHA: a list of jobs, each with an image/template, commands, env, secrets, artifacts, and a timeout. No YAML DAG, matrix, expressions, or cross-job dependencies.
 3. **The server never executes untrusted code.** Runners and sandboxes are external processes. The server owns the control plane (API, DB, queue, gates); a runner owns job execution; a sandbox provider owns isolation.
-4. **Two providers, one sandbox API.** The server exposes an E2B-shaped sandbox API and calls a configured provider: `local` (`starforge-sandboxd`, a separate daemon with container-runtime access) or `e2b` (remote `api.e2b.app`). The runner uses the same server API. The server and sandboxd share a wire-protocol crate (`starforge-sandbox-protocol`, MIT/Apache) so neither depends on `starforged-*`.
+4. **A runtime matrix behind one sandbox API.** The server exposes an E2B-shaped sandbox API with a `runtime` field; the provider selects an adapter. v1 ships `podman` (rootless containers, the stable default) and `e2b` (remote cloud); `gvisor` is an opt-in runtime of the local daemon; `firecracker` and `kata`/Kubernetes are later adapters behind the same `starforge-sandbox-protocol` wire crate (MIT/Apache). Every adapter is Rust: the local daemon is Rust and shells out to `podman`/`runsc`; the E2B adapter is a Rust `reqwest` client. The runner uses the same server API, so a job can run on any runtime.
 5. **Starforge-native runner protocol.** Borrow GitHub/GitLab shapes (one-time registration, outbound long-poll, chunked trace, authorize-then-upload artifacts, per-job token, cancel header) but do not claim GitHub-runner wire compatibility. GitHub Actions users keep the statuses/webhooks path.
 6. **Four token kinds, four auth paths.**
    - Registration token: random, hashed, 1 h TTL, one-time, repo-scoped (`runner_registration_tokens`).
@@ -23,7 +23,7 @@
    - Per-job token: random, hashed (`ci_job_tokens`), bound to `(job, repo, commit)`, TTL = deadline + 10 min, revoked at finish; used by a `JobAuth` extractor. Scopes are fixed (`session:upload`, `repo:read`, `sandbox:run`).
    - Artifact token: one-time HMAC-signed, bound to `(job, name, size, sha256)`, 10 min TTL.
    Upload authorization for a job token uses a new `IngestAuth::CiJob { job_id, repo_id, commit_sha }` path: the job was authorized at creation, sessions it uploads carry `ci_job_id` and `uploader_id = ci_jobs.created_by`; the job token may write only those sessions. The user-facing `authorize_upload` (≥`Write`) is unchanged for PATs.
-7. **Secrets are sealed with a distinct key domain and never logged.** Repo secrets use XChaCha20-Poly1305 via the existing `SealedBox` with HKDF info `ci-secrets-v1` under `secret_key` (not the webhook key). The spec stores secret *names*, never values. Secrets are injected only for runs on protected branches or Trails with maintainer approval; `refs/for` runs get none unless the repo sets `ci.allow_secrets_on_refs_for = true`. Preferred injection is an egress proxy that adds headers on outbound HTTPS (E2B-style); env injection is the fallback, with server-side log scrubbing and ephemeral sandboxes.
+7. **Secrets are sealed with a distinct key domain and never logged.** Repo secrets use XChaCha20-Poly1305 via the existing `SealedBox` with HKDF info `ci-secrets-v1` under `secret_key` (not the webhook key). The spec stores secret *names*, never values. Secrets are injected only for runs on protected branches or Trails with maintainer approval; `refs/for` runs get none unless the repo sets `ci.allow_secrets_on_refs_for = true`. **Egress-proxy header injection is the required path**: the sandbox's outbound HTTPS goes through a proxy that adds the secret header only for allowlisted destinations; secret values never enter the sandbox environment or filesystem. Env injection exists only as an explicit per-repo opt-in (`ci.env_secrets = true`) for providers that cannot proxy, with server-side log scrubbing and an ephemeral sandbox.
 8. **Local isolation v1 = rootless containers, fully hardened.** `starforge-sandboxd` uses rootless podman with no host mounts, dropped capabilities, `no-new-privileges`, read-only root, seccomp, cgroup limits, and default-deny egress. Its control socket is a 0600 token file plus `SO_PEERCRED` peer checks; the token rotates on restart. gVisor and Firecracker are later provider runtimes behind the same wire protocol; no GPU in v1.
 9. **CI results use a dedicated internal status path.** A job writes context `ci/<job-name>` through `Core::submit_ci_status` (creator handle `ci`, no user `Write` check, archived-repo refusal, `check` webhook dispatch). The user-facing `submit_status` is unchanged. Canceled jobs write `error` with description `canceled by <user>` (GitHub-compatible states stay unchanged).
 10. **No new git namespaces.** A runner pushes only `refs/heads/*` or `refs/for/*`. The runner obtains a short-lived git credential from `POST /api/v1/ci/jobs/{id}/git-credential` (runner auth, TTL = job, repo-scoped) or uses an operator-configured deploy key; the agent never receives a long-lived PAT.
@@ -31,6 +31,8 @@
 12. **No HA, no Windows server, no server-side agents/LLM calls.** The single-process deployment model and §11.2 stand.
 13. **`ci_jobs` is a separate table, not the internal `jobs` queue.** The internal queue's `claim_next` is for in-process workers and has no runner identity or fencing; `ci_jobs` reuses the lease/attempt *pattern* with configurable constants (`ci.lease_secs = 60`, `ci.max_attempts = 3`) and a per-claim `lease_token` fence. Every trace/result/artifact call must present the fence; a stale fence is `409`.
 14. **The `ci` webhook event is added** (run queued/started/finished/canceled). This requires extending `EVENT_TYPES`, `normalize_events`, `check_events`, the hook-create docs/tests, OpenAPI, and spec §10.4. The existing `check` event still covers status transitions.
+15. **Session text stays server-rendered and server-redacted.** Session pages, segments, search hits, and API responses are rendered/redacted on the server (no client-side transcript assembly). CI secret values are registered for dynamic redaction for the job's sessions: the server stores only a sealed value plus a fingerprint, applies exact-value redaction at ingest and again at render, and never writes the value into session text, logs, or the search index. Session routes send `Cache-Control: no-store, private`, `Pragma: no-cache`, and `Vary: Cookie, Authorization`; the session-viewer JS fetches with `cache: "no-store"`; no session content is cached by shared proxies or the browser.
+16. **CI provider adapters are a later layer.** The native runner is the first adapter. External providers (GitHub Actions, GitLab, Buildkite, …) keep the statuses/webhooks compatibility path now; a `CiProvider` adapter trait (Rust) will map their job/run models onto `ci_jobs` without changing the runner protocol or the sandbox API. The plan reserves the seam but implements only the native adapter.
 
 ## Architecture
 
@@ -83,7 +85,7 @@ Also: `ALTER TABLE sessions ADD COLUMN ci_job_id INTEGER REFERENCES ci_jobs(id) 
 
 | Table | Columns |
 |---|---|
-| `sandboxes` | `id, provider, external_id, job_id?, owner_id, repo_id, state (creating/running/paused/killed/error), template, cpu, mem_mb, disk_gb, idempotency_key, metadata TEXT(JSON), created_at, expires_at, last_seen_at` |
+| `sandboxes` | `id, provider, runtime (podman/gvisor/e2b/firecracker/kata), external_id, job_id?, owner_id, repo_id, state (creating/running/paused/killed/error), template, cpu, mem_mb, disk_gb, idempotency_key, metadata TEXT(JSON), created_at, expires_at, last_seen_at` |
 | `sandbox_usage` | `id, owner_id, repo_id, window_start, seconds, created_at` |
 
 Unique `(owner_id, idempotency_key)`; index `sandboxes(state, expires_at)`, `sandboxes(job_id)`.
@@ -92,7 +94,8 @@ Unique `(owner_id, idempotency_key)`; index `sandboxes(state, expires_at)`, `san
 
 | Table | Columns |
 |---|---|
-| `ci_secrets` | `id, repo_id, name, sealed_value, created_by, created_at, updated_at`, unique `(repo_id, name)` |
+| `ci_secrets` | `id, repo_id, name, sealed_value, redact_in_sessions, created_by, created_at, updated_at`, unique `(repo_id, name)` |
+| `ci_job_secrets` | `job_id, secret_id, fingerprint, created_at` (which secrets a job resolved, for dynamic session redaction) |
 
 ### 0039_ci_usage.sql
 
@@ -129,7 +132,8 @@ All routes are under `/api/v1`, use the `{error:{code,message,details}}` envelop
 
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
-| POST | `/sandboxes` | PAT `sandbox:run` + `repo_for` (user permission), or `JobAuth` | Create `{template, timeout_s, cpu, mem_mb, disk_gb, envs?, network{allow_out,deny_out,secret_headers}, metadata{job_id,trail_id}, idempotency_key}` |
+| POST | `/sandboxes` | PAT `sandbox:run` + `repo_for` (user permission), or `JobAuth` | Create `{runtime, template, timeout_s, cpu, mem_mb, disk_gb, envs?, network{allow_out,deny_out,secret_headers}, metadata{job_id,trail_id}, idempotency_key}` |
+| GET | `/sandboxes/runtimes` | PAT `sandbox:run` | List the configured runtimes and their availability |
 | GET | `/sandboxes/{id}` | owner/admin or the job's runner | State, expiry, provider |
 | DELETE | `/sandboxes/{id}` | owner/admin or the job's runner | Kill |
 | POST | `/sandboxes/{id}/pause` / `resume` / `timeout` | owner/admin or the job's runner | Lifecycle |
@@ -171,7 +175,9 @@ Validation: image/template allowlist from config; commands non-empty; timeout �
 | Untrusted repo code escapes | Sandbox only; rootless containers, no host mounts, dropped caps, no-new-privileges, read-only root, seccomp; gVisor/Firecracker behind the provider protocol |
 | Rogue runner / stolen runner token | One-time 1 h registration token, hashed auth token, per-runner revocation, labels/groups scoping, audit; per-claim `lease_token` fence on every trace/result/artifact call |
 | Stolen per-job token | Bound to `(job, repo, commit)`, short TTL, revoked at finish; `IngestAuth::CiJob` writes only sessions with that `ci_job_id`; no user `Write` bypass |
-| Secret exfiltration by a committer | Secrets only on protected branches / approved Trails by default; per-repo allowlist; egress-proxy header injection; env fallback with scrub; ephemeral sandbox; never in audit/logs; spec stores names only |
+| Secret exfiltration by a committer | Secrets only on protected branches / approved Trails by default; per-repo allowlist; egress-proxy header injection required; env only with explicit opt-in; ephemeral sandbox; never in audit/logs; spec stores names only |
+| Secret in session text | Dynamic exact-value redaction at ingest and render; sealed value + fingerprint; never in the search index; tests with a secret in a transcript |
+| Session content cached client-side | Server-rendered text only; `Cache-Control: no-store, private`, `Pragma: no-cache`, `Vary: Cookie, Authorization` on session pages/segments/search/API; the viewer JS fetches `cache: "no-store"` |
 | Log injection / split secrets | `Content-Range` validation, 100 MiB cap, ANSI/control stripping, per-chunk idempotency, scrub with an overlap window across chunks, server-side full-log recheck on finish |
 | Artifact traversal / swap | Name charset/length rules, relative paths only, size cap, authorize token bound to `(job, name, size, sha256)`, one-time, blob store (no filesystem paths), auth on download, expiry |
 | Sandbox file traversal | Relative paths only, no `..`/absolute/symlink following, size caps |
@@ -207,16 +213,18 @@ Audit: runner register/revoke, job cancel, secret create/rotate, sandbox create/
 ### M6b — Sandbox provider API
 
 - [ ] **B1: protocol crate + provider trait + config.** `crates/starforge-sandbox-protocol` (MIT/Apache) wire types; `[sandbox]` config (`provider`, `local.socket`, `local.token_file`, `e2b.api_url`, `e2b.api_key`, limits, default TTL), `#[serde(default)]`, env overrides, docs rows. Server-side provider trait in `starforged-core/src/sandboxes.rs`.
-- [ ] **B2: local provider daemon.** New `crates/starforge-sandboxd` (MIT/Apache): Unix-socket HTTP, 0600 token file + `SO_PEERCRED`, rootless podman, image allowlist, no host mounts, dropped caps, no-new-privileges, read-only root, seccomp, cgroup limits, default-deny network, exec/files/kill, TTL. Tests: fake runtime unit tests; a real podman smoke test gated by `STARFORGE_TEST_SANDBOX=1`.
+- [ ] **B2: local provider daemon.** New `crates/starforge-sandboxd` (MIT/Apache): Unix-socket HTTP, 0600 token file + `SO_PEERCRED`, rootless podman (default) with gVisor (`runsc`) as an opt-in runtime, image allowlist, no host mounts, dropped caps, no-new-privileges, read-only root, seccomp, cgroup limits, default-deny network, exec/files/kill, TTL. Tests: fake runtime unit tests; a real podman smoke test gated by `STARFORGE_TEST_SANDBOX=1`.
 - [ ] **B3: E2B adapter.** `reqwest` client for create/get/kill/exec/files/ports; sealed API key; idempotency; error mapping. Tests: a local fake E2B server (axum) covering create/exec/kill and error paths.
 - [ ] **B4: sandbox API.** Routes, `sandbox:run` scope + `repo_for`, owner/admin/job-runner checks, idempotency key, path validation, network policy enforcement, quotas (concurrent, minutes/hour), audit. Tests: auth matrix, quota 429, lifecycle, exec stream cap, file caps, traversal.
 - [ ] **B5: sandbox GC + admin UI.** Expired-sandbox GC (moved here from M6a), `/admin/sandboxes` list/kill, run detail link; docs. Tests: page 200/403/404, GC.
+- [ ] **B6: runtime matrix + later adapters.** `GET /sandboxes/runtimes`; a runtime capability table (podman, gvisor, e2b, firecracker, kata) with availability/limits; Firecracker and Kata/Kubernetes adapters are stubs behind the protocol until their phase. Tests: runtime selection, unavailable runtime 422, capability reporting.
 
 ### M6c — CI triggers, artifacts, secrets
 
 - [ ] **C1: triggers.** Post-receive push (branch globs), Trail change opened/updated (revision), manual API; `ci_jobs.created_by` is the trigger actor (pusher / Trail author) or the repo owner for manual runs; dedupe per `(repo, commit, job)`; supersede on a new revision when `ci.cancel_superseded = true` (default false for pushes, true for Trail revisions). Tests: trigger matrix, dedupe, supersede, attribution.
 - [ ] **C2: artifacts.** Authorize/upload/download, CAS blob store reuse with refcounts, BLAKE3 identity (+ optional client SHA-256), size cap, expiry 30 d, GC. Tests: traversal names, oversize, auth, expiry, blob GC.
-- [ ] **C3: secrets.** Sealed repo secrets CRUD (≥Admin) with HKDF `ci-secrets-v1`; trust rule (protected branches / approved Trails; `refs/for` only with `ci.allow_secrets_on_refs_for`); per-job resolution for the runner; egress-proxy header injection (local provider) or env fallback; log scrubbing. Tests: seal/open, no plaintext in DB/logs/spec, cross-repo denial, refs/for denial.
+- [ ] **C3: secrets.** Sealed repo secrets CRUD (≥Admin) with HKDF `ci-secrets-v1`; trust rule (protected branches / approved Trails; `refs/for` only with `ci.allow_secrets_on_refs_for`); per-job resolution for the runner; **egress-proxy header injection required** (secret values never enter the sandbox env/filesystem), with `ci.env_secrets = true` as an explicit per-repo opt-in for providers without a proxy; log scrubbing. Register each resolved secret in `ci_job_secrets` for dynamic session redaction. Tests: seal/open, no plaintext in DB/logs/spec/env, cross-repo denial, refs/for denial, proxy header only on allowlisted destinations.
+- [ ] **C6: session redaction + no-store caching.** Dynamic exact-value redaction of CI secrets at ingest and render (sealed value + fingerprint, never in the search index); audit the session pages/segments/search/API for `Cache-Control: no-store, private`, `Pragma: no-cache`, `Vary: Cookie, Authorization`; the session-viewer JS fetches with `cache: "no-store"`; tests: secret in a transcript is redacted on page/segment/search, headers present, no client-side transcript assembly.
 - [ ] **C4: checks/gates/webhooks/UI.** `ci/<job>` statuses via `submit_ci_status`, `ci` webhook event, run pages, gate panel link. Tests: gate integration, webhook payload/signature, page states.
 - [ ] **C5: CI integration tests.** Trigger → job → fake runner → status → gate; artifact and secret paths; SQLite + Postgres.
 
@@ -244,17 +252,17 @@ Audit: runner register/revoke, job cancel, secret create/rotate, sandbox create/
 2. A sandbox is created via the API, execs a command, reads/writes a file, and is killed; quotas return 429; the local provider refuses host mounts, privileged requests, and egress widening.
 3. A coding agent runs in a sandbox, captures a session, uploads it with the per-job token, and the commit/Trail/run page shows the session; no long-lived PAT is present in the sandbox.
 4. The E2B adapter passes the fake-server end-to-end test; the local provider passes the podman smoke test when enabled.
-5. Security tests cover runner token replay, stale-fence results, cross-repo claims, log injection, split-secret scrubbing, artifact traversal/swap, secret leakage, and quota exhaustion.
-6. SQLite and Postgres suites pass; OpenAPI lists every route and auth scheme; docs and CHANGELOG updated; the spec amendment is committed.
+5. Security tests cover runner token replay, stale-fence results, cross-repo claims, log injection, split-secret scrubbing, artifact traversal/swap, secret leakage, quota exhaustion, and a CI secret appearing in session text (redacted on page, segment, and search).
+6. Session pages/segments/search/API send `Cache-Control: no-store, private` and the viewer JS fetches with `cache: "no-store"`; no transcript is assembled client-side.
+7. SQLite and Postgres suites pass; OpenAPI lists every route and auth scheme; docs and CHANGELOG updated; the spec amendment is committed.
 
 ## Open questions (resolve before implementation)
 
 - Runner distribution: `starforge runner` subcommand vs a standalone `starforge-runner` binary; recommended both (library + subcommand, standalone binary from the same crate).
-- Sandbox local runtime: rootless podman v1; gVisor/Firecracker after the API stabilizes.
-- Secret injection: egress proxy preferred; env fallback. Confirm the local provider can run a proxy sidecar or use the runner as the proxy.
+- E2B SDK wire compatibility: verify before promising it; otherwise document the mapping. The API is E2B-shaped, not a compatibility claim.
 - Artifact storage: CAS blob store with refcounts and a 30 d expiry; confirm quota accounting.
 - Whether a CI job may push a branch: recommended runner-pushed only; an agent-requested short-lived git credential is a later extension.
-- E2B SDK wire compatibility: verify before promising it; otherwise document the mapping.
+- Firecracker/Kata adapter timing: after the podman/gVisor/E2B matrix stabilizes; they are stubs in M6b.
 
 ## Testing strategy
 
