@@ -3,6 +3,7 @@
 mod admin;
 pub mod auth;
 mod changes;
+pub mod ci_auth;
 pub mod error;
 mod gate_rules;
 mod github_import;

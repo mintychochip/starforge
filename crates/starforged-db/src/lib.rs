@@ -17,6 +17,7 @@ pub mod audit;
 pub mod auth_factors;
 pub mod changes;
 pub mod checks;
+pub mod ci;
 pub mod collaborators;
 pub mod doctor;
 pub mod email_tokens;

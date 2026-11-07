@@ -506,7 +506,7 @@ A plain ES-module script enhances server-rendered HTML; without JavaScript the p
 
 - REST JSON under `/api/v1`; OpenAPI 3.1 generated from code and served at `/api/v1/openapi.json`; cursor pagination; one error envelope `{error: {code, message, details}}`; bearer authentication with personal access tokens or OAuth tokens.
 - **Commit statuses:** `POST /api/v1/repos/{owner}/{repo}/statuses/{sha}` and `GET …/commits/{ref}/status`, with request and response shapes compatible with GitHub's commit status API, so existing CI systems can report results.
-- **Webhooks:** events `push`, `trail` (opened, updated, ready, merged, closed), `review`, `check`, `session` (uploaded, quarantined, published). Payloads are signed with HMAC-SHA256 (`X-Starforge-Signature-256`). Deliveries are logged with request, response, and duration, and can be redelivered.
+- **Webhooks:** events `push`, `trail` (opened, updated, ready, merged, closed), `review`, `check`, `session` (uploaded, quarantined, published), and `ci` (queued, started, finished, canceled). Payloads are signed with HMAC-SHA256 (`X-Starforge-Signature-256`). Deliveries are logged with request, response, and duration, and can be redelivered.
 
 ### 10.5 Search
 

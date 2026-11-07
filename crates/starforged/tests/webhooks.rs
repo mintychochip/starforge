@@ -1,5 +1,5 @@
 //! Webhooks: CRUD permissions, secret-once, the spec §10.4 event model
-//! (five event types, one envelope, `X-Starforge-Signature-256`), signed
+//! (six event types, one envelope, `X-Starforge-Signature-256`), signed
 //! delivery, the retry ladder, disable, dead-endpoint safety, and a
 //! push→review→merge end-to-end.
 mod common;
@@ -391,13 +391,14 @@ async fn hook_create_rejects_legacy_event_names() {
         assert_eq!(res.status(), 422, "legacy event {legacy} rejected");
     }
 
-    // The five spec types are accepted.
+    // The six spec types are accepted.
     for events in [
         vec!["push"],
         vec!["trail"],
         vec!["review"],
         vec!["check"],
         vec!["session"],
+        vec!["ci"],
         vec!["trail", "check"],
     ] {
         let res = client
@@ -465,6 +466,45 @@ async fn event_filter_and_signed_delivery() {
     assert_eq!(deliveries.len(), 1);
     assert_eq!(deliveries[0].event, "check");
     assert_eq!(deliveries[0].status_code, Some(200));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ci_event_dispatch_enqueues_delivery() {
+    let c = Ctx::start().await;
+    let (sink_url, sink) = Sink::spawn(false).await;
+    let created = c.create_hook(&c.alice_rw, &sink_url, &["ci"]).await;
+    let secret = created["secret"].as_str().unwrap().to_owned();
+    let repo_id =
+        c.s.core
+            .repo_for(Some(&c.alice), "alice", "proj")
+            .await
+            .unwrap()
+            .repo
+            .id;
+
+    c.s.core
+        .dispatch_event(
+            repo_id,
+            starforged_core::webhooks::HookEvent {
+                event: "ci",
+                action: Some("queued"),
+                cause: None,
+                sender: Some("alice".to_owned()),
+                subject: json!({"job_id": 1, "state": "queued"}),
+            },
+        )
+        .await;
+    c.s.core.run_due_jobs().await.unwrap();
+
+    let hits = sink.hits.lock().unwrap().clone();
+    assert_eq!(hits.len(), 1, "the ci hook delivers");
+    let hit = &hits[0];
+    assert_eq!(hit.event.as_deref(), Some("ci"));
+    let body = check_delivery(hit, &secret);
+    let repo_url = format!("{}/alice/proj", c.s.base);
+    let subject = check_envelope(&body, "ci", Some("queued"), None, "alice", &repo_url);
+    assert_eq!(subject["job_id"], 1);
+    assert_eq!(subject["state"], "queued");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

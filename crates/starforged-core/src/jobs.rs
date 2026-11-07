@@ -918,19 +918,18 @@ mod tests {
             .fetch_all(core.db().pool())
             .await
             .unwrap();
-        let session_id =
-            starforged_db::sessions::session_by_ulid(core.db(), auth.access.repo.id, ulid)
-                .await
-                .unwrap()
-                .unwrap()
-                .id;
+        let session_id = starforged_db::sessions::session_by_ulid(core.db(), auth.repo_id(), ulid)
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&payloads[0]).unwrap(),
             serde_json::json!({"kind": "index_session_events", "session_id": session_id})
         );
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&payloads[1]).unwrap(),
-            serde_json::json!({"kind": "resolve_commit_links", "repo_id": auth.access.repo.id, "session_ulid": ulid})
+            serde_json::json!({"kind": "resolve_commit_links", "repo_id": auth.repo_id(), "session_ulid": ulid})
         );
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&payloads[2]).unwrap(),
@@ -939,7 +938,7 @@ mod tests {
         // `run_due_jobs` recomputes the session counts from the segment events;
         // the three stub arms succeed and every job lands `done`.
         core.run_due_jobs().await.unwrap();
-        let row = starforged_db::sessions::session_by_ulid(core.db(), auth.access.repo.id, ulid)
+        let row = starforged_db::sessions::session_by_ulid(core.db(), auth.repo_id(), ulid)
             .await
             .unwrap()
             .unwrap();
@@ -987,9 +986,8 @@ mod tests {
             hashes.push(hash);
         }
         // Purging session A drops its blob to zero references; the file lingers for the sweep.
-        core.purge_session(&alice, &auth.access, ulid_a)
-            .await
-            .unwrap();
+        let access = auth.pat_access().expect("PAT ingest auth carries access");
+        core.purge_session(&alice, access, ulid_a).await.unwrap();
         for hash in &hashes {
             assert!(
                 starforged_blob::blob_file_path(&core.config().blob_dir, hash).exists(),
@@ -1035,9 +1033,8 @@ mod tests {
         }
         // Purging leaves a zero-ref row behind; a concurrent upload references the
         // bytes again before the sweep claims the row.
-        core.purge_session(&alice, &auth.access, ulid)
-            .await
-            .unwrap();
+        let access = auth.pat_access().expect("PAT ingest auth carries access");
+        core.purge_session(&alice, access, ulid).await.unwrap();
         starforged_db::sessions::blob_incref(
             core.db(),
             &hash,

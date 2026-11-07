@@ -133,7 +133,7 @@ pub async fn list_hooks(
 
 /// `POST /repos/{owner}/{repo}/hooks` (201): creates a hook and returns it
 /// with the plaintext `secret` — the only response that ever carries one.
-/// `events` must be a subset of `push, trail, review, check, session`
+/// `events` must be a subset of `push, trail, review, check, session, ci`
 /// (empty means all); anything else is `422`.
 #[utoipa::path(
     post,

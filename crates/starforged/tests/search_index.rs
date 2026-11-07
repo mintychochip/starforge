@@ -148,9 +148,8 @@ async fn seed(config_path: &Path) -> Core {
         .await
         .unwrap();
     core.complete_session(&auth, ULID).await.unwrap();
-    core.publish_session(&alice, &auth.access, ULID)
-        .await
-        .unwrap();
+    let access = auth.pat_access().expect("PAT ingest auth carries access");
+    core.publish_session(&alice, access, ULID).await.unwrap();
     core
 }
 

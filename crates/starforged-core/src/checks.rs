@@ -66,7 +66,7 @@ pub(crate) fn validate_context(context: &str) -> CoreResult<()> {
     Ok(())
 }
 
-fn validate_status(
+pub(crate) fn validate_status(
     sha: &str,
     state: &str,
     context: &str,
@@ -101,7 +101,7 @@ fn validate_status(
     Ok(())
 }
 
-async fn status_dto(core: &Core, row: db_checks::CheckRow) -> CoreResult<StatusDto> {
+pub(crate) async fn status_dto(core: &Core, row: db_checks::CheckRow) -> CoreResult<StatusDto> {
     let creator_handle = match row.creator_id {
         None => None,
         Some(id) => core.user_by_id(id).await?.map(|user| user.handle.clone()),

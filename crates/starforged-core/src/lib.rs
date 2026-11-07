@@ -8,6 +8,7 @@ pub mod audit;
 pub mod blame;
 pub mod changes;
 pub mod checks;
+pub mod ci;
 pub mod content;
 pub mod crypto;
 pub mod email_tokens;

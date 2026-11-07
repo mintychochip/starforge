@@ -1,8 +1,10 @@
 //! Session upload routes (spec §6.3): the four ingest endpoints the CLI drives.
 //!
-//! Handlers check the `session:upload` scope, authorize `write` on the
-//! repository through [`Core::authorize_upload`], and delegate to `Core`. D4
-//! validates hashes/sizes/sequence numbers; D5 re-scans for quarantine.
+//! Handlers authenticate through [`SessionAuth`] (PAT or CI job token): a
+//! PAT still needs the `session:upload` scope plus `write` via
+//! [`Core::authorize_upload`], while a CI job upload is capped to the job's
+//! own repo by [`Core::authorize_job_upload`]. D4 validates hashes/sizes/
+//! sequence numbers; D5 re-scans for quarantine.
 
 use axum::Json;
 use axum::body::Bytes;
@@ -11,16 +13,42 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use starforged_core::ingest::SegmentPut;
+use starforged_core::ingest::{IngestAuth, SegmentPut};
 use starforged_core::permission::Permission;
 use starforged_core::read::SessionPageItem;
 use starforged_core::rescan::QuarantineOutcome;
-use starforged_core::tokens::Scope;
+use starforged_core::tokens::{Scope, grants};
 
 use crate::ApiState;
 use crate::auth::ApiAuth;
+use crate::ci_auth::SessionAuth;
 use crate::error::ApiError;
 
+/// Resolves one upload's auth for the URL repository: a PAT needs
+/// `session:upload` plus `write` (as before); a CI job principal must be
+/// capped to this repo (no scope check — the job token's scope is fixed).
+async fn authorize_ingest(
+    state: &ApiState,
+    auth: SessionAuth,
+    owner: &str,
+    repo: &str,
+) -> Result<IngestAuth, ApiError> {
+    match auth {
+        SessionAuth::Pat(token) => {
+            if !grants(&token.scopes, Scope::SessionUpload) {
+                return Err(ApiError::Forbidden(format!(
+                    "this token lacks the {} scope",
+                    Scope::SessionUpload.as_str()
+                )));
+            }
+            Ok(state.core.authorize_upload(&token, owner, repo).await?)
+        }
+        SessionAuth::Job(principal) => Ok(state
+            .core
+            .authorize_job_upload(&principal, owner, repo)
+            .await?),
+    }
+}
 fn session_json(id: i64, ulid: &str, lifecycle: &str, quarantine: &str) -> Value {
     json!({ "id": id, "ulid": ulid, "lifecycle": lifecycle, "quarantine": quarantine })
 }
@@ -63,12 +91,11 @@ pub struct SessionListQuery {
 
 pub async fn put_meta(
     State(state): State<ApiState>,
-    auth: ApiAuth,
+    auth: SessionAuth,
     Path((owner, repo, ulid)): Path<(String, String, String)>,
     body: Bytes,
 ) -> Result<impl IntoResponse, ApiError> {
-    let token = auth.require(Scope::SessionUpload)?;
-    let ingest = state.core.authorize_upload(token, &owner, &repo).await?;
+    let ingest = authorize_ingest(&state, auth, &owner, &repo).await?;
     let meta: Value =
         serde_json::from_slice(&body).map_err(|_| ApiError::Invalid("body must be JSON".into()))?;
     if !meta.is_object() {
@@ -129,13 +156,12 @@ pub async fn put_meta(
 
 pub async fn put_segment(
     State(state): State<ApiState>,
-    auth: ApiAuth,
+    auth: SessionAuth,
     Path((owner, repo, ulid, n)): Path<(String, String, String, i64)>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    let token = auth.require(Scope::SessionUpload)?;
-    let ingest = state.core.authorize_upload(token, &owner, &repo).await?;
+    let ingest = authorize_ingest(&state, auth, &owner, &repo).await?;
     let cap = state.core.config().max_segment_bytes;
     if body.len() as u64 > cap {
         return Err(ApiError::PayloadTooLarge(format!(
@@ -204,12 +230,11 @@ pub async fn put_segment(
 
 pub async fn post_complete(
     State(state): State<ApiState>,
-    auth: ApiAuth,
+    auth: SessionAuth,
     Path((owner, repo, ulid)): Path<(String, String, String)>,
     body: Bytes,
 ) -> Result<impl IntoResponse, ApiError> {
-    let token = auth.require(Scope::SessionUpload)?;
-    let ingest = state.core.authorize_upload(token, &owner, &repo).await?;
+    let ingest = authorize_ingest(&state, auth, &owner, &repo).await?;
     let value: Value =
         serde_json::from_slice(&body).map_err(|_| ApiError::Invalid("body must be JSON".into()))?;
     if value.as_object().is_none_or(|o| !o.is_empty()) {
@@ -250,12 +275,11 @@ pub async fn post_complete(
 
 pub async fn post_links(
     State(state): State<ApiState>,
-    auth: ApiAuth,
+    auth: SessionAuth,
     Path((owner, repo, ulid)): Path<(String, String, String)>,
     body: Bytes,
 ) -> Result<impl IntoResponse, ApiError> {
-    let token = auth.require(Scope::SessionUpload)?;
-    let ingest = state.core.authorize_upload(token, &owner, &repo).await?;
+    let ingest = authorize_ingest(&state, auth, &owner, &repo).await?;
     let value: Value =
         serde_json::from_slice(&body).map_err(|_| ApiError::Invalid("body must be JSON".into()))?;
     let links = value

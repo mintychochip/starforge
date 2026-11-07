@@ -64,6 +64,15 @@ pub async fn rate_limit(State(state): State<ApiState>, request: Request, next: N
     let Some(token) = bearer_token(request.headers()).map(str::to_owned) else {
         return next.run(request).await;
     };
+    // CI job/runner tokens never spend the PAT hourly budget (M6-0 F2):
+    // they pass through untouched and their own extractors authenticate
+    // them. `authenticate_token` would reject the prefix anyway, but the
+    // explicit skip makes the budget separation independent of that.
+    if token.starts_with(starforged_core::ci::JOB_TOKEN_PREFIX)
+        || token.starts_with(starforged_core::ci::RUNNER_TOKEN_PREFIX)
+    {
+        return next.run(request).await;
+    }
     let Ok(auth) = state.core.authenticate_token(&token).await else {
         return next.run(request).await;
     };

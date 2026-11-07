@@ -8,10 +8,12 @@
 use std::collections::HashSet;
 
 use starforge_format::{FormatError, SessionMeta, blake3_hex, decompress_bounded, parse_event};
+use starforged_db::ci as db_ci;
 use starforged_db::sessions::{self as db_sessions, NewSession, SessionRow};
 use ulid::Ulid;
 
 use crate::accounts::User;
+use crate::ci::JobPrincipal;
 use crate::jobs::Job;
 use crate::permission::{Permission, Visibility};
 use crate::quota;
@@ -19,11 +21,44 @@ use crate::repos::RepoAccess;
 use crate::tokens::TokenAuth;
 use crate::{Core, CoreConfig, CoreError, CoreResult};
 
-/// Proof that an authenticated caller may upload sessions to a repository.
+/// Proof that an authenticated caller may upload sessions to a repository:
+/// a PAT caller ([`IngestAuth::Pat`], gated on `session:upload` + `write`
+/// as before) or a CI job execution ([`IngestAuth::CiJob`], capped to the
+/// job's repo/commit — M6-0 F3, decision 6). A job token may write only
+/// sessions whose `ci_job_id` is the principal's job.
 #[derive(Debug, Clone)]
-pub struct IngestAuth {
-    pub user: User,
-    pub access: RepoAccess,
+#[allow(clippy::large_enum_variant)] // short-lived per-request value; boxing would churn every call site
+pub enum IngestAuth {
+    Pat { user: User, access: RepoAccess },
+    CiJob(JobPrincipal),
+}
+
+impl IngestAuth {
+    /// The repository every upload below writes to.
+    pub fn repo_id(&self) -> i64 {
+        match self {
+            IngestAuth::Pat { access, .. } => access.repo.id,
+            IngestAuth::CiJob(principal) => principal.repo_id,
+        }
+    }
+
+    /// Whose quota and quarantine attribution the upload counts against:
+    /// the PAT user, or the job's triggering user.
+    pub fn uploader_id(&self) -> i64 {
+        match self {
+            IngestAuth::Pat { user, .. } => user.id,
+            IngestAuth::CiJob(principal) => principal.user_id,
+        }
+    }
+
+    /// The repository access a PAT carries (`None` for a job principal,
+    /// which is capped to its own repo by construction).
+    pub fn pat_access(&self) -> Option<&RepoAccess> {
+        match self {
+            IngestAuth::Pat { access, .. } => Some(access),
+            IngestAuth::CiJob(_) => None,
+        }
+    }
 }
 
 /// Outcome of a segment `PUT`: the stored row, or the stored hash when the
@@ -47,18 +82,40 @@ pub struct StoredBlob {
 }
 
 impl Core {
+    /// The job bound to a session row (`sessions.ci_job_id`), `None` for
+    /// PAT-uploaded sessions.
+    async fn session_ci_job_id(&self, session_id: i64) -> CoreResult<Option<i64>> {
+        Ok(db_ci::session_ci_job_id(self.db(), session_id).await?)
+    }
+
     /// Session-write guard: the uploader or a repo admin may mutate the
-    /// session (metadata, segments, lifecycle, links). Any other writer who
-    /// knows the ULID gets `Forbidden` — without this, a stranger could
-    /// append segments to someone else's session, complete it, file commit
-    /// links, or squat segment numbers so the uploader's bytes 409 forever.
-    /// Takes `&IngestAuth` (not `&TokenAuth`) because the caller's effective
-    /// repo permission is already resolved on `access` by `authorize_upload`.
-    fn authorize_session_write(session: &SessionRow, auth: &IngestAuth) -> CoreResult<()> {
-        if session.uploader_id == auth.user.id || auth.access.permission >= Permission::Admin {
-            return Ok(());
+    /// session (metadata, segments, lifecycle, links). A CI job execution
+    /// may mutate only sessions bound to its own job (`sessions.ci_job_id`).
+    /// Any other writer who knows the ULID gets `Forbidden` — without this,
+    /// a stranger could append segments to someone else's session, complete
+    /// it, file commit links, or squat segment numbers so the uploader's
+    /// bytes 409 forever. Takes `&IngestAuth` (not `&TokenAuth`) because
+    /// the caller's effective repo permission is already resolved on
+    /// `access` by `authorize_upload`.
+    async fn authorize_session_write(
+        &self,
+        session: &SessionRow,
+        auth: &IngestAuth,
+    ) -> CoreResult<()> {
+        match auth {
+            IngestAuth::Pat { user, access } => {
+                if session.uploader_id == user.id || access.permission >= Permission::Admin {
+                    return Ok(());
+                }
+                Err(CoreError::Forbidden)
+            }
+            IngestAuth::CiJob(principal) => {
+                if self.session_ci_job_id(session.id).await? == Some(principal.job_id) {
+                    return Ok(());
+                }
+                Err(CoreError::Forbidden)
+            }
         }
-        Err(CoreError::Forbidden)
     }
 
     /// Authorizes a session upload: the caller must have effective `write` or
@@ -78,10 +135,33 @@ impl Core {
         let access = self
             .require_repo(Some(&auth.user), owner, name, Permission::Write)
             .await?;
-        Ok(IngestAuth {
+        Ok(IngestAuth::Pat {
             user: auth.user.clone(),
             access,
         })
+    }
+
+    /// Authorizes a session upload for a CI job execution (M6-0 F3): the
+    /// URL repository must be exactly the principal's repo (`Forbidden`
+    /// when the triggering user can read it but the ids differ, `NotFound`
+    /// when it is invisible to them) and the triggering user must still be
+    /// active. No `Write` requirement: the job was authorized at creation.
+    pub async fn authorize_job_upload(
+        &self,
+        principal: &JobPrincipal,
+        owner: &str,
+        name: &str,
+    ) -> CoreResult<IngestAuth> {
+        let user = self
+            .user_by_id(principal.user_id)
+            .await?
+            .filter(|user| user.active)
+            .ok_or(CoreError::Unauthenticated)?;
+        let access = self.repo_for(Some(&user), owner, name).await?;
+        if access.repo.id != principal.repo_id {
+            return Err(CoreError::Forbidden);
+        }
+        Ok(IngestAuth::CiJob(principal.clone()))
     }
 
     /// Creates the session row for `ulid`, or refreshes its metadata when the
@@ -117,7 +197,8 @@ impl Core {
                 "session id in body must match the URL".into(),
             ));
         }
-        let repo_id = auth.access.repo.id;
+        let repo_id = auth.repo_id();
+        let uploader_id = auth.uploader_id();
         // Scan the viewer-rendered metadata strings with the same compiled
         // rule set as the segment path; the redacted values are what get
         // stored below, never the raw secrets.
@@ -141,7 +222,7 @@ impl Core {
         let ended_at = meta_ts_unix_opt(meta, &["ended_at"])?;
         let new = session_from_meta(
             repo_id,
-            auth.user.id,
+            uploader_id,
             ulid,
             meta,
             "receiving",
@@ -166,6 +247,11 @@ impl Core {
                 // Trailers may have arrived before the upload (push first, sync later):
                 // point those rows at the session now that it exists.
                 db_sessions::backfill_trailer_session_id(self.db(), repo_id, ulid, id).await?;
+                // A job upload binds the session to the job (the write cap);
+                // `uploader_id` already carries the triggering user.
+                if let IngestAuth::CiJob(principal) = auth {
+                    db_ci::set_session_ci_job(self.db(), id, principal.job_id).await?;
+                }
                 let mut row = db_sessions::session_by_ulid(self.db(), repo_id, ulid)
                     .await?
                     .ok_or_else(|| CoreError::Internal("session vanished after insert".into()))?;
@@ -173,7 +259,7 @@ impl Core {
                 // A metadata hit quarantines here (same audit string as the
                 // segment path); the redacted values are already stored.
                 if let Some(hit) = &meta_scan.first_hit {
-                    self.apply_quarantine_hit(Some(auth.user.id), &row, hit)
+                    self.apply_quarantine_hit(Some(uploader_id), &row, hit)
                         .await?;
                     row = db_sessions::session_by_ulid(self.db(), repo_id, ulid)
                         .await?
@@ -184,7 +270,7 @@ impl Core {
                 Ok((row, true))
             }
             Some(existing) => {
-                Self::authorize_session_write(&existing, auth)?;
+                self.authorize_session_write(&existing, auth).await?;
                 let mut updated = session_from_meta(
                     repo_id,
                     existing.uploader_id,
@@ -234,7 +320,7 @@ impl Core {
                 // already-quarantined one this is a no-op, so the stored
                 // verdict (and its single audit row) stands.
                 if let Some(hit) = &meta_scan.first_hit {
-                    self.apply_quarantine_hit(Some(auth.user.id), &row, hit)
+                    self.apply_quarantine_hit(Some(uploader_id), &row, hit)
                         .await?;
                     row = db_sessions::session_by_ulid(self.db(), repo_id, ulid)
                         .await?
@@ -289,13 +375,13 @@ impl Core {
         if n < 0 {
             return Err(CoreError::Invalid("segment numbers start at 0".into()));
         }
-        let repo_id = auth.access.repo.id;
+        let repo_id = auth.repo_id();
         let session = db_sessions::session_by_ulid(self.db(), repo_id, ulid)
             .await?
             .ok_or(CoreError::NotFound)?;
         // Before the idempotency branches: the `Conflict` hash is still a
         // stored-secret oracle, and every later path writes.
-        Self::authorize_session_write(&session, auth)?;
+        self.authorize_session_write(&session, auth).await?;
         let stored_segments = db_sessions::segments_of(self.db(), session.id).await?;
         let expected = stored_segments.len() as i64;
         let actual_hex = blake3_hex(bytes);
@@ -325,8 +411,8 @@ impl Core {
             return Err(CoreError::Invalid("session is complete".into()));
         }
         quota::check_rate_limit()?;
-        quota::check_storage_quotas(self, auth.user.id, repo_id, bytes.len() as u64).await?;
-        quota::check_hourly_volume(self, auth.user.id, bytes.len() as u64).await?;
+        quota::check_storage_quotas(self, auth.uploader_id(), repo_id, bytes.len() as u64).await?;
+        quota::check_hourly_volume(self, auth.uploader_id(), bytes.len() as u64).await?;
         match claimed_hex {
             Some(claimed) if claimed == actual_hex => {}
             Some(_) => {
@@ -373,7 +459,7 @@ impl Core {
                     .ok_or_else(|| CoreError::Internal("session vanished after insert".into()))?;
                 self.merge_scan_counts(&accepted, &scan.counts).await?;
                 if let Some(hit) = &scan.first_hit {
-                    self.apply_quarantine_hit(Some(auth.user.id), &accepted, hit)
+                    self.apply_quarantine_hit(Some(auth.uploader_id()), &accepted, hit)
                         .await?;
                 }
                 let done = db_sessions::session_by_ulid(self.db(), repo_id, ulid)
@@ -412,21 +498,22 @@ impl Core {
     /// The first transition to `complete` emits `session`/`uploaded` with
     /// the uploader as sender; repeats emit nothing.
     pub async fn complete_session(&self, auth: &IngestAuth, ulid: &str) -> CoreResult<SessionRow> {
-        let session = db_sessions::session_by_ulid(self.db(), auth.access.repo.id, ulid)
+        let repo_id = auth.repo_id();
+        let session = db_sessions::session_by_ulid(self.db(), repo_id, ulid)
             .await?
             .ok_or(CoreError::NotFound)?;
-        Self::authorize_session_write(&session, auth)?;
+        self.authorize_session_write(&session, auth).await?;
         if session.lifecycle != "complete" {
             db_sessions::set_lifecycle(self.db(), session.id, "complete").await?;
             let sender = self.sender_of(session.uploader_id).await;
-            self.dispatch_session_event(auth.access.repo.id, sender, "uploaded", ulid)
+            self.dispatch_session_event(repo_id, sender, "uploaded", ulid)
                 .await;
             self.enqueue_index(&crate::jobs::Job::IndexSessionEvents {
                 session_id: session.id,
             })
             .await;
         }
-        db_sessions::session_by_ulid(self.db(), auth.access.repo.id, ulid)
+        db_sessions::session_by_ulid(self.db(), repo_id, ulid)
             .await?
             .ok_or_else(|| CoreError::Internal("session vanished after complete".into()))
     }
@@ -445,10 +532,11 @@ impl Core {
         ulid: &str,
         links: &[serde_json::Value],
     ) -> CoreResult<usize> {
-        let session = db_sessions::session_by_ulid(self.db(), auth.access.repo.id, ulid)
+        let repo_id = auth.repo_id();
+        let session = db_sessions::session_by_ulid(self.db(), repo_id, ulid)
             .await?
             .ok_or(CoreError::NotFound)?;
-        Self::authorize_session_write(&session, auth)?;
+        self.authorize_session_write(&session, auth).await?;
         let mut seen = HashSet::new();
         let mut valid = Vec::with_capacity(links.len());
         for link in links {
@@ -498,8 +586,7 @@ impl Core {
                 seq_end: entry.seq_end,
             })
             .collect();
-        db_sessions::upsert_claim_links(self.db(), auth.access.repo.id, session.id, ulid, &batch)
-            .await?;
+        db_sessions::upsert_claim_links(self.db(), repo_id, session.id, ulid, &batch).await?;
         self.enqueue_index(&crate::jobs::Job::IndexSessionEvents {
             session_id: session.id,
         })
@@ -1118,7 +1205,7 @@ mod tests {
     #[tokio::test]
     async fn trailer_scan_records_rows_and_claim_merges() {
         let (core, _f, auth) = ingest_ctx().await;
-        let repo_id = auth.access.repo.id;
+        let repo_id = auth.repo_id();
         core.upsert_session_meta(&auth, ULID_A, &meta(ULID_A))
             .await
             .unwrap();
@@ -1185,7 +1272,7 @@ mod tests {
     #[tokio::test]
     async fn trailer_first_row_is_backfilled_on_upload() {
         let (core, _f, auth) = ingest_ctx().await;
-        let repo_id = auth.access.repo.id;
+        let repo_id = auth.repo_id();
         // Trailer arrives before any session upload: the row stores with a NULL session id.
         let sha = "ef".repeat(20);
         core.record_trailer_links(
@@ -1227,7 +1314,7 @@ mod tests {
     #[tokio::test]
     async fn claim_before_trailer_still_merges() {
         let (core, _f, auth) = ingest_ctx().await;
-        let repo_id = auth.access.repo.id;
+        let repo_id = auth.repo_id();
         core.upsert_session_meta(&auth, ULID_A, &meta(ULID_A))
             .await
             .unwrap();
@@ -1290,7 +1377,7 @@ mod tests {
             other => panic!("unexpected put outcome: {other:?}"),
         }
         core.run_due_jobs().await.unwrap();
-        let before = db_sessions::session_by_ulid(core.db(), auth.access.repo.id, ULID_A)
+        let before = db_sessions::session_by_ulid(core.db(), auth.repo_id(), ULID_A)
             .await
             .unwrap()
             .unwrap();

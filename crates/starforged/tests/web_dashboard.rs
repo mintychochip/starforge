@@ -284,7 +284,7 @@ async fn dashboard_hides_unpublished_non_member_session() {
             .repo_for(Some(&c.alice), "bob", "open")
             .await
             .unwrap();
-    let auth = IngestAuth {
+    let auth = IngestAuth::Pat {
         user: c.alice.clone(),
         access,
     };

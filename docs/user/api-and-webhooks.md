@@ -8,6 +8,9 @@ push `refs/for/*`, maintain+), and
 with the new location.
 `GET`/`POST /user/keys` and `DELETE /user/keys/{id}` manage the caller's SSH keys (the same keys as **Settings → Keys**); `GET`/`POST /repos/{owner}/{repo}/keys` (with `"read_write"`) and `DELETE /repos/{owner}/{repo}/keys/{id}` manage that repository's deploy keys (admin only; below-threshold callers get `403`, non-readers `404`; archived repositories refuse adds). Key lists carry `id`, `title`, `algorithm`, `fingerprint`, and (for deploy keys) `read_write`.
 Errors use `{"error": {"code", "message"}}`.
+Personal access tokens carry scopes: `repo:read`, `repo:write`, `trail:write`,
+`session:upload`, `sandbox:run`, and `admin`. `admin` implies every scope;
+`repo:write` implies `repo:read` only (it does not imply `sandbox:run`).
 `POST /api/v1/oauth/revoke` (form body `token=<value>`, RFC 7009) revokes the access
 or refresh token whose SHA-256 hash matches and always answers `200`, even for
 unknown or already-revoked tokens.

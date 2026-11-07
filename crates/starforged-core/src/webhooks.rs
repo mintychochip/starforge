@@ -48,14 +48,15 @@ use crate::{Core, CoreError, CoreResult};
 
 /// Events a hook may subscribe to (spec §10.4 D4). An empty subscription
 /// means all of them.
-pub const EVENT_TYPES: [&str; 5] = ["push", "trail", "review", "check", "session"];
+pub const EVENT_TYPES: [&str; 6] = ["push", "trail", "review", "check", "session", "ci"];
 
 /// One webhook event (spec §10.4 D1–D3). `event` is one of [`EVENT_TYPES`];
 /// `subject` is the JSON for the key named by `event`.
 pub struct HookEvent {
     pub event: &'static str,
-    /// `opened`/`updated`/… (`trail`, `review`, `session`); always `None` for
-    /// `push` and `check`.
+    /// `opened`/`updated`/… (`trail`, `review`, `session`); `queued`/
+    /// `started`/`finished`/`canceled` (`ci`); always `None` for `push` and
+    /// `check`.
     pub action: Option<&'static str>,
     /// Only with action `updated`: why the trail changed (D3).
     pub cause: Option<&'static str>,

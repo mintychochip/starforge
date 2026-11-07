@@ -13,15 +13,17 @@ pub enum Scope {
     RepoWrite,
     TrailWrite,
     SessionUpload,
+    SandboxRun,
     Admin,
 }
 
 impl Scope {
-    pub const ALL: [Scope; 5] = [
+    pub const ALL: [Scope; 6] = [
         Scope::RepoRead,
         Scope::RepoWrite,
         Scope::TrailWrite,
         Scope::SessionUpload,
+        Scope::SandboxRun,
         Scope::Admin,
     ];
 
@@ -31,6 +33,7 @@ impl Scope {
             Scope::RepoWrite => "repo:write",
             Scope::TrailWrite => "trail:write",
             Scope::SessionUpload => "session:upload",
+            Scope::SandboxRun => "sandbox:run",
             Scope::Admin => "admin",
         }
     }
@@ -219,10 +222,28 @@ mod tests {
         assert!(grants(&[Scope::RepoWrite], Scope::RepoRead));
         assert!(!grants(&[Scope::RepoRead], Scope::RepoWrite));
         assert!(grants(&[Scope::Admin], Scope::SessionUpload));
+        assert!(grants(&[Scope::Admin], Scope::SandboxRun));
+        assert!(!grants(&[Scope::RepoWrite], Scope::SandboxRun));
         assert_eq!(
             format_scopes(&[Scope::RepoRead, Scope::TrailWrite]),
             "repo:read trail:write"
         );
+    }
+
+    #[test]
+    fn sandbox_run_scope_round_trip() {
+        assert_eq!(Scope::ALL.len(), 6);
+        assert_eq!(Scope::SandboxRun.as_str(), "sandbox:run");
+        assert_eq!(Scope::parse("sandbox:run"), Some(Scope::SandboxRun));
+        assert_eq!(
+            parse_scopes("sandbox:run").unwrap(),
+            vec![Scope::SandboxRun]
+        );
+        assert_eq!(
+            format_scopes(&parse_scopes("sandbox:run").unwrap()),
+            "sandbox:run"
+        );
+        assert!(parse_scopes("bogus:run").is_err());
     }
 
     #[tokio::test]
