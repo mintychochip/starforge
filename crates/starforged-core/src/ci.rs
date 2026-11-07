@@ -923,8 +923,15 @@ impl Core {
             Err(ClaimGate::Canceled) => return Ok(TraceOutcome::Canceled),
         };
         // The first accepted trace marks the job running (the runner is
-        // executing it); later traces keep the state.
+        // executing it); later traces keep the state. Every trace also
+        // renews the 60-second lease, so a runner that is streaming logs
+        // never loses its claim while the job runs.
         db_ci::set_ci_job_running(self.db(), job_id, fence).await?;
+        if !db_ci::renew_ci_job_lease(self.db(), job_id, fence, now() + Self::CLAIM_LEASE_SECS)
+            .await?
+        {
+            return Ok(TraceOutcome::FenceMismatch);
+        }
         if end < start || end - start != bytes.len() as i64 {
             return Ok(TraceOutcome::RangeMismatch);
         }
@@ -961,6 +968,37 @@ impl Core {
         )
         .await?;
         Ok(TraceOutcome::Accepted)
+    }
+
+    /// Renews the lease for a claimed/running job (runner heartbeat). The
+    /// runner presents its fence; a canceled job answers a conflict so the
+    /// runner stops. Traces renew the lease too; the heartbeat covers long
+    /// commands that produce no log output.
+    pub async fn heartbeat_ci_job(
+        &self,
+        runner: &RunnerPrincipal,
+        job_id: i64,
+        fence: &str,
+    ) -> CoreResult<()> {
+        match self.checked_claim(runner, job_id, fence).await? {
+            Ok(_) => {
+                if db_ci::renew_ci_job_lease(
+                    self.db(),
+                    job_id,
+                    fence,
+                    now() + Self::CLAIM_LEASE_SECS,
+                )
+                .await?
+                {
+                    Ok(())
+                } else {
+                    Err(CoreError::Conflict("stale runner fence".into()))
+                }
+            }
+            Err(ClaimGate::NotFound) => Err(CoreError::NotFound),
+            Err(ClaimGate::FenceMismatch) => Err(CoreError::Conflict("stale runner fence".into())),
+            Err(ClaimGate::Canceled) => Err(CoreError::Conflict("job is canceled".into())),
+        }
     }
 
     /// Finishes a claimed job (decision 9): writes the `ci/<job_name>`

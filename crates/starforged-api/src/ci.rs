@@ -441,6 +441,33 @@ pub async fn trace_job(
     }
 }
 
+/// `POST /runners/jobs/{id}/heartbeat` (204; 409 stale fence or canceled).
+#[utoipa::path(
+    post,
+    path = "/api/v1/runners/jobs/{id}/heartbeat",
+    params(
+        ("id" = i64, Path, description = "CI job id"),
+        ("X-Starforge-Fence" = String, Header, description = "Per-claim lease fence"),
+    ),
+    responses(
+        (status = 204, description = "Lease renewed"),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 409, description = "Stale fence or canceled job", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+pub async fn heartbeat_job(
+    State(state): State<ApiState>,
+    RunnerAuth(runner): RunnerAuth,
+    Path(id): Path<i64>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    let fence = fence_header(&headers)?;
+    state.core.heartbeat_ci_job(&runner, id, &fence).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// `PUT /runners/jobs/{id}` (200 finished; `Job-Status: canceled` when
 /// the job was canceled).
 #[utoipa::path(

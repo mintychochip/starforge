@@ -67,9 +67,11 @@ artifacts, and finishes (`PUT /runners/jobs/{id}`).
 
 Every trace/result/artifact call carries the per-claim `lease_token`
 fence; a stale fence answers `409` and the job is fenced out.
-The claim lease is 60 seconds, renewed by trace/put activity. An
-expired lease requeues the job (up to 3 attempts), after which the
-job fails.
+The claim lease is 60 seconds, renewed by trace activity and by the
+runner's 30-second heartbeat (`POST /runners/jobs/{id}/heartbeat`, same
+fence; `204`, or `409` for a stale fence or a canceled job), so a quiet
+command cannot let the lease expire. An expired lease requeues the job
+(up to 3 attempts), after which the job fails.
 
 ## `starforge-sandboxd`
 

@@ -131,6 +131,12 @@ status. A gate that requires `ci/<job-name>` blocks until the check is
 `state` is `succeeded`, `failed`, or `error`; `exit_code` and `checksum`
 are optional; `session_ulids` link captured agent sessions to the run.
 
+While a job runs, the runner renews its 60-second lease with
+`POST /api/v1/runners/jobs/{id}/heartbeat` (runner token plus the
+`X-Starforge-Fence` header; `204` on success, `409` for a stale fence or
+a canceled job). Log traces renew the lease too; the heartbeat covers a
+command that produces no output for more than a minute.
+
 ## Artifacts
 
 An artifact's run-detail metadata is `name`, `size`, `blake3`, optional

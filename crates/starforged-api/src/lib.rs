@@ -369,6 +369,7 @@ pub fn router(core: Core, base_url: String) -> Router {
         .route("/runners/{id}", delete(ci::revoke_runner))
         .route("/runners/jobs/request", post(ci::request_job))
         .route("/runners/jobs/{id}/trace", patch(ci::trace_job))
+        .route("/runners/jobs/{id}/heartbeat", post(ci::heartbeat_job))
         .route("/runners/jobs/{id}", put(ci::finish_job))
         .route("/ci/jobs/{id}/git-credential", post(ci::git_credential))
         .route(

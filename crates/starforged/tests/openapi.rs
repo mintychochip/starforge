@@ -283,6 +283,7 @@ const ROUTES: &[(&str, &str)] = &[
     ("delete", "/api/v1/runners/{id}"),
     ("post", "/api/v1/runners/jobs/request"),
     ("patch", "/api/v1/runners/jobs/{id}/trace"),
+    ("post", "/api/v1/runners/jobs/{id}/heartbeat"),
     ("put", "/api/v1/runners/jobs/{id}"),
     ("post", "/api/v1/ci/jobs/{id}/git-credential"),
     ("post", "/api/v1/repos/{owner}/{repo}/ci/runs/{id}/cancel"),

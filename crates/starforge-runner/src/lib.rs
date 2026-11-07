@@ -25,6 +25,8 @@ pub const FENCE_HEADER: &str = "x-starforge-fence";
 pub const JOB_STATUS_HEADER: &str = "job-status";
 /// Max log chunk sent per trace request.
 pub const TRACE_CHUNK: usize = 64 * 1024;
+/// Lease heartbeat interval; the server's claim lease is 60 seconds.
+pub const HEARTBEAT_SECS: u64 = 30;
 
 // ---------------------------------------------------------------------------
 // Config
@@ -583,6 +585,20 @@ impl Client {
         Ok(TraceResult::Accepted)
     }
 
+    /// Renews the claim lease. Called every [`HEARTBEAT_SECS`] while a job
+    /// runs, so a quiet command cannot let the lease expire.
+    pub async fn heartbeat(&self, job_id: i64, fence: &str) -> Result<(), RunnerError> {
+        let resp = self
+            .http
+            .post(format!("{}/runners/jobs/{job_id}/heartbeat", self.base))
+            .bearer_auth(&self.token)
+            .header(FENCE_HEADER, fence)
+            .send()
+            .await
+            .map_err(RunnerError::from_reqwest)?;
+        self.check_fence(resp.status()).await
+    }
+
     pub async fn finish(
         &self,
         job_id: i64,
@@ -780,7 +796,10 @@ impl<P: SandboxProvider> Executor<P> {
             .spec
             .timeout_duration()
             .unwrap_or(Duration::from_secs(3600));
-        match tokio::time::timeout(timeout, self.execute_inner(&job)).await {
+        let heartbeat = self.spawn_heartbeat(&job);
+        let result = tokio::time::timeout(timeout, self.execute_inner(&job)).await;
+        heartbeat.abort();
+        match result {
             Ok(o) => o,
             Err(_) => {
                 // Best effort: kill + finish failed.
@@ -792,6 +811,30 @@ impl<P: SandboxProvider> Executor<P> {
                 JobOutcome::TimedOut
             }
         }
+    }
+
+    /// Keeps the claim lease alive while a job runs. Log traces renew the
+    /// lease too, but a command that is quiet for more than the 60-second
+    /// lease would otherwise let the reaper requeue the job. The task stops
+    /// on a stale fence or a missing job, and is aborted when the job ends.
+    fn spawn_heartbeat(&self, job: &ClaimedJob) -> tokio::task::JoinHandle<()> {
+        let server_url = self.config.server_url.clone();
+        let token = self.config.token.clone();
+        let job_id = job.job_id;
+        let fence = job.fence.clone();
+        tokio::spawn(async move {
+            let client = Client::new(&server_url, &token);
+            let mut interval = tokio::time::interval(Duration::from_secs(HEARTBEAT_SECS));
+            interval.tick().await; // the first tick is immediate
+            loop {
+                interval.tick().await;
+                match client.heartbeat(job_id, &fence).await {
+                    Ok(()) => {}
+                    Err(RunnerError::StaleFence | RunnerError::NotFound) => break,
+                    Err(_) => {}
+                }
+            }
+        })
     }
 
     async fn execute_inner(&self, job: &ClaimedJob) -> JobOutcome {

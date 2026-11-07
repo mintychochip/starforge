@@ -586,6 +586,28 @@ pub async fn set_ci_job_running(db: &Db, id: i64, lease_token: &str) -> DbResult
     Ok(affected == 1)
 }
 
+/// Extends a claimed/running job's lease under its fence. False when the
+/// fence no longer matches or the job is terminal (canceled, finished, or
+/// reaped) — the caller treats that as a stale claim.
+pub async fn renew_ci_job_lease(
+    db: &Db,
+    id: i64,
+    lease_token: &str,
+    lease_until: i64,
+) -> DbResult<bool> {
+    let affected = sqlx::query(
+        "UPDATE ci_jobs SET lease_until = $1 \
+         WHERE id = $2 AND lease_token = $3 AND state IN ('claimed', 'running')",
+    )
+    .bind(lease_until)
+    .bind(id)
+    .bind(lease_token)
+    .execute(db.pool())
+    .await?
+    .rows_affected();
+    Ok(affected == 1)
+}
+
 /// CI jobs of the repo, newest first, at most `limit` rows.
 pub async fn list_ci_jobs_for_repo(db: &Db, repo_id: i64, limit: i64) -> DbResult<Vec<CiJobRow>> {
     let rows = sqlx::query(select_ci_job!(

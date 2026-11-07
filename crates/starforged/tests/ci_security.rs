@@ -272,6 +272,12 @@ fn new_routes(
             Some(b"hello"),
         ),
         (
+            "POST",
+            format!("/api/v1/runners/jobs/{jid}/heartbeat"),
+            Some(json!({})),
+            None,
+        ),
+        (
             "PUT",
             format!("/api/v1/runners/jobs/{jid}"),
             Some(json!({"state": "succeeded", "exit_code": 0})),

@@ -203,10 +203,31 @@ async fn claim_trace_finish_round_trip() {
         )
         .await
     }
+    // A trace renews the 60-second lease: a quiet job must not be reaped
+    // while its runner is still working.
+    sqlx::query("UPDATE ci_jobs SET lease_until = $1 WHERE id = $2")
+        .bind(starforged_db::now() - 10)
+        .bind(job_id)
+        .execute(s.db().pool())
+        .await
+        .unwrap();
+    let expired = starforged_db::ci::ci_job_by_id(s.db(), job_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .lease_until
+        .unwrap();
     assert_eq!(
         trace(&s, &runner, &trace_url, &fence, 0, 5).await.0,
         StatusCode::ACCEPTED
     );
+    let renewed = starforged_db::ci::ci_job_by_id(s.db(), job_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .lease_until
+        .unwrap();
+    assert!(renewed > expired, "the trace renewed the lease");
     assert_eq!(
         trace(&s, &runner, &trace_url, &fence, 0, 5).await.0,
         StatusCode::ACCEPTED,
@@ -273,6 +294,97 @@ async fn claim_trace_finish_round_trip() {
     // Nothing left to claim (core-level: no 50 s long-poll wait).
     let principal = s.core.authenticate_runner(&runner).await.unwrap();
     assert!(s.core.claim_ci_job(&principal).await.unwrap().is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn heartbeat_renews_the_lease_and_rejects_stale_or_canceled() {
+    let s = TestServer::start().await;
+    let alice = s.user("alice").await;
+    let repo = s.repo(&alice, "proj", Visibility::Public).await;
+    let pat = s.token(&alice, &[Scope::RepoWrite]).await;
+    let runner = register_runner(&s, &pat, &["linux"]).await;
+    let job_id = queue_job(&s, repo.id, alice.id, "test", &[]).await;
+
+    let (status, _, value) = api_raw(
+        &s.browser(),
+        "POST",
+        &s.url("/api/v1/runners/jobs/request"),
+        &runner,
+        &[],
+        Some(json!({})),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{value}");
+    let fence = value["fence"].as_str().unwrap().to_owned();
+    let heartbeat_url = s.url(&format!("/api/v1/runners/jobs/{job_id}/heartbeat"));
+
+    // Expire the lease, then renew it with a heartbeat.
+    sqlx::query("UPDATE ci_jobs SET lease_until = $1 WHERE id = $2")
+        .bind(starforged_db::now() - 10)
+        .bind(job_id)
+        .execute(s.db().pool())
+        .await
+        .unwrap();
+    let expired = starforged_db::ci::ci_job_by_id(s.db(), job_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .lease_until
+        .unwrap();
+    let (status, _, _) = api_raw(
+        &s.browser(),
+        "POST",
+        &heartbeat_url,
+        &runner,
+        &[("x-starforge-fence", fence.as_str())],
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let renewed = starforged_db::ci::ci_job_by_id(s.db(), job_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .lease_until
+        .unwrap();
+    assert!(renewed > expired, "the heartbeat renewed the lease");
+
+    // A stale fence is a conflict.
+    let (status, _, _) = api_raw(
+        &s.browser(),
+        "POST",
+        &heartbeat_url,
+        &runner,
+        &[("x-starforge-fence", "stale-fence")],
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    // A canceled job answers a conflict, so the runner stops.
+    let (status, value) = api(
+        &s.browser(),
+        "POST",
+        &s.url(&format!("/api/v1/repos/alice/proj/ci/runs/{job_id}/cancel")),
+        &pat,
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{value}");
+    let (status, _, _) = api_raw(
+        &s.browser(),
+        "POST",
+        &heartbeat_url,
+        &runner,
+        &[("x-starforge-fence", fence.as_str())],
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -173,6 +173,7 @@ impl Modify for SecurityAddon {
         crate::ci::revoke_runner,
         crate::ci::request_job,
         crate::ci::trace_job,
+        crate::ci::heartbeat_job,
         crate::ci::finish_job,
         crate::ci::git_credential,
         crate::ci::cancel_run,
