@@ -10,6 +10,8 @@ cd "$(dirname "$0")/.."
 TARGET_DIR="${CARGO_TARGET_DIR:-target}"
 # Always build: a stale binary from an earlier checkout must not pass the smoke.
 cargo build -p starforged -p starforge-cli
+# The smoke `cd`s into a temp workdir, so the binary paths must be absolute.
+TARGET_DIR="$(cd "$TARGET_DIR" && pwd)"
 STARFORGED="$TARGET_DIR/debug/starforged"
 STARFORGE="$TARGET_DIR/debug/starforge"
 [[ -x "$STARFORGED" ]] || { echo "error: starforged binary not found at $STARFORGED" >&2; exit 1; }
