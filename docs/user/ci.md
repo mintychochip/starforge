@@ -12,7 +12,7 @@ require, exactly like an external CI context.
 
 The spec is read from the commit tree of the repository (never the
 working tree), so every commit carries the CI definition it runs with.
-A malformed spec fails the run with a `ci` check `error` and a clear
+A malformed spec fails the run with a `ci/spec` check `error` and a clear
 description. The file is at most 256 KiB, holds at most 100 jobs, and
 every key must be known — unknown fields are rejected.
 

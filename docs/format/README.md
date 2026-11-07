@@ -29,3 +29,8 @@ Implementations: `starforge-format` (encoding, segmentation) and
 normal upload API, preserving ULIDs and re-creating `cli_claim` links from
 `links.json`; a ULID already present in the target repository is reported
 `exists` and skipped.
+
+## CI format
+
+- [CI spec and run events](ci-v1.md) — `.starforge/ci.toml`, run states,
+  check descriptions, and the `ci`/`check` webhook payloads.

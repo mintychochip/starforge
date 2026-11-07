@@ -37,8 +37,8 @@ search, webhooks, and mirrors, on SQLite or Postgres.
   revisions, reviews, threaded comments, and pending (draft) reviews;
   commit statuses, fail-closed merge gates, `merge`/`squash`/`fast_forward`
   merges; branch and tag protection; webhooks (`push`, `trail`, `review`,
-  `check`, `session`) with signed deliveries, a delivery log, and
-  redelivery; dashboard sections and Trail/session/code search (Tantivy,
+  `check`, `session`; `ci` added in M6) with signed deliveries, a delivery
+  log, and redelivery; dashboard sections and Trail/session/code search (Tantivy,
   `git grep` over the default branch).
 - **Organizations and SSH (M3):** orgs, teams, and base permissions with
   repository transfer; git over SSH (`ssh://git@…`) with user and deploy
@@ -71,7 +71,7 @@ search, webhooks, and mirrors, on SQLite or Postgres.
   hook session-end`; `enable` configures only agents it detects), `status`,
   `doctor`, `sync`, `spool prune` (drop uploaded session blobs, `--dry-run`),
   `sessions list/show/link/unlink/backfill-links/publish/unpublish/delete`,
-  `export`/`import`, and `trail
+  `export`/`import`, `runner` (self-hosted CI runner), and `trail
   list/show/create/comment/push/checkout/review/merge`. Server discovery
   uses `GET /.well-known/starforge.json`; the advertised `api_url` must
   share the origin of the repository's remote (or of `git config

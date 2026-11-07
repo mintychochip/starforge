@@ -111,8 +111,10 @@ kill / exec / files / ports) with a sealed API key, idempotent create,
 and provider error mapping. It sits behind the same provider trait as
 the local daemon, so `GET /sandboxes/runtimes` reports the configured
 runtimes and their availability, and a job runs on any runtime without
-changing the runner. The API is E2B-shaped, not an E2B wire-compat
-promise.
+changing the runner. The adapter targets an E2B-shaped gateway, not
+`api.e2b.dev`: real E2B uses `/v2/sandboxes` for the control plane and
+envd for exec/files/ports, while this adapter's data-plane routes are
+Starforge's own REST shape. It is not a wire-compatibility promise.
 
 ## Egress proxy and per-sandbox CA
 

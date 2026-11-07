@@ -38,7 +38,7 @@ runs_on = ["linux"]
 | `triggers.trail` | array | `opened` and/or `updated`. Empty/absent disables Trail runs. Both trigger lists empty means manual-only. |
 | `jobs` (alias `job`) | array of tables | At most 100 jobs; `name` unique. |
 | `jobs[].name` | string | 1–64 chars of `[A-Za-z0-9_-]`; the check context is `ci/<name>`. |
-| `jobs[].image` / `jobs[].template` | string | Exactly one; 256 chars. Checked against the server allowlist. |
+| `jobs[].image` / `jobs[].template` | string | Exactly one; 256 chars, validated as an image reference. The local sandbox daemon additionally enforces its image allowlist. |
 | `jobs[].commands` | array of strings | Non-empty; at most 100 commands, 4096 chars each; run in order at `/workspace`. |
 | `jobs[].timeout` | string | `90s`, `30m`, `1h`, or bare seconds; at most 4 hours. Default 1 hour. |
 | `jobs[].env` | table | At most 64 entries; key 128 chars, value 4096 chars. Plain values only. |

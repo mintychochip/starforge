@@ -84,7 +84,7 @@ scripts/docs-smoke.sh                 # run the documented quick start end to en
 
 ## Known gaps
 
-Explicit v0.1.0 non-goals (program rulings):
+Explicit v0.1.0 non-goals and deferrals (program rulings):
 
 - **Fluent message catalog (§10.6):** English strings stay in templates.
   Moving every template string into Fluent is a large retrofit with no
