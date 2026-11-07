@@ -290,6 +290,15 @@ const ROUTES: &[(&str, &str)] = &[
     ("get", "/api/v1/repos/{owner}/{repo}/ci/runs"),
     ("post", "/api/v1/repos/{owner}/{repo}/ci/runs"),
     ("get", "/api/v1/repos/{owner}/{repo}/ci/runs/{id}"),
+    ("get", "/api/v1/repos/{owner}/{repo}/ci/usage"),
+    (
+        "put",
+        "/api/v1/repos/{owner}/{repo}/ci/suppliers/{supplier}",
+    ),
+    (
+        "delete",
+        "/api/v1/repos/{owner}/{repo}/ci/suppliers/{supplier}",
+    ),
     ("post", "/api/v1/runners/jobs/{id}/artifacts/authorize"),
     ("put", "/api/v1/runners/jobs/{id}/artifacts/{*name}"),
     ("get", "/api/v1/runners/jobs/{id}/artifacts/{*name}"),

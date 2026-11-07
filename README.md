@@ -101,8 +101,10 @@ Explicit v0.1.0 non-goals and deferrals (program rulings):
   status API and webhooks. The server never executes job code: operators
   run `starforge-runner` and `starforge-sandboxd`. The E2B adapter is
   E2B-shaped, not a wire-compatibility promise; Firecracker and Kata are
-  reserved runtime names for a later release. Cost: those runtimes need
-  an adapter, not a config change.
+  reserved runtime names for a later release. Of external CI suppliers,
+  only Depot is integrated, and only to read usage; GitHub Actions,
+  Namespace, Blacksmith, and Buildkite usage is not read. Cost: those
+  runtimes and suppliers need an adapter, not a config change.
 - **Antigravity CLI capture:** current Antigravity CLI releases keep sessions
   under `~/.gemini/antigravity-cli/brain/<id>/` in an undocumented, closed
   format, which the Gemini adapter does not read. Gemini CLI sessions are

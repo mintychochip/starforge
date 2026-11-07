@@ -865,8 +865,10 @@ impl Core {
         }
         for job in db_ci::ci_jobs_for_runner(self.db(), runner_id).await? {
             self.revoke_job_credentials(job.id).await?;
-            if let Some(fence) = job.lease_token.as_deref() {
-                db_ci::release_ci_job(self.db(), job.id, fence).await?;
+            if let Some(fence) = job.lease_token.as_deref()
+                && db_ci::release_ci_job(self.db(), job.id, fence).await?
+            {
+                db_ci::record_attempt_usage(self.db(), &job, now()).await?;
             }
         }
         self.audit(
@@ -1000,6 +1002,7 @@ impl Core {
             if job.state != "canceled"
                 && db_ci::cancel_ci_job(self.db(), job_id, Some(fence), now()).await?
             {
+                db_ci::record_attempt_usage(self.db(), &job, now()).await?;
                 self.terminate_ci_job(&job, "canceled", "error", "canceled", None)
                     .await?;
             }
@@ -1188,6 +1191,7 @@ impl Core {
         {
             return Ok(FinishOutcome::FenceMismatch);
         }
+        db_ci::record_attempt_usage(self.db(), &job, now()).await?;
         self.emit_ci_event(&job, "finished", state, exit_code).await;
         self.revoke_job_credentials(job.id).await?;
         self.audit(
@@ -1578,6 +1582,13 @@ impl Core {
         job: &crate::ci_spec::CiJobSpec,
         created_by: Option<i64>,
     ) -> CoreResult<Option<i64>> {
+        // The native minutes quota (`[ci.limits]`): a used-up month refuses
+        // the run and says why on its check instead of queueing it.
+        if let Some(message) = self.ci_minutes_quota_exhausted(repo_id).await? {
+            self.record_ci_quota_refusal(repo_id, commit_sha, &job.name, &message, created_by)
+                .await?;
+            return Ok(None);
+        }
         let now_ts = now();
         let timeout_secs = job_timeout_secs(job);
         let spec_json = serde_json::to_string(job).unwrap_or_else(|_| "{}".into());
@@ -1689,6 +1700,11 @@ impl Core {
         for change in db_changes::changes_with_current_head(self.db(), repo_id, commit_sha).await? {
             for stale in db_ci::active_ci_jobs_for_change(self.db(), repo_id, change.id).await? {
                 if db_ci::cancel_ci_job(self.db(), stale.id, None, now()).await? {
+                    // A queued job's `claimed_at` may be a label-mismatch
+                    // bounce or an attempt already recorded at requeue.
+                    if stale.state != "queued" {
+                        db_ci::record_attempt_usage(self.db(), &stale, now()).await?;
+                    }
                     self.terminate_ci_job(
                         &stale,
                         "canceled",
@@ -1761,6 +1777,9 @@ impl Core {
             }
             None => spec.jobs.iter().collect(),
         };
+        if let Some(message) = self.ci_minutes_quota_exhausted(access.repo.id).await? {
+            return Err(CoreError::Invalid(message));
+        }
         let mut ids = Vec::new();
         for job in jobs {
             if let Some(id) = self
@@ -2123,6 +2142,7 @@ impl Core {
                 "artifact size {size} exceeds the {MAX_ARTIFACT_BYTES}-byte cap"
             )));
         }
+        self.check_artifact_quota(job.repo_id, size).await?;
         let sha256 = sha256.to_ascii_lowercase();
         if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err(CoreError::Invalid(

@@ -4,6 +4,9 @@
 {% include "repo_head.html" %}
 <section>
   <h2>CI runs</h2>
+  {% if can_view_usage %}
+  <p><a href="/{{ head.owner }}/{{ head.name }}/ci/usage">Usage this month</a></p>
+  {% endif %}
   {% if runs.is_empty() %}
   <p class="muted">No CI runs yet.</p>
   {% else %}

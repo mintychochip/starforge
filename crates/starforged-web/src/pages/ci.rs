@@ -49,6 +49,8 @@ pub struct RunsPage {
     nav_user: Option<NavUser>,
     head: RepoHead,
     runs: Vec<RunRow>,
+    /// Maintainers see a link to the usage page.
+    can_view_usage: bool,
 }
 
 /// `/{owner}/{repo}/ci`: the repository's CI runs, newest first (Core caps
@@ -65,7 +67,92 @@ pub async fn runs(
         nav_user: session.as_ref().map(NavUser::from_session),
         head: RepoHead::new(&access, "ci", None),
         runs: rows.into_iter().map(run_row).collect(),
+        can_view_usage: access.permission >= Permission::Maintain,
     })
+}
+
+/// One metric of a supplier's usage report, formatted for display.
+pub struct UsageMetricRow {
+    name: &'static str,
+    used: String,
+    /// The enforced limit, or `None` when Starforge has none to show.
+    limit: Option<String>,
+}
+
+/// One supplier's usage report on the usage page.
+pub struct SupplierUsageRow {
+    supplier: &'static str,
+    enforced_by: &'static str,
+    external_ref: Option<String>,
+    period: String,
+    metrics: Vec<UsageMetricRow>,
+    error: Option<String>,
+}
+
+/// `12.5 minutes`, `15 bytes`: whole numbers without a fraction.
+fn quantity(value: f64, unit: &str) -> String {
+    if value.fract() == 0.0 {
+        format!("{} {unit}", value as i64)
+    } else {
+        format!("{value:.2} {unit}")
+    }
+}
+
+fn supplier_usage_row(report: starforged_core::ci_usage::SupplierUsage) -> SupplierUsageRow {
+    SupplierUsageRow {
+        supplier: report.supplier,
+        enforced_by: report.enforced_by,
+        external_ref: report.external_ref,
+        period: format!(
+            "{} to {}",
+            crate::views::format_time(report.period_start),
+            crate::views::format_time(report.period_end)
+        ),
+        metrics: report
+            .metrics
+            .into_iter()
+            .map(|metric| UsageMetricRow {
+                name: metric.name,
+                used: quantity(metric.used, metric.unit),
+                limit: metric.limit.map(|limit| quantity(limit, metric.unit)),
+            })
+            .collect(),
+        error: report.error,
+    }
+}
+
+#[derive(Template, WebTemplate)]
+#[template(path = "ci_usage.html")]
+pub struct UsagePage {
+    nav_user: Option<NavUser>,
+    head: RepoHead,
+    suppliers: Vec<SupplierUsageRow>,
+}
+
+/// `/{owner}/{repo}/ci/usage`: this month's CI usage per supplier
+/// (at least Maintain; Core enforces it). Native runners are metered and
+/// limited by Starforge; a linked supplier's usage comes from its own API
+/// and its limits are its own.
+pub async fn usage(
+    State(state): State<AppState>,
+    RequireUser(session): RequireUser,
+    Path((owner, repo)): Path<(String, String)>,
+) -> Result<Response, WebError> {
+    let reports = state.core.ci_usage(&session.user, &owner, &repo).await?;
+    let access = state
+        .core
+        .repo_for(Some(&session.user), &owner, &repo)
+        .await?;
+    let mut response = UsagePage {
+        nav_user: Some(NavUser::from_session(&session)),
+        head: RepoHead::new(&access, "ci", None),
+        suppliers: reports.into_iter().map(supplier_usage_row).collect(),
+    }
+    .into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(response)
 }
 
 /// One artifact row for the run detail: metadata only (no filesystem path;

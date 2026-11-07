@@ -10,6 +10,8 @@ pub mod changes;
 pub mod checks;
 pub mod ci;
 pub mod ci_spec;
+pub mod ci_usage;
+pub mod ci_usage_depot;
 pub mod content;
 pub mod crypto;
 pub mod email_tokens;
@@ -154,6 +156,9 @@ pub struct CoreConfig {
     /// The `[sandbox]` section (plan M6b): provider selection, local
     /// daemon socket/token, E2B endpoint, quotas, default TTL.
     pub sandbox: sandboxes::SandboxConfig,
+    /// The `[ci]` section: native-runner quotas and external CI suppliers
+    /// whose usage Starforge reads (`ci_usage`).
+    pub ci: ci_usage::CiConfig,
 }
 
 /// The 32-byte key sealing webhook secrets at rest.
@@ -420,6 +425,7 @@ pub(crate) mod testing {
             api_per_token_per_hour: 5000,
             refs_for_new_changes_per_hour: 30,
             sandbox: crate::sandboxes::SandboxConfig::default(),
+            ci: crate::ci_usage::CiConfig::default(),
         };
         configure(&mut config, dir.path());
         (Core::new(db.db.clone(), config), Fixture { _db: db, dir })

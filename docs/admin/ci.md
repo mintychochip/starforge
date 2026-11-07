@@ -135,25 +135,42 @@ never enter the sandbox environment or filesystem.
 
 ## Quotas
 
-Admission is enforced in-transaction and answers `429` with
-`Retry-After` when exceeded:
+Sandbox quotas answer `429` with `Retry-After` when exceeded:
 
 - Concurrent sandboxes per user / per repo
   (`sandbox.limits.max_concurrent_per_user`,
   `sandbox.limits.max_concurrent_per_repo`);
 - Sandbox-seconds per user per hour
-  (`sandbox.limits.sandbox_seconds_per_hour`);
-- CI usage (`ci_usage`): runs, sandbox-seconds, log bytes, and
-  artifact bytes per repo/user/window;
-- Logs cap at 100 MiB per job; artifacts at 1 GiB per job, 30-day
-  expiry with CAS-blob GC.
+  (`sandbox.limits.sandbox_seconds_per_hour`).
+
+CI usage and its limits belong to whoever runs the compute:
+
+- **Native runners.** Starforge meters each job attempt's runner
+  wall-clock time, recorded in `ci_usage` when the attempt ends (finish,
+  cancel, lease expiry, timeout, or runner revocation), and the
+  repository's unexpired artifacts. It enforces `[ci.limits]` per
+  repository: `minutes_per_month` (calendar month, UTC) when a run is
+  queued — a refused run gets an `error` `ci/<job>` check naming the reset
+  date, and a manual trigger answers `422` — and `artifact_bytes` when an
+  upload is authorized (`422`). Runs already queued still finish.
+- **Depot.** A repository admin links the repository
+  (`PUT /api/v1/repos/{owner}/{repo}/ci/suppliers/depot` with its Depot
+  name, `owner/name`). Starforge reads its usage from Depot's
+  `depot.core.v1.UsageService/GetUsage` with the organization token in
+  `ci.depot.api_token`. Depot's API exposes no limits: plan allowances and
+  usage caps are set and enforced in Depot, and Starforge only reports.
+
+Per-item caps apply to every run: logs cap at 100 MiB per job;
+artifacts at 1 GiB each, with a 30-day expiry and CAS-blob GC.
 
 ## Audit
 
 Audited actions: runner registration and revocation, job enqueue /
-cancel / finish, secret create / rotate / resolve, sandbox create /
-kill. Per-log-chunk and per-status events are not audited. Audit
-details never carry token hashes, secret values, or sealed material.
+cancel / finish, quota refusals (`ci.job.quota`), supplier link and
+unlink (`ci.supplier.link`, `ci.supplier.unlink`), secret create /
+rotate / resolve, sandbox create / kill. Per-log-chunk and per-status
+events are not audited. Audit details never carry token hashes, secret
+values, or sealed material.
 
 ## Sandbox image contract
 

@@ -53,21 +53,27 @@
 
 ### CI (M6, opt-in)
 
-CI has no server-wide `[ci]` section in `starforged.toml`. The control
-plane (runners, jobs, artifacts, secrets) is configured per repository
-through `.starforge/ci.toml` and the APIs; see [User: CI](../user/ci.md)
-and [CI administration](ci.md). The per-repo `[ci]` keys set in the
-repository's `.starforge/ci.toml` are:
+The CI control plane (runners, jobs, artifacts, secrets) is configured per
+repository through `.starforge/ci.toml` and the APIs; see
+[User: CI](../user/ci.md) and [CI administration](ci.md). The server-wide
+`[ci]` section holds the usage quotas for native runners and the external CI
+suppliers whose usage Starforge reads:
 
 | Key | Meaning |
 |---|---|
-| `ci.allow_secrets_on_refs_for` | Whether `refs/for` runs may resolve repo secrets (default `false`, server-wide default `false`; when off, `refs/for` runs get no secrets) |
-| `ci.env_secrets` | Explicit per-repo opt-in to inject secret values into the job environment for providers without an egress proxy (default `false`; by default secrets only enter the egress-proxy headers) |
+| `ci.limits.minutes_per_month` | Native runner minutes per repository per calendar month (UTC). A run queued after the month's minutes are used up is refused with an `error` check naming the reset date (default `0`; `0` disables) |
+| `ci.limits.artifact_bytes` | Bytes of unexpired CI artifacts per repository; an upload that would exceed it is refused (default `0`; `0` disables) |
+| `ci.depot.api_url` | Base URL of the Depot API (default `https://api.depot.dev`) |
+| `ci.depot.api_token` | Depot organization token, used only to read linked repositories' usage (never logged or rendered; empty disables the Depot supplier) |
+
+Two secret policies are fixed in this release, not settings: `refs/for`
+runs never resolve repository secrets, and secret values never enter the
+job environment (only the egress proxy's headers).
 
 Any key can be overridden with an environment variable such as `STARFORGE__SERVER__HTTP_ADDR` or
 `STARFORGE__DATABASE__URL`. `STARFORGE_CONFIG` sets the config file path.
 
-Every key above is overridable as `STARFORGE__<SECTION>__<KEY>` (upper-cased, e.g. `STARFORGE__SERVER__HTTP_ADDR`). `STARFORGE_CONFIG` sets the config file path. Full key list also includes the sections below: `sessions.*`, `webhooks.allow_loopback`, `git.allowed_ref_namespaces`, `github.api_url`, `storage.index_dir`, `log.*`, `metrics.token`, `limits.*`, `sandbox.*` (nested keys use one `__` per level, e.g. `STARFORGE__SANDBOX__LOCAL__SOCKET`).
+Every key above is overridable as `STARFORGE__<SECTION>__<KEY>` (upper-cased, e.g. `STARFORGE__SERVER__HTTP_ADDR`). `STARFORGE_CONFIG` sets the config file path. Full key list also includes the sections below: `sessions.*`, `webhooks.allow_loopback`, `git.allowed_ref_namespaces`, `github.api_url`, `storage.index_dir`, `log.*`, `metrics.token`, `limits.*`, `sandbox.*`, `ci.*` (nested keys use one `__` per level, e.g. `STARFORGE__SANDBOX__LOCAL__SOCKET`, `STARFORGE__CI__LIMITS__MINUTES_PER_MONTH`).
 
 Abuse controls (spec §11.6) are all configurable under `[limits]`; every key is
 also overridable as `STARFORGE__LIMITS__*`. Setting any limit to `0` disables it.

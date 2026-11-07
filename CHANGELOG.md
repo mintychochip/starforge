@@ -61,9 +61,12 @@ search, webhooks, and mirrors, on SQLite or Postgres.
   `starforge-sandboxd` (`podman`/gVisor) or an E2B-shaped adapter;
   artifacts with BLAKE3 CAS and 30-day retention; sealed repo secrets
   injected only by the egress proxy; per-job agent sessions linked to the
-  run; and the `ci` webhook event (`queued`/`started`/`finished`/
-  `canceled`). External CI statuses and webhooks are unchanged, and the
-  server never runs job code.
+  run; the `ci` webhook event (`queued`/`started`/`finished`/
+  `canceled`); and usage by supplier — native runner minutes and artifact
+  storage metered and limited by Starforge (`[ci.limits]`), and a linked
+  Depot repository's usage read from Depot's API with its limits left to
+  Depot (`GET /repos/{owner}/{repo}/ci/usage`). External CI statuses and
+  webhooks are unchanged, and the server never runs job code.
 - **CLI:** `starforge` — `auth login` (device flow, scopes `repo:read
   trail:write session:upload`), `auth ssh-key add` (one-time `repo:write`
   device flow; both tokens are revoked and never stored), `enable`/`disable`
@@ -122,6 +125,7 @@ before upgrading (see `docs/admin/backup-and-restore.md`).
 | 0036 | CI runners, jobs, logs, artifacts, job sessions and tokens |
 | 0037 | Sandboxes and sandbox-second usage windows |
 | 0038 | CI secrets and one-time artifact tokens |
+| 0039 | CI usage per job attempt and CI supplier links |
 
 Note: migration numbers 0030–0033 do not exist; the series jumps from 0029
 to 0034.

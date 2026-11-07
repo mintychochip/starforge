@@ -579,6 +579,7 @@ async fn invalid_namespace_entry_fails_startup() {
         log: starforged::config::LogConfig::default(),
         metrics: starforged::config::MetricsConfig::default(),
         sandbox: starforged_core::sandboxes::SandboxConfig::default(),
+        ci: starforged_core::ci_usage::CiConfig::default(),
     };
     let err =
         match starforged::serve::build(&config, PathBuf::from(env!("CARGO_BIN_EXE_starforged")))

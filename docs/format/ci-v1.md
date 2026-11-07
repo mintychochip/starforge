@@ -76,6 +76,7 @@ Each run writes the commit status `ci/<job-name>`:
 | Lease expiry with attempts left | — | The job returns to `queued`; the check stays `pending`. |
 | Lease expiry out of attempts | `failure` | `the runner stopped before finishing`. |
 | Timeout passed while still claimed or running | `failure` | `the job exceeded its timeout` (60 seconds after the deadline; the runner normally reports its own timeout first). |
+| Native minutes quota used up when the run would be queued | `error` | `the CI minutes quota for this month (<N> minutes) is used up; it resets on <YYYY-MM-DD>`. No job is created and no `ci` event is sent. |
 
 The server sweeps claimed and running jobs every 30 seconds for expired
 leases (3 attempts per job) and passed deadlines. A job failed by the

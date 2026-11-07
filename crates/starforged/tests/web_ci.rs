@@ -623,3 +623,60 @@ async fn ci_pages_matrix_cancel_and_escaping() {
         .unwrap();
     assert_eq!(resp.status(), 404);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ci_usage_page_is_for_maintainers() {
+    let s = TestServer::start_with(|c| c.ci.limits.minutes_per_month = 600).await;
+    let alice = s.user("alice").await;
+    s.user("bob").await;
+    s.repo(&alice, "proj", Visibility::Private).await;
+    s.core
+        .set_collaborator(&alice, "alice", "proj", "bob", Permission::Read)
+        .await
+        .unwrap();
+
+    let (alice_browser, _) = s.login("alice").await;
+    assert!(
+        get_text(&alice_browser, &s.url("/alice/proj/ci"))
+            .await
+            .contains("/alice/proj/ci/usage")
+    );
+    let resp = alice_browser
+        .get(s.url("/alice/proj/ci/usage"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers()["cache-control"], "no-store");
+    let page = resp.text().await.unwrap();
+    assert!(page.contains("runner_minutes"), "{page}");
+    assert!(page.contains("limits enforced by starforge"), "{page}");
+    assert!(
+        page.contains("600 minutes"),
+        "the native limit shows: {page}"
+    );
+
+    // A reader sees no link and cannot open the page.
+    let (bob_browser, _) = s.login("bob").await;
+    assert!(
+        !get_text(&bob_browser, &s.url("/alice/proj/ci"))
+            .await
+            .contains("/alice/proj/ci/usage")
+    );
+    let status = bob_browser
+        .get(s.url("/alice/proj/ci/usage"))
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert!(status == 403 || status == 404, "{status}");
+    // Anonymous visitors are sent to sign in.
+    let status = s
+        .browser()
+        .get(s.url("/alice/proj/ci/usage"))
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_ne!(status, 200);
+}

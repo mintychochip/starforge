@@ -417,6 +417,7 @@ fn page_routes() -> Router<AppState> {
         )
         .route("/{owner}/{repo}/commit/{id}", get(pages::history::commit))
         .route("/{owner}/{repo}/ci", get(pages::ci::runs))
+        .route("/{owner}/{repo}/ci/usage", get(pages::ci::usage))
         .route("/{owner}/{repo}/ci/{id}", get(pages::ci::run))
         .route("/{owner}/{repo}/ci/{id}/logs", get(pages::ci::logs))
         .route("/{owner}/{repo}/ci/{id}/cancel", post(pages::ci::cancel))

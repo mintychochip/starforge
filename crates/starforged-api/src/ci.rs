@@ -1180,3 +1180,176 @@ pub async fn resolve_job_secrets(
 fn bearer_of(headers: &HeaderMap) -> Option<String> {
     crate::auth::bearer_token(headers).map(str::to_owned)
 }
+
+/// One measured quantity in a CI supplier's usage report.
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct UsageMetricJson {
+    /// Stable metric name, e.g. `runner_minutes`, `depot_ci_vcpu_minutes`.
+    pub name: String,
+    /// Unit of `used` and `limit`: `minutes`, `vcpu_minutes`, `bytes`,
+    /// `attempts`, or `jobs`.
+    pub unit: String,
+    pub used: f64,
+    /// The enforced limit when Starforge can see one; `null` otherwise.
+    pub limit: Option<f64>,
+}
+
+/// Usage of one CI supplier for the current calendar month (UTC).
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct SupplierUsageJson {
+    /// `native` (Starforge's runners) or a linked supplier (`depot`).
+    pub supplier: String,
+    /// Who enforces the limits: `starforge` for native runners, the
+    /// supplier itself otherwise.
+    pub enforced_by: String,
+    /// The supplier's name for the repository (linked suppliers only).
+    pub external_ref: Option<String>,
+    pub period_start: String,
+    pub period_end: String,
+    pub metrics: Vec<UsageMetricJson>,
+    /// Why the supplier's usage could not be read, when it could not.
+    pub error: Option<String>,
+}
+
+/// `GET /repos/{owner}/{repo}/ci/usage`: one report per supplier.
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct CiUsageJson {
+    pub suppliers: Vec<SupplierUsageJson>,
+}
+
+/// Body of `PUT /repos/{owner}/{repo}/ci/suppliers/{supplier}`.
+#[derive(Deserialize, utoipa::ToSchema)]
+pub struct SupplierLinkBody {
+    /// The supplier's name for the repository, `owner/name`.
+    pub external_ref: String,
+}
+
+/// A repository's link to an external CI supplier.
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct SupplierLinkJson {
+    pub supplier: String,
+    pub external_ref: String,
+    pub updated_at: String,
+}
+
+/// `GET /repos/{owner}/{repo}/ci/usage` (at least Maintain): this month's
+/// CI usage per supplier. Native usage is metered and limited by
+/// Starforge; a linked supplier's usage is read from its API and its
+/// limits are the supplier's own.
+#[utoipa::path(
+    get,
+    path = "/api/v1/repos/{owner}/{repo}/ci/usage",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+    ),
+    responses(
+        (status = 200, description = "Usage per supplier", body = CiUsageJson),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+pub async fn get_usage(
+    State(state): State<ApiState>,
+    auth: ApiAuth,
+    Path((owner, repo)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    let auth = auth.require(Scope::RepoRead)?;
+    let reports = state.core.ci_usage(&auth.user, &owner, &repo).await?;
+    let suppliers = reports
+        .into_iter()
+        .map(|report| SupplierUsageJson {
+            supplier: report.supplier.to_owned(),
+            enforced_by: report.enforced_by.to_owned(),
+            external_ref: report.external_ref,
+            period_start: rfc3339(report.period_start),
+            period_end: rfc3339(report.period_end),
+            metrics: report
+                .metrics
+                .into_iter()
+                .map(|metric| UsageMetricJson {
+                    name: metric.name.to_owned(),
+                    unit: metric.unit.to_owned(),
+                    used: metric.used,
+                    limit: metric.limit,
+                })
+                .collect(),
+            error: report.error,
+        })
+        .collect();
+    let mut response = Json(CiUsageJson { suppliers }).into_response();
+    no_store(response.headers_mut());
+    Ok(response)
+}
+
+/// `PUT /repos/{owner}/{repo}/ci/suppliers/{supplier}` (at least Admin):
+/// links the repository to an external CI supplier (`depot`), replacing an
+/// existing link.
+#[utoipa::path(
+    put,
+    path = "/api/v1/repos/{owner}/{repo}/ci/suppliers/{supplier}",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("supplier" = String, Path, description = "CI supplier (`depot`)"),
+    ),
+    request_body = SupplierLinkBody,
+    responses(
+        (status = 200, description = "Linked", body = SupplierLinkJson),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 422, description = "Unknown supplier or invalid external_ref", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+pub async fn put_supplier_link(
+    State(state): State<ApiState>,
+    auth: ApiAuth,
+    Path((owner, repo, supplier)): Path<(String, String, String)>,
+    Json(body): Json<SupplierLinkBody>,
+) -> Result<Json<SupplierLinkJson>, ApiError> {
+    let auth = auth.require(Scope::RepoWrite)?;
+    let link = state
+        .core
+        .set_ci_supplier_link(&auth.user, &owner, &repo, &supplier, &body.external_ref)
+        .await?;
+    Ok(Json(SupplierLinkJson {
+        supplier: link.supplier,
+        external_ref: link.external_ref,
+        updated_at: rfc3339(link.updated_at),
+    }))
+}
+
+/// `DELETE /repos/{owner}/{repo}/ci/suppliers/{supplier}` (at least
+/// Admin): removes the link (204; 404 when there is none).
+#[utoipa::path(
+    delete,
+    path = "/api/v1/repos/{owner}/{repo}/ci/suppliers/{supplier}",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("supplier" = String, Path, description = "CI supplier (`depot`)"),
+    ),
+    responses(
+        (status = 204, description = "Unlinked"),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+pub async fn delete_supplier_link(
+    State(state): State<ApiState>,
+    auth: ApiAuth,
+    Path((owner, repo, supplier)): Path<(String, String, String)>,
+) -> Result<StatusCode, ApiError> {
+    let auth = auth.require(Scope::RepoWrite)?;
+    state
+        .core
+        .delete_ci_supplier_link(&auth.user, &owner, &repo, &supplier)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}

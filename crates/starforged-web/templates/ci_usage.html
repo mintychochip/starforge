@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block title %}CI usage · {{ head.owner }}/{{ head.name }}{% endblock %}
+{% block content %}
+{% include "repo_head.html" %}
+<section>
+  <h2>CI usage this month</h2>
+  <p class="muted">Each CI supplier reports its own usage. Starforge meters and limits its native runners; a linked supplier's usage comes from the supplier's API, and its limits are set and enforced by the supplier.</p>
+  {% for report in suppliers %}
+  <h3>{{ report.supplier }}{% if let Some(external_ref) = report.external_ref %} <span class="muted">({{ external_ref }})</span>{% endif %}</h3>
+  <p class="muted">{{ report.period }} · limits enforced by {{ report.enforced_by }}</p>
+  {% if let Some(error) = report.error %}
+  <p class="flash error">{{ error }}</p>
+  {% endif %}
+  {% if !report.metrics.is_empty() %}
+  <table>
+    <thead>
+      <tr><th>Metric</th><th>Used</th><th>Limit</th></tr>
+    </thead>
+    <tbody>
+      {% for metric in report.metrics %}
+      <tr>
+        <td><code>{{ metric.name }}</code></td>
+        <td>{{ metric.used }}</td>
+        <td>{% if let Some(limit) = metric.limit %}{{ limit }}{% else %}<span class="muted">none in Starforge</span>{% endif %}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+  {% endfor %}
+</section>
+{% endblock %}

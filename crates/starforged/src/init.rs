@@ -56,6 +56,7 @@ pub fn run(opts: &InitOptions<'_>) -> anyhow::Result<Config> {
         log: crate::config::LogConfig::default(),
         metrics: crate::config::MetricsConfig::default(),
         sandbox: starforged_core::sandboxes::SandboxConfig::default(),
+        ci: starforged_core::ci_usage::CiConfig::default(),
     };
     config.validate()?;
     // Document the blob_dir resolution rule in the generated file so operators

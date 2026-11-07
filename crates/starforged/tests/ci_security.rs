@@ -345,6 +345,24 @@ fn new_routes(
             None,
         ),
         (
+            "GET",
+            "/api/v1/repos/alice/proj/ci/usage".into(),
+            None,
+            None,
+        ),
+        (
+            "PUT",
+            "/api/v1/repos/alice/proj/ci/suppliers/depot".into(),
+            Some(json!({"external_ref": "acme/app"})),
+            None,
+        ),
+        (
+            "DELETE",
+            "/api/v1/repos/alice/proj/ci/suppliers/depot".into(),
+            None,
+            None,
+        ),
+        (
             "DELETE",
             "/api/v1/repos/alice/proj/ci/secrets/MY_SECRET".into(),
             None,
@@ -473,6 +491,7 @@ async fn auth_matrix_no_token_wrong_scope_and_confusion() {
             "POST",
             "/api/v1/repos/alice/proj/runners/registration-token",
         ),
+        ("DELETE", "/api/v1/repos/alice/proj/ci/suppliers/depot"),
     ] {
         let (status, _) = api(
             &s.browser(),

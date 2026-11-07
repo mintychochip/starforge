@@ -381,6 +381,11 @@ pub fn router(core: Core, base_url: String) -> Router {
             get(ci::list_runs).post(ci::trigger_run),
         )
         .route("/repos/{owner}/{repo}/ci/runs/{id}", get(ci::get_run))
+        .route("/repos/{owner}/{repo}/ci/usage", get(ci::get_usage))
+        .route(
+            "/repos/{owner}/{repo}/ci/suppliers/{supplier}",
+            put(ci::put_supplier_link).delete(ci::delete_supplier_link),
+        )
         .route(
             "/runners/jobs/{id}/artifacts/authorize",
             post(ci::authorize_artifact),

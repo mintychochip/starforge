@@ -95,6 +95,8 @@ pub struct CiJobRow {
     pub created_at: i64,
     pub started_at: Option<i64>,
     pub finished_at: Option<i64>,
+    /// When the current attempt was claimed; native usage is metered from it.
+    pub claimed_at: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -197,7 +199,7 @@ macro_rules! select_ci_job {
             "SELECT id, repo_id, trail_id, change_id, revision_id, commit_sha, base_sha, ",
             "job_name, spec, state, runner_id, attempts, run_at, lease_until, lease_token, ",
             "deadline, exit_code, checksum, cancel_requested, created_by, git_token_id, ",
-            "last_error, created_at, started_at, finished_at FROM ci_jobs ",
+            "last_error, created_at, started_at, finished_at, claimed_at FROM ci_jobs ",
             $tail
         )
     };
@@ -299,6 +301,7 @@ fn ci_job_from_row(row: &AnyRow) -> DbResult<CiJobRow> {
         created_at: row.try_get("created_at")?,
         started_at: row.try_get("started_at")?,
         finished_at: row.try_get("finished_at")?,
+        claimed_at: row.try_get("claimed_at")?,
     })
 }
 
@@ -475,7 +478,7 @@ pub async fn insert_ci_job(db: &Db, n: &NewCiJob<'_>) -> DbResult<CiJobRow> {
     let row = sqlx::query(
         "INSERT INTO ci_jobs (repo_id, trail_id, change_id, revision_id, commit_sha, base_sha, job_name, spec, run_at, deadline, created_by, created_at) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
-         RETURNING id, repo_id, trail_id, change_id, revision_id, commit_sha, base_sha, job_name, spec, state, runner_id, attempts, run_at, lease_until, lease_token, deadline, exit_code, checksum, cancel_requested, created_by, git_token_id, last_error, created_at, started_at, finished_at",
+         RETURNING id, repo_id, trail_id, change_id, revision_id, commit_sha, base_sha, job_name, spec, state, runner_id, attempts, run_at, lease_until, lease_token, deadline, exit_code, checksum, cancel_requested, created_by, git_token_id, last_error, created_at, started_at, finished_at, claimed_at",
     )
     .bind(n.repo_id)
     .bind(n.trail_id)
@@ -536,7 +539,7 @@ pub async fn claim_next_ci_job(
         };
         let claimed = sqlx::query(
             "UPDATE ci_jobs SET state = 'claimed', runner_id = $1, attempts = attempts + 1, lease_until = $2, \
-             lease_token = $3, started_at = COALESCE(started_at, $4), deadline = $5 \
+             lease_token = $3, started_at = COALESCE(started_at, $4), claimed_at = $4, deadline = $5 \
              WHERE id = $6 AND state = 'queued'",
         )
         .bind(runner_id)
@@ -808,6 +811,7 @@ pub async fn requeue_expired_ci_jobs(
         if affected != 1 {
             continue;
         }
+        record_attempt_usage(db, job, now_ts).await?;
         revoke_job_tokens_for_job(db, job.id, now_ts).await?;
         if let (Some(token_id), Some(user_id)) = (job.git_token_id, job.created_by) {
             crate::tokens::revoke(db, user_id, token_id).await?;
@@ -852,6 +856,7 @@ pub async fn fail_overdue_ci_jobs(db: &Db, cutoff: i64, now_ts: i64) -> DbResult
         if affected != 1 {
             continue;
         }
+        record_attempt_usage(db, job, now_ts).await?;
         revoke_job_tokens_for_job(db, job.id, now_ts).await?;
         if let (Some(token_id), Some(user_id)) = (job.git_token_id, job.created_by) {
             crate::tokens::revoke(db, user_id, token_id).await?;
@@ -859,6 +864,148 @@ pub async fn fail_overdue_ci_jobs(db: &Db, cutoff: i64, now_ts: i64) -> DbResult
         ids.push(job.id);
     }
     Ok(ids)
+}
+
+/// Records the runner time of the attempt `job` was on, ending at
+/// `ended_at`: one `ci_usage` row for `(job, attempt)`, from the attempt's
+/// `claimed_at`. Pass the job row as it was before the transition that ended
+/// the attempt (it still names the runner). Idempotent per attempt: a second
+/// call for the same attempt (a cancel acknowledged after the reaper ended
+/// it, say) writes nothing. A job that was never claimed records nothing.
+pub async fn record_attempt_usage(db: &Db, job: &CiJobRow, ended_at: i64) -> DbResult<()> {
+    let Some(started_at) = job.claimed_at else {
+        return Ok(());
+    };
+    if job.attempts < 1 {
+        return Ok(());
+    }
+    sqlx::query(
+        "INSERT INTO ci_usage (repo_id, job_id, attempt, runner_id, user_id, started_at, ended_at, seconds, created_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $7) \
+         ON CONFLICT (job_id, attempt) DO NOTHING",
+    )
+    .bind(job.repo_id)
+    .bind(job.id)
+    .bind(job.attempts)
+    .bind(job.runner_id)
+    .bind(job.created_by)
+    .bind(started_at)
+    .bind(ended_at)
+    .bind((ended_at - started_at).max(0))
+    .execute(db.pool())
+    .await?;
+    Ok(())
+}
+
+/// Runner seconds of the repository's attempts that ended at or after
+/// `since` (unix seconds).
+pub async fn usage_seconds_since(db: &Db, repo_id: i64, since: i64) -> DbResult<i64> {
+    // CAST: Postgres sums widen (bigint -> numeric); keep the result an i64.
+    let total: i64 = sqlx::query_scalar(
+        "SELECT CAST(COALESCE(SUM(seconds), 0) AS BIGINT) FROM ci_usage \
+         WHERE repo_id = $1 AND ended_at >= $2",
+    )
+    .bind(repo_id)
+    .bind(since)
+    .fetch_one(db.read_pool())
+    .await?;
+    Ok(total)
+}
+
+/// Attempts of the repository that ended at or after `since`.
+pub async fn usage_attempts_since(db: &Db, repo_id: i64, since: i64) -> DbResult<i64> {
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM ci_usage WHERE repo_id = $1 AND ended_at >= $2")
+            .bind(repo_id)
+            .bind(since)
+            .fetch_one(db.read_pool())
+            .await?;
+    Ok(count)
+}
+
+/// Bytes of the repository's CI artifacts that have not expired at `now`.
+pub async fn live_artifact_bytes(db: &Db, repo_id: i64, now: i64) -> DbResult<i64> {
+    // `size` is BIGINT on Postgres, whose SUM is NUMERIC: cast back to i64.
+    let total: i64 = sqlx::query_scalar(
+        "SELECT CAST(COALESCE(SUM(a.size), 0) AS BIGINT) FROM ci_artifacts a \
+         JOIN ci_jobs j ON j.id = a.job_id WHERE j.repo_id = $1 AND a.expires_at > $2",
+    )
+    .bind(repo_id)
+    .bind(now)
+    .fetch_one(db.read_pool())
+    .await?;
+    Ok(total)
+}
+
+/// A repository's link to an external CI supplier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SupplierLinkRow {
+    pub repo_id: i64,
+    pub supplier: String,
+    pub external_ref: String,
+    pub created_by: Option<i64>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+fn supplier_link_from_row(row: &AnyRow) -> DbResult<SupplierLinkRow> {
+    Ok(SupplierLinkRow {
+        repo_id: row.try_get("repo_id")?,
+        supplier: row.try_get("supplier")?,
+        external_ref: row.try_get("external_ref")?,
+        created_by: row.try_get("created_by")?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+    })
+}
+
+/// Creates or replaces the repository's link to `supplier`.
+pub async fn upsert_supplier_link(
+    db: &Db,
+    repo_id: i64,
+    supplier: &str,
+    external_ref: &str,
+    created_by: Option<i64>,
+    now: i64,
+) -> DbResult<SupplierLinkRow> {
+    let row = sqlx::query(
+        "INSERT INTO ci_supplier_links (repo_id, supplier, external_ref, created_by, created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, $5, $5) \
+         ON CONFLICT (repo_id, supplier) DO UPDATE SET external_ref = $3, updated_at = $5 \
+         RETURNING repo_id, supplier, external_ref, created_by, created_at, updated_at",
+    )
+    .bind(repo_id)
+    .bind(supplier)
+    .bind(external_ref)
+    .bind(created_by)
+    .bind(now)
+    .fetch_one(db.pool())
+    .await?;
+    supplier_link_from_row(&row)
+}
+
+/// The repository's supplier links, ordered by supplier.
+pub async fn supplier_links_for_repo(db: &Db, repo_id: i64) -> DbResult<Vec<SupplierLinkRow>> {
+    let rows = sqlx::query(
+        "SELECT repo_id, supplier, external_ref, created_by, created_at, updated_at \
+         FROM ci_supplier_links WHERE repo_id = $1 ORDER BY supplier",
+    )
+    .bind(repo_id)
+    .fetch_all(db.read_pool())
+    .await?;
+    rows.iter().map(supplier_link_from_row).collect()
+}
+
+/// Removes the repository's link to `supplier`; false when there was none.
+pub async fn delete_supplier_link(db: &Db, repo_id: i64, supplier: &str) -> DbResult<bool> {
+    let affected =
+        sqlx::query("DELETE FROM ci_supplier_links WHERE repo_id = $1 AND supplier = $2")
+            .bind(repo_id)
+            .bind(supplier)
+            .execute(db.pool())
+            .await?
+            .rows_affected();
+    Ok(affected == 1)
 }
 
 /// Inserts a per-job token; `token_hash` is the SHA-256 of the token
@@ -1767,5 +1914,42 @@ mod tests {
                 .unwrap(),
             "one-time"
         );
+    }
+
+    #[tokio::test]
+    async fn attempt_usage_counts_each_attempt_once() {
+        let (t, alice, repo_id) = setup().await;
+        let r = insert_runner(&t.db, &runner(repo_id, "hash-r1"))
+            .await
+            .unwrap();
+        let job = insert_ci_job(&t.db, &ci_job(repo_id, alice, "test", 0))
+            .await
+            .unwrap();
+        // A job that was never claimed records nothing.
+        record_attempt_usage(&t.db, &job, 500).await.unwrap();
+        assert_eq!(usage_attempts_since(&t.db, repo_id, 0).await.unwrap(), 0);
+
+        // Attempt 1 runs from 100 to 160; two transitions that end it
+        // (the reaper, then a late cancel acknowledgement) count it once.
+        claim_next_ci_job(&t.db, r.id, repo_id, 100, 60, "fence-1", 100 + 14_400)
+            .await
+            .unwrap()
+            .unwrap();
+        let attempt1 = ci_job_by_id(&t.db, job.id).await.unwrap().unwrap();
+        record_attempt_usage(&t.db, &attempt1, 160).await.unwrap();
+        record_attempt_usage(&t.db, &attempt1, 999).await.unwrap();
+        assert_eq!(usage_seconds_since(&t.db, repo_id, 0).await.unwrap(), 60);
+
+        // A second attempt is a separate row; the window filters by end.
+        requeue_expired_ci_jobs(&t.db, 161, 3).await.unwrap();
+        claim_next_ci_job(&t.db, r.id, repo_id, 300, 60, "fence-2", 300 + 14_400)
+            .await
+            .unwrap()
+            .unwrap();
+        let attempt2 = ci_job_by_id(&t.db, job.id).await.unwrap().unwrap();
+        record_attempt_usage(&t.db, &attempt2, 330).await.unwrap();
+        assert_eq!(usage_seconds_since(&t.db, repo_id, 0).await.unwrap(), 90);
+        assert_eq!(usage_attempts_since(&t.db, repo_id, 0).await.unwrap(), 2);
+        assert_eq!(usage_seconds_since(&t.db, repo_id, 200).await.unwrap(), 30);
     }
 }

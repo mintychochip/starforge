@@ -493,6 +493,7 @@ async fn backup_during_a_http_push_contains_pre_or_post_state() {
         log: starforged::config::LogConfig::default(),
         metrics: starforged::config::MetricsConfig::default(),
         sandbox: starforged_core::sandboxes::SandboxConfig::default(),
+        ci: starforged_core::ci_usage::CiConfig::default(),
     };
     std::fs::write(&config_path, toml::to_string_pretty(&config).unwrap()).unwrap();
 

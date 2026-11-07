@@ -59,6 +59,11 @@ pub struct Config {
     /// (`local`, 3600 s default TTL).
     #[serde(default)]
     pub sandbox: starforged_core::sandboxes::SandboxConfig,
+    /// CI usage (`[ci]`): native-runner quotas (`[ci.limits]`, all
+    /// `0`-disabled) and the Depot supplier (`[ci.depot]`). Missing section
+    /// defaults to no limits and no external supplier.
+    #[serde(default)]
+    pub ci: starforged_core::ci_usage::CiConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -717,6 +722,18 @@ impl Config {
                         .parse()
                         .map_err(|_| anyhow::anyhow!("{key} must be a non-negative count"))?;
                 }
+                "ci__limits__minutes_per_month" => {
+                    self.ci.limits.minutes_per_month = value
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("{key} must be a non-negative count"))?;
+                }
+                "ci__limits__artifact_bytes" => {
+                    self.ci.limits.artifact_bytes = value
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("{key} must be a non-negative count"))?;
+                }
+                "ci__depot__api_url" => self.ci.depot.api_url = value,
+                "ci__depot__api_token" => self.ci.depot.api_token = value,
                 _ => bail!("unknown configuration override {key}"),
             }
         }
@@ -940,6 +957,7 @@ mod tests {
             log: LogConfig::default(),
             metrics: MetricsConfig::default(),
             sandbox: starforged_core::sandboxes::SandboxConfig::default(),
+            ci: starforged_core::ci_usage::CiConfig::default(),
         }
     }
 
@@ -1342,6 +1360,61 @@ security.secret_key = "ababababababababababababababababababababababababababababa
 "#;
         let loaded: Config = toml::from_str(text).unwrap();
         assert_eq!(loaded.sandbox, config.sandbox);
+    }
+
+    #[test]
+    fn ci_section_defaults_parses_and_env_overrides() {
+        let config = sample();
+        assert_eq!(config.ci.limits.minutes_per_month, 0);
+        assert_eq!(config.ci.depot.api_url, "https://api.depot.dev");
+        assert!(config.ci.depot.api_token.is_empty());
+        // A partial `[ci]` section keeps the defaults for missing keys.
+        let text = r#"
+server.http_addr = "127.0.0.1:3000"
+server.base_url = "http://127.0.0.1:3000"
+storage.data_dir = "/srv/starforge"
+security.secret_key = "abababababababababababababababababababababababababababababababababab"
+
+[ci.limits]
+minutes_per_month = 600
+artifact_bytes = 1048576
+
+[ci.depot]
+api_token = "sf-test-depot-token"
+"#;
+        let loaded: Config = toml::from_str(text).unwrap();
+        assert_eq!(loaded.ci.limits.minutes_per_month, 600);
+        assert_eq!(loaded.ci.limits.artifact_bytes, 1_048_576);
+        assert_eq!(loaded.ci.depot.api_url, "https://api.depot.dev");
+        assert_eq!(loaded.ci.depot.api_token, "sf-test-depot-token");
+        assert!(
+            !format!("{:?}", loaded.ci).contains("sf-test-depot-token"),
+            "the token stays out of Debug"
+        );
+
+        let mut config = sample();
+        config
+            .apply_env([
+                (
+                    "STARFORGE__CI__LIMITS__MINUTES_PER_MONTH".to_owned(),
+                    "90".to_owned(),
+                ),
+                (
+                    "STARFORGE__CI__DEPOT__API_URL".to_owned(),
+                    "http://127.0.0.1:9".to_owned(),
+                ),
+            ])
+            .unwrap();
+        assert_eq!(config.ci.limits.minutes_per_month, 90);
+        assert_eq!(config.ci.depot.api_url, "http://127.0.0.1:9");
+        assert!(
+            config
+                .apply_env([(
+                    "STARFORGE__CI__LIMITS__ARTIFACT_BYTES".to_owned(),
+                    "-1".to_owned()
+                )])
+                .is_err()
+        );
     }
 
     #[test]

@@ -132,14 +132,52 @@ curl -X DELETE "$SERVER/api/v1/repos/$OWNER/$REPO/ci/secrets/CARGO_REGISTRY_TOKE
 
 Values are sealed (XChaCha20-Poly1305) and never stored or logged in
 plaintext; the spec carries names only. Secrets resolve only for runs
-on protected branches or approved Trails; `refs/for` runs get none
-unless the repo sets `ci.allow_secrets_on_refs_for = true`. By default
-values never enter the sandbox environment or filesystem — the egress
-proxy injects them as headers for allowlisted destinations only
-(`ci.env_secrets = true` is the explicit per-repo opt-in for providers
-without a proxy). A secret's value is registered for dynamic redaction
-in the job's sessions, so it cannot appear in session text, logs, or
-search results.
+on protected branches or approved Trails; `refs/for` runs get none.
+Values never enter the sandbox environment or filesystem — the egress
+proxy injects them as headers for allowlisted destinations only. A
+secret's value is registered for dynamic redaction in the job's
+sessions, so it cannot appear in session text, logs, or search results.
+
+## Usage and quotas
+
+Who meters CI usage and enforces its limits depends on who runs the
+compute:
+
+- **Native runners** (registered with Starforge): Starforge meters each
+  job attempt's runner time and the repository's unexpired artifacts. The
+  server operator may set quotas (`[ci.limits]`): when the month's runner
+  minutes are used up, new runs are not queued and the job's `ci/<job>`
+  check says why and when the quota resets; an artifact upload past the
+  storage quota is refused. Runs already queued still finish.
+- **Depot**: a repository admin links the repository to its name in
+  Depot (`owner/name`). Starforge then reads that repository's usage from
+  Depot's API. Depot's plan allowances and usage caps apply and are
+  enforced by Depot; Starforge does not limit Depot work.
+
+```shell
+# This month's usage per supplier (at least Maintain)
+curl "$SERVER/api/v1/repos/$OWNER/$REPO/ci/usage" \
+  -H "Authorization: Bearer $TOKEN"
+
+# Link (or relink) the repository to Depot (at least Admin)
+curl -X PUT "$SERVER/api/v1/repos/$OWNER/$REPO/ci/suppliers/depot" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"external_ref": "acme/app"}'
+
+# Unlink
+curl -X DELETE "$SERVER/api/v1/repos/$OWNER/$REPO/ci/suppliers/depot" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+Each supplier's report lists metrics with `used` and, when Starforge
+enforces one, `limit`; `enforced_by` says who enforces the limits.
+Native metrics are `runner_minutes`, `attempts`, and `artifact_bytes`;
+Depot metrics are `depot_ci_vcpu_minutes`, `depot_ci_minutes`,
+`depot_ci_attempts`, `github_actions_minutes`, and `github_actions_jobs`
+for the linked repository. If Depot cannot be reached, its report carries
+an `error` and the native report is unaffected. Maintainers also see the
+report on the repository's CI page (**Usage this month**).
 
 The normative spec — limits, run states, check descriptions, and the
 `ci`/`check` webhook payloads — is [CI Format v1](../format/ci-v1.md).
