@@ -114,3 +114,21 @@ Antigravity CLI sessions are not captured in v0.1.0 (see Known gaps).
 Pi/omp capture is discovery-only: they have no verified JSON-config hook
 surface, so `starforge enable` installs no Pi/omp hook files; sessions are
 picked up by discovery at commit/push/sync.
+
+Pi/omp records are the real JSONL record structure (one object per line,
+each carrying `type`, `id`, `parentId`, an ISO `timestamp`, and
+`runtime.version`): a `session` header record (with `cwd`, the format
+`version`, and an initial title), `title` / `title_change` records (latest
+wins), `message` records whose `message.role` shapes the event (`user`,
+`assistant` with `thinking` / `text` / `toolCall` blocks, `toolResult` with
+an `[image: <mime>]` placeholder for image blocks, `custom`, `developer`),
+`custom_message` context injections (as readable `system` text),
+`compaction` records, and a `custom` record with `customType:
+"session_exit"` that ends the session. Auxiliary/noise records are skipped
+by rule: `model_usage` (side calls, not turns), `mode_change`,
+`model_change`, `thinking_level_change` (runtime state), `credential_pin`
+(never captured), and other `custom` progress markers; the header's models
+and usage totals come from assistant messages only. Unknown record types
+and roles keep the raw JSON as a `system` event — never dropped silently.
+Record timestamps are used verbatim (never "now"), so an old session's
+last activity stays old and the 24 h idle rule can end it.

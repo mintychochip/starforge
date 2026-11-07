@@ -179,6 +179,44 @@ fn ingest_redacts_seed_spool_and_records_fingerprint() {
     );
 }
 
+// The 24 h idle rule: an ingest at now = last record + 25 h sets
+// `ended_at` to the last record's timestamp. The session's records keep
+// their real timestamps (never the ingest "now"), so the rule can fire.
+#[test]
+fn idle_rule_ends_session_25h_after_last_record() {
+    let (_repo_dir, repo) = init_repo();
+    let home = TempDir::new().unwrap();
+    let cwd = repo.to_string_lossy();
+    let native = format!(
+        "{{\"type\":\"session\",\"version\":3,\"id\":\"idle-1\",\"timestamp\":\"2026-10-01T12:00:00Z\",\"cwd\":\"{cwd}\",\"runtime\":{{\"version\":\"0.5.2\"}}}}\n{{\"type\":\"message\",\"id\":\"m1\",\"parentId\":null,\"timestamp\":\"2026-10-01T12:00:00Z\",\"runtime\":{{\"version\":\"0.5.2\"}},\"message\":{{\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":\"hello\"}}]}}}}\n"
+    );
+    let store = home.path().join(".pi/agent/sessions/--x--");
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::write(store.join("idle-1.jsonl"), native).unwrap();
+
+    let common = common_dir(&repo).unwrap();
+    let spool = Spool::open(&common);
+    spool.ensure_layout().unwrap();
+    let roots = BTreeMap::from([(
+        "pi".to_string(),
+        Roots {
+            config_dir: home.path().join(".config"),
+            data_dir: home.path().to_path_buf(),
+            worktree: repo.clone(),
+        },
+    )]);
+    // now = last record (2026-10-01T12:00:00Z) + 25 h.
+    let stats = ingest(&spool, &roots, &repo, parse_now("2026-10-02T13:00:00Z")).unwrap();
+    assert_eq!(stats.sessions, 1);
+    let ulid = spool_ulid(&spool);
+    let meta = spool.read_meta(&ulid).unwrap();
+    assert_eq!(
+        meta.ended_at.as_deref(),
+        Some("2026-10-01T12:00:00Z"),
+        "idle rule ends the session at the last record's timestamp"
+    );
+}
+
 // Finding 1: one unreadable native file for an earlier adapter must not
 // starve a later adapter's valid session. The Codex file below is not valid
 // JSONL, so Codex `read` fails; the Pi session must still reach the spool.
@@ -247,7 +285,7 @@ fn model_field_detector_hit_is_redacted_and_counted() {
     let home = TempDir::new().unwrap();
     let cwd = repo.to_string_lossy();
     let native = format!(
-        "{{\"type\":\"message\",\"role\":\"user\",\"session\":\"raw-only-1\",\"cwd\":\"{cwd}\",\"version\":\"0.5.2\",\"timestamp\":\"2026-10-01T12:00:00Z\",\"content\":\"hello\"}}\n{{\"type\":\"message\",\"role\":\"assistant\",\"session\":\"raw-only-1\",\"cwd\":\"{cwd}\",\"version\":\"0.5.2\",\"timestamp\":\"2026-10-01T12:01:00Z\",\"model\":\"sk-ant-abcdefghij1234567890\",\"content\":\"all good\"}}\n"
+        "{{\"type\":\"session\",\"version\":3,\"id\":\"raw-only-1\",\"timestamp\":\"2026-10-01T12:00:00Z\",\"cwd\":\"{cwd}\",\"runtime\":{{\"version\":\"0.5.2\"}}}}\n{{\"type\":\"message\",\"id\":\"m1\",\"parentId\":null,\"timestamp\":\"2026-10-01T12:00:00Z\",\"runtime\":{{\"version\":\"0.5.2\"}},\"message\":{{\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":\"hello\"}}]}}}}\n{{\"type\":\"message\",\"id\":\"m2\",\"parentId\":\"m1\",\"timestamp\":\"2026-10-01T12:01:00Z\",\"runtime\":{{\"version\":\"0.5.2\"}},\"message\":{{\"role\":\"assistant\",\"model\":\"sk-ant-abcdefghij1234567890\",\"provider\":\"anthropic\",\"usage\":{{\"input\":1,\"output\":1,\"cacheRead\":0,\"cacheWrite\":0,\"totalTokens\":2}},\"content\":[{{\"type\":\"text\",\"text\":\"all good\"}}]}}}}\n"
     );
     let store = home.path().join(".pi/agent/sessions/--x--");
     std::fs::create_dir_all(&store).unwrap();
@@ -402,8 +440,7 @@ fn spool_failure_leaves_cursor_and_replays_without_loss_or_dupes() {
     let mut grown = fixture_body(&repo).into_bytes();
     grown.extend_from_slice(
         format!(
-            "{{\"cwd\":\"{}\",\"input\":{{\"edits\":2,\"file_path\":\"{}/src/main.rs\"}},\"name\":\"Edit\",\"session\":\"pi-session-1\",\"timestamp\":\"2026-10-01T12:03:00Z\",\"type\":\"tool_call\",\"version\":\"0.5.2\"}}\n",
-            repo.to_string_lossy(),
+            "{{\"type\":\"message\",\"id\":\"m4\",\"parentId\":\"m3\",\"timestamp\":\"2026-10-01T12:03:00Z\",\"runtime\":{{\"version\":\"0.5.2\"}},\"message\":{{\"role\":\"assistant\",\"model\":\"pi-model-x\",\"provider\":\"anthropic\",\"usage\":{{\"input\":12,\"output\":22,\"cacheRead\":0,\"cacheWrite\":0,\"totalTokens\":34}},\"content\":[{{\"type\":\"toolCall\",\"id\":\"tool-2\",\"name\":\"Edit\",\"arguments\":{{\"file_path\":\"{}/src/main.rs\",\"edits\":2}}}}]}}}}\n",
             repo.to_string_lossy()
         )
         .as_bytes(),

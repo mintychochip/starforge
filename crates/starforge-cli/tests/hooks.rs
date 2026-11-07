@@ -512,7 +512,7 @@ fn real_ingest_fileless_session_trailer_lifecycle() {
     let cwd = repo.to_string_lossy().into_owned();
     let native = |ts: &str| {
         format!(
-            "{{\"type\":\"message\",\"role\":\"user\",\"content\":\"hi\",\"cwd\":\"{cwd}\",\"session\":\"s1\",\"version\":\"0.5.2\",\"timestamp\":\"{ts}\"}}\n"
+            "{{\"type\":\"session\",\"version\":3,\"id\":\"s1\",\"timestamp\":\"{ts}\",\"cwd\":\"{cwd}\",\"runtime\":{{\"version\":\"0.5.2\"}}}}\n{{\"type\":\"message\",\"id\":\"m1\",\"parentId\":null,\"timestamp\":\"{ts}\",\"runtime\":{{\"version\":\"0.5.2\"}},\"message\":{{\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":\"hi\"}}]}}}}\n"
         )
     };
     let store = home.path().join(".pi/agent/sessions/--x--");

@@ -381,17 +381,19 @@ fn pi_growing_transcript_resume() {
     let a = PiAdapter;
     let cand = single_candidate(&a, &roots);
     let first = a.read(&cand, &Cursor::start(), FALLBACK_TS).unwrap();
-    assert_eq!(first.events.len(), 9);
+    assert_eq!(first.events.len(), 10);
     let resume_at = first.next;
 
     let appended = serde_json::json!({
         "type": "message",
-        "role": "user",
-        "content": FOLLOW_UP_TEXT,
-        "cwd": "/repo",
-        "session": PI_SESSION_ID,
-        "version": "0.5.2",
+        "id": "m9",
+        "parentId": null,
         "timestamp": GROWTH_TS,
+        "runtime": { "version": "0.5.2" },
+        "message": {
+            "role": "user",
+            "content": [{ "type": "text", "text": FOLLOW_UP_TEXT }],
+        },
     });
     std::fs::write(
         &cand.native_path,
@@ -410,7 +412,7 @@ fn pi_growing_transcript_resume() {
     assert_eq!(user_text(&tail.events[0]), FOLLOW_UP_TEXT);
 
     let fresh = a.read(&cand, &Cursor::start(), FALLBACK_TS).unwrap();
-    assert_eq!(fresh.events.len(), 10);
+    assert_eq!(fresh.events.len(), 11);
     assert_resume_continuity(&first.events, &tail.events, &fresh.events);
 }
 
@@ -423,12 +425,13 @@ fn pi_compaction_boundary() {
     let resume_at = first.next;
 
     let appended = serde_json::json!({
-        "type": "summary",
-        "summary": COMPACTION_TEXT,
-        "cwd": "/repo",
-        "session": PI_SESSION_ID,
-        "version": "0.5.2",
+        "type": "compaction",
+        "id": "cp9",
+        "parentId": null,
         "timestamp": COMPACTION_TS,
+        "runtime": { "version": "0.5.2" },
+        "summary": COMPACTION_TEXT,
+        "shortSummary": "Second checkpoint",
     });
     std::fs::write(
         &cand.native_path,
@@ -462,12 +465,14 @@ fn pi_discover_incremental() {
 
     let appended = serde_json::json!({
         "type": "message",
-        "role": "user",
-        "content": FOLLOW_UP_TEXT,
-        "cwd": "/repo",
-        "session": PI_SESSION_ID,
-        "version": "0.5.2",
+        "id": "m9",
+        "parentId": null,
         "timestamp": GROWTH_TS,
+        "runtime": { "version": "0.5.2" },
+        "message": {
+            "role": "user",
+            "content": [{ "type": "text", "text": FOLLOW_UP_TEXT }],
+        },
     });
     std::fs::write(
         &cand.native_path,

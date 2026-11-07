@@ -65,6 +65,27 @@ fn event_lines(header_events: &[starforge_format::Event]) -> Vec<String> {
         .collect()
 }
 
+/// The fixture's event kinds in order: user, reasoning, assistant text,
+/// tool call, tool result, tool-call-only assistant turn, image tool result,
+/// advisor system message, compaction, unknown-record system fallback.
+/// The `session_exit` record ends the session without an event; the skipped
+/// records (model_usage, mode_change, credential_pin, tool_execution_start)
+/// emit none.
+fn fixture_kinds() -> Vec<&'static str> {
+    vec![
+        "user_message",
+        "reasoning",
+        "assistant_message",
+        "tool_call",
+        "tool_result",
+        "tool_call",
+        "tool_result",
+        "system",
+        "compaction",
+        "system",
+    ]
+}
+
 #[test]
 fn pi_golden_pinned_version() {
     let (_tmp, roots, _native) = setup_pi("0.5.2");
@@ -83,21 +104,40 @@ fn pi_golden_pinned_version() {
     }
     assert_eq!(out.header.agent.name, starforge_format::AgentName::Pi);
     let kinds: Vec<&str> = out.events.iter().map(|e| kind_name(&e.kind)).collect();
-    assert_eq!(
-        kinds,
-        vec![
-            "user_message",
-            "assistant_message",
-            "reasoning",
-            "tool_call",
-            "tool_result",
-            "subagent_start",
-            "subagent_end",
-            "assistant_message",
-            "compaction",
-        ]
-    );
+    assert_eq!(kinds, fixture_kinds());
     assert!(out.header.capture.adapter_version_verified);
+
+    // The leading `title` record (no `timestamp`) must NOT get the fallback
+    // "now": no event carries FALLBACK_TS, so the 24 h idle rule can end
+    // the session. The advisor message is readable system text; the unknown
+    // record keeps its raw JSON.
+    assert!(out.events.iter().all(|e| e.ts != FALLBACK_TS));
+    let systems: Vec<&starforge_format::System> = out
+        .events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            starforge_format::EventKind::System(s) => Some(s),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(systems.len(), 2);
+    assert_eq!(
+        systems[0].text,
+        "Consider running the test suite before finishing."
+    );
+    assert!(systems[1].text.contains("\"mystery_record\""));
+
+    // `credential_pin` contents never appear anywhere in the output.
+    let all = format!("{:?}", out.events) + &format!("{:?}", out.header);
+    assert!(
+        !all.contains("sk-secret-should-not-appear-in-output"),
+        "credential_pin content must never be captured"
+    );
+    // The image tool result is a placeholder, never inlined data.
+    assert!(
+        !all.contains("aGVsbG8="),
+        "image data must never be inlined"
+    );
 
     // Header matches meta.json exactly.
     let meta = std::fs::read_to_string(fixture_dir("0.5.2").join("meta.json")).unwrap();
@@ -105,11 +145,19 @@ fn pi_golden_pinned_version() {
     assert_eq!(out.header, want);
     assert_eq!(out.header.usage.input, 2600);
     assert_eq!(out.header.usage.output, 85);
+    assert_eq!(out.header.usage.cache_read, 100);
+    assert_eq!(out.header.usage.cache_write, 20);
+    assert_eq!(out.header.usage.reasoning, 30);
     assert_eq!(out.header.files_touched, vec!["src/auth.rs"]);
+    assert_eq!(out.header.title.as_deref(), Some("Refactor auth module"));
+    assert_eq!(
+        out.header.ended_at.as_deref(),
+        Some("2026-11-04T12:00:20.000Z")
+    );
 }
 
 #[test]
-fn omp_golden_version_unverified_with_system_fallback() {
+fn omp_golden_version_unverified() {
     let (_tmp, roots, _native) = setup_omp("omp-0.9.1");
     let a = PiAdapter;
     assert!(a.detect(&roots));
@@ -126,45 +174,12 @@ fn omp_golden_version_unverified_with_system_fallback() {
     for (i, e) in out.events.iter().enumerate() {
         assert_eq!(e.seq, i as u64, "event {i} seq");
     }
-    // omp shares the Pi agent name per §7.8's five-name table.
+    // omp shares the Pi agent name per §7.8's five-name table; the format
+    // version (`session.version` == 3) never appears as the agent version.
     assert_eq!(out.header.agent.name, starforge_format::AgentName::Pi);
     assert_eq!(out.header.agent.version, "omp-0.9.1");
     let kinds: Vec<&str> = out.events.iter().map(|e| kind_name(&e.kind)).collect();
-    assert_eq!(
-        kinds,
-        vec![
-            "user_message",
-            "assistant_message",
-            "reasoning",
-            "tool_call",
-            "tool_result",
-            "system",
-            "subagent_start",
-            "subagent_end",
-            "assistant_message",
-            "compaction",
-        ]
-    );
-    // The omp-only record shape is never dropped: it maps to `system` whose
-    // text carries the raw native JSON.
-    let system = out
-        .events
-        .iter()
-        .find(|e| kind_name(&e.kind) == "system")
-        .expect("omp fixture must contain a system fallback event");
-    let starforge_format::EventKind::System(body) = &system.kind else {
-        unreachable!("kind_name already matched system");
-    };
-    assert!(
-        body.text.contains("\"extension_state\""),
-        "system text must carry the raw record JSON: {}",
-        body.text
-    );
-    assert!(
-        body.text.contains("starforge-lint"),
-        "system text must preserve the unmapped payload: {}",
-        body.text
-    );
+    assert_eq!(kinds, fixture_kinds());
     // omp versions ship unverified.
     assert!(!out.header.capture.adapter_version_verified);
 
@@ -183,7 +198,7 @@ fn pi_unknown_version_parses_unverified() {
     assert_eq!(found.len(), 1);
     let out = a.read(&found[0], &Cursor::start(), FALLBACK_TS).unwrap();
     // Identical event bytes to the pinned fixture; only the header differs.
-    let expected = std::fs::read_to_string(fixture_dir("0.5.2").join("expected.jsonl")).unwrap();
+    let expected = std::fs::read_to_string(fixture_dir("unknown").join("expected.jsonl")).unwrap();
     let got = event_lines(&out.events);
     assert_eq!(got.join("\n") + "\n", expected);
     assert!(!out.header.capture.adapter_version_verified);
@@ -221,22 +236,26 @@ fn pi_incremental_read_resumes() {
     let found = a.discover(&roots, &HashMap::new());
     assert_eq!(found.len(), 1);
     let first = a.read(&found[0], &Cursor::start(), FALLBACK_TS).unwrap();
-    assert_eq!(first.events.len(), 9);
+    assert_eq!(first.events.len(), 10);
     let next = first.next;
-    assert_eq!(next.lines, 8);
+    // 16 records in the fixture (title, session, title_change, 5 message
+    // records, custom, custom_message, model_usage, mode_change,
+    // credential_pin, compaction, mystery, session_exit).
+    assert_eq!(next.lines, 16);
 
     // Empty growth: same cursor back.
     let again = a.read(&found[0], &next, FALLBACK_TS).unwrap();
     assert!(again.events.is_empty());
     assert_eq!(again.next, next);
 
-    // Partial resume across the multi-event assistant record (record index 1
-    // emits two events): cursor after 2 records holds 3 events, so the tail
-    // continues at seq 3 with no reuse, skip, or reorder.
+    // Partial resume across the multi-event assistant record (record index 4
+    // emits reasoning + assistant + tool_call): a cursor after 5 records
+    // holds 4 events, so the tail continues at seq 4 with no reuse, skip,
+    // or reorder.
     let file_len = std::fs::metadata(&found[0].native_path).unwrap().len();
     let raw = std::fs::read(&found[0].native_path).unwrap();
     let mut off = 0u64;
-    for _ in 0..2 {
+    for _ in 0..5 {
         let rel: usize = raw[off as usize..]
             .iter()
             .position(|&b| b == b'\n')
@@ -247,13 +266,13 @@ fn pi_incremental_read_resumes() {
     assert!(off < file_len);
     let mid = Cursor {
         offset: off,
-        lines: 2,
-        events: 3,
+        lines: 5,
+        events: 4,
     };
     let tail = a.read(&found[0], &mid, FALLBACK_TS).unwrap();
     assert_eq!(tail.events.len(), 6);
-    assert_eq!(tail.events[0].seq, 3);
-    assert_eq!(tail.next.lines, 8);
+    assert_eq!(tail.events[0].seq, 4);
+    assert_eq!(tail.next.lines, 16);
     assert_eq!(tail.next.offset, file_len);
 
     // discover with the full cursor reports nothing new.
@@ -281,6 +300,47 @@ fn pi_incremental_read_resumes() {
         matches!(err, starforge_capture::CaptureError::BadTimestamp(_)),
         "unexpected error: {err:?}"
     );
+}
+
+/// A resumed batch starting with a record that lacks both `timestamp` and
+/// `updatedAt` inherits the most recent timestamp already seen in the batch
+/// — never the fallback "now".
+#[test]
+fn pi_incremental_timestamp_inherits_last_seen() {
+    let (_tmp, roots, _native) = setup_pi("0.5.2");
+    let a = PiAdapter;
+    let found = a.discover(&roots, &HashMap::new());
+    assert_eq!(found.len(), 1);
+    let first = a.read(&found[0], &Cursor::start(), FALLBACK_TS).unwrap();
+    let resume_at = first.next;
+    // The last fixture record is `session_exit` at 12:00:20.
+    let last_ts = "2026-11-04T12:00:20.000Z";
+
+    // Append a `custom_message` with no timestamp at all.
+    let appended = serde_json::json!({
+        "type": "custom_message",
+        "id": "c9",
+        "parentId": null,
+        "runtime": { "version": "0.5.2" },
+        "customType": "advisor",
+        "content": "Late note without a timestamp.",
+        "display": true,
+    });
+    std::fs::write(
+        &found[0].native_path,
+        format!(
+            "{}{}\n",
+            std::fs::read_to_string(&found[0].native_path).unwrap(),
+            serde_json::to_string(&appended).unwrap()
+        ),
+    )
+    .unwrap();
+
+    let tail = a.read(&found[0], &resume_at, FALLBACK_TS).unwrap();
+    assert_eq!(tail.events.len(), 1);
+    assert_eq!(kind_name(&tail.events[0].kind), "system");
+    assert_eq!(tail.events[0].ts, last_ts);
+    assert_ne!(tail.events[0].ts, FALLBACK_TS);
 }
 
 /// A foreign store file without the marker is never deleted by `remove_hooks`,

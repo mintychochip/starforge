@@ -194,7 +194,7 @@ fn gemini_inside_cwd_chat_is_discovered_any_hash() {
 
 #[test]
 fn pi_cwd_less_session_is_not_discovered() {
-    let body = "{\"type\":\"message\",\"timestamp\":\"2026-11-04T12:00:00Z\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n";
+    let body = "{\"type\":\"message\",\"id\":\"m1\",\"timestamp\":\"2026-11-04T12:00:00Z\",\"runtime\":{\"version\":\"0.5.2\"},\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}}\n";
     let (_tmp, roots) = pi_case(body);
     assert!(PiAdapter.discover(&roots, &HashMap::new()).is_empty());
 }
@@ -202,14 +202,14 @@ fn pi_cwd_less_session_is_not_discovered() {
 #[test]
 fn pi_empty_header_cwd_session_is_not_discovered() {
     // Old Pi sessions carry an empty header cwd: unknown, so skipped.
-    let body = "{\"type\":\"session\",\"version\":3,\"id\":\"uuid\",\"timestamp\":\"2024-12-03T14:00:00.000Z\",\"cwd\":\"\"}\n{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n";
+    let body = "{\"type\":\"session\",\"version\":3,\"id\":\"uuid\",\"timestamp\":\"2024-12-03T14:00:00.000Z\",\"cwd\":\"\",\"runtime\":{\"version\":\"0.5.2\"}}\n{\"type\":\"message\",\"id\":\"m1\",\"timestamp\":\"2024-12-03T14:00:01.000Z\",\"runtime\":{\"version\":\"0.5.2\"},\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}}\n";
     let (_tmp, roots) = pi_case(body);
     assert!(PiAdapter.discover(&roots, &HashMap::new()).is_empty());
 }
 
 #[test]
 fn pi_header_cwd_session_is_discovered() {
-    let body = "{\"type\":\"session\",\"version\":3,\"id\":\"uuid\",\"timestamp\":\"2024-12-03T14:00:00.000Z\",\"cwd\":\"/repo\"}\n{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n";
+    let body = "{\"type\":\"session\",\"version\":3,\"id\":\"uuid\",\"timestamp\":\"2024-12-03T14:00:00.000Z\",\"cwd\":\"/repo\",\"runtime\":{\"version\":\"0.5.2\"}}\n{\"type\":\"message\",\"id\":\"m1\",\"timestamp\":\"2024-12-03T14:00:01.000Z\",\"runtime\":{\"version\":\"0.5.2\"},\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}}\n";
     let (_tmp, roots) = pi_case(body);
     let found = PiAdapter.discover(&roots, &HashMap::new());
     assert_eq!(found.len(), 1);
@@ -218,7 +218,7 @@ fn pi_header_cwd_session_is_discovered() {
 
 #[test]
 fn pi_outside_cwd_session_is_not_discovered() {
-    let body = "{\"type\":\"session\",\"version\":3,\"id\":\"uuid\",\"timestamp\":\"2024-12-03T14:00:00.000Z\",\"cwd\":\"/elsewhere\"}\n{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n";
+    let body = "{\"type\":\"session\",\"version\":3,\"id\":\"uuid\",\"timestamp\":\"2024-12-03T14:00:00.000Z\",\"cwd\":\"/elsewhere\",\"runtime\":{\"version\":\"0.5.2\"}}\n{\"type\":\"message\",\"id\":\"m1\",\"timestamp\":\"2024-12-03T14:00:01.000Z\",\"runtime\":{\"version\":\"0.5.2\"},\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}}\n";
     let (_tmp, roots) = pi_case(body);
     assert!(PiAdapter.discover(&roots, &HashMap::new()).is_empty());
 }
@@ -226,7 +226,7 @@ fn pi_outside_cwd_session_is_not_discovered() {
 #[test]
 fn pi_per_record_cwd_session_is_discovered() {
     // omp shape: no public spec; per-record cwd is accepted.
-    let body = "{\"type\":\"message\",\"cwd\":\"/repo/sub\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n";
+    let body = "{\"type\":\"message\",\"id\":\"m1\",\"cwd\":\"/repo/sub\",\"timestamp\":\"2024-12-03T14:00:01.000Z\",\"runtime\":{\"version\":\"0.5.2\"},\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}}\n";
     let (_tmp, roots) = pi_case(body);
     assert_eq!(PiAdapter.discover(&roots, &HashMap::new()).len(), 1);
 }

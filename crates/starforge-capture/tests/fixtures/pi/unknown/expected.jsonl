@@ -1,9 +1,10 @@
-{"kind":"user_message","seq":0,"text":"Help me refactor the auth module.","ts":"2026-11-04T12:00:00Z","v":1}
-{"kind":"assistant_message","model":"pi-medium","seq":1,"text":"I'll start by reading the auth module.","ts":"2026-11-04T12:00:05Z","usage":{"cache_read":0,"cache_write":0,"input":1200,"output":60,"reasoning":0},"v":1}
-{"kind":"reasoning","seq":2,"text":"The auth module has tangled session logic; check src/auth.rs first.","ts":"2026-11-04T12:00:05Z","v":1}
-{"kind":"tool_call","seq":3,"tool":{"input":{"file_path":"/repo/src/auth.rs"},"name":"Edit"},"ts":"2026-11-04T12:00:09Z","v":1}
-{"kind":"tool_result","result":{"is_error":false,"original_bytes":24,"output":"Edited /repo/src/auth.rs","truncated":false},"seq":4,"ts":"2026-11-04T12:00:10Z","v":1}
-{"kind":"subagent_start","seq":5,"subagent_id":"agent-1","task":"Explore auth callers","ts":"2026-11-04T12:00:11Z","v":1}
-{"kind":"subagent_end","seq":6,"subagent_id":"agent-1","task":"Explore auth callers","ts":"2026-11-04T12:00:13Z","v":1}
-{"kind":"assistant_message","model":"pi-medium","seq":7,"text":"Done. The refactor is complete.","ts":"2026-11-04T12:00:14Z","usage":{"cache_read":0,"cache_write":0,"input":1400,"output":25,"reasoning":0},"v":1}
-{"kind":"compaction","seq":8,"summary":"Refactored the auth module.","ts":"2026-11-04T12:00:15Z","v":1}
+{"kind":"user_message","seq":0,"text":"Help me refactor the auth module.","ts":"2026-11-04T12:00:02.000Z","v":1}
+{"kind":"reasoning","seq":1,"text":"Check src/auth.rs first.","ts":"2026-11-04T12:00:05.000Z","v":1}
+{"kind":"assistant_message","model":"pi-medium","seq":2,"text":"I'll start by reading the auth module.","ts":"2026-11-04T12:00:05.000Z","usage":{"cache_read":100,"cache_write":20,"input":1200,"output":60,"reasoning":30},"v":1}
+{"kind":"tool_call","seq":3,"tool":{"input":{"file_path":"/repo/src/auth.rs"},"name":"Edit"},"ts":"2026-11-04T12:00:05.000Z","v":1}
+{"kind":"tool_result","result":{"is_error":false,"original_bytes":24,"output":"Edited /repo/src/auth.rs","truncated":false},"seq":4,"ts":"2026-11-04T12:00:10.000Z","v":1}
+{"kind":"tool_call","seq":5,"tool":{"input":{"file_path":"/repo/src/auth.rs"},"name":"Read"},"ts":"2026-11-04T12:00:14.000Z","v":1}
+{"kind":"tool_result","result":{"is_error":true,"original_bytes":18,"output":"[image: image/png]","truncated":false},"seq":6,"ts":"2026-11-04T12:00:15.000Z","v":1}
+{"kind":"system","seq":7,"text":"Consider running the test suite before finishing.","ts":"2026-11-04T12:00:17.000Z","v":1}
+{"kind":"compaction","seq":8,"summary":"Refactored the auth module.","ts":"2026-11-04T12:00:19.500Z","v":1}
+{"kind":"system","seq":9,"text":"{\"type\":\"mystery_record\",\"id\":\"x1\",\"parentId\":\"m5\",\"timestamp\":\"2026-11-04T12:00:19.750Z\",\"runtime\":{\"version\":\"0.0.0-unknown\"},\"foo\":\"bar\"}","ts":"2026-11-04T12:00:19.750Z","v":1}

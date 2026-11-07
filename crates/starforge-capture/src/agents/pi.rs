@@ -2,34 +2,85 @@
 //! recursive — real installs nest one dir per cwd) and
 //! `<data_dir>/.omp/agent/sessions/**/*.jsonl` (omp, recursive).
 //!
-//! Native shape (one JSON object per line): `message` records carrying a `role`
-//! (`user` | `assistant`), `content` text, and — assistant only — `model`,
-//! `reasoning`, and token `usage`; `tool_call` records with `name` and `input`;
-//! `tool_result` records with `output`; `subagent_start` / `subagent_end`
-//! records with `subagent_id` and `task`; and `summary` records carrying
-//! compaction context in `summary`. Every record may carry `cwd`, `session`
-//! (`sessionId` is accepted too, for the omp shape), `version`, and
-//! `timestamp` (`ts` is accepted as a fallback key). An assistant `message`
-//! carrying `reasoning` emits two events (the multi-event record the
-//! incremental test resumes across).
+//! Native shape (one JSON object per line; every record carries `type`, `id`,
+//! `parentId`, an ISO-8601 `timestamp`, and `runtime: { version }`, except
+//! `title`, which carries `updatedAt` instead of `timestamp`):
+//! - `session`: `{ version: <format version int>, id, timestamp, cwd,
+//!   [title, titleSource] }` — the header record.
+//! - `title`: `{ v, title, source: "auto", updatedAt, pad }`, usually line 1.
+//!   `title_change`: `{ previousTitle, title, source, trigger }`.
+//! - `message`: `{ message: {…} }` with `message.timestamp` an int (the
+//!   record-level ISO `timestamp` is used). Roles:
+//!   - `user`: `content: [{ type: "text", text }]` → one `user_message`
+//!     (text blocks joined).
+//!   - `assistant`: `{ api, model, provider, usage, stopReason, …,
+//!     content: […] }` whose blocks, in order, are `thinking`
+//!     (`{ thinking, … }`) → `reasoning`, `text` (`{ text, … }`) →
+//!     `assistant_message` (with `model` and mapped `usage` attached exactly
+//!     as the Claude adapter attaches them), and `toolCall`
+//!     (`{ id, name, arguments }`) → `tool_call` (input = `arguments`).
+//!     `usage` folds into the header totals even when the message carries
+//!     only tool calls. Cost fields are ignored.
+//!   - `toolResult`: `{ toolCallId, toolName, isError, details, content }`
+//!     → `tool_result` paired by `toolCallId`; output is the text blocks
+//!     joined (an image block becomes `[image: <mimeType>]`, never inlined);
+//!     `details` is ignored.
+//!   - `custom`: `{ customType, content, display, attribution }` → `system`
+//!     with readable text.
+//!   - `developer`: `content: [{ type: "text", text }]` → `system` with the
+//!     joined text.
+//! - `custom_message`: `{ customType, content, display, attribution }` — a
+//!   message injected into the model's context (advisor, goal-mode context,
+//!   etc.) → `system` with readable text (`content` string or joined text
+//!   blocks).
+//! - `compaction`: `{ summary, shortSummary, … }` → `compaction` (`summary`,
+//!   falling back to `shortSummary`).
+//! - `custom` with `customType: "session_exit"` ends the session: the header's
+//!   `ended_at` is set to that record's timestamp (no event).
 //!
-//! omp sessions parse with the same mapper and share [`AgentName::Pi`] (the
-//! five-name table has no omp entry); their versions are reported as
-//! `omp-<version>` (kept by store). omp-only record shapes (e.g.
-//! `extension_state`) map to `system { text: <raw JSON> }`: never dropped,
-//! never an error.
+//! Intentionally skipped (no events), by documented rule:
+//! - `model_usage` — auxiliary side calls (job widgets, captions, cache-warm),
+//!   not conversation turns. The header's usage totals are the sum of
+//!   assistant-message usage only.
+//! - `mode_change`, `model_change`, `thinking_level_change` — runtime state,
+//!   not conversation.
+//! - `credential_pin` — credential bookkeeping; its contents are never
+//!   captured.
+//! - `custom` records other than `session_exit` — progress/bookkeeping
+//!   markers (e.g. the per-tool-call `tool_execution_start` thousands, HUD
+//!   state, reminders).
+//! - `session`, `title`, `title_change` — header facts only: `cwd` and the
+//!   initial title come from `session`; the latest `title` / `title_change`
+//!   wins the header title.
 //!
-//! Discovery attribution: a session is captured only when a non-empty
-//! `cwd` inside the worktree is found; unknown/empty `cwd` is skipped
-//! (never defaulted to the worktree). Pi stores `cwd` in the
-//! `{"type":"session",...}` header record (first line of the file):
-//! https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/src/core/session-manager.ts
-//! and https://pi.dev/docs/latest/session-format (`SessionHeader`).
-//! The header carries no per-record `cwd` on later entries, so the
-//! identity scan reads the header's `cwd` (an empty header `cwd` means
-//! an old session whose cwd is unknown: skipped). omp has no public
-//! session-format spec, so omp records keep the per-record `cwd`
-//! lookup and rely on the same skip-unknown rule.
+//! Any other record type, or a message role not listed above, keeps the
+//! raw-JSON `system` fallback: never dropped silently, never an error.
+//!
+//! Identity scan: `cwd` comes from the `session` record (a per-record `cwd`
+//! is accepted as a fallback for omp); the agent version is the first
+//! `runtime.version`. `session.version` is the FORMAT version and is never
+//! used as the agent version. For files under the omp store the reported
+//! version is `omp-<runtime.version>` (`omp-unknown` with no runtime
+//! version); for the Pi store it is `runtime.version` as-is.
+//!
+//! Timestamps, in order of preference: the record's ISO `timestamp`, then
+//! `updatedAt`, then the most recent timestamp already seen in this read
+//! batch, and only then `fallback_ts`. In particular the leading `title`
+//! record never gets "now": an imported session keeps its real timestamps so
+//! the 24 h idle rule in ingest can end it.
+//!
+//! Public sources: Pi's session format is documented at
+//! https://pi.dev/docs/latest/session-format and in the public pi-mono
+//! source (badlogic/pi-mono), `packages/coding-agent/src/core/session-manager.ts`.
+//! omp has no public session-format spec; its record fields above were
+//! confirmed against real omp session files (field names, types, and enum
+//! values only). No invented record shape remains: earlier flat records
+//! (`{"type":"message","role":…,"content":…}`) are written by no real Pi or
+//! omp release and are not parsed.
+//!
+//! Discovery attribution: a session is captured only when a non-empty `cwd`
+//! inside the worktree is found; unknown/empty `cwd` is skipped (never
+//! defaulted to the worktree).
 //!
 //! Hook story: Pi/omp have no verified JSON-config hook surface, so
 //! [`Adapter::install_hooks`] is a no-op (`Ok(vec![])`). Capture happens
@@ -46,8 +97,8 @@ use std::str::FromStr;
 use serde_json::Value;
 use starforge_format::{
     Agent, AgentName, AssistantMessage, CaptureInfo, CaptureMode, Compaction, Event, EventKind,
-    FORMAT_TAG, Reasoning, SessionMeta, SubagentBoundary, System, ToolCall, ToolOutcome, ToolRef,
-    ToolResult, Usage, UserMessage,
+    FORMAT_TAG, Reasoning, SessionMeta, System, ToolCall, ToolOutcome, ToolRef, ToolResult, Usage,
+    UserMessage,
 };
 use time::format_description::well_known::Rfc3339;
 use ulid::Ulid;
@@ -99,34 +150,68 @@ fn line_text(bytes: &[u8], span: (usize, usize)) -> &str {
     std::str::from_utf8(s).unwrap_or("")
 }
 
-/// Render a tool-result `output` value (`string | scalar`) as text.
-fn content_to_string(v: &Value) -> String {
+/// Join the `text` of every `{"type":"text"}` block in a content array.
+fn text_blocks(blocks: &[Value]) -> String {
+    let texts: Vec<&str> = blocks
+        .iter()
+        .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+        .filter_map(|b| b.get("text").and_then(Value::as_str))
+        .collect();
+    texts.join("\n")
+}
+
+/// A `content` value that is either a string or an array of text blocks,
+/// rendered as readable text.
+fn content_text(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),
-        Value::Null => String::new(),
-        other => other.to_string(),
+        Value::Array(blocks) => text_blocks(blocks),
+        _ => String::new(),
     }
 }
 
+/// Render a `toolResult` message's `content` array as text: text blocks
+/// joined; an image block becomes a short placeholder (never inline data).
+fn tool_result_text(blocks: &[Value]) -> String {
+    let mut parts = Vec::new();
+    for b in blocks {
+        match b.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                if let Some(text) = b.get("text").and_then(Value::as_str) {
+                    parts.push(text.to_string());
+                }
+            }
+            Some("image") => {
+                let mime = b
+                    .get("mimeType")
+                    .and_then(Value::as_str)
+                    .unwrap_or("image/png");
+                parts.push(format!("[image: {mime}]"));
+            }
+            _ => {}
+        }
+    }
+    parts.join("\n")
+}
+
+/// Pi/omp assistant usage: `{ input, output, cacheRead, cacheWrite,
+/// reasoningTokens?, … }`. Cost fields are ignored.
 fn parse_usage(v: &Value) -> Usage {
     let n = |key: &str| v.get(key).and_then(Value::as_u64).unwrap_or(0);
     Usage {
-        input: n("input_tokens"),
-        output: n("output_tokens"),
-        cache_read: n("cache_read_tokens"),
-        cache_write: n("cache_write_tokens"),
-        reasoning: 0,
+        input: n("input"),
+        output: n("output"),
+        cache_read: n("cacheRead"),
+        cache_write: n("cacheWrite"),
+        reasoning: n("reasoningTokens"),
     }
 }
 
 fn is_error(v: &Value) -> bool {
-    v.get("is_error")
-        .or_else(|| v.get("isError"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
+    v.get("isError").and_then(Value::as_bool).unwrap_or(false)
 }
 
-/// `file_path` carried by an `Edit`/`Write` tool input, if any.
+/// `file_path` carried by an `Edit`/`Write` tool call's arguments, if any.
 fn edit_path(tool_name: &str, input: &Value) -> Option<String> {
     if tool_name != "Edit" && tool_name != "Write" {
         return None;
@@ -143,7 +228,9 @@ struct HeaderFold {
     version: Option<String>,
     workdir: Option<String>,
     session_id: Option<String>,
+    title: Option<String>,
     started_at: Option<String>,
+    ended_at: Option<String>,
     models: Vec<String>,
     usage: Usage,
     files_touched: Vec<String>,
@@ -151,8 +238,14 @@ struct HeaderFold {
 
 impl HeaderFold {
     fn feed(&mut self, record: &Value, ts: &str) {
+        // Agent version: first `runtime.version`. `session.version` is the
+        // format version and never counts here; only `session` records carry
+        // `cwd` (per-record `cwd` is an omp fallback).
         if self.version.is_none()
-            && let Some(v) = record.get("version").and_then(Value::as_str)
+            && let Some(v) = record
+                .get("runtime")
+                .and_then(|r| r.get("version"))
+                .and_then(Value::as_str)
         {
             self.version = Some(v.to_string());
         }
@@ -162,15 +255,34 @@ impl HeaderFold {
         {
             self.workdir = Some(cwd.to_string());
         }
-        if self.session_id.is_none() {
-            let id = record
-                .get("session")
-                .or_else(|| record.get("sessionId"))
-                .or_else(|| record.get("session_id"))
-                .and_then(Value::as_str);
-            if let Some(id) = id {
-                self.session_id = Some(id.to_string());
+        let rtype = record.get("type").and_then(Value::as_str).unwrap_or("");
+        match rtype {
+            "session" => {
+                if self.session_id.is_none()
+                    && let Some(id) = record.get("id").and_then(Value::as_str)
+                {
+                    self.session_id = Some(id.to_string());
+                }
+                // The session title is an initial value; a later `title` /
+                // `title_change` record replaces it.
+                if let Some(title) = record.get("title").and_then(Value::as_str) {
+                    self.title = Some(title.to_string());
+                }
             }
+            "title" | "title_change" => {
+                // The latest title wins.
+                if let Some(title) = record.get("title").and_then(Value::as_str) {
+                    self.title = Some(title.to_string());
+                }
+            }
+            "custom"
+                if record.get("customType").and_then(Value::as_str) == Some("session_exit") =>
+            {
+                // The adapter contract can express a session end: the
+                // header's `ended_at` takes the exit record's timestamp.
+                self.ended_at = Some(ts.to_string());
+            }
+            _ => {}
         }
         if self.started_at.is_none() {
             self.started_at = Some(ts.to_string());
@@ -200,23 +312,27 @@ impl HeaderFold {
     }
 }
 
-/// One parsed record's timestamp: native `timestamp` (or `ts`) when valid
-/// RFC 3339, else `fallback_ts`.
-fn record_ts(record: &Value, fallback_ts: &str) -> String {
-    let native = record
-        .get("timestamp")
-        .or_else(|| record.get("ts"))
-        .and_then(Value::as_str);
-    match native {
-        Some(ts) if valid_ts(ts) => ts.to_string(),
-        _ => fallback_ts.to_string(),
+/// One parsed record's timestamp: the record's ISO `timestamp`, else
+/// `updatedAt`, else the most recent timestamp already seen in this read
+/// batch, else `fallback_ts`.
+fn record_ts(record: &Value, last_seen: Option<&str>, fallback_ts: &str) -> String {
+    for key in ["timestamp", "updatedAt"] {
+        if let Some(ts) = record.get(key).and_then(Value::as_str)
+            && valid_ts(ts)
+        {
+            return ts.to_string();
+        }
+    }
+    match last_seen {
+        Some(ts) => ts.to_string(),
+        None => fallback_ts.to_string(),
     }
 }
 
-/// Map one parsed record to events (timestamps resolved, `seq` assigned by
-/// the caller). Mutates `fold` with header facts (models, usage, files).
-/// `raw` is the record's source line: unmapped (omp-only) shapes fall back to
-/// `system { text: <raw JSON> }` so no record is ever dropped.
+/// Map one parsed record to events. Mutates `fold` with header facts
+/// (models, usage, files). `raw` is the record's source line: unknown record
+/// types and unknown message roles fall back to `system { text: <raw JSON> }`
+/// so no record is ever dropped.
 fn record_events(
     raw: &str,
     record: &Value,
@@ -227,120 +343,147 @@ fn record_events(
     let rtype = record.get("type").and_then(Value::as_str).unwrap_or("");
     match rtype {
         "message" => {
-            let role = record.get("role").and_then(Value::as_str).unwrap_or("");
+            let Some(msg) = record.get("message") else {
+                return kinds;
+            };
+            let role = msg.get("role").and_then(Value::as_str).unwrap_or("");
             match role {
                 "user" => {
-                    if let Some(text) = record.get("content").and_then(Value::as_str)
-                        && !text.is_empty()
-                    {
-                        kinds.push(EventKind::UserMessage(UserMessage {
-                            text: text.to_string(),
-                        }));
+                    let text = msg.get("content").map(content_text).unwrap_or_default();
+                    if !text.is_empty() {
+                        kinds.push(EventKind::UserMessage(UserMessage { text }));
                     }
                 }
                 "assistant" => {
-                    let model = record.get("model").and_then(Value::as_str).unwrap_or("");
+                    let model = msg.get("model").and_then(Value::as_str).unwrap_or("");
                     if !model.is_empty() {
                         fold.note_model(model);
                     }
-                    let usage = record.get("usage").map(parse_usage).unwrap_or_default();
+                    let usage = msg.get("usage").map(parse_usage).unwrap_or_default();
                     fold.note_usage(usage);
-                    if let Some(text) = record.get("content").and_then(Value::as_str)
-                        && !text.is_empty()
-                    {
-                        kinds.push(EventKind::AssistantMessage(AssistantMessage {
-                            text: text.to_string(),
-                            model: if model.is_empty() {
-                                None
-                            } else {
-                                Some(model.to_string())
-                            },
-                            usage,
-                        }));
-                    }
-                    // An assistant message may carry its reasoning inline; it
-                    // emits a second event after the message (this is the
-                    // multi-event record the incremental test resumes across).
-                    if let Some(reasoning) = record.get("reasoning").and_then(Value::as_str)
-                        && !reasoning.is_empty()
-                    {
-                        kinds.push(EventKind::Reasoning(Reasoning {
-                            text: reasoning.to_string(),
-                        }));
+                    kinds.extend(assistant_block_kinds(msg, model, usage, fold, workdir));
+                }
+                "toolResult" => {
+                    let output = msg
+                        .get("content")
+                        .and_then(Value::as_array)
+                        .map(|blocks| tool_result_text(blocks))
+                        .unwrap_or_default();
+                    kinds.push(EventKind::ToolResult(ToolResult {
+                        result: ToolOutcome {
+                            original_bytes: output.len() as u64,
+                            output,
+                            is_error: is_error(msg),
+                            truncated: false,
+                        },
+                    }));
+                }
+                "custom" | "developer" => {
+                    let text = msg.get("content").map(content_text).unwrap_or_default();
+                    if !text.is_empty() {
+                        kinds.push(EventKind::System(System { text }));
                     }
                 }
                 _ => {
-                    // Unknown role: preserve the raw record rather than drop it.
                     kinds.push(EventKind::System(System {
                         text: raw.to_string(),
                     }));
                 }
             }
         }
-        "tool_call" => {
-            let name = record
-                .get("name")
-                .or_else(|| record.get("tool"))
+        "custom_message" => {
+            let text = record.get("content").map(content_text).unwrap_or_default();
+            if !text.is_empty() {
+                kinds.push(EventKind::System(System { text }));
+            }
+        }
+        "compaction" => {
+            let summary = record
+                .get("summary")
                 .and_then(Value::as_str)
-                .unwrap_or("unknown");
-            let input = record.get("input").cloned().unwrap_or(Value::Null);
-            if let Some(path) = edit_path(name, &input) {
-                fold.note_file(workdir, &path);
-            }
-            kinds.push(EventKind::ToolCall(ToolCall {
-                tool: ToolRef {
-                    name: name.to_string(),
-                    input,
-                },
-            }));
-        }
-        "tool_result" => {
-            let output = record
-                .get("output")
-                .map(content_to_string)
-                .unwrap_or_default();
-            kinds.push(EventKind::ToolResult(ToolResult {
-                result: ToolOutcome {
-                    original_bytes: output.len() as u64,
-                    output,
-                    is_error: is_error(record),
-                    truncated: false,
-                },
-            }));
-        }
-        "subagent_start" | "subagent_end" => {
-            let boundary = SubagentBoundary {
-                subagent_id: record
-                    .get("subagent_id")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string(),
-                task: record
-                    .get("task")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string(),
-            };
-            if rtype == "subagent_start" {
-                kinds.push(EventKind::SubagentStart(boundary));
-            } else {
-                kinds.push(EventKind::SubagentEnd(boundary));
-            }
-        }
-        "summary" => {
+                .or_else(|| record.get("shortSummary").and_then(Value::as_str));
             kinds.push(EventKind::Compaction(Compaction {
-                summary: record
-                    .get("summary")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
+                summary: summary.map(str::to_string),
             }));
         }
+        // Header facts only (session/title/title_change), documented skips
+        // (model_usage, mode/model/thinking-level changes, credential_pin,
+        // custom records other than session_exit): no events.
+        "session"
+        | "title"
+        | "title_change"
+        | "model_usage"
+        | "mode_change"
+        | "model_change"
+        | "thinking_level_change"
+        | "credential_pin"
+        | "custom" => {}
         _ => {
-            // Unmapped (omp-only) record shape: raw JSON into `system`.
-            // Never dropped, never an error.
             kinds.push(EventKind::System(System {
                 text: raw.to_string(),
             }));
+        }
+    }
+    kinds
+}
+
+/// Assistant content blocks in order, following the Claude adapter's
+/// conventions: `thinking` → reasoning, `text` → assistant text carrying
+/// `model` and `usage`, `toolCall` → tool call (input = `arguments`).
+/// Unknown block types keep the raw-block system fallback, never dropped.
+fn assistant_block_kinds(
+    msg: &Value,
+    model: &str,
+    usage: Usage,
+    fold: &mut HeaderFold,
+    workdir: &str,
+) -> Vec<EventKind> {
+    let mut kinds = Vec::new();
+    let model_opt = if model.is_empty() {
+        None
+    } else {
+        Some(model.to_string())
+    };
+    let Some(blocks) = msg.get("content").and_then(Value::as_array) else {
+        return kinds;
+    };
+    for b in blocks {
+        let btype = b.get("type").and_then(Value::as_str).unwrap_or("");
+        match btype {
+            "text" => {
+                if let Some(text) = b.get("text").and_then(Value::as_str) {
+                    kinds.push(EventKind::AssistantMessage(AssistantMessage {
+                        text: text.to_string(),
+                        model: model_opt.clone(),
+                        usage,
+                    }));
+                }
+            }
+            "thinking" => {
+                if let Some(thinking) = b.get("thinking").and_then(Value::as_str) {
+                    kinds.push(EventKind::Reasoning(Reasoning {
+                        text: thinking.to_string(),
+                    }));
+                }
+            }
+            "toolCall" => {
+                let name = b.get("name").and_then(Value::as_str).unwrap_or("unknown");
+                let input = b.get("arguments").cloned().unwrap_or(Value::Null);
+                if let Some(path) = edit_path(name, &input) {
+                    fold.note_file(workdir, &path);
+                }
+                kinds.push(EventKind::ToolCall(ToolCall {
+                    tool: ToolRef {
+                        name: name.to_string(),
+                        input,
+                    },
+                }));
+            }
+            _ => {
+                kinds.push(EventKind::System(System {
+                    text: b.to_string(),
+                }));
+            }
         }
     }
     kinds
@@ -362,10 +505,12 @@ fn collect_jsonl(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// First non-empty `cwd` and `version` seen in a transcript (cheap
-/// identity scan). Pi's `{"type":"session"}` header record (first
-/// line) carries `cwd`; per-record `cwd` is accepted too (omp shape).
-/// An empty `cwd` counts as unknown and does not stop the scan.
+/// First non-empty `cwd` and first `runtime.version` seen in a transcript
+/// (cheap identity scan). `cwd` comes from the `session` record (a
+/// per-record `cwd` is accepted as the omp fallback); the version is the
+/// first `runtime.version` — `session.version` is the format version and is
+/// never the agent version. An empty `cwd` counts as unknown and does not
+/// stop the scan.
 fn scan_identity(native_path: &std::path::Path) -> (Option<String>, Option<String>) {
     let Ok(body) = std::fs::read_to_string(native_path) else {
         return (None, None);
@@ -387,7 +532,10 @@ fn scan_identity(native_path: &std::path::Path) -> (Option<String>, Option<Strin
             cwd = Some(c.to_string());
         }
         if version.is_none()
-            && let Some(v) = record.get("version").and_then(Value::as_str)
+            && let Some(v) = record
+                .get("runtime")
+                .and_then(|r| r.get("version"))
+                .and_then(Value::as_str)
         {
             version = Some(v.to_string());
         }
@@ -396,6 +544,22 @@ fn scan_identity(native_path: &std::path::Path) -> (Option<String>, Option<Strin
         }
     }
     (cwd, version)
+}
+
+/// Whether a native path lives under the omp store (`.omp/agent/sessions`).
+fn is_omp_store(native_path: &std::path::Path) -> bool {
+    native_path.components().any(|c| c.as_os_str() == ".omp")
+}
+
+/// Format a raw `runtime.version` for reporting: omp-store files report
+/// `omp-<version>` (`omp-unknown` with none); Pi-store files report it as-is.
+fn format_version(raw: Option<&str>, is_omp: bool) -> String {
+    match (raw, is_omp) {
+        (Some(v), true) => format!("omp-{v}"),
+        (None, true) => "omp-unknown".to_string(),
+        (Some(v), false) => v.to_string(),
+        (None, false) => String::new(),
+    }
 }
 
 impl Adapter for PiAdapter {
@@ -486,10 +650,11 @@ impl Adapter for PiAdapter {
                 {
                     continue;
                 }
+                let agent_version = format_version(version.as_deref(), is_omp_store(&native_path));
                 out.push(Candidate {
                     session_key,
                     native_path,
-                    agent_version: version.unwrap_or_default(),
+                    agent_version,
                     workdir,
                 });
             }
@@ -512,9 +677,12 @@ impl Adapter for PiAdapter {
             return Err(CaptureError::CursorBeyondEnd(cursor.offset, len));
         }
         // Header pass: fold every complete line so the header always reflects
-        // the full session, even on incremental reads.
+        // the full session, even on incremental reads. Timestamps resolve in
+        // file order, so a resumed batch inherits the most recent timestamp
+        // already seen instead of "now".
         let all = complete_lines(&bytes, 0);
         let mut parsed: Vec<(String, String, Value)> = Vec::with_capacity(all.len());
+        let mut last_seen: Option<String> = None;
         for span in &all {
             let text = line_text(&bytes, *span);
             if text.trim().is_empty() {
@@ -527,7 +695,8 @@ impl Adapter for PiAdapter {
                     "record is not an object".to_string(),
                 ));
             }
-            let ts = record_ts(&record, fallback_ts);
+            let ts = record_ts(&record, last_seen.as_deref(), fallback_ts);
+            last_seen = Some(ts.clone());
             parsed.push((text.to_string(), ts, record));
         }
         let mut fold = HeaderFold::default();
@@ -583,7 +752,10 @@ impl Adapter for PiAdapter {
                 events: cursor.events + events.len() as u64,
             }
         };
-        let version = fold.version.clone().unwrap_or_default();
+        let version = format_version(
+            fold.version.as_deref(),
+            is_omp_store(&candidate.native_path),
+        );
         let covered = self.version_status(&version).covered;
         let id = fold
             .session_id
@@ -598,12 +770,12 @@ impl Adapter for PiAdapter {
                 version,
             },
             models: fold.models.clone(),
-            title: None,
+            title: fold.title.clone(),
             started_at: fold
                 .started_at
                 .clone()
                 .unwrap_or_else(|| fallback_ts.to_string()),
-            ended_at: None,
+            ended_at: fold.ended_at.clone(),
             repo: Default::default(),
             parent_id: None,
             usage: fold.usage,

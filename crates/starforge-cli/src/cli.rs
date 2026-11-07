@@ -1145,11 +1145,21 @@ mod tests {
         assert!(cli.dry_run);
     }
 
-    #[test]
-    fn cli_stub_returns_exit_1() {
-        let cli = Cli::try_parse_from(["starforge", "status"]).unwrap();
-        let paths = CliPaths::from_home(PathBuf::from("/tmp/cli-test"));
-        assert_eq!(run(cli, paths), std::process::ExitCode::from(1));
+    /// `status` in a repository with no remote and no `starforge.*` config
+    /// exits 1. The repository is a fresh temp repo, never the one the tests
+    /// happen to run in (a developer's own checkout may point at a forge).
+    #[tokio::test]
+    async fn status_without_a_configured_server_exits_1() {
+        let tmp = tempfile::tempdir().unwrap();
+        let init = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .arg(tmp.path())
+            .status()
+            .unwrap();
+        assert!(init.success());
+        let paths = CliPaths::from_home(tmp.path().join("home"));
+        let (out, code) = crate::commands::status::status(tmp.path(), &paths, false).await;
+        assert_eq!(code, 1, "{out}");
     }
 
     #[test]
