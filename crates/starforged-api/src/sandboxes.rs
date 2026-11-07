@@ -613,3 +613,50 @@ pub async fn sandbox_port_url(
         expires_at: url.expires_at,
     }))
 }
+
+/// One row of the runtime capability table (M6b B6).
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+pub struct RuntimeJson {
+    pub name: String,
+    pub available: bool,
+    /// Reserved names (`firecracker`, `kata`) report `available = false`:
+    /// creating one is refused with 422 until its adapter ships.
+    pub reserved: bool,
+    pub detail: String,
+}
+
+/// `GET /api/v1/sandboxes/runtimes` response.
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+pub struct RuntimesJson {
+    pub runtimes: Vec<RuntimeJson>,
+}
+
+/// `GET /api/v1/sandboxes/runtimes`: the runtime capability table.
+#[utoipa::path(
+    get,
+    path = "/api/v1/sandboxes/runtimes",
+    responses(
+        (status = 200, description = "Runtime capability table", body = RuntimesJson),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+pub async fn list_runtimes(
+    State(state): State<ApiState>,
+    _auth: SandboxAuth,
+) -> Result<Json<RuntimesJson>, ApiError> {
+    Ok(Json(RuntimesJson {
+        runtimes: state
+            .core
+            .sandbox_runtimes()
+            .into_iter()
+            .map(|info| RuntimeJson {
+                name: info.name.to_owned(),
+                available: info.available,
+                reserved: info.reserved,
+                detail: info.detail.to_owned(),
+            })
+            .collect(),
+    }))
+}

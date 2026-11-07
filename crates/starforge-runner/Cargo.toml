@@ -1,0 +1,30 @@
+[package]
+name = "starforge-runner"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "MIT OR Apache-2.0"
+publish = true
+description = "Starforge CI runner: claims jobs, executes them in sandboxes, streams logs, uploads artifacts (plan M6d D4)"
+readme = "../../README.md"
+keywords = ["starforge", "ci", "runner"]
+categories = ["command-line-utilities"]
+
+[lints]
+workspace = true
+
+[dependencies]
+clap.workspace = true
+hex.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+starforge-sandbox-protocol = { path = "../starforge-sandbox-protocol", version = "0.1.0" }
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+url.workspace = true
+
+[dev-dependencies]

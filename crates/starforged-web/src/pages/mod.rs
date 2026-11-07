@@ -3,6 +3,7 @@
 pub mod admin;
 pub mod blame;
 pub mod changes;
+pub mod ci;
 pub mod code;
 pub mod collaborators;
 pub mod compare;

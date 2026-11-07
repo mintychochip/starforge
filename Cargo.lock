@@ -5664,6 +5664,7 @@ dependencies = [
  "starforge-capture",
  "starforge-format",
  "starforge-redact",
+ "starforge-runner",
  "tempfile",
  "thiserror",
  "time",
@@ -5703,6 +5704,24 @@ dependencies = [
  "tempfile",
  "thiserror",
  "toml",
+]
+
+[[package]]
+name = "starforge-runner"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "hex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "starforge-sandbox-protocol",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "url",
 ]
 
 [[package]]

@@ -177,6 +177,7 @@ impl Modify for SecurityAddon {
         crate::ci::git_credential,
         crate::ci::cancel_run,
         crate::sandboxes::create_sandbox,
+        crate::sandboxes::list_runtimes,
         crate::sandboxes::get_sandbox,
         crate::sandboxes::kill_sandbox,
         crate::sandboxes::pause_sandbox,
@@ -300,6 +301,8 @@ impl Modify for SecurityAddon {
         crate::sandboxes::FileJson,
         crate::sandboxes::FileWriteBody,
         crate::sandboxes::PortUrlJson,
+        crate::sandboxes::RuntimeJson,
+        crate::sandboxes::RuntimesJson,
     )),
     modifiers(&SecurityAddon),
 )]

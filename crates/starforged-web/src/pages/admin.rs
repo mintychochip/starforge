@@ -1005,3 +1005,85 @@ pub async fn health_page(
             .unwrap_or_else(|| "disabled".to_owned()),
     })
 }
+
+/// One sandbox row for the admin sandboxes page: the provider handle links
+/// nowhere (a kill is the only action), while the run that created it links
+/// to its CI run detail when the sandbox belongs to a job.
+pub struct SandboxRowView {
+    id: String,
+    state: String,
+    provider: String,
+    runtime: String,
+    template: String,
+    owner: String,
+    repo: String,
+    job_id: Option<i64>,
+    run_href: Option<String>,
+    expires_at: String,
+    created_at: String,
+    killable: bool,
+}
+
+#[derive(Template, WebTemplate)]
+#[template(path = "admin_sandboxes.html")]
+pub struct SandboxesPage {
+    nav_user: Option<NavUser>,
+    csrf: String,
+    admin_tab: &'static str,
+    sandboxes: Vec<SandboxRowView>,
+}
+
+/// `/admin/sandboxes`: every live and recently-killed sandbox, newest
+/// first (M6b B5). Site admins only; anyone else gets 404 from
+/// [`RequireAdmin`] like every other admin page.
+pub async fn sandboxes(
+    State(state): State<AppState>,
+    RequireAdmin(session): RequireAdmin,
+) -> Result<SandboxesPage, WebError> {
+    let rows = state.core.list_all_sandboxes(&session.user, 200).await?;
+    let sandboxes = rows
+        .into_iter()
+        .map(|entry| {
+            let view = entry.view;
+            let run_href = view
+                .job_id
+                .map(|job_id| format!("/{}/{}/ci/{job_id}", entry.owner, entry.repo));
+            SandboxRowView {
+                id: view.id.clone(),
+                state: view.state.clone(),
+                provider: view.provider.clone(),
+                runtime: view.runtime.clone(),
+                template: view.template.clone(),
+                owner: entry.owner,
+                repo: entry.repo,
+                job_id: view.job_id,
+                run_href,
+                expires_at: crate::views::format_time(view.expires_at),
+                created_at: crate::views::format_time(view.created_at),
+                killable: !matches!(view.state.as_str(), "killed" | "error"),
+            }
+        })
+        .collect();
+    Ok(SandboxesPage {
+        nav_user: Some(NavUser::from_session(&session)),
+        csrf: session.csrf_token.clone(),
+        admin_tab: "sandboxes",
+        sandboxes,
+    })
+}
+
+/// Kills one sandbox by provider handle (B5): a missing handle answers 404,
+/// anything else redirects back to the list.
+pub async fn kill_sandbox(
+    State(state): State<AppState>,
+    RequireAdmin(session): RequireAdmin,
+    Path(id): Path<String>,
+    Form(form): Form<CsrfForm>,
+) -> Result<Response, WebError> {
+    verify_csrf(&session.csrf_token, &form.csrf)?;
+    match state.core.kill_sandbox_admin(&session.user, &id).await {
+        Ok(_) => Ok(Redirect::to("/admin/sandboxes").into_response()),
+        Err(CoreError::NotFound) => Err(WebError::NotFound),
+        Err(other) => Err(other.into()),
+    }
+}

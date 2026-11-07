@@ -37,6 +37,7 @@ serde_json.workspace = true
 starforge-capture.workspace = true
 starforge-format.workspace = true
 starforge-redact.workspace = true
+starforge-runner.workspace = true
 thiserror.workspace = true
 time.workspace = true
 tokio.workspace = true

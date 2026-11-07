@@ -397,6 +397,7 @@ pub fn router(core: Core, base_url: String) -> Router {
             "/repos/{owner}/{repo}/ci/secrets/{name}",
             delete(ci::delete_secret),
         )
+        .route("/sandboxes/runtimes", get(sandboxes::list_runtimes))
         .route("/sandboxes", post(sandboxes::create_sandbox))
         .route(
             "/sandboxes/{id}",

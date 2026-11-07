@@ -1,0 +1,52 @@
+{% extends "base.html" %}
+{% block title %}CI {{ run.job_name }} · {{ head.owner }}/{{ head.name }}{% endblock %}
+{% block content %}
+{% include "repo_head.html" %}
+<section>
+  <h2>{{ run.job_name }} <span class="badge">{{ run.state }}</span></h2>
+  <p class="muted"><a href="/{{ head.owner }}/{{ head.name }}/ci">&larr; all runs</a> · commit <a href="/{{ head.owner }}/{{ head.name }}/commit/{{ run.commit_sha }}"><code>{{ run.commit_sha }}</code></a> · created {{ run.created_at }}{% if let Some(f) = run.finished_at %} · finished {{ f }}{% endif %}</p>
+  <p><a href="{{ logs_href }}">Full logs</a> · <a href="{{ gate_href }}">Gate panel</a></p>
+  {% if can_cancel %}
+  <form method="post" action="/{{ head.owner }}/{{ head.name }}/ci/{{ run.job_id }}/cancel" class="inline"><input type="hidden" name="_csrf" value="{{ csrf }}"><button type="submit">Cancel run</button></form>
+  {% endif %}
+</section>
+<section>
+  <h3>Artifacts</h3>
+  {% if artifacts.is_empty() %}
+  <p class="muted">No artifacts.</p>
+  {% else %}
+  <table>
+    <thead>
+      <tr><th>Name</th><th>Size</th><th>BLAKE3</th><th>SHA-256</th><th>Expires</th></tr>
+    </thead>
+    <tbody>
+      {% for artifact in artifacts %}
+      <tr>
+        <td><code>{{ artifact.name }}</code></td>
+        <td>{{ artifact.size }}</td>
+        <td><code>{{ artifact.blake3 }}</code></td>
+        <td>{% if let Some(s) = artifact.sha256 %}<code>{{ s }}</code>{% endif %}</td>
+        <td>{{ artifact.expires_at }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+</section>
+<section>
+  <h3>Sessions</h3>
+  {% if sessions.is_empty() %}
+  <p class="muted">No sessions.</p>
+  {% else %}
+  <ul>
+    {% for ulid in sessions %}
+    <li><a href="/{{ head.owner }}/{{ head.name }}/sessions/{{ ulid }}">{{ ulid }}</a></li>
+    {% endfor %}
+  </ul>
+  {% endif %}
+</section>
+<section>
+  <h3>Logs</h3>
+  <pre>{{ logs }}</pre>
+</section>
+{% endblock %}

@@ -279,6 +279,26 @@ pub struct SandboxView {
     pub last_seen_at: Option<i64>,
 }
 
+/// One row of the runtime capability table (M6b B6): a runtime name, whether
+/// the create path can serve it today, whether the name is reserved for a
+/// later adapter, and a human-readable note on what backs it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RuntimeInfo {
+    pub name: &'static str,
+    pub available: bool,
+    pub reserved: bool,
+    pub detail: &'static str,
+}
+
+/// One sandbox row for the site-admin page: the control-plane view plus the
+/// repository owner's handle and name (so a job link can be built).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AdminSandbox {
+    pub view: SandboxView,
+    pub owner: String,
+    pub repo: String,
+}
+
 /// Who a sandbox call acts for: the PAT user (owner/admin) or the job
 /// execution (`JobAuth`). A job caller sees only its own job's sandbox;
 /// a user sees sandboxes they own (site admins see everything).
@@ -1156,6 +1176,105 @@ impl Core {
             db_sandboxes::sandboxes_for_owner(self.db(), caller.user_id, limit.clamp(1, 200))
                 .await?;
         Ok(rows.iter().map(view_of).collect())
+    }
+
+    /// The runtime capability table (M6b B6): which runtimes the create
+    /// path can serve today. `podman`, `gvisor`, and `e2b` are available;
+    /// `firecracker` and `kata` are reserved names for later adapters and a
+    /// create naming one is refused (422) by [`Core::create_sandbox_inner`].
+    pub fn sandbox_runtimes(&self) -> Vec<RuntimeInfo> {
+        vec![
+            RuntimeInfo {
+                name: "podman",
+                available: true,
+                reserved: false,
+                detail: "Rootless containers via the local sandbox daemon (default)",
+            },
+            RuntimeInfo {
+                name: "gvisor",
+                available: true,
+                reserved: false,
+                detail: "runsc (gVisor) via the local sandbox daemon (opt-in runtime)",
+            },
+            RuntimeInfo {
+                name: "e2b",
+                available: true,
+                reserved: false,
+                detail: "Remote cloud sandboxes via the E2B adapter",
+            },
+            RuntimeInfo {
+                name: "firecracker",
+                available: false,
+                reserved: true,
+                detail: "Reserved for a later provider adapter",
+            },
+            RuntimeInfo {
+                name: "kata",
+                available: false,
+                reserved: true,
+                detail: "Reserved for a later Kubernetes adapter",
+            },
+        ]
+    }
+
+    /// Every sandbox, newest first, for the site-admin page. Only site
+    /// admins may list; ownership is irrelevant here (callers are
+    /// [`RequireAdmin`]-gated in the web layer, this is defense in depth).
+    pub async fn list_all_sandboxes(
+        &self,
+        admin: &User,
+        limit: i64,
+    ) -> CoreResult<Vec<AdminSandbox>> {
+        if !admin.is_admin {
+            return Err(CoreError::Forbidden);
+        }
+        let rows = db_sandboxes::list_all_sandboxes(self.db(), limit.clamp(1, 200)).await?;
+        Ok(rows
+            .into_iter()
+            .map(|(row, owner, repo)| AdminSandbox {
+                view: view_of(&row),
+                owner,
+                repo,
+            })
+            .collect())
+    }
+
+    /// Kills one sandbox as a site admin (B5): admins may kill a sandbox
+    /// they do not own, and the kill is audited like any other.
+    pub async fn kill_sandbox_admin(&self, admin: &User, id: &str) -> CoreResult<SandboxView> {
+        if !admin.is_admin {
+            return Err(CoreError::Forbidden);
+        }
+        self.kill_sandbox(
+            SandboxCaller {
+                user_id: admin.id,
+                is_admin: true,
+                job_id: None,
+            },
+            id,
+        )
+        .await
+    }
+
+    /// Kills every sandbox past its expiry and records it `killed`
+    /// (M6b B5). The hourly cleanup calls this; it is also safe to call
+    /// directly. A provider that is unreachable does not pin the record:
+    /// the best-effort kill failure is logged and the row is still marked
+    /// killed, so a dead daemon cannot leak control-plane rows forever.
+    pub async fn gc_expired_sandboxes(&self) -> CoreResult<Vec<String>> {
+        let ids = db_sandboxes::expired_sandbox_ids(self.db(), now(), 100).await?;
+        let mut killed = Vec::new();
+        for id in ids {
+            let Some(row) = db_sandboxes::sandbox_by_external_id(self.db(), &id).await? else {
+                continue;
+            };
+            if let Err(err) = self.sandbox_provider(&row.runtime).kill(id.clone()).await {
+                tracing::warn!(sandbox = %id, error = %err, "sandbox GC: provider kill failed; marking killed anyway");
+            }
+            db_sandboxes::update_sandbox_state(self.db(), &id, "killed", now()).await?;
+            killed.push(id);
+        }
+        Ok(killed)
     }
 }
 #[cfg(test)]

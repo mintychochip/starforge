@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block title %}CI · {{ head.owner }}/{{ head.name }}{% endblock %}
+{% block content %}
+{% include "repo_head.html" %}
+<section>
+  <h2>CI runs</h2>
+  {% if runs.is_empty() %}
+  <p class="muted">No CI runs yet.</p>
+  {% else %}
+  <table>
+    <thead>
+      <tr><th>Job</th><th>State</th><th>Commit</th><th>Created</th><th>Finished</th></tr>
+    </thead>
+    <tbody>
+      {% for run in runs %}
+      <tr>
+        <td><a href="/{{ head.owner }}/{{ head.name }}/ci/{{ run.job_id }}">{{ run.job_name }}</a></td>
+        <td><span class="badge">{{ run.state }}</span></td>
+        <td><a href="/{{ head.owner }}/{{ head.name }}/commit/{{ run.commit_sha }}"><code>{{ run.commit_sha }}</code></a></td>
+        <td>{{ run.created_at }}</td>
+        <td>{% if let Some(f) = run.finished_at %}{{ f }}{% endif %}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+</section>
+{% endblock %}

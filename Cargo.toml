@@ -44,6 +44,7 @@ starforge-capture = { path = "crates/starforge-capture", version = "0.1.0" }
 starforge-cli = { path = "crates/starforge-cli", version = "0.1.0" }
 starforge-format = { path = "crates/starforge-format", version = "0.1.0" }
 starforge-redact = { path = "crates/starforge-redact", version = "0.1.0" }
+starforge-runner = { path = "crates/starforge-runner", version = "0.1.0" }
 subtle = "2.6.1"
 tantivy = "0.27.0"
 syntect = { version = "5.3.0", default-features = false, features = ["default-fancy"] }

@@ -202,6 +202,11 @@ fn page_routes() -> Router<AppState> {
             post(pages::admin::purge_quarantine),
         )
         .route("/admin/health", get(pages::admin::health_page))
+        .route("/admin/sandboxes", get(pages::admin::sandboxes))
+        .route(
+            "/admin/sandboxes/{id}/kill",
+            post(pages::admin::kill_sandbox),
+        )
         .route("/admin/jobs/{id}/retry", post(pages::admin::retry_job))
         .route("/admin/jobs/{id}/delete", post(pages::admin::delete_job))
         .route(
@@ -411,6 +416,10 @@ fn page_routes() -> Router<AppState> {
             get(pages::history::commits),
         )
         .route("/{owner}/{repo}/commit/{id}", get(pages::history::commit))
+        .route("/{owner}/{repo}/ci", get(pages::ci::runs))
+        .route("/{owner}/{repo}/ci/{id}", get(pages::ci::run))
+        .route("/{owner}/{repo}/ci/{id}/logs", get(pages::ci::logs))
+        .route("/{owner}/{repo}/ci/{id}/cancel", post(pages::ci::cancel))
         .route("/{owner}/{repo}/sessions", get(pages::sessions::list))
         .route("/{owner}/{repo}/sessions/{ulid}", get(pages::session::show))
         .route(

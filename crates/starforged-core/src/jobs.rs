@@ -435,6 +435,8 @@ impl Core {
         // CI jobs whose runner lease expired: requeue or fail, revoking the
         // stale attempt's job token and git credential (M6a A6).
         starforged_db::ci::requeue_expired_ci_jobs(self.db(), ts, 3).await?;
+        // Expired sandboxes are killed and marked (M6b B5).
+        self.gc_expired_sandboxes().await?;
         // Delivery attempts older than 30 days fall out of the log (D5).
         starforged_db::checks::prune_deliveries_before(self.db(), ts - 30 * DAY).await?;
         // Every link in a message is dead 7 days after it was sent (invites live longest), so a failed

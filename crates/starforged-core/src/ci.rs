@@ -1590,6 +1590,42 @@ impl Core {
         })
     }
 
+    /// The full log text of one CI job (C4 web run detail): chunks in
+    /// offset order, concatenated. Callers need at least `Read` on the
+    /// repository; a job of another repository is `NotFound`. The trace
+    /// path already stripped control/ANSI bytes and secret-scanned the
+    /// chunks, so this returns displayable text; callers must still render
+    /// it escaped (the log is runner-supplied).
+    pub async fn get_ci_job_logs(
+        &self,
+        viewer: Option<&crate::accounts::User>,
+        owner: &str,
+        repo: &str,
+        job_id: i64,
+    ) -> CoreResult<String> {
+        let access = self
+            .require_repo(viewer, owner, repo, Permission::Read)
+            .await?;
+        let job = db_ci::ci_job_by_id(self.db(), job_id)
+            .await?
+            .ok_or(CoreError::NotFound)?;
+        if job.repo_id != access.repo.id {
+            return Err(CoreError::NotFound);
+        }
+        let chunks = db_ci::log_chunks_for_job(self.db(), job_id).await?;
+        let mut out = String::new();
+        for chunk in chunks {
+            let bytes = self
+                .config()
+                .blob_store
+                .get_by_hash(&chunk.blake3)
+                .await
+                .map_err(|e| CoreError::Internal(format!("reading CI log blob: {e}")))?;
+            out.push_str(&String::from_utf8_lossy(&bytes));
+        }
+        Ok(out)
+    }
+
     /// The secret-trust rule (plan decision 7) for one job: secrets resolve
     /// only on a protected branch or a Trail change with maintainer
     /// approval. `refs/for` runs are only trusted when

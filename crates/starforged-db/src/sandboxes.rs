@@ -155,6 +155,39 @@ pub async fn sandboxes_for_owner(db: &Db, owner_id: i64, limit: i64) -> DbResult
     rows.iter().map(sandbox_from_row).collect()
 }
 
+/// Every sandbox, newest first (capped at `limit`), with the repository
+/// owner's handle and name for the site-admin page. Sandboxes of a
+/// repository that was purged are omitted (no names to show).
+pub async fn list_all_sandboxes(
+    db: &Db,
+    limit: i64,
+) -> DbResult<Vec<(SandboxRow, String, String)>> {
+    let rows = sqlx::query(
+        "SELECT sandboxes.id, sandboxes.provider, sandboxes.runtime, \
+         sandboxes.external_id, sandboxes.job_id, sandboxes.owner_id, sandboxes.repo_id, \
+         sandboxes.state, sandboxes.template, sandboxes.cpu, sandboxes.mem_mb, \
+         sandboxes.disk_gb, sandboxes.idempotency_key, sandboxes.ca_fingerprint, \
+         sandboxes.metadata, sandboxes.created_at, sandboxes.expires_at, sandboxes.last_seen_at, \
+         owners.handle AS owner_handle, repos.name AS repo_name \
+         FROM sandboxes \
+         JOIN repos ON repos.id = sandboxes.repo_id \
+         JOIN owners ON owners.id = repos.owner_id \
+         ORDER BY sandboxes.created_at DESC, sandboxes.id DESC LIMIT $1",
+    )
+    .bind(limit)
+    .fetch_all(db.read_pool())
+    .await?;
+    rows.iter()
+        .map(|row| {
+            Ok((
+                sandbox_from_row(row)?,
+                row.try_get("owner_handle")?,
+                row.try_get("repo_name")?,
+            ))
+        })
+        .collect()
+}
+
 /// Updates a sandbox's state (and `last_seen_at` heartbeat); false when
 /// the row is gone. `state` must be a valid lifecycle state.
 pub async fn update_sandbox_state(

@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+{% block title %}Sandboxes · Site administration{% endblock %}
+{% block content %}
+<h1>Site administration</h1>
+{% include "admin_nav.html" %}
+<section>
+  <h2>Sandboxes</h2>
+  {% if sandboxes.is_empty() %}
+  <p>No sandboxes.</p>
+  {% else %}
+  <table>
+    <thead>
+      <tr><th>ID</th><th>State</th><th>Provider</th><th>Runtime</th><th>Template</th><th>Repository</th><th>Run</th><th>Expires</th><th>Created</th><th></th></tr>
+    </thead>
+    <tbody>
+      {% for sandbox in sandboxes %}
+      <tr>
+        <td><code>{{ sandbox.id }}</code></td>
+        <td>{{ sandbox.state }}</td>
+        <td>{{ sandbox.provider }}</td>
+        <td>{{ sandbox.runtime }}</td>
+        <td>{{ sandbox.template }}</td>
+        <td>{{ sandbox.owner }}/{{ sandbox.repo }}</td>
+        <td>{% if let Some(href) = sandbox.run_href %}<a href="{{ href }}">run {{ sandbox.job_id.unwrap() }}</a>{% else %}—{% endif %}</td>
+        <td>{{ sandbox.expires_at }}</td>
+        <td>{{ sandbox.created_at }}</td>
+        <td>{% if sandbox.killable %}<form method="post" action="/admin/sandboxes/{{ sandbox.id }}/kill" class="inline"><input type="hidden" name="_csrf" value="{{ csrf }}"><button type="submit">Kill</button></form>{% endif %}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+</section>
+{% endblock %}

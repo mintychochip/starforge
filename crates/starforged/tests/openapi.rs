@@ -297,6 +297,7 @@ const ROUTES: &[(&str, &str)] = &[
     ("post", "/api/v1/repos/{owner}/{repo}/ci/secrets"),
     ("delete", "/api/v1/repos/{owner}/{repo}/ci/secrets/{name}"),
     ("post", "/api/v1/sandboxes"),
+    ("get", "/api/v1/sandboxes/runtimes"),
     ("get", "/api/v1/sandboxes/{id}"),
     ("delete", "/api/v1/sandboxes/{id}"),
     ("post", "/api/v1/sandboxes/{id}/pause"),

@@ -90,6 +90,11 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: SpoolCmd,
     },
+    /// Run the CI runner: claim jobs and execute them in sandboxes.
+    Runner {
+        #[command(flatten)]
+        args: starforge_runner::RunnerArgs,
+    },
 }
 
 /// `spool` subcommands.
@@ -439,7 +444,8 @@ pub fn run(cli: Cli, paths: CliPaths) -> std::process::ExitCode {
             SessionsCmd::Publish { .. } | SessionsCmd::Unpublish { .. } | SessionsCmd::Delete { .. },
     }
     | Cmd::Export { .. }
-    | Cmd::Import { .. } = &cli.cmd
+    | Cmd::Import { .. }
+    | Cmd::Runner { .. } = &cli.cmd
     {
         // fall through to async dispatch below
     } else {
@@ -476,6 +482,7 @@ fn sync_stub(cli: Cli, paths: CliPaths) -> std::process::ExitCode {
         Cmd::Export { .. } => unreachable!("export dispatches via run_async"),
         Cmd::Import { .. } => unreachable!("import dispatches via run_async"),
         Cmd::Trail { .. } => unreachable!("trail dispatches via run_async"),
+        Cmd::Runner { .. } => unreachable!("runner dispatches via run_async"),
     }
 }
 
@@ -632,6 +639,10 @@ pub async fn run_async(cli: Cli, paths: CliPaths) -> std::process::ExitCode {
         Cmd::HookPostCommit => run_hook_post_commit(paths),
         Cmd::HookPrePush => run_hook_pre_push_async(paths).await,
         Cmd::Hook { cmd } => run_hook(cmd, paths).await,
+        Cmd::Runner { args } => {
+            let code = crate::commands::runner::run(args, dry_run).await;
+            std::process::ExitCode::from(code)
+        }
     }
 }
 /// `hook` subcommands: agent hook entry points (always exit 0, never break

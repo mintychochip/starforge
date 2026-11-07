@@ -1,0 +1,71 @@
+# Starforge reference sandbox image (plan M6d D2).
+#
+# The image a CI job's coding agent runs in. It is deliberately boring:
+# Alpine, git, the `starforge` CLI, and one agent CLI (Pi, which also
+# serves omp transcripts) — nothing else. It runs as the non-root
+# `sandbox` user, checks the repository out at `/workspace`, and receives
+# its only secrets at run time from the runner (the per-job token, see
+# packaging/sandbox/README.md). No secrets, credentials, or registry
+# tokens are baked into this image; it must stay buildable and
+# publishable with no access to any Starforge server.
+#
+# Build (the release tarballs come from `scripts/build-release.sh`, as
+# for the server image in the repo root):
+#
+#   podman build --build-arg STARFORGE_TARGET=x86_64-unknown-linux-musl \
+#     -t starforge-sandbox:0.1.0 -f packaging/sandbox/Containerfile .
+#
+# For aarch64, pass --build-arg STARFORGE_TARGET=aarch64-unknown-linux-musl
+# (and a matching build host / --platform).
+#
+# Run (normally driven by `starforge-sandboxd` / the runner, which pass
+# the workspace volume, the egress proxy env, and the per-job token;
+# this is the manual equivalent):
+#
+#   podman run --rm -it \
+#     -v starforge-workspace:/workspace \
+#     -e STARFORGE_TOKEN="<per-job token>" \
+#     starforge-sandbox:0.1.0
+
+FROM docker.io/library/alpine:3
+
+ARG STARFORGE_TARGET=x86_64-unknown-linux-musl
+
+# Runtime dependencies only: git (checkout + trailers), ca-certificates
+# (TLS through the egress proxy; the per-sandbox CA is added on top at
+# run time by sandboxd), and bash/zstd so agent CLIs and `starforge`
+# spool handling have the usual Unix toolkit.
+RUN apk add --no-cache git ca-certificates bash zstd \
+  && adduser -D -s /bin/sh sandbox \
+  && mkdir -p /workspace /home/sandbox \
+  && chown sandbox:sandbox /workspace /home/sandbox
+
+# Static musl binaries (cargo-zigbuild), installed side by side with the
+# server image's layout so `starforge` resolves identically.
+COPY target/release-artifacts/starforged-*-${STARFORGE_TARGET}.tar.gz /tmp/artifacts.tar.gz
+# One agent CLI: Pi (which also serves omp transcripts). Starforge does
+# not build the agent — it is an external binary the operator stages
+# into the build context before building (see
+# packaging/sandbox/README.md):
+#
+#   mkdir -p target/agent-bin
+#   install -m 0755 /path/to/pi target/agent-bin/pi
+#   podman build -f packaging/sandbox/Containerfile .
+#
+# `starforge sync` ingest reads the agent's native session store, so the
+# agent needs no Starforge integration beyond writing its transcript
+# under $HOME/.pi/agent/sessions/.
+COPY target/agent-bin/pi /usr/local/bin/pi
+
+USER sandbox
+WORKDIR /workspace
+
+# Agent capture roots live under $HOME (see README.md); keep them
+# pre-created and writable by the sandbox user.
+ENV HOME=/home/sandbox \
+    STARFORGE_HOME=/home/sandbox/.starforge \
+    PATH="/usr/local/bin:$PATH"
+
+# No ENTRYPOINT: the runner's job commands are the entrypoint. The
+# image's only job is to provide the toolchain and the env contract.
+CMD ["/bin/sh"]
