@@ -116,6 +116,7 @@ fn seed_session(spool: &Spool, ulid: &str, files: &[&str], extra_events: &str) {
             ulid,
             starforge_capture::Cursor::start(),
             "/tmp/native.jsonl",
+            None,
         )
         .unwrap();
 }

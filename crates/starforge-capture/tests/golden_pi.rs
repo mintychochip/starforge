@@ -68,9 +68,9 @@ fn event_lines(header_events: &[starforge_format::Event]) -> Vec<String> {
 /// The fixture's event kinds in order: user, reasoning, assistant text,
 /// tool call, tool result, tool-call-only assistant turn, image tool result,
 /// advisor system message, compaction, unknown-record system fallback.
-/// The `session_exit` record ends the session without an event; the skipped
-/// records (model_usage, mode_change, credential_pin, tool_execution_start)
-/// emit none.
+/// The `session_exit` record yields no event and no `ended_at` (a skipped
+/// runtime marker); the skipped records (model_usage, mode_change,
+/// credential_pin, tool_execution_start) emit none.
 fn fixture_kinds() -> Vec<&'static str> {
     vec![
         "user_message",
@@ -151,8 +151,8 @@ fn pi_golden_pinned_version() {
     assert_eq!(out.header.files_touched, vec!["src/auth.rs"]);
     assert_eq!(out.header.title.as_deref(), Some("Refactor auth module"));
     assert_eq!(
-        out.header.ended_at.as_deref(),
-        Some("2026-11-04T12:00:20.000Z")
+        out.header.ended_at, None,
+        "session_exit does not end the session"
     );
 }
 
@@ -240,7 +240,8 @@ fn pi_incremental_read_resumes() {
     let next = first.next;
     // 16 records in the fixture (title, session, title_change, 5 message
     // records, custom, custom_message, model_usage, mode_change,
-    // credential_pin, compaction, mystery, session_exit).
+    // credential_pin, compaction, mystery, session_exit). `session_exit`
+    // is a skipped runtime marker: it yields no event and no `ended_at`.
     assert_eq!(next.lines, 16);
 
     // Empty growth: same cursor back.
@@ -313,7 +314,8 @@ fn pi_incremental_timestamp_inherits_last_seen() {
     assert_eq!(found.len(), 1);
     let first = a.read(&found[0], &Cursor::start(), FALLBACK_TS).unwrap();
     let resume_at = first.next;
-    // The last fixture record is `session_exit` at 12:00:20.
+    // The last fixture record is `session_exit` (a skipped marker) at
+    // 12:00:20; a later record without a timestamp inherits it.
     let last_ts = "2026-11-04T12:00:20.000Z";
 
     // Append a `custom_message` with no timestamp at all.

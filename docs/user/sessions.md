@@ -123,12 +123,17 @@ wins), `message` records whose `message.role` shapes the event (`user`,
 `assistant` with `thinking` / `text` / `toolCall` blocks, `toolResult` with
 an `[image: <mime>]` placeholder for image blocks, `custom`, `developer`),
 `custom_message` context injections (as readable `system` text),
-`compaction` records, and a `custom` record with `customType:
-"session_exit"` that ends the session. Auxiliary/noise records are skipped
+`compaction` records, and `custom` records, including ones with
+`customType: "session_exit"`, which are skipped as progress markers.
+omp can resume a session in the same file after a `session_exit`, so
+`session_exit` does not end the session: Pi/omp sessions end only by the
+24 h idle rule. Auxiliary/noise records are skipped
 by rule: `model_usage` (side calls, not turns), `mode_change`,
 `model_change`, `thinking_level_change` (runtime state), `credential_pin`
 (never captured), and other `custom` progress markers; the header's models
 and usage totals come from assistant messages only. Unknown record types
 and roles keep the raw JSON as a `system` event — never dropped silently.
 Record timestamps are used verbatim (never "now"), so an old session's
-last activity stays old and the 24 h idle rule can end it.
+last activity stays old and the 24 h idle rule can end it. Every ingest
+(hooks and `starforge sync`) ends sessions idle ≥ 24 h even if their
+transcript never grows again.

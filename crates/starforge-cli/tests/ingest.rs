@@ -216,6 +216,68 @@ fn idle_rule_ends_session_25h_after_last_record() {
         "idle rule ends the session at the last record's timestamp"
     );
 }
+// Idle sweep: a session ingested while active (now = last + 1 h) stays
+// open; a later ingest with no transcript growth (now = last + 25 h)
+// ends it at the last event with exactly one `Complete` queued, and a
+// third ingest queues no second `Complete`.
+#[test]
+fn idle_sweep_ends_stalled_session_on_later_ingest() {
+    let (_repo_dir, repo) = init_repo();
+    let home = TempDir::new().unwrap();
+    let cwd = repo.to_string_lossy();
+    let native = format!(
+        "{{\"type\":\"session\",\"version\":3,\"id\":\"idle-1\",\"timestamp\":\"2026-10-01T12:00:00Z\",\"cwd\":\"{cwd}\",\"runtime\":{{\"version\":\"0.5.2\"}}}}\n{{\"type\":\"message\",\"id\":\"m1\",\"parentId\":null,\"timestamp\":\"2026-10-01T12:00:00Z\",\"runtime\":{{\"version\":\"0.5.2\"}},\"message\":{{\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":\"hello\"}}]}}}}\n"
+    );
+    let store = home.path().join(".pi/agent/sessions/--x--");
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::write(store.join("idle-1.jsonl"), native).unwrap();
+
+    let common = common_dir(&repo).unwrap();
+    let spool = Spool::open(&common);
+    spool.ensure_layout().unwrap();
+    let roots = BTreeMap::from([(
+        "pi".to_string(),
+        Roots {
+            config_dir: home.path().join(".config"),
+            data_dir: home.path().to_path_buf(),
+            worktree: repo.clone(),
+        },
+    )]);
+    // First ingest while active: last + 1 h — still open, no Complete.
+    ingest(&spool, &roots, &repo, parse_now("2026-10-01T13:00:00Z")).unwrap();
+    let ulid = spool_ulid(&spool);
+    let meta = spool.read_meta(&ulid).unwrap();
+    assert_eq!(meta.ended_at, None, "session still open at last + 1 h");
+    assert!(
+        !read_queue(&spool)
+            .unwrap()
+            .iter()
+            .any(|e| e.op == QueueOp::Complete),
+        "no Complete queued while active"
+    );
+    // Second ingest without touching the transcript: last + 25 h ends it.
+    ingest(&spool, &roots, &repo, parse_now("2026-10-02T13:00:00Z")).unwrap();
+    let meta = spool.read_meta(&ulid).unwrap();
+    assert_eq!(
+        meta.ended_at.as_deref(),
+        Some("2026-10-01T12:00:00Z"),
+        "idle sweep ends the stalled session at its last event"
+    );
+    let completes = read_queue(&spool)
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.op == QueueOp::Complete)
+        .count();
+    assert_eq!(completes, 1, "exactly one Complete queued");
+    // Third ingest must not queue a second Complete.
+    ingest(&spool, &roots, &repo, parse_now("2026-10-02T14:00:00Z")).unwrap();
+    let completes = read_queue(&spool)
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.op == QueueOp::Complete)
+        .count();
+    assert_eq!(completes, 1, "no second Complete queued");
+}
 
 // Finding 1: one unreadable native file for an earlier adapter must not
 // starve a later adapter's valid session. The Codex file below is not valid

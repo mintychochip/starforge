@@ -424,7 +424,13 @@ fn cursors_round_trip_cursor_shape_and_unknown_key_is_absent() {
         events: 3,
     };
     spool
-        .write_cursor("pi/pi-test", &ulid, cursor, "/tmp/x/sessions/pi-test.jsonl")
+        .write_cursor(
+            "pi/pi-test",
+            &ulid,
+            cursor,
+            "/tmp/x/sessions/pi-test.jsonl",
+            None,
+        )
         .unwrap();
 
     let rec = spool.read_cursor("pi/pi-test").unwrap().expect("stored");

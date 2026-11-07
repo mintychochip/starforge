@@ -185,6 +185,38 @@ impl Job {
             _ => self.recurrence().map(|_| self.kind().to_owned()),
         }
     }
+
+    /// Whether an enqueue of this kind that arrives while the same-key job is running records a rerun
+    /// request, so the job runs once more after the current run finishes (see
+    /// [`NewJob::rerun_if_running`](starforged_db::jobs::NewJob)). Only the kinds that rebuild
+    /// derived state from the database opt in: a running copy may have read the state before the
+    /// change that triggered the new request. The rest keep the old behavior: imports must not
+    /// repeat; mirrors and recurring jobs reschedule themselves; maintenance, rebuild, document
+    /// drops, and revision commits are covered by the running copy.
+    pub fn rerun_if_running(&self) -> bool {
+        match self {
+            Job::IndexSessionEvents { .. }
+            | Job::IndexTrail { .. }
+            | Job::IndexRepo { .. }
+            | Job::ChangeMergeability { .. } => true,
+            Job::HourlyCleanup
+            | Job::DailyPrune
+            | Job::PurgeDeletedRepos
+            | Job::SendEmail { .. }
+            | Job::GitMaintenance { .. }
+            | Job::DropSessionDocs { .. }
+            | Job::RebuildIndex
+            | Job::ResolveCommitLinks { .. }
+            | Job::UpdateSessionStats { .. }
+            | Job::SessionWebhookOutbox { .. }
+            | Job::RecordRevisionCommits { .. }
+            | Job::WebhookDelivery { .. }
+            | Job::ImportRepo { .. }
+            | Job::ImportGithub { .. }
+            | Job::PullMirror { .. }
+            | Job::PushMirror { .. } => false,
+        }
+    }
 }
 
 impl Core {
@@ -202,7 +234,9 @@ impl Core {
     /// future (pull-mirror "sync now" and reconfiguration): the insert
     /// collides with the scheduled row, so the queued row is expedited to
     /// `now()` instead of being left in the future. A running job already
-    /// covers the request and is untouched.
+    /// covers the request and is untouched. Rerun kinds
+    /// ([`Job::rerun_if_running`]) are the exception: the running copy
+    /// gains a rerun request and runs again after it finishes.
     pub async fn enqueue_or_expedite(&self, job: &Job) -> CoreResult<()> {
         let id = self.insert_job(job, now()).await?;
         if id.is_none()
@@ -236,6 +270,7 @@ impl Core {
                 payload: &payload,
                 dedupe_key: dedupe_key.as_deref(),
                 run_at,
+                rerun_if_running: job.rerun_if_running(),
             },
         )
         .await?;
@@ -267,12 +302,21 @@ impl Core {
                 "unreadable job payload: {err}"
             ))),
         };
+        self.finish_job(&row, &job, outcome).await?;
+        Ok(true)
+    }
+
+    /// Finishes one claimed job: the complete/fail bookkeeping, the job metrics, and the recurring
+    /// and mirror rescheduling. A recorded rerun request (`rerun_at`) re-enqueues the job once more.
+    async fn finish_job(
+        &self,
+        row: &jobs::JobRow,
+        job: &Result<Job, serde_json::Error>,
+        outcome: CoreResult<()>,
+    ) -> CoreResult<()> {
         let mut counter_outcome = "ok";
-        let finished = match outcome {
-            Ok(()) => {
-                jobs::complete(self.db(), row.id).await?;
-                true
-            }
+        let (finished, rerun_at) = match outcome {
+            Ok(()) => (true, jobs::complete(self.db(), row.id).await?),
             Err(err) => {
                 // A payload that cannot be read will not become readable later.
                 let retry_at = if job.is_ok() {
@@ -286,8 +330,8 @@ impl Core {
                     "failed"
                 };
                 tracing::warn!(job = row.id, kind = %row.kind, attempts = row.attempts, error = %err, "job failed");
-                jobs::fail(self.db(), row.id, &err.to_string(), retry_at).await?;
-                retry_at.is_none()
+                let rerun_at = jobs::fail(self.db(), row.id, &err.to_string(), retry_at).await?;
+                (retry_at.is_none(), rerun_at)
             }
         };
         self.metrics().inc_job(&row.kind, counter_outcome);
@@ -314,7 +358,14 @@ impl Core {
         if finished && let Ok(Job::PushMirror { remote_id }) = &job {
             self.reschedule_push_mirror(*remote_id).await?;
         }
-        Ok(true)
+        // A request that arrived while this job was running runs it once more.
+        if finished
+            && let Ok(job) = job
+            && let Some(at) = rerun_at
+        {
+            self.insert_job(job, at).await?;
+        }
+        Ok(())
     }
 
     async fn execute(&self, id: i64, job: &Job) -> CoreResult<()> {
@@ -612,6 +663,7 @@ mod tests {
                 payload: r#"{"kind":"mystery"}"#,
                 dedupe_key: None,
                 run_at: 0,
+                rerun_if_running: false,
             },
         )
         .await
@@ -1003,5 +1055,49 @@ mod tests {
             .expect("blob row");
         assert_eq!(row.refcount, 1);
         assert!(starforged_blob::blob_file_path(&core.config().blob_dir, &hash).exists());
+    }
+
+    #[tokio::test]
+    async fn index_request_while_running_reruns_after_complete() {
+        use crate::ingest::SegmentPut;
+        let (core, _f, auth, _alice) = ingest_ctx().await;
+        let ulid = "01ARZ3NDEKTSV4RRFFQ69G5FB0";
+        core.upsert_session_meta(&auth, ulid, &session_meta(ulid))
+            .await
+            .unwrap();
+        let (bytes, hash) = segment_payload(&stats_lines());
+        match core
+            .put_segment(&auth, ulid, 0, &bytes, Some(hash))
+            .await
+            .unwrap()
+        {
+            SegmentPut::Stored(_) => {}
+            other => panic!("unexpected put outcome: {other:?}"),
+        }
+        // The segment store queued the index job while the session is still `receiving`. Claim it
+        // and run it: still `receiving`, so it indexes nothing.
+        let row = jobs::claim_next(core.db(), now(), LEASE_SECS)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.kind, "index_session_events");
+        let parsed = serde_json::from_str::<Job>(&row.payload);
+        core.execute(row.id, parsed.as_ref().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            core.search_index().stats().unwrap().events,
+            0,
+            "a receiving session is not indexed"
+        );
+        // Completing while the run still holds its key records a rerun instead of dropping it.
+        core.complete_session(&auth, ulid).await.unwrap();
+        core.finish_job(&row, &parsed, Ok(())).await.unwrap();
+        core.run_due_jobs().await.unwrap();
+        assert_eq!(
+            core.search_index().stats().unwrap().events,
+            4,
+            "the rerun indexes the completed session's events"
+        );
     }
 }

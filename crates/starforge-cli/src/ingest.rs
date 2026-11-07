@@ -15,12 +15,18 @@
 //! repo's effective rules, and the rule-set fingerprint lands in
 //! `meta.redaction`. A session ends when its last event is older than 24 h
 //! relative to the caller-supplied `now` (adapters expose no end signal).
+//! Because discovery skips transcripts that have not grown, the batch path
+//! alone cannot end a session ingested while active once its transcript
+//! stops growing; an idle sweep at the end of [`ingest`] therefore ends
+//! every spooled session whose cursor `last_event_at` is at least 24 h
+//! before `now` (records without `last_event_at`, spooled by older CLIs,
+//! are left alone).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use starforge_capture::{Adapter, Roots};
-use starforge_format::{AgentName, Event, EventKind, Usage};
+use starforge_format::{AgentName, Event, EventKind, SessionMeta, Usage};
 use time::OffsetDateTime;
 
 /// Ingest outcome.
@@ -116,6 +122,82 @@ fn op_present(
     segment: Option<u64>,
 ) -> bool {
     queued.contains(&(op, ulid.to_string(), segment))
+}
+
+/// End `meta` at `last_event_at` when it is idle at least 24 h before
+/// `now_rfc3339`. Returns `true` when the session was ended. The single
+/// implementation of the rule, shared by the batch path and the idle sweep.
+fn end_at_last_if_idle(meta: &mut SessionMeta, last_event_at: &str, now_rfc3339: &str) -> bool {
+    if meta.ended_at.is_some() {
+        return false;
+    }
+    let (Some(last_dt), Some(now_dt)) = (parse_ts(last_event_at), parse_ts(now_rfc3339)) else {
+        return false;
+    };
+    if now_dt - last_dt < time::Duration::hours(24) {
+        return false;
+    }
+    meta.ended_at = Some(last_event_at.to_string());
+    true
+}
+
+/// Enqueue one op unless the queue already holds a matching entry (the
+/// `queued` set is seeded from the spool queue at sweep start).
+fn enqueue_op(
+    spool: &crate::spool::Spool,
+    op: crate::queue::QueueOp,
+    segment: Option<u64>,
+    ulid: &str,
+    now_rfc3339: &str,
+    queued: &mut HashSet<(u8, String, Option<u64>)>,
+    stats: &mut IngestStats,
+) -> Result<(), IngestError> {
+    let disc = match op {
+        crate::queue::QueueOp::Meta => 0,
+        crate::queue::QueueOp::Segment => 1,
+        crate::queue::QueueOp::Complete => 2,
+        crate::queue::QueueOp::Links => 3,
+    };
+    if !op_present(queued, disc, ulid, segment) {
+        crate::queue::enqueue(
+            spool,
+            crate::queue::QueueEntry {
+                op,
+                ulid: ulid.to_string(),
+                repo: String::new(),
+                segment,
+                attempts: 0,
+                not_before: now_rfc3339.to_string(),
+            },
+        )?;
+        queued.insert((disc, ulid.to_string(), segment));
+        stats.enqueued += 1;
+    }
+    Ok(())
+}
+
+/// Queue `Complete` for an ended session unless the upload state already
+/// marks it complete, with the same `queued` dedupe as the batch path.
+fn queue_complete(
+    spool: &crate::spool::Spool,
+    ulid: &str,
+    now_rfc3339: &str,
+    queued: &mut HashSet<(u8, String, Option<u64>)>,
+    stats: &mut IngestStats,
+) -> Result<(), IngestError> {
+    let state = spool.read_upload(ulid)?;
+    if !state.complete {
+        enqueue_op(
+            spool,
+            crate::queue::QueueOp::Complete,
+            None,
+            ulid,
+            now_rfc3339,
+            queued,
+            stats,
+        )?;
+    }
+    Ok(())
 }
 
 /// File paths carried by one normalized event (mirrors the trailer logic).
@@ -235,11 +317,12 @@ pub fn ingest(
         }
         for candidate in adapter.discover(roots, &known) {
             let key = format!("{agent}/{}", candidate.session_key);
-            let (ulid, cursor) = match spool.read_cursor(&key)? {
-                Some(rec) => (rec.ulid, rec.cursor),
+            let (ulid, cursor, prev_last) = match spool.read_cursor(&key)? {
+                Some(rec) => (rec.ulid, rec.cursor, rec.last_event_at),
                 None => (
                     ulid::Ulid::new().to_string(),
                     starforge_capture::Cursor::start(),
+                    None,
                 ),
             };
             let first_sight = spool.read_meta(&ulid).is_err();
@@ -260,6 +343,7 @@ pub fn ingest(
                         &ulid,
                         out.next,
                         &candidate.native_path.to_string_lossy(),
+                        None,
                     )?;
                 }
                 continue;
@@ -452,62 +536,41 @@ pub fn ingest(
                 }
             }
             meta.started_at = min_ts;
-            if meta.ended_at.is_none()
-                && let Some(last) = max_ts
-                && let (Some(last_dt), Some(now_dt)) = (parse_ts(&last), parse_ts(&now_rfc3339))
-                && now_dt - last_dt >= time::Duration::hours(24)
-            {
-                meta.ended_at = Some(last);
+            let merged_last = match (prev_last, max_ts) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (Some(a), None) => Some(a),
+                (None, b) => b,
+            };
+            if let Some(last) = merged_last.as_deref() {
+                end_at_last_if_idle(&mut meta, last, &now_rfc3339);
             }
             spool.put_session(&meta)?;
 
             let state = spool.read_upload(&ulid)?;
-            let maybe_enqueue = |op: crate::queue::QueueOp,
-                                 segment: Option<u64>,
-                                 queued: &mut HashSet<(u8, String, Option<u64>)>,
-                                 stats: &mut IngestStats|
-             -> Result<(), IngestError> {
-                let disc = match op {
-                    crate::queue::QueueOp::Meta => 0,
-                    crate::queue::QueueOp::Segment => 1,
-                    crate::queue::QueueOp::Complete => 2,
-                    crate::queue::QueueOp::Links => 3,
-                };
-                if !op_present(queued, disc, &ulid, segment) {
-                    crate::queue::enqueue(
-                        spool,
-                        crate::queue::QueueEntry {
-                            op,
-                            ulid: ulid.clone(),
-                            repo: String::new(),
-                            segment,
-                            attempts: 0,
-                            not_before: now_rfc3339.clone(),
-                        },
-                    )?;
-                    queued.insert((disc, ulid.clone(), segment));
-                    stats.enqueued += 1;
-                }
-                Ok(())
-            };
             if state.meta_hash.is_none() {
-                maybe_enqueue(crate::queue::QueueOp::Meta, None, &mut queued, &mut stats)?;
+                enqueue_op(
+                    spool,
+                    crate::queue::QueueOp::Meta,
+                    None,
+                    &ulid,
+                    &now_rfc3339,
+                    &mut queued,
+                    &mut stats,
+                )?;
             }
             for n in &nums {
-                maybe_enqueue(
+                enqueue_op(
+                    spool,
                     crate::queue::QueueOp::Segment,
                     Some(*n),
+                    &ulid,
+                    &now_rfc3339,
                     &mut queued,
                     &mut stats,
                 )?;
             }
-            if meta.ended_at.is_some() && !state.complete {
-                maybe_enqueue(
-                    crate::queue::QueueOp::Complete,
-                    None,
-                    &mut queued,
-                    &mut stats,
-                )?;
+            if meta.ended_at.is_some() {
+                queue_complete(spool, &ulid, &now_rfc3339, &mut queued, &mut stats)?;
             }
             // Cursor advances LAST: every persist above (session dir, segments,
             // raw slices, meta fold, queue entries) succeeded when this runs, so
@@ -520,9 +583,29 @@ pub fn ingest(
                     &ulid,
                     out.next,
                     &candidate.native_path.to_string_lossy(),
+                    merged_last.clone(),
                 )?;
             }
         }
+    }
+    // Idle sweep: discovery skips ungrown transcripts, so sessions
+    // ingested while active would otherwise stay `receiving` forever once
+    // growth stops. End any session whose cursor `last_event_at` is idle
+    // at least 24 h before `now`, for every cached record (including
+    // agents not detected this run). Records without `last_event_at`
+    // (spooled by older CLIs) are left alone.
+    for rec in spool.cursor_records()?.values() {
+        let Some(last_event_at) = rec.last_event_at.as_deref() else {
+            continue;
+        };
+        let Ok(mut meta) = spool.read_meta(&rec.ulid) else {
+            continue;
+        };
+        if !end_at_last_if_idle(&mut meta, last_event_at, &now_rfc3339) {
+            continue;
+        }
+        spool.put_session(&meta)?;
+        queue_complete(spool, &rec.ulid, &now_rfc3339, &mut queued, &mut stats)?;
     }
     Ok(stats)
 }

@@ -35,8 +35,11 @@
 //!   blocks).
 //! - `compaction`: `{ summary, shortSummary, … }` → `compaction` (`summary`,
 //!   falling back to `shortSummary`).
-//! - `custom` with `customType: "session_exit"` ends the session: the header's
-//!   `ended_at` is set to that record's timestamp (no event).
+//! - `custom` with `customType: "session_exit"` does NOT end the session:
+//!   omp resumes sessions by appending to the same file after an exit, so
+//!   an exit is a skipped runtime marker like the other `custom` progress
+//!   markers (no event). The header's `ended_at` is always `None`;
+//!   sessions end by the 24 h idle rule in ingest.
 //!
 //! Intentionally skipped (no events), by documented rule:
 //! - `model_usage` — auxiliary side calls (job widgets, captions, cache-warm),
@@ -46,9 +49,11 @@
 //!   not conversation.
 //! - `credential_pin` — credential bookkeeping; its contents are never
 //!   captured.
-//! - `custom` records other than `session_exit` — progress/bookkeeping
-//!   markers (e.g. the per-tool-call `tool_execution_start` thousands, HUD
-//!   state, reminders).
+//! - `custom` records, including `customType: "session_exit"` — progress/
+//!   bookkeeping markers (e.g. the per-tool-call `tool_execution_start`
+//!   thousands, HUD state, reminders). `session_exit` does not end the
+//!   session: omp resumes by appending after an exit in the same file, so
+//!   sessions end only by the 24 h idle rule.
 //! - `session`, `title`, `title_change` — header facts only: `cwd` and the
 //!   initial title come from `session`; the latest `title` / `title_change`
 //!   wins the header title.
@@ -230,7 +235,6 @@ struct HeaderFold {
     session_id: Option<String>,
     title: Option<String>,
     started_at: Option<String>,
-    ended_at: Option<String>,
     models: Vec<String>,
     usage: Usage,
     files_touched: Vec<String>,
@@ -274,13 +278,6 @@ impl HeaderFold {
                 if let Some(title) = record.get("title").and_then(Value::as_str) {
                     self.title = Some(title.to_string());
                 }
-            }
-            "custom"
-                if record.get("customType").and_then(Value::as_str) == Some("session_exit") =>
-            {
-                // The adapter contract can express a session end: the
-                // header's `ended_at` takes the exit record's timestamp.
-                self.ended_at = Some(ts.to_string());
             }
             _ => {}
         }
@@ -408,7 +405,7 @@ fn record_events(
         }
         // Header facts only (session/title/title_change), documented skips
         // (model_usage, mode/model/thinking-level changes, credential_pin,
-        // custom records other than session_exit): no events.
+        // custom records including session_exit): no events.
         "session"
         | "title"
         | "title_change"
@@ -775,7 +772,7 @@ impl Adapter for PiAdapter {
                 .started_at
                 .clone()
                 .unwrap_or_else(|| fallback_ts.to_string()),
-            ended_at: fold.ended_at.clone(),
+            ended_at: None,
             repo: Default::default(),
             parent_id: None,
             usage: fold.usage,

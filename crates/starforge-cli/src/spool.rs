@@ -70,6 +70,12 @@ pub struct CursorRecord {
     pub cursor: Cursor,
     /// Native transcript path the cursor belongs to.
     pub native_path: String,
+    /// Newest event timestamp ingested for this session (RFC 3339 string
+    /// as produced by adapters). Drives the idle sweep for sessions whose
+    /// transcript stopped growing. Absent for cursors written by older
+    /// CLIs; those sessions are left alone by the sweep.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_event_at: Option<String>,
 }
 
 /// Whole `cursors.json` file.
@@ -615,21 +621,31 @@ impl Spool {
     }
 
     /// Store resume state for `"<agent>/<session_key>"`, atomically
-    /// (read-modify-write of the whole `cursors.json`).
+    /// (read-modify-write of the whole `cursors.json`). `last_event_at` is
+    /// the newest event timestamp ingested in this write; `None` preserves
+    /// the stored value so a cursor write carrying no new events never
+    /// erases it.
     pub fn write_cursor(
         &self,
         key: &str,
         ulid: &str,
         cursor: Cursor,
         native_path: &str,
+        last_event_at: Option<String>,
     ) -> Result<(), SpoolError> {
         let mut file = self.read_cursors()?;
+        let preserved = file
+            .sessions
+            .get(key)
+            .and_then(|rec| rec.last_event_at.clone());
+        let stored = last_event_at.or(preserved);
         file.sessions.insert(
             key.to_string(),
             CursorRecord {
                 ulid: ulid.to_string(),
                 cursor,
                 native_path: native_path.to_string(),
+                last_event_at: stored,
             },
         );
         atomic_write(

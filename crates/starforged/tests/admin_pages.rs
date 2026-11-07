@@ -184,6 +184,7 @@ async fn health_shows_version_engine_git_and_job_aggregates() {
             payload: "{}",
             dedupe_key: None,
             run_at: 1_700_000_000,
+            rerun_if_running: false,
         },
     )
     .await
@@ -197,6 +198,7 @@ async fn health_shows_version_engine_git_and_job_aggregates() {
             payload: "{}",
             dedupe_key: None,
             run_at: 1_700_000_000,
+            rerun_if_running: false,
         },
     )
     .await

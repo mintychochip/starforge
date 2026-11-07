@@ -1,5 +1,9 @@
 //! `jobs`: the durable background queue (forge-basics design §8). Workers claim due rows with a guarded
 //! `UPDATE … WHERE state = 'queued'`, which behaves the same on SQLite and Postgres.
+//!
+//! A request for a deduplicated job that arrives while the same-key job is running is dropped,
+//! unless the job opted into reruns ([`NewJob`]): then `rerun_at` records it on the running row and
+//! the job runs once more after the current run finishes.
 
 use sqlx::Row;
 use sqlx::any::AnyRow;
@@ -14,6 +18,7 @@ pub struct JobRow {
     pub state: String,
     pub dedupe_key: Option<String>,
     pub run_at: i64,
+    pub rerun_at: Option<i64>,
     pub attempts: i64,
     pub locked_until: Option<i64>,
     pub last_error: String,
@@ -24,15 +29,21 @@ pub struct JobRow {
 pub struct NewJob<'a> {
     pub kind: &'a str,
     pub payload: &'a str,
-    /// At most one job per key is queued or running (partial unique index `jobs_dedupe`).
+    /// At most one job per key is queued or running (partial unique index `jobs_dedupe`): a colliding
+    /// request is dropped, unless `rerun_if_running` asks for a rerun while the same-key job runs.
     pub dedupe_key: Option<&'a str>,
     pub run_at: i64,
+    /// When set, an insert that collides with a running same-key job records `rerun_at = run_at` on
+    /// the running row, so it runs once more after the current run finishes. A collision with a
+    /// queued copy records nothing: the queued copy re-reads state when it runs. Without this flag
+    /// the colliding request is dropped as before.
+    pub rerun_if_running: bool,
 }
 
 macro_rules! select_job {
     ($tail:literal) => {
         concat!(
-            "SELECT id, kind, payload, state, dedupe_key, run_at, attempts, locked_until, last_error, created_at, updated_at ",
+            "SELECT id, kind, payload, state, dedupe_key, run_at, rerun_at, attempts, locked_until, last_error, created_at, updated_at ",
             "FROM jobs ",
             $tail
         )
@@ -47,6 +58,7 @@ fn from_row(row: &AnyRow) -> DbResult<JobRow> {
         state: row.try_get("state")?,
         dedupe_key: row.try_get("dedupe_key")?,
         run_at: row.try_get("run_at")?,
+        rerun_at: row.try_get("rerun_at")?,
         attempts: row.try_get("attempts")?,
         locked_until: row.try_get("locked_until")?,
         last_error: row.try_get("last_error")?,
@@ -56,29 +68,55 @@ fn from_row(row: &AnyRow) -> DbResult<JobRow> {
 }
 
 /// Queues a job and returns its id, or `None` when `dedupe_key` is set and a job with that key is
-/// already queued or running.
+/// already queued or running. With `rerun_if_running`, a colliding request records `rerun_at` on a
+/// running same-key job and still returns `None`; the running job runs once more after it finishes.
+/// A collision with a queued copy records nothing.
 pub async fn insert(db: &Db, job: &NewJob<'_>) -> DbResult<Option<i64>> {
     let ts = now();
-    let inserted: Result<i64, sqlx::Error> = sqlx::query_scalar(
-        "INSERT INTO jobs (kind, payload, dedupe_key, run_at, created_at, updated_at) \
-         VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
-    )
-    .bind(job.kind)
-    .bind(job.payload)
-    .bind(job.dedupe_key.map(str::to_owned))
-    .bind(job.run_at)
-    .bind(ts)
-    .bind(ts)
-    .fetch_one(db.pool())
-    .await;
-    match inserted {
-        Ok(id) => Ok(Some(id)),
-        Err(err) => {
-            let err = DbError::from(err);
-            if job.dedupe_key.is_some() && err.is_unique_violation() {
-                Ok(None)
-            } else {
-                Err(err)
+    let mut round = 0;
+    loop {
+        let inserted: Result<i64, sqlx::Error> = sqlx::query_scalar(
+            "INSERT INTO jobs (kind, payload, dedupe_key, run_at, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+        )
+        .bind(job.kind)
+        .bind(job.payload)
+        .bind(job.dedupe_key.map(str::to_owned))
+        .bind(job.run_at)
+        .bind(ts)
+        .bind(ts)
+        .fetch_one(db.pool())
+        .await;
+        match inserted {
+            Ok(id) => return Ok(Some(id)),
+            Err(err) => {
+                let err = DbError::from(err);
+                if job.dedupe_key.is_none() || !err.is_unique_violation() {
+                    return Err(err);
+                }
+                if !job.rerun_if_running {
+                    return Ok(None);
+                }
+                let affected = sqlx::query(
+                    "UPDATE jobs SET rerun_at = CASE WHEN state = 'running' AND (rerun_at IS NULL OR rerun_at > $1) THEN $1 ELSE rerun_at END \
+                     WHERE dedupe_key = $2 AND state IN ('queued', 'running')",
+                )
+                .bind(job.run_at)
+                .bind(job.dedupe_key.map(str::to_owned))
+                .execute(db.pool())
+                .await?
+                .rows_affected();
+                if affected >= 1 {
+                    return Ok(None);
+                }
+                // The colliding row finished in between: retry the insert. Every
+                // retry needs another same-key row to start and finish meanwhile,
+                // so the bound is never hit in practice; when it is, the last
+                // collision is the error.
+                round += 1;
+                if round == 8 {
+                    return Err(err);
+                }
             }
         }
     }
@@ -136,24 +174,28 @@ pub async fn claim_next(db: &Db, now_ts: i64, lease_secs: i64) -> DbResult<Optio
     }
 }
 
-pub async fn complete(db: &Db, id: i64) -> DbResult<()> {
-    sqlx::query(
-        "UPDATE jobs SET state = 'done', locked_until = NULL, updated_at = $1 WHERE id = $2",
+/// Marks the row `done` and returns the `rerun_at` recorded by a request that arrived while it ran
+/// (see [`insert`]); `None` when no rerun was requested or the id is unknown.
+pub async fn complete(db: &Db, id: i64) -> DbResult<Option<i64>> {
+    let rerun_at: Option<Option<i64>> = sqlx::query_scalar(
+        "UPDATE jobs SET state = 'done', locked_until = NULL, updated_at = $1 WHERE id = $2 RETURNING rerun_at",
     )
     .bind(now())
     .bind(id)
-    .execute(db.pool())
+    .fetch_optional(db.pool())
     .await?;
-    Ok(())
+    Ok(rerun_at.flatten())
 }
 
 /// Records a failed attempt: back to `queued` at `retry_at`, or `failed` for good when `retry_at` is `None`.
-pub async fn fail(db: &Db, id: i64, error: &str, retry_at: Option<i64>) -> DbResult<()> {
+/// A retry clears any recorded rerun (the retry re-reads state) and returns `None`; a permanent failure
+/// returns the recorded rerun so the caller runs the job once more.
+pub async fn fail(db: &Db, id: i64, error: &str, retry_at: Option<i64>) -> DbResult<Option<i64>> {
     let ts = now();
     match retry_at {
         Some(at) => {
             sqlx::query(
-                "UPDATE jobs SET state = 'queued', run_at = $1, locked_until = NULL, last_error = $2, updated_at = $3 \
+                "UPDATE jobs SET state = 'queued', run_at = $1, locked_until = NULL, last_error = $2, updated_at = $3, rerun_at = NULL \
                  WHERE id = $4",
             )
             .bind(at)
@@ -162,19 +204,20 @@ pub async fn fail(db: &Db, id: i64, error: &str, retry_at: Option<i64>) -> DbRes
             .bind(id)
             .execute(db.pool())
             .await?;
+            Ok(None)
         }
         None => {
-            sqlx::query(
-                "UPDATE jobs SET state = 'failed', locked_until = NULL, last_error = $1, updated_at = $2 WHERE id = $3",
+            let rerun_at: Option<Option<i64>> = sqlx::query_scalar(
+                "UPDATE jobs SET state = 'failed', locked_until = NULL, last_error = $1, updated_at = $2 WHERE id = $3 RETURNING rerun_at",
             )
             .bind(error)
             .bind(ts)
             .bind(id)
-            .execute(db.pool())
+            .fetch_optional(db.pool())
             .await?;
+            Ok(rerun_at.flatten())
         }
     }
-    Ok(())
 }
 
 /// Running jobs whose lease ended before `now_ts` belonged to a worker that stopped. They go back to the
@@ -182,7 +225,8 @@ pub async fn fail(db: &Db, id: i64, error: &str, retry_at: Option<i64>) -> DbRes
 pub async fn requeue_expired(db: &Db, now_ts: i64, max_attempts: i64) -> DbResult<u64> {
     let result = sqlx::query(
         "UPDATE jobs SET state = CASE WHEN attempts >= $1 THEN 'failed' ELSE 'queued' END, \
-         locked_until = NULL, last_error = 'the worker stopped before finishing', updated_at = $2 \
+         locked_until = NULL, rerun_at = CASE WHEN attempts >= $1 THEN rerun_at ELSE NULL END, \
+         last_error = 'the worker stopped before finishing', updated_at = $2 \
          WHERE state = 'running' AND locked_until < $3",
     )
     .bind(max_attempts)
@@ -240,7 +284,7 @@ pub async fn list_recent(db: &Db, limit: i64) -> DbResult<Vec<JobRow>> {
 /// Re-queues a failed job now; false when the job is missing or not failed.
 pub async fn retry_failed(db: &Db, id: i64, now_ts: i64) -> DbResult<bool> {
     let changed = sqlx::query(
-        "UPDATE jobs SET state = 'queued', run_at = $1, locked_until = NULL, updated_at = $1 WHERE id = $2 AND state = 'failed'",
+        "UPDATE jobs SET state = 'queued', run_at = $1, locked_until = NULL, rerun_at = NULL, updated_at = $1 WHERE id = $2 AND state = 'failed'",
     )
     .bind(now_ts)
     .bind(id)
@@ -304,6 +348,17 @@ mod tests {
             payload: "{}",
             dedupe_key: key,
             run_at,
+            rerun_if_running: false,
+        }
+    }
+
+    fn rerun_job(key: Option<&'static str>, run_at: i64) -> NewJob<'static> {
+        NewJob {
+            kind: "test",
+            payload: "{}",
+            dedupe_key: key,
+            run_at,
+            rerun_if_running: true,
         }
     }
 
@@ -453,6 +508,7 @@ mod tests {
                 payload: "{}",
                 dedupe_key: None,
                 run_at: now,
+                rerun_if_running: false,
             },
         )
         .await
@@ -466,6 +522,7 @@ mod tests {
                 payload: "{}",
                 dedupe_key: None,
                 run_at: now,
+                rerun_if_running: false,
             },
         )
         .await
@@ -480,5 +537,49 @@ mod tests {
         assert!(delete_job(&t.db, failed).await.unwrap());
         assert!(by_id(&t.db, failed).await.unwrap().is_none());
         assert_eq!(count_by_state(&t.db, "queued").await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn rerun_requests_survive_the_running_job() {
+        let t = TestDb::new().await;
+        // A request that arrives while its job is running is recorded and returned by `complete`.
+        let first = insert(&t.db, &rerun_job(Some("r"), 0))
+            .await
+            .unwrap()
+            .unwrap();
+        claim_next(&t.db, 10, 600).await.unwrap().unwrap();
+        assert_eq!(
+            insert(&t.db, &rerun_job(Some("r"), 42)).await.unwrap(),
+            None,
+            "the request collides with the running row"
+        );
+        assert_eq!(
+            complete(&t.db, first).await.unwrap(),
+            Some(42),
+            "a rerun is due at the request time"
+        );
+        // Without the opt-in the same request is dropped: nothing is returned.
+        let plain = insert(&t.db, &job(Some("p"), 0)).await.unwrap().unwrap();
+        claim_next(&t.db, 10, 600).await.unwrap().unwrap();
+        assert_eq!(insert(&t.db, &job(Some("p"), 0)).await.unwrap(), None);
+        assert_eq!(complete(&t.db, plain).await.unwrap(), None);
+        // A request that arrives while its job is queued needs no rerun: the queued copy re-reads state.
+        let queued = insert(&t.db, &rerun_job(Some("q"), 0))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(insert(&t.db, &rerun_job(Some("q"), 0)).await.unwrap(), None);
+        claim_next(&t.db, 10, 600).await.unwrap().unwrap();
+        assert_eq!(complete(&t.db, queued).await.unwrap(), None);
+        // A retrying `fail` clears the recorded rerun: the retry re-reads state.
+        let retried = insert(&t.db, &rerun_job(Some("f"), 0))
+            .await
+            .unwrap()
+            .unwrap();
+        claim_next(&t.db, 10, 600).await.unwrap().unwrap();
+        assert_eq!(insert(&t.db, &rerun_job(Some("f"), 0)).await.unwrap(), None);
+        fail(&t.db, retried, "boom", Some(70)).await.unwrap();
+        claim_next(&t.db, 70, 600).await.unwrap().unwrap();
+        assert_eq!(complete(&t.db, retried).await.unwrap(), None);
     }
 }
