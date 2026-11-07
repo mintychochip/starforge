@@ -347,14 +347,21 @@ impl HeaderFold {
         self.usage.reasoning += u.reasoning;
     }
 
+    /// Record one touched file: absolute paths inside the workdir are
+    /// stored repo-relative, relative paths stay as-is, and absolute
+    /// paths outside the workdir are dropped entirely — storing one
+    /// verbatim would upload a path like `/home/<user>/.ssh/…` (or
+    /// another repository's layout) in `files_touched`.
     fn note_file(&mut self, workdir: &str, path: &str) {
         let path = path.trim();
         if path.is_empty() {
             return;
         }
         let stored = if std::path::Path::new(path).is_absolute() {
-            crate::repo_relative(std::path::Path::new(workdir), path)
-                .unwrap_or_else(|| path.to_string())
+            let Some(rel) = crate::repo_relative(std::path::Path::new(workdir), path) else {
+                return;
+            };
+            rel
         } else {
             path.to_string()
         };

@@ -912,17 +912,20 @@ pub async fn sessions_of_repo_newest(
     rows.iter().map(session_from_row).collect()
 }
 
-/// Direct subagent sessions of one parent in the repository, oldest first.
+/// Direct subagent sessions of one parent in the repository, oldest first,
+/// at most `limit` rows. Callers pass a sane `limit`.
 pub async fn sessions_by_parent(
     db: &Db,
     repo_id: i64,
     parent_ulid: &str,
+    limit: i64,
 ) -> DbResult<Vec<SessionRow>> {
     let rows = sqlx::query(select_session!(
-        "WHERE repo_id = $1 AND parent_ulid = $2 ORDER BY started_at ASC, id ASC"
+        "WHERE repo_id = $1 AND parent_ulid = $2 ORDER BY started_at ASC, id ASC LIMIT $3"
     ))
     .bind(repo_id)
     .bind(parent_ulid)
+    .bind(limit)
     .fetch_all(db.read_pool())
     .await?;
     rows.iter().map(session_from_row).collect()

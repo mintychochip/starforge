@@ -579,3 +579,107 @@ async fn listing_capped_keeps_newest_readable_sessions() {
     assert_eq!(ulids, vec![ULID_NEWEST_TWO, ULID_NEWEST, ULID_MIDDLE]);
     assert_eq!(total, 3);
 }
+
+fn child_ulid(index: usize) -> String {
+    format!("01ARZ3NDEKTSV4RRFFQ69G5{:04}", index)
+}
+
+async fn insert_many_children(s: &TestServer, rid: i64, uploader: i64, n: usize) {
+    for i in 0..n {
+        let ulid = child_ulid(i);
+        insert(
+            s,
+            rid,
+            uploader,
+            &ulid,
+            &format!("Child {i}"),
+            "pi",
+            1_700_003_600 + i as i64,
+            None,
+            Some(ULID_PARENT),
+            "complete",
+            1,
+            1,
+        )
+        .await;
+    }
+}
+
+fn child_link_count(page: &str) -> usize {
+    page.matches(r#"<li><a href="/alice/proj/sessions/"#)
+        .count()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn viewer_caps_children_at_fifty_with_note() {
+    let s = TestServer::start().await;
+    let alice = s.user("alice").await;
+    s.repo(&alice, "proj", Visibility::Private).await;
+    let rid = repo_id(&s, "alice", "proj", &alice).await;
+    insert(
+        &s,
+        rid,
+        alice.id,
+        ULID_PARENT,
+        "Parent session",
+        "pi",
+        1_700_000_000,
+        None,
+        None,
+        "receiving",
+        2,
+        3,
+    )
+    .await;
+    insert_many_children(&s, rid, alice.id, 51).await;
+    let (client, _csrf) = s.login("alice").await;
+    let parent = get_text(
+        &client,
+        &s.url(&format!("/alice/proj/sessions/{ULID_PARENT}")),
+    )
+    .await;
+    assert!(parent.contains("Subagent sessions (50)"), "{parent}");
+    assert_eq!(child_link_count(&parent), 50, "{parent}");
+    assert!(
+        parent.contains("Showing the first 50 subagent sessions."),
+        "{parent}"
+    );
+    assert!(!parent.contains("Child 50"), "{parent}");
+    assert!(parent.contains("Child 0"), "{parent}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn viewer_lists_all_children_below_cap_without_note() {
+    let s = TestServer::start().await;
+    let alice = s.user("alice").await;
+    s.repo(&alice, "proj", Visibility::Private).await;
+    let rid = repo_id(&s, "alice", "proj", &alice).await;
+    insert(
+        &s,
+        rid,
+        alice.id,
+        ULID_PARENT,
+        "Parent session",
+        "pi",
+        1_700_000_000,
+        None,
+        None,
+        "receiving",
+        2,
+        3,
+    )
+    .await;
+    insert_many_children(&s, rid, alice.id, 49).await;
+    let (client, _csrf) = s.login("alice").await;
+    let parent = get_text(
+        &client,
+        &s.url(&format!("/alice/proj/sessions/{ULID_PARENT}")),
+    )
+    .await;
+    assert!(parent.contains("Subagent sessions (49)"), "{parent}");
+    assert_eq!(child_link_count(&parent), 49, "{parent}");
+    assert!(
+        !parent.contains("Showing the first 50 subagent sessions."),
+        "{parent}"
+    );
+}

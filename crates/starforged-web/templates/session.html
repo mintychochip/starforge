@@ -63,6 +63,7 @@
 {% if !children.is_empty() %}
 <section class="subagents" aria-label="Subagent sessions">
 <h3>Subagent sessions ({{ children.len() }})</h3>
+{% if child_truncated %}<p class="muted">Showing the first 50 subagent sessions.</p>{% endif %}
 <ul>
 {% for c in children %}
 <li><a href="/{{ head.owner }}/{{ head.name }}/sessions/{{ c.ulid }}">{{ c.title }}</a> <span class="muted">{{ c.agent_name }}</span> <span class="badge">{{ c.lifecycle }}</span></li>

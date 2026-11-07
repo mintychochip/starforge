@@ -185,25 +185,28 @@ pub async fn register_key(
 ) -> Result<CreatedKey, AuthError> {
     let flow = DeviceFlow::new(api_base.to_string());
     let creds = flow.login_with_scopes(sleeper, now, SSH_KEY_SCOPE).await?;
-    // One-time token: used once below, then revoked server-side and dropped
-    // with `creds`; nothing is stored.
-    let created = register_with_token(&flow, &creds.access_token, key, title).await?;
-    if let Err(err) = revoke_refresh_token(&flow, &creds.refresh_token).await {
-        eprintln!(
-            "warning: the SSH key was registered, but revoking the one-time token failed: {err}"
-        );
+    // One-time token: used once below, then dropped with `creds`; nothing
+    // is stored. Both tokens must be revoked on *every* path — a failed key
+    // post (e.g. duplicate-key 422) still leaves a live `repo:write`
+    // refresh token — so the result is captured first and revocation
+    // always runs before it is returned.
+    let result = register_with_token(&flow, &creds.access_token, key, title).await;
+    for token in [&creds.access_token, &creds.refresh_token] {
+        if let Err(err) = revoke_token(&flow, token).await {
+            eprintln!("warning: revoking the one-time token failed: {err}");
+        }
     }
-    Ok(created)
+    result
 }
 
-/// Best-effort `POST /api/v1/oauth/revoke` (RFC 7009) for the one-time
-/// refresh token minted by the `repo:write` device flow.
-async fn revoke_refresh_token(flow: &DeviceFlow, refresh_token: &str) -> Result<(), AuthError> {
+/// Best-effort `POST /api/v1/oauth/revoke` (RFC 7009) for one of the
+/// one-time tokens minted by the `repo:write` device flow.
+async fn revoke_token(flow: &DeviceFlow, token: &str) -> Result<(), AuthError> {
     let url = format!("{}/api/v1/oauth/revoke", flow.base_url);
     let resp = flow
         .client
         .post(&url)
-        .form(&[("token", refresh_token)])
+        .form(&[("token", token)])
         .send()
         .await
         .map_err(|err| AuthError::Http(err.to_string()))?;

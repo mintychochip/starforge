@@ -122,8 +122,10 @@ pub async fn token(State(state): State<ApiState>, Form(form): Form<TokenForm>) -
 
 /// `POST /api/v1/oauth/revoke`: RFC 7009 token revocation. The form body
 /// carries `token` (access or refresh); the SHA-256 hash identifies the
-/// row. Always answers `200`, even for unknown or already-revoked tokens,
-/// so callers never learn whether a token existed.
+/// row. Unknown or already-revoked tokens still answer `200`, so callers
+/// never learn whether a token existed; a real DB failure maps to a 5xx
+/// through `ApiError` so the caller can warn truthfully that revocation
+/// did not happen.
 #[utoipa::path(
     post,
     path = "/api/v1/oauth/revoke",
@@ -134,8 +136,10 @@ pub async fn token(State(state): State<ApiState>, Form(form): Form<TokenForm>) -
 )]
 pub async fn revoke(State(state): State<ApiState>, Form(form): Form<RevokeForm>) -> Response {
     let hash = starforged_core::crypto::sha256_hex(&form.token);
-    let _ = state.core.revoke_token_hash(&hash).await;
-    StatusCode::OK.into_response()
+    match state.core.revoke_token_hash(&hash).await {
+        Ok(_) => StatusCode::OK.into_response(),
+        Err(other) => crate::error::ApiError::from(other).into_response(),
+    }
 }
 
 fn oauth_error(error: &str) -> Response {

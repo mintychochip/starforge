@@ -149,7 +149,7 @@ To enable git pushes after `auth login` with an SSH remote, register your
 public key with `starforge auth ssh-key add [<public-key-path>] [--server <host>] [--title <title>]`
 (the default key is the first of `~/.ssh/id_ed25519.pub`, `~/.ssh/id_ecdsa.pub`, `~/.ssh/id_rsa.pub`).
 It runs a one-time device-flow approval requesting only `repo:write`, posts `POST /api/v1/user/keys`
-with the approval token, then revokes the one-time refresh token via `POST /api/v1/oauth/revoke`
+with the approval token, then revokes both one-time tokens (access and refresh) via `POST /api/v1/oauth/revoke`
 and discards both tokens — the stored login token is never replaced or
 touched. Point your git remote at the printed SSH URL (`ssh://git@<host>:<port>/<owner>/<repo>.git`)
 and `git push` authenticates with the registered key; no token is handed to git.

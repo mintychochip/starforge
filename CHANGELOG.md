@@ -25,7 +25,8 @@ search, webhooks, and mirrors, on SQLite or Postgres.
   `docs/user/sessions.md`), session viewer with in-session search and split
   view, a per-repository sessions list with agent/state filters and the
   subagent hierarchy (omp nested sessions link to their parent), fallback
-  titles and `files_touched` from real tool-call records, quarantine on
+  titles and `files_touched` from real tool-call records (repo-relative
+  paths only; absolute paths outside the workdir are dropped), quarantine on
   high-confidence redaction hits, publish/unpublish/delete, export/import
   bundles. Only sessions whose
   working directory lies inside the repository are captured; sessions with
@@ -56,11 +57,11 @@ search, webhooks, and mirrors, on SQLite or Postgres.
   (`tests/browser/`).
 - **CLI:** `starforge` — `auth login` (device flow, scopes `repo:read
   trail:write session:upload`), `auth ssh-key add` (one-time `repo:write`
-  device flow, token never stored), `enable`/`disable` (git hooks plus the
-  Claude Code `SessionEnd` hook, which runs `starforge hook session-end`;
-  `enable` configures only agents it detects), `status`, `doctor`, `sync`,
-  `spool prune` (drop uploaded session blobs, `--dry-run`), `sessions
-  list/show/link/unlink/backfill-links/publish/unpublish/delete`,
+  device flow; both tokens are revoked and never stored), `enable`/`disable`
+  (git hooks plus the Claude Code `SessionEnd` hook, which runs `starforge
+  hook session-end`; `enable` configures only agents it detects), `status`,
+  `doctor`, `sync`, `spool prune` (drop uploaded session blobs, `--dry-run`),
+  `sessions list/show/link/unlink/backfill-links/publish/unpublish/delete`,
   `export`/`import`, and `trail
   list/show/create/comment/push/checkout/review/merge`. Server discovery
   uses `GET /.well-known/starforge.json`; the advertised `api_url` must

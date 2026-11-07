@@ -148,6 +148,51 @@ fn opencode_golden_pinned_version() {
     );
 }
 
+/// File-modifying tools' paths go through the same normalization as the Pi
+/// adapter: absolute inside the workdir becomes repo-relative, absolute
+/// outside is dropped (never stored verbatim — it could name e.g.
+/// `/home/<user>/.ssh/…`), relative stays as-is.
+#[test]
+fn opencode_files_touched_drops_absolute_paths_outside_workdir() {
+    let (_tmp, roots, db) = setup_db("2.0.29");
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch(
+        "INSERT INTO session_message(id, session_id, type, seq, time_created, time_updated, data)
+         VALUES('msg_paths', '01ARZ3NDEKTSV4RRFFQ69G5FAY', 'assistant', 8, 1793793650000, 1793793655000,
+                '{\"agent\":\"build\",\"model\":{\"id\":\"claude-sonnet-4-5\",\"providerID\":\"anthropic\"},\"content\":[],\"tokens\":{\"input\":0,\"output\":0,\"reasoning\":0,\"cache\":{\"read\":0,\"write\":0}},\"cost\":0,\"time\":{\"created\":1793793650000}}');
+         INSERT INTO session_part(message_id, session_id, ordinal, type, call_id, time_created, time_updated, data)
+         VALUES('msg_paths', '01ARZ3NDEKTSV4RRFFQ69G5FAY', 0, 'tool', 'call_inside', 1793793650000, 1793793655000,
+                '{\"type\":\"tool\",\"id\":\"call_inside\",\"name\":\"edit\",\"state\":{\"status\":\"completed\",\"input\":{\"path\":\"/repo/src/inside.rs\"},\"content\":[]}}');
+         INSERT INTO session_part(message_id, session_id, ordinal, type, call_id, time_created, time_updated, data)
+         VALUES('msg_paths', '01ARZ3NDEKTSV4RRFFQ69G5FAY', 1, 'tool', 'call_outside', 1793793650000, 1793793655000,
+                '{\"type\":\"tool\",\"id\":\"call_outside\",\"name\":\"edit\",\"state\":{\"status\":\"completed\",\"input\":{\"path\":\"/home/jlo/.ssh/id_rsa\"},\"content\":[]}}');
+         INSERT INTO session_part(message_id, session_id, ordinal, type, call_id, time_created, time_updated, data)
+         VALUES('msg_paths', '01ARZ3NDEKTSV4RRFFQ69G5FAY', 2, 'tool', 'call_rel', 1793793650000, 1793793655000,
+                '{\"type\":\"tool\",\"id\":\"call_rel\",\"name\":\"write\",\"state\":{\"status\":\"completed\",\"input\":{\"path\":\"src/rel.rs\"},\"content\":[]}}');",
+    )
+    .unwrap();
+    drop(conn);
+    let a = OpencodeAdapter;
+    let found = a.discover(&roots, &HashMap::new());
+    assert_eq!(found.len(), 1);
+    let out = a.read(&found[0], &Cursor::start(), FALLBACK_TS).unwrap();
+    assert_eq!(
+        out.header.files_touched,
+        vec![
+            "src/auth.rs",
+            "src/modern.rs",
+            "src/legacy.rs",
+            "src/inside.rs",
+            "src/rel.rs",
+        ]
+    );
+    assert!(
+        !out.header.files_touched.iter().any(|f| f.contains(".ssh")),
+        "{:?}",
+        out.header.files_touched
+    );
+}
+
 #[test]
 fn opencode_unknown_version_parses_unverified() {
     let (_tmp, roots, _db) = setup_db("unknown");

@@ -116,6 +116,9 @@ pub struct SessionPageView {
     parent: Option<RelatedSessionView>,
     /// Readable direct subagent sessions, oldest first.
     children: Vec<RelatedSessionView>,
+    /// True when exactly the display cap of children is shown: the list
+    /// may be truncated (no total or candidate count is ever revealed).
+    child_truncated: bool,
 }
 
 /// `GET /{owner}/{repo}/sessions/{ulid}?page=N&focus=seq&q=needle&split=<sha>`:
@@ -244,10 +247,14 @@ pub async fn show(
             row.lifecycle.clone(),
         )
     });
+    // One parent may have hundreds of children: cap candidates at the
+    // display cap so neither the query nor the per-row auth checks grow
+    // with the family size. Only the shown count is ever rendered.
     let child_rows = state
         .core
-        .readable_child_sessions(user, &access, &session_row.ulid)
+        .readable_child_sessions(user, &access, &session_row.ulid, 50)
         .await?;
+    let child_truncated = child_rows.len() == 50;
     let children = child_rows
         .iter()
         .map(|row| {
@@ -317,6 +324,7 @@ pub async fn show(
         truncated,
         parent,
         children,
+        child_truncated,
     };
     // Sessions never reach search indexes (spec §11.1). The transcript is
     // attacker-influenced, so the viewer also carries the strict CSP (it

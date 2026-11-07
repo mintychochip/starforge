@@ -84,9 +84,11 @@ appear — not even as locked rows.
 
 The viewer links the subagent hierarchy: a readable parent shows as
 `Subagent of <parent title>` and readable direct children list under
-`Subagent sessions (N)` with title, agent, and lifecycle, oldest first.
-An unreadable parent stays hidden on both the list (the child counts as
-top-level while its parent is unreadable) and the viewer.
+`Subagent sessions (N)` with title, agent, and lifecycle, oldest first,
+capped at the first 50 (with a `Showing the first 50 subagent sessions.`
+note when the cap is reached). An unreadable parent stays hidden on both
+the list (the child counts as top-level while its parent is unreadable)
+and the viewer.
 
 The viewer, download, and blame pages (the three surfaces rendered from
 attacker-influenced content) carry a strict Content-Security-Policy
@@ -189,7 +191,9 @@ while `write` carries `path` directly (Pi's `file_path` is also honoured);
 `read`, `grep`, `glob`, and `bash` never count. Trace Format v1 documents
 `files_touched` as repo-relative paths, so absolute paths inside the
 session's workdir are stored relative to it, absolute paths outside the
-workdir stay absolute, and relative paths stay as-is.
+workdir are dropped entirely (they could name e.g. `/home/<user>/.ssh/…`
+or another repository's layout, and are never stored verbatim), and
+relative paths stay as-is.
 
 OpenCode message rows map `synthetic`/`system` to readable `system`
 events (a non-empty `description`, when present, prefixes the text as

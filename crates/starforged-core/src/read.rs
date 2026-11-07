@@ -653,14 +653,19 @@ impl Core {
     }
 
     /// Direct subagent sessions of `ulid` in `access.repo` that `viewer`
-    /// may read, oldest first by `started_at`.
+    /// may read, oldest first by `started_at`, at most `limit` candidates.
+    /// Only the fetched candidates are authorization-checked: with a small
+    /// `limit` a parent with hundreds of children never costs hundreds of
+    /// checks.
     pub async fn readable_child_sessions(
         &self,
         viewer: Option<&User>,
         access: &RepoAccess,
         ulid: &str,
+        limit: i64,
     ) -> CoreResult<Vec<SessionRow>> {
-        let candidates = db_sessions::sessions_by_parent(self.db(), access.repo.id, ulid).await?;
+        let candidates =
+            db_sessions::sessions_by_parent(self.db(), access.repo.id, ulid, limit).await?;
         let mut out = Vec::with_capacity(candidates.len());
         for candidate in candidates {
             if self

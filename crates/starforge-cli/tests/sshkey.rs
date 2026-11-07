@@ -282,19 +282,28 @@ async fn ssh_key_add_requests_repo_write_posts_key_and_keeps_credentials() {
         "Bearer one-time-token-xyz1234"
     );
 
-    // The one-time refresh token was revoked after the key post.
+    // Both one-time tokens (access + refresh) were revoked after the key post.
     let revokes = stub.revoke_bodies.lock().unwrap();
     assert_eq!(
         revokes.len(),
-        1,
-        "exactly one revoke post, got: {revokes:?}"
+        2,
+        "exactly two revoke posts, got: {revokes:?}"
     );
-    let revoke_params = form_pairs(&revokes[0]);
+    let revoked: std::collections::BTreeSet<String> = revokes
+        .iter()
+        .map(|body| {
+            form_pairs(body)
+                .remove("token")
+                .expect("revoke body must carry a token")
+        })
+        .collect();
     assert_eq!(
-        revoke_params.get("token").map(String::as_str),
-        Some("one-time-refresh"),
-        "revoke must carry the refresh token, body: {}",
-        revokes[0]
+        revoked,
+        std::collections::BTreeSet::from([
+            "one-time-token-xyz1234".to_string(),
+            "one-time-refresh".to_string(),
+        ]),
+        "both the access and refresh tokens must be revoked, got: {revoked:?}"
     );
     drop(revokes);
 
@@ -327,6 +336,31 @@ async fn ssh_key_add_reports_already_registered() {
         err.to_string().contains("already registered"),
         "duplicate must report clearly, got: {err}"
     );
+
+    // Even on the duplicate-key failure path, both one-time tokens were revoked.
+    let revokes = stub.revoke_bodies.lock().unwrap();
+    assert_eq!(
+        revokes.len(),
+        2,
+        "exactly two revoke posts on the failure path, got: {revokes:?}"
+    );
+    let revoked: std::collections::BTreeSet<String> = revokes
+        .iter()
+        .map(|body| {
+            form_pairs(body)
+                .remove("token")
+                .expect("revoke body must carry a token")
+        })
+        .collect();
+    assert_eq!(
+        revoked,
+        std::collections::BTreeSet::from([
+            "one-time-token-xyz1234".to_string(),
+            "one-time-refresh".to_string(),
+        ]),
+        "both the access and refresh tokens must be revoked even when the key post fails, got: {revoked:?}"
+    );
+    drop(revokes);
 }
 
 #[tokio::test]
