@@ -433,8 +433,32 @@ impl Core {
         starforged_db::invites::delete_expired_before(self.db(), ts - 30 * DAY).await?;
         starforged_db::oauth::delete_expired(self.db(), ts).await?;
         // CI jobs whose runner lease expired: requeue or fail, revoking the
-        // stale attempt's job token and git credential (M6a A6).
-        starforged_db::ci::requeue_expired_ci_jobs(self.db(), ts, 3).await?;
+        // stale attempt's job token and git credential (M6a A6). A job that
+        // ends here (canceled or out of attempts) writes its terminal check
+        // and emits the `ci` event; a requeued job does neither.
+        let reaped = starforged_db::ci::requeue_expired_ci_jobs(self.db(), ts, 3).await?;
+        for id in reaped {
+            let Some(job) = starforged_db::ci::ci_job_by_id(self.db(), id).await? else {
+                continue;
+            };
+            match job.state.as_str() {
+                "canceled" => {
+                    self.terminate_ci_job(&job, "canceled", "error", "canceled", None)
+                        .await?;
+                }
+                "failed" => {
+                    self.terminate_ci_job(
+                        &job,
+                        "failed",
+                        "failure",
+                        "the runner stopped before finishing",
+                        None,
+                    )
+                    .await?;
+                }
+                _ => {}
+            }
+        }
         // Expired sandboxes are killed and marked (M6b B5).
         self.gc_expired_sandboxes().await?;
         // Delivery attempts older than 30 days fall out of the log (D5).

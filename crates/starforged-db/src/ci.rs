@@ -731,10 +731,18 @@ pub async fn requeue_expired_ci_jobs(
     let mut ids = Vec::with_capacity(jobs.len());
     for job in &jobs {
         sqlx::query(
-            "UPDATE ci_jobs SET state = CASE WHEN attempts >= $1 THEN 'failed' ELSE 'queued' END, \
+            "UPDATE ci_jobs SET state = CASE \
+                 WHEN cancel_requested = 1 THEN 'canceled' \
+                 WHEN attempts >= $1 THEN 'failed' \
+                 ELSE 'queued' END, \
              lease_until = NULL, lease_token = NULL, runner_id = NULL, \
-             last_error = CASE WHEN attempts >= $1 THEN last_error ELSE 'the runner stopped before finishing' END, \
-             finished_at = CASE WHEN attempts >= $1 THEN $2 ELSE finished_at END \
+             last_error = CASE \
+                 WHEN cancel_requested = 1 THEN last_error \
+                 WHEN attempts >= $1 THEN last_error \
+                 ELSE 'the runner stopped before finishing' END, \
+             finished_at = CASE \
+                 WHEN cancel_requested = 1 OR attempts >= $1 THEN $2 \
+                 ELSE finished_at END \
              WHERE id = $3",
         )
         .bind(max_attempts)

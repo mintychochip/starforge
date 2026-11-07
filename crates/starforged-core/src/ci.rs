@@ -418,6 +418,125 @@ impl Core {
         status_dto(self, row).await
     }
 
+    /// Emits the `ci` webhook for one lifecycle transition (decision 14:
+    /// `queued`/`started`/`finished`/`canceled`). The `check` event still
+    /// covers status transitions; this event carries the run identity.
+    async fn emit_ci_event(&self, job: &db_ci::CiJobRow, action: &'static str, state: &str) {
+        let sender = match job.created_by {
+            Some(user_id) => self.sender_of(user_id).await,
+            None => None,
+        };
+        self.dispatch_event(
+            job.repo_id,
+            HookEvent {
+                event: "ci",
+                action: Some(action),
+                cause: None,
+                sender,
+                subject: serde_json::json!({
+                    "ci_job_id": job.id,
+                    "job_name": job.job_name,
+                    "commit_sha": job.commit_sha,
+                    "state": state,
+                    "runner_id": job.runner_id,
+                    "exit_code": job.exit_code,
+                    "created_by": job.created_by,
+                }),
+            },
+        )
+        .await;
+    }
+
+    /// Writes the terminal `ci/<job>` check for a job that ends without a
+    /// runner result, unless the check is already terminal (the cancel
+    /// request writes it immediately; the runner's later acknowledgement
+    /// must not overwrite `canceled by <user>`). Dispatches the `check`
+    /// webhook on a write. Returns whether a check was written.
+    async fn write_ci_terminal_check(
+        &self,
+        job: &db_ci::CiJobRow,
+        check_state: &str,
+        description: &str,
+        actor: Option<i64>,
+    ) -> CoreResult<bool> {
+        let Some(repo_row) = db_repos::by_id(self.db(), job.repo_id).await? else {
+            return Ok(false);
+        };
+        let repo = to_repo(repo_row)?;
+        if repo.archived_at.is_some() {
+            return Ok(false);
+        }
+        let context = format!("ci/{}", job.job_name);
+        let existing =
+            db_checks::latest_checks_for_sha(self.db(), job.repo_id, &job.commit_sha).await?;
+        if existing.iter().any(|check| {
+            check.context == context
+                && matches!(check.state.as_str(), "success" | "failure" | "error")
+        }) {
+            return Ok(false);
+        }
+        let creator = actor.or(job.created_by);
+        db_checks::insert_check(
+            self.db(),
+            job.repo_id,
+            &job.commit_sha,
+            &context,
+            check_state,
+            None,
+            Some(description),
+            creator,
+            now(),
+        )
+        .await?;
+        let sender = match creator {
+            Some(user_id) => self.sender_of(user_id).await,
+            None => None,
+        };
+        self.dispatch_event(
+            job.repo_id,
+            HookEvent {
+                event: "check",
+                action: None,
+                cause: None,
+                sender: sender.clone(),
+                subject: serde_json::json!({
+                    "sha": job.commit_sha,
+                    "context": context,
+                    "state": check_state,
+                    "target_url": null,
+                    "description": description,
+                    "creator": sender,
+                    "ci_job_id": job.id,
+                }),
+            },
+        )
+        .await;
+        Ok(true)
+    }
+
+    /// The single terminal path for a job that ends without a runner
+    /// result (user cancel, supersede, lease expiry, cancel
+    /// acknowledgement): writes the terminal check (once) and emits the
+    /// `ci` event. `job_state` is `canceled` or `failed`.
+    pub(crate) async fn terminate_ci_job(
+        &self,
+        job: &db_ci::CiJobRow,
+        job_state: &'static str,
+        check_state: &str,
+        description: &str,
+        actor: Option<i64>,
+    ) -> CoreResult<()> {
+        self.write_ci_terminal_check(job, check_state, description, actor)
+            .await?;
+        let action = if job_state == "canceled" {
+            "canceled"
+        } else {
+            "finished"
+        };
+        self.emit_ci_event(job, action, job_state).await;
+        Ok(())
+    }
+
     /// Mints the short-lived, repo-scoped git credential for a claimed or
     /// running job (decision 10): an `sfp_` PAT with `repo:read repo:write`
     /// expiring at `min(job deadline, now + 1h)`. The token id is stored in
@@ -724,6 +843,7 @@ impl Core {
                 },
             )
             .await?;
+            self.emit_ci_event(&job, "started", "claimed").await;
             return Ok(Some(ClaimedCiJob {
                 job_id: job.id,
                 job_name: job.job_name.clone(),
@@ -758,8 +878,11 @@ impl Core {
             return Ok(Err(ClaimGate::FenceMismatch));
         }
         if job.state == "canceled" || job.cancel_requested != 0 {
-            if job.state != "canceled" {
-                db_ci::cancel_ci_job(self.db(), job_id, Some(fence), now()).await?;
+            if job.state != "canceled"
+                && db_ci::cancel_ci_job(self.db(), job_id, Some(fence), now()).await?
+            {
+                self.terminate_ci_job(&job, "canceled", "error", "canceled", None)
+                    .await?;
             }
             return Ok(Err(ClaimGate::Canceled));
         }
@@ -908,6 +1031,7 @@ impl Core {
         {
             return Ok(FinishOutcome::FenceMismatch);
         }
+        self.emit_ci_event(&job, "finished", state).await;
         self.revoke_job_credentials(job.id).await?;
         self.audit(
             job.created_by,
@@ -939,8 +1063,24 @@ impl Core {
         if job.repo_id != access.repo.id {
             return Err(CoreError::NotFound);
         }
-        if !db_ci::request_cancel_ci_job(self.db(), job_id, now()).await? {
-            return Err(CoreError::NotFound);
+        let description = format!("canceled by {}", user.handle);
+        if job.state == "queued" {
+            // No runner owns a queued job, so cancel it terminally here;
+            // otherwise it would wait for a claim that may never come.
+            if !db_ci::cancel_ci_job(self.db(), job_id, None, now()).await? {
+                return Err(CoreError::NotFound);
+            }
+            self.terminate_ci_job(&job, "canceled", "error", &description, Some(user.id))
+                .await?;
+        } else {
+            // A claimed/running job is canceled by its runner on the next
+            // trace/finish; write the terminal check now so the gate does
+            // not stay pending while the runner notices.
+            if !db_ci::request_cancel_ci_job(self.db(), job_id, now()).await? {
+                return Err(CoreError::NotFound);
+            }
+            self.write_ci_terminal_check(&job, "error", &description, Some(user.id))
+                .await?;
         }
         self.audit(
             Some(user.id),
@@ -1314,27 +1454,7 @@ impl Core {
             now_ts,
         )
         .await;
-        let sender = match created_by {
-            Some(user_id) => self.sender_of(user_id).await,
-            None => None,
-        };
-        self.dispatch_event(
-            repo_id,
-            HookEvent {
-                event: "ci",
-                action: Some("queued"),
-                cause: None,
-                sender,
-                subject: serde_json::json!({
-                    "ci_job_id": row.id,
-                    "job_name": job.name,
-                    "commit_sha": commit_sha,
-                    "state": "queued",
-                    "created_by": created_by,
-                }),
-            },
-        )
-        .await;
+        self.emit_ci_event(&row, "queued", "queued").await;
         self.audit(
             created_by,
             "ci.job.enqueue",
@@ -1405,7 +1525,16 @@ impl Core {
         let mut ids = Vec::new();
         for change in db_changes::changes_with_current_head(self.db(), repo_id, commit_sha).await? {
             for stale in db_ci::active_ci_jobs_for_change(self.db(), repo_id, change.id).await? {
-                db_ci::cancel_ci_job(self.db(), stale.id, None, now()).await?;
+                if db_ci::cancel_ci_job(self.db(), stale.id, None, now()).await? {
+                    self.terminate_ci_job(
+                        &stale,
+                        "canceled",
+                        "error",
+                        "superseded by a newer revision",
+                        actor,
+                    )
+                    .await?;
+                }
             }
             let created_by = change.creator_id.or(actor);
             for job in &spec.jobs {

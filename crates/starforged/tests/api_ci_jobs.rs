@@ -376,6 +376,19 @@ async fn cancel_wins_over_trace_and_finish() {
     .await;
     assert_eq!(status, StatusCode::ACCEPTED, "{value}");
 
+    // The cancel request writes the terminal check immediately, so the gate
+    // does not stay pending while the runner notices.
+    let checks = starforged_db::checks::latest_checks_for_sha(s.db(), repo.id, SHA)
+        .await
+        .unwrap();
+    let check = checks.iter().find(|c| c.context == "ci/test").unwrap();
+    assert_eq!(check.state, "error", "{checks:?}");
+    assert_eq!(
+        check.description.as_deref(),
+        Some("canceled by alice"),
+        "{checks:?}"
+    );
+
     // The next trace reports Job-Status: canceled instead of appending.
     let (status, headers, _) = api_raw(
         &s.browser(),
@@ -392,6 +405,15 @@ async fn cancel_wins_over_trace_and_finish() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(headers.get("job-status").unwrap(), "canceled");
+    let checks = starforged_db::checks::latest_checks_for_sha(s.db(), repo.id, SHA)
+        .await
+        .unwrap();
+    let check = checks.iter().find(|c| c.context == "ci/test").unwrap();
+    assert_eq!(
+        check.description.as_deref(),
+        Some("canceled by alice"),
+        "the runner's acknowledgement must not overwrite the cancel reason"
+    );
 
     // A late finish is canceled too, and the job ends canceled.
     let (status, headers, _) = api_raw(
@@ -411,6 +433,88 @@ async fn cancel_wins_over_trace_and_finish() {
         .unwrap()
         .unwrap();
     assert_eq!(row.state, "canceled");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_queued_job_writes_terminal_check() {
+    let s = TestServer::start().await;
+    let alice = s.user("alice").await;
+    let repo = s.repo(&alice, "proj", Visibility::Public).await;
+    let pat = s.token(&alice, &[Scope::RepoWrite]).await;
+    let job_id = queue_job(&s, repo.id, alice.id, "test", &[]).await;
+
+    let (status, value) = api(
+        &s.browser(),
+        "POST",
+        &s.url(&format!("/api/v1/repos/alice/proj/ci/runs/{job_id}/cancel")),
+        &pat,
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{value}");
+
+    let row = starforged_db::ci::ci_job_by_id(s.db(), job_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.state, "canceled", "a queued job cancels immediately");
+    let checks = starforged_db::checks::latest_checks_for_sha(s.db(), repo.id, SHA)
+        .await
+        .unwrap();
+    let check = checks.iter().find(|c| c.context == "ci/test").unwrap();
+    assert_eq!(check.state, "error", "{checks:?}");
+    assert_eq!(check.description.as_deref(), Some("canceled by alice"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expired_lease_writes_failure_check() {
+    let s = TestServer::start().await;
+    let alice = s.user("alice").await;
+    let repo = s.repo(&alice, "proj", Visibility::Public).await;
+    let pat = s.token(&alice, &[Scope::RepoWrite]).await;
+    let runner = register_runner(&s, &pat, &["linux"]).await;
+    let job_id = queue_job(&s, repo.id, alice.id, "test", &[]).await;
+
+    let (status, _, value) = api_raw(
+        &s.browser(),
+        "POST",
+        &s.url("/api/v1/runners/jobs/request"),
+        &runner,
+        &[],
+        Some(json!({})),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{value}");
+
+    // Exhaust the attempts and expire the lease, then run the hourly
+    // cleanup that reaps it.
+    sqlx::query("UPDATE ci_jobs SET attempts = 3, lease_until = $1 WHERE id = $2")
+        .bind(starforged_db::now() - 10)
+        .bind(job_id)
+        .execute(s.db().pool())
+        .await
+        .unwrap();
+    s.core
+        .enqueue_or_expedite(&starforged_core::jobs::Job::HourlyCleanup)
+        .await
+        .unwrap();
+    s.core.run_due_jobs().await.unwrap();
+
+    let row = starforged_db::ci::ci_job_by_id(s.db(), job_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.state, "failed");
+    let checks = starforged_db::checks::latest_checks_for_sha(s.db(), repo.id, SHA)
+        .await
+        .unwrap();
+    let check = checks.iter().find(|c| c.context == "ci/test").unwrap();
+    assert_eq!(check.state, "failure", "{checks:?}");
+    assert_eq!(
+        check.description.as_deref(),
+        Some("the runner stopped before finishing")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

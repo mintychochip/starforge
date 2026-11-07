@@ -508,6 +508,144 @@ async fn ci_event_dispatch_enqueues_delivery() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ci_lifecycle_emits_started_finished_canceled() {
+    let c = Ctx::start().await;
+    let (sink_url, sink) = Sink::spawn(false).await;
+    let created = c.create_hook(&c.alice_rw, &sink_url, &["ci"]).await;
+    let secret = created["secret"].as_str().unwrap().to_owned();
+    let repo_id =
+        c.s.core
+            .repo_for(Some(&c.alice), "alice", "proj")
+            .await
+            .unwrap()
+            .repo
+            .id;
+    let now = starforged_db::now();
+    let runner = starforged_db::ci::insert_runner(
+        c.s.core.db(),
+        &starforged_db::ci::NewRunner {
+            repo_id,
+            name: "r1",
+            token_hash: "hash",
+            token_hint: "hint",
+            labels: r#"["linux"]"#,
+            ephemeral: false,
+            max_concurrent: 1,
+            version: "test",
+            now,
+        },
+    )
+    .await
+    .unwrap();
+    let spec = json!({
+        "name": "test",
+        "image": "example.test/image:1",
+        "commands": ["true"],
+        "runs_on": [],
+    })
+    .to_string();
+    let job = starforged_db::ci::insert_ci_job(
+        c.s.core.db(),
+        &starforged_db::ci::NewCiJob {
+            repo_id,
+            trail_id: None,
+            change_id: None,
+            revision_id: None,
+            commit_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            base_sha: None,
+            job_name: "test",
+            spec: &spec,
+            run_at: 0,
+            deadline: now + 3600,
+            created_by: Some(c.alice.id),
+            now,
+        },
+    )
+    .await
+    .unwrap();
+    let principal = starforged_core::ci::RunnerPrincipal {
+        runner_id: runner.id,
+        repo_id,
+        labels: vec!["linux".into()],
+    };
+    let claimed = c.s.core.claim_ci_job(&principal).await.unwrap().unwrap();
+    c.s.core.run_due_jobs().await.unwrap();
+    let hits = sink.hits.lock().unwrap().clone();
+    assert_eq!(hits.len(), 1, "claim emits one ci event");
+    let body = check_delivery(&hits[0], &secret);
+    assert_eq!(body["action"], "started");
+    assert_eq!(body["ci"]["state"], "claimed");
+
+    c.s.core
+        .finish_ci_job(
+            &principal,
+            job.id,
+            &claimed.fence,
+            "succeeded",
+            Some(0),
+            None,
+            &[],
+        )
+        .await
+        .unwrap();
+    c.s.core.run_due_jobs().await.unwrap();
+    let hits = sink.hits.lock().unwrap().clone();
+    assert_eq!(hits.len(), 2, "finish emits one ci event");
+    let body = check_delivery(&hits[1], &secret);
+    assert_eq!(body["action"], "finished");
+    assert_eq!(body["ci"]["state"], "succeeded");
+
+    let job2 = starforged_db::ci::insert_ci_job(
+        c.s.core.db(),
+        &starforged_db::ci::NewCiJob {
+            repo_id,
+            trail_id: None,
+            change_id: None,
+            revision_id: None,
+            commit_sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            base_sha: None,
+            job_name: "test2",
+            spec: &spec,
+            run_at: 0,
+            deadline: now + 3600,
+            created_by: Some(c.alice.id),
+            now,
+        },
+    )
+    .await
+    .unwrap();
+    let claimed2 = c.s.core.claim_ci_job(&principal).await.unwrap().unwrap();
+    c.s.core
+        .cancel_ci_job(&c.alice, "alice", "proj", job2.id)
+        .await
+        .unwrap();
+    // The cancel request writes the check; the runner's acknowledgement is
+    // the terminal transition that emits the `ci` event.
+    c.s.core
+        .finish_ci_job(
+            &principal,
+            job2.id,
+            &claimed2.fence,
+            "succeeded",
+            Some(0),
+            None,
+            &[],
+        )
+        .await
+        .unwrap();
+    c.s.core.run_due_jobs().await.unwrap();
+    let hits = sink.hits.lock().unwrap().clone();
+    assert_eq!(
+        hits.len(),
+        4,
+        "claim + cancel acknowledgement emit ci events"
+    );
+    let body = check_delivery(&hits[3], &secret);
+    assert_eq!(body["action"], "canceled");
+    assert_eq!(body["ci"]["state"], "canceled");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn emitters_deliver_the_spec_envelope() {
     let c = Ctx::start().await;
     let client = reqwest::Client::new();

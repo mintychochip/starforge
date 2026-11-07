@@ -741,4 +741,20 @@ async fn refs_for_jobs_get_no_secrets_without_approval() {
         superseded, "canceled",
         "a new revision supersedes the old job"
     );
+    let old = starforged_db::ci::ci_job_by_id(s.db(), trail_job)
+        .await
+        .unwrap()
+        .unwrap();
+    let checks = starforged_db::checks::latest_checks_for_sha(s.db(), repo.id, &old.commit_sha)
+        .await
+        .unwrap();
+    let check = checks
+        .iter()
+        .find(|c| c.context == format!("ci/{}", old.job_name))
+        .unwrap();
+    assert_eq!(check.state, "error", "{checks:?}");
+    assert_eq!(
+        check.description.as_deref(),
+        Some("superseded by a newer revision")
+    );
 }
