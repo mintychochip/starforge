@@ -745,14 +745,29 @@ async fn refs_for_jobs_get_no_secrets_without_approval() {
         .await
         .unwrap()
         .unwrap();
-    let checks = starforged_db::checks::latest_checks_for_sha(s.db(), repo.id, &old.commit_sha)
-        .await
-        .unwrap();
-    let check = checks
-        .iter()
-        .find(|c| c.context == format!("ci/{}", old.job_name))
-        .unwrap();
-    assert_eq!(check.state, "error", "{checks:?}");
+    // The job state flips before the terminal check is written; poll for
+    // the check with the same deadline instead of racing the trigger.
+    let start = Instant::now();
+    let check = loop {
+        let checks = starforged_db::checks::latest_checks_for_sha(s.db(), repo.id, &old.commit_sha)
+            .await
+            .unwrap();
+        if let Some(check) = checks
+            .iter()
+            .find(|c| c.context == format!("ci/{}", old.job_name))
+            .cloned()
+            && check.state == "error"
+            && check.description.as_deref() == Some("superseded by a newer revision")
+        {
+            break check;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "timed out waiting for the superseded check"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(check.state, "error");
     assert_eq!(
         check.description.as_deref(),
         Some("superseded by a newer revision")
