@@ -505,9 +505,14 @@ pub async fn ci_job_by_id(db: &Db, id: i64) -> DbResult<Option<CiJobRow>> {
 
 /// Claims the oldest due queued job of the runner's repo for `runner_id`:
 /// `state = 'claimed'`, `attempts + 1`, `lease_until = now + lease_secs`,
-/// and the per-claim `lease_token` fence. Returns the claimed row (with
-/// `lease_token`/`lease_until`), or `None` when nothing is due. The
-/// guarded update makes concurrent claims safe on both engines.
+/// the per-claim `lease_token` fence, and `deadline = provisional_deadline`.
+/// The caller passes an upper bound for the provisional deadline (the
+/// longest allowed job timeout) and then lowers it to the job's own
+/// timeout with [`set_ci_job_deadline`]; until then no sweep can see the
+/// stale enqueue-time deadline of a job that waited in the queue. Returns
+/// the claimed row (with `lease_token`/`lease_until`), or `None` when
+/// nothing is due. The guarded update makes concurrent claims safe on
+/// both engines.
 pub async fn claim_next_ci_job(
     db: &Db,
     runner_id: i64,
@@ -515,6 +520,7 @@ pub async fn claim_next_ci_job(
     now_ts: i64,
     lease_secs: i64,
     lease_token: &str,
+    provisional_deadline: i64,
 ) -> DbResult<Option<CiJobRow>> {
     loop {
         let id: Option<i64> = sqlx::query_scalar(
@@ -530,13 +536,14 @@ pub async fn claim_next_ci_job(
         };
         let claimed = sqlx::query(
             "UPDATE ci_jobs SET state = 'claimed', runner_id = $1, attempts = attempts + 1, lease_until = $2, \
-             lease_token = $3, started_at = COALESCE(started_at, $4) \
-             WHERE id = $5 AND state = 'queued'",
+             lease_token = $3, started_at = COALESCE(started_at, $4), deadline = $5 \
+             WHERE id = $6 AND state = 'queued'",
         )
         .bind(runner_id)
         .bind(now_ts + lease_secs)
         .bind(lease_token)
         .bind(now_ts)
+        .bind(provisional_deadline)
         .bind(id)
         .execute(db.pool())
         .await?
@@ -600,6 +607,27 @@ pub async fn renew_ci_job_lease(
          WHERE id = $2 AND lease_token = $3 AND state IN ('claimed', 'running')",
     )
     .bind(lease_until)
+    .bind(id)
+    .bind(lease_token)
+    .execute(db.pool())
+    .await?
+    .rows_affected();
+    Ok(affected == 1)
+}
+
+/// Sets a just-claimed job's deadline under its fence (the claim wrote a
+/// provisional upper bound; this lowers it to the job's own timeout).
+/// False when the fence no longer matches or the job left `claimed`.
+pub async fn set_ci_job_deadline(
+    db: &Db,
+    id: i64,
+    lease_token: &str,
+    deadline: i64,
+) -> DbResult<bool> {
+    let affected = sqlx::query(
+        "UPDATE ci_jobs SET deadline = $1 WHERE id = $2 AND lease_token = $3 AND state = 'claimed'",
+    )
+    .bind(deadline)
     .bind(id)
     .bind(lease_token)
     .execute(db.pool())
@@ -774,6 +802,50 @@ pub async fn requeue_expired_ci_jobs(
         .bind(now_ts)
         .bind(job.id)
         .bind(now_ts)
+        .execute(db.pool())
+        .await?
+        .rows_affected();
+        if affected != 1 {
+            continue;
+        }
+        revoke_job_tokens_for_job(db, job.id, now_ts).await?;
+        if let (Some(token_id), Some(user_id)) = (job.git_token_id, job.created_by) {
+            crate::tokens::revoke(db, user_id, token_id).await?;
+        }
+        ids.push(job.id);
+    }
+    Ok(ids)
+}
+
+/// Claimed/running jobs whose deadline is before `cutoff` ran past their
+/// timeout while their runner kept the lease alive. They are failed
+/// terminally (`last_error` names the timeout) and their credentials are
+/// revoked, like a reaped attempt. The fence is kept, so the runner's next
+/// call answers a stale-fence conflict and the runner stops. Returns the
+/// ids of the jobs this call failed.
+pub async fn fail_overdue_ci_jobs(db: &Db, cutoff: i64, now_ts: i64) -> DbResult<Vec<i64>> {
+    let rows = sqlx::query(select_ci_job!(
+        "WHERE state IN ('claimed', 'running') AND deadline < $1 ORDER BY id ASC"
+    ))
+    .bind(cutoff)
+    .fetch_all(db.read_pool())
+    .await?;
+    let jobs = rows
+        .iter()
+        .map(ci_job_from_row)
+        .collect::<DbResult<Vec<_>>>()?;
+    let mut ids = Vec::with_capacity(jobs.len());
+    for job in &jobs {
+        // Re-check under the row update: a runner may have finished the job,
+        // or a re-claim may have reset its deadline, since the SELECT.
+        let affected = sqlx::query(
+            "UPDATE ci_jobs SET state = 'failed', finished_at = $1, lease_until = NULL, \
+             last_error = 'the job exceeded its timeout' \
+             WHERE id = $2 AND state IN ('claimed', 'running') AND deadline < $3",
+        )
+        .bind(now_ts)
+        .bind(job.id)
+        .bind(cutoff)
         .execute(db.pool())
         .await?
         .rows_affected();
@@ -1405,7 +1477,7 @@ mod tests {
                 .is_err()
         );
 
-        let claimed = claim_next_ci_job(&t.db, r.id, repo_id, 10, 60, "fence-1")
+        let claimed = claim_next_ci_job(&t.db, r.id, repo_id, 10, 60, "fence-1", 10 + 14_400)
             .await
             .unwrap()
             .unwrap();
@@ -1417,7 +1489,7 @@ mod tests {
         assert_eq!(claimed.attempts, 1);
         // Nothing else due.
         assert!(
-            claim_next_ci_job(&t.db, r.id, repo_id, 10, 60, "fence-2")
+            claim_next_ci_job(&t.db, r.id, repo_id, 10, 60, "fence-2", 10 + 14_400)
                 .await
                 .unwrap()
                 .is_none()
@@ -1477,7 +1549,7 @@ mod tests {
         let stuck = insert_ci_job(&t.db, &ci_job(repo_id, alice, "lint", 0))
             .await
             .unwrap();
-        claim_next_ci_job(&t.db, r.id, repo_id, 10, 60, "fence-9")
+        claim_next_ci_job(&t.db, r.id, repo_id, 10, 60, "fence-9", 10 + 14_400)
             .await
             .unwrap()
             .unwrap();
@@ -1489,7 +1561,7 @@ mod tests {
             ci_job_by_id(&t.db, stuck.id).await.unwrap().unwrap().state,
             "queued"
         );
-        claim_next_ci_job(&t.db, r.id, repo_id, 80, 60, "fence-10")
+        claim_next_ci_job(&t.db, r.id, repo_id, 80, 60, "fence-10", 80 + 14_400)
             .await
             .unwrap()
             .unwrap();
@@ -1497,7 +1569,7 @@ mod tests {
             requeue_expired_ci_jobs(&t.db, 141, 3).await.unwrap(),
             [stuck.id]
         );
-        claim_next_ci_job(&t.db, r.id, repo_id, 200, 60, "fence-11")
+        claim_next_ci_job(&t.db, r.id, repo_id, 200, 60, "fence-11", 200 + 14_400)
             .await
             .unwrap()
             .unwrap();

@@ -599,19 +599,14 @@ async fn expired_lease_writes_failure_check() {
     .await;
     assert_eq!(status, StatusCode::CREATED, "{value}");
 
-    // Exhaust the attempts and expire the lease, then run the hourly
-    // cleanup that reaps it.
+    // Exhaust the attempts and expire the lease, then sweep.
     sqlx::query("UPDATE ci_jobs SET attempts = 3, lease_until = $1 WHERE id = $2")
         .bind(starforged_db::now() - 10)
         .bind(job_id)
         .execute(s.db().pool())
         .await
         .unwrap();
-    s.core
-        .enqueue_or_expedite(&starforged_core::jobs::Job::HourlyCleanup)
-        .await
-        .unwrap();
-    s.core.run_due_jobs().await.unwrap();
+    s.core.sweep_ci_jobs().await.unwrap();
 
     let row = starforged_db::ci::ci_job_by_id(s.db(), job_id)
         .await
@@ -627,6 +622,151 @@ async fn expired_lease_writes_failure_check() {
         check.description.as_deref(),
         Some("the runner stopped before finishing")
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn overdue_job_fails_after_the_grace_and_fences_out_the_runner() {
+    let s = TestServer::start().await;
+    let alice = s.user("alice").await;
+    let repo = s.repo(&alice, "proj", Visibility::Public).await;
+    let pat = s.token(&alice, &[Scope::RepoWrite]).await;
+    let runner = register_runner(&s, &pat, &["linux"]).await;
+    let job_id = queue_job(&s, repo.id, alice.id, "test", &[]).await;
+
+    let (status, _, value) = api_raw(
+        &s.browser(),
+        "POST",
+        &s.url("/api/v1/runners/jobs/request"),
+        &runner,
+        &[],
+        Some(json!({})),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{value}");
+    let fence = value["fence"].as_str().unwrap().to_owned();
+    let job_token = value["job_token"].as_str().unwrap().to_owned();
+    let set_deadline = |deadline: i64| {
+        let pool = s.db().pool().clone();
+        async move {
+            sqlx::query("UPDATE ci_jobs SET deadline = $1 WHERE id = $2")
+                .bind(deadline)
+                .bind(job_id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+    };
+
+    // Within the grace the runner may still report its own timeout.
+    set_deadline(starforged_db::now() - 10).await;
+    s.core.sweep_ci_jobs().await.unwrap();
+    let row = starforged_db::ci::ci_job_by_id(s.db(), job_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.state, "claimed",
+        "inside the grace the job keeps running"
+    );
+
+    // Past the grace the sweep fails it.
+    set_deadline(starforged_db::now() - starforged_core::Core::CI_DEADLINE_GRACE_SECS - 10).await;
+    s.core.sweep_ci_jobs().await.unwrap();
+    let row = starforged_db::ci::ci_job_by_id(s.db(), job_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.state, "failed");
+    assert_eq!(row.last_error, "the job exceeded its timeout");
+    let checks = starforged_db::checks::latest_checks_for_sha(s.db(), repo.id, SHA)
+        .await
+        .unwrap();
+    let check = checks.iter().find(|c| c.context == "ci/test").unwrap();
+    assert_eq!(check.state, "failure", "{checks:?}");
+    assert_eq!(
+        check.description.as_deref(),
+        Some("the job exceeded its timeout")
+    );
+
+    // Its credentials are dead and the runner is fenced out.
+    assert!(s.core.authenticate_job(&job_token).await.is_err());
+    let (status, _, _) = api_raw(
+        &s.browser(),
+        "POST",
+        &s.url(&format!("/api/v1/runners/jobs/{job_id}/heartbeat")),
+        &runner,
+        &[("x-starforge-fence", fence.as_str())],
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn long_queued_job_gets_its_full_timeout_at_claim() {
+    let s = TestServer::start().await;
+    let alice = s.user("alice").await;
+    let repo = s.repo(&alice, "proj", Visibility::Public).await;
+    let pat = s.token(&alice, &[Scope::RepoWrite]).await;
+    let runner = register_runner(&s, &pat, &["linux"]).await;
+    let job_id = queue_job(&s, repo.id, alice.id, "test", &[]).await;
+
+    // The job waited two hours for a runner: its enqueue-time deadline
+    // (one-hour default timeout) has long passed.
+    sqlx::query("UPDATE ci_jobs SET deadline = $1 WHERE id = $2")
+        .bind(starforged_db::now() - 7200)
+        .bind(job_id)
+        .execute(s.db().pool())
+        .await
+        .unwrap();
+
+    let (status, _, value) = api_raw(
+        &s.browser(),
+        "POST",
+        &s.url("/api/v1/runners/jobs/request"),
+        &runner,
+        &[],
+        Some(json!({})),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{value}");
+    let fence = value["fence"].as_str().unwrap().to_owned();
+    let job_token = value["job_token"].as_str().unwrap().to_owned();
+
+    // The deadline is measured from the claim, so the job gets its full
+    // timeout, a live job token, and a git credential.
+    let row = starforged_db::ci::ci_job_by_id(s.db(), job_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        row.deadline >= starforged_db::now() + 3600 - 60,
+        "deadline {} is measured from the claim",
+        row.deadline
+    );
+    assert!(s.core.authenticate_job(&job_token).await.is_ok());
+    let (status, _, value) = api_raw(
+        &s.browser(),
+        "POST",
+        &s.url(&format!("/api/v1/ci/jobs/{job_id}/git-credential")),
+        &runner,
+        &[("x-starforge-fence", fence.as_str())],
+        Some(json!({})),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{value}");
+
+    // A sweep right after the claim leaves it running.
+    s.core.sweep_ci_jobs().await.unwrap();
+    let row = starforged_db::ci::ci_job_by_id(s.db(), job_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.state, "claimed");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

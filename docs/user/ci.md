@@ -42,11 +42,14 @@ runs_on = ["linux"]
   job. `name` must be unique in the file. Exactly one of `image` /
   `template` names what runs: an image reference
   (`docker.io/library/rust:1.85`) or a template name
-  (`starforge/rust`). Both are checked against the server's allowlist.
+  (`starforge/rust`). The local sandbox daemon only runs images on its
+  operator-configured allowlist.
 - `commands` is a non-empty list of shell commands, run in order in the
   sandbox at `/workspace`.
-- `timeout` is `90s`, `30m`, `1h`, or bare seconds; the maximum is 4
-  hours.
+- `timeout` is `90s`, `30m`, `1h`, or bare seconds; the default is 1
+  hour and the maximum is 4 hours. It counts from the moment a runner
+  claims the job, so time spent waiting for a runner does not count; a
+  job still running past it fails with `the job exceeded its timeout`.
 - `env` injects plain environment variables into the job.
 - `secrets` lists secret **names** (never values) to resolve for the
   job. A name that does not exist for the repo, or that the trust rule

@@ -40,7 +40,7 @@ runs_on = ["linux"]
 | `jobs[].name` | string | 1–64 chars of `[A-Za-z0-9_-]`; the check context is `ci/<name>`. |
 | `jobs[].image` / `jobs[].template` | string | Exactly one; 256 chars, validated as an image reference. The local sandbox daemon additionally enforces its image allowlist. |
 | `jobs[].commands` | array of strings | Non-empty; at most 100 commands, 4096 chars each; run in order at `/workspace`. |
-| `jobs[].timeout` | string | `90s`, `30m`, `1h`, or bare seconds; at most 4 hours. Default 1 hour. |
+| `jobs[].timeout` | string | `90s`, `30m`, `1h`, or bare seconds; at most 4 hours. Default 1 hour. Counted from the moment a runner claims the job, so time spent waiting for a runner does not count. |
 | `jobs[].env` | table | At most 64 entries; key 128 chars, value 4096 chars. Plain values only. |
 | `jobs[].secrets` | array of names | At most 32 names, 128 chars each. Secret **names**, never values; the trust rule is applied at resolution. |
 | `jobs[].artifacts` | array of globs | At most 32; relative, non-empty, no `..`, 256 chars; each artifact at most 1 GiB, retained 30 days. |
@@ -75,6 +75,12 @@ Each run writes the commit status `ci/<job-name>`:
 | Supersede | `error` | `superseded by a newer revision`. |
 | Lease expiry with attempts left | — | The job returns to `queued`; the check stays `pending`. |
 | Lease expiry out of attempts | `failure` | `the runner stopped before finishing`. |
+| Timeout passed while still claimed or running | `failure` | `the job exceeded its timeout` (60 seconds after the deadline; the runner normally reports its own timeout first). |
+
+The server sweeps claimed and running jobs every 30 seconds for expired
+leases (3 attempts per job) and passed deadlines. A job failed by the
+sweep has its job token and git credential revoked; its runner's next
+call answers `409`.
 
 A canceled job wins over a late trace or finish. A terminal check is
 never overwritten by a later runner acknowledgement.

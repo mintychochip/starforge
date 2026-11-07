@@ -212,6 +212,10 @@ struct Inner {
     /// every loop, and [`Core::run_due_jobs`] refreshes it too (tests run
     /// jobs directly, without workers).
     worker_heartbeat: std::sync::atomic::AtomicI64,
+    /// Unix seconds at which the next CI sweep ([`Core::sweep_ci_jobs`]) is
+    /// due. Zero at construction, so the first worker loop sweeps; the
+    /// worker that wins the compare-exchange moves it one interval ahead.
+    ci_sweep_due: std::sync::atomic::AtomicI64,
     /// Whether this instance's SSH listener is bound and serving (the
     /// `/readyz` SSH check, plan M5b D5). Set by `starforged_ssh` after
     /// bind, cleared when the server task ends. Per-instance (not
@@ -236,6 +240,7 @@ impl Core {
                 limits: limits::Limiters::default(),
                 metrics: metrics::Metrics::new(),
                 worker_heartbeat: std::sync::atomic::AtomicI64::new(starforged_db::now()),
+                ci_sweep_due: std::sync::atomic::AtomicI64::new(0),
                 ssh_listening: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             }),
         }

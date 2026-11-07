@@ -70,8 +70,11 @@ fence; a stale fence answers `409` and the job is fenced out.
 The claim lease is 60 seconds, renewed by trace activity and by the
 runner's 30-second heartbeat (`POST /runners/jobs/{id}/heartbeat`, same
 fence; `204`, or `409` for a stale fence or a canceled job), so a quiet
-command cannot let the lease expire. An expired lease requeues the job
-(up to 3 attempts), after which the job fails.
+command cannot let the lease expire. The server sweeps claimed and
+running jobs every 30 seconds: an expired lease requeues the job (up to
+3 attempts), after which the job fails, and a job still running 60
+seconds past its timeout (counted from the claim) is failed and its
+credentials revoked.
 
 ## `starforge-sandboxd`
 

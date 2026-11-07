@@ -432,41 +432,6 @@ impl Core {
         starforged_db::email_tokens::delete_expired(self.db(), ts).await?;
         starforged_db::invites::delete_expired_before(self.db(), ts - 30 * DAY).await?;
         starforged_db::oauth::delete_expired(self.db(), ts).await?;
-        // CI jobs whose runner lease expired: requeue or fail, revoking the
-        // stale attempt's job token and git credential (M6a A6). A job that
-        // ends here (canceled or out of attempts) writes its terminal check
-        // and emits the `ci` event; a requeued job does neither.
-        let reaped = starforged_db::ci::requeue_expired_ci_jobs(self.db(), ts, 3).await?;
-        for id in reaped {
-            let job = match starforged_db::ci::ci_job_by_id(self.db(), id).await {
-                Ok(Some(job)) => job,
-                Ok(None) => continue,
-                Err(err) => {
-                    tracing::warn!(job_id = id, error = %err, "reading a reaped CI job failed");
-                    continue;
-                }
-            };
-            let outcome = match job.state.as_str() {
-                "canceled" => {
-                    self.terminate_ci_job(&job, "canceled", "error", "canceled", None)
-                        .await
-                }
-                "failed" => {
-                    self.terminate_ci_job(
-                        &job,
-                        "failed",
-                        "failure",
-                        "the runner stopped before finishing",
-                        None,
-                    )
-                    .await
-                }
-                _ => Ok(()),
-            };
-            if let Err(err) = outcome {
-                tracing::warn!(job_id = id, error = %err, "recording a reaped CI job failed");
-            }
-        }
         // Expired sandboxes are killed and marked (M6b B5).
         self.gc_expired_sandboxes().await?;
         // Delivery attempts older than 30 days fall out of the log (D5).
@@ -556,6 +521,10 @@ impl Core {
     async fn worker(self) {
         loop {
             self.record_worker_heartbeat();
+            // CI leases are 60 seconds, so expired leases and passed
+            // deadlines are swept on a short interval here rather than by
+            // the hourly cleanup (rate-limited across workers).
+            self.run_ci_sweep_if_due().await;
             match self.run_one_job().await {
                 Ok(true) => continue,
                 Ok(false) => {}

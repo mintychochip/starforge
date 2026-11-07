@@ -544,6 +544,97 @@ impl Core {
         Ok(())
     }
 
+    /// Sweeps CI jobs whose runner stopped serving them (decision 13).
+    /// Claimed or running jobs whose lease expired go back to `queued`, or
+    /// end `failed` once out of attempts (`canceled` when a cancel was
+    /// requested). Jobs whose deadline passed by more than
+    /// [`Core::CI_DEADLINE_GRACE_SECS`] end `failed`. Every job that ends
+    /// here writes its terminal check and emits the `ci` event; a requeued
+    /// job does neither. Jobs are handled independently: a failure on one
+    /// is logged and the sweep continues. The job workers run this every
+    /// [`Core::CI_SWEEP_INTERVAL_SECS`]; tests call it directly.
+    pub async fn sweep_ci_jobs(&self) -> CoreResult<()> {
+        let now_ts = now();
+        let reaped =
+            db_ci::requeue_expired_ci_jobs(self.db(), now_ts, Self::CI_MAX_ATTEMPTS).await?;
+        for id in reaped {
+            let outcome = match db_ci::ci_job_by_id(self.db(), id).await {
+                Ok(Some(job)) => match job.state.as_str() {
+                    "canceled" => {
+                        self.terminate_ci_job(&job, "canceled", "error", "canceled", None)
+                            .await
+                    }
+                    "failed" => {
+                        self.terminate_ci_job(
+                            &job,
+                            "failed",
+                            "failure",
+                            "the runner stopped before finishing",
+                            None,
+                        )
+                        .await
+                    }
+                    _ => Ok(()),
+                },
+                Ok(None) => Ok(()),
+                Err(err) => Err(err.into()),
+            };
+            if let Err(err) = outcome {
+                tracing::warn!(ci_job_id = id, error = %err, "recording a reaped CI job failed");
+            }
+        }
+        let overdue =
+            db_ci::fail_overdue_ci_jobs(self.db(), now_ts - Self::CI_DEADLINE_GRACE_SECS, now_ts)
+                .await?;
+        for id in overdue {
+            let outcome = match db_ci::ci_job_by_id(self.db(), id).await {
+                Ok(Some(job)) => {
+                    self.terminate_ci_job(
+                        &job,
+                        "failed",
+                        "failure",
+                        "the job exceeded its timeout",
+                        None,
+                    )
+                    .await
+                }
+                Ok(None) => Ok(()),
+                Err(err) => Err(err.into()),
+            };
+            if let Err(err) = outcome {
+                tracing::warn!(ci_job_id = id, error = %err, "recording an overdue CI job failed");
+            }
+        }
+        Ok(())
+    }
+
+    /// Runs [`Core::sweep_ci_jobs`] when one is due. Every job worker calls
+    /// this on each loop; the compare-exchange on the due time lets one of
+    /// them sweep per [`Core::CI_SWEEP_INTERVAL_SECS`]. Errors are logged,
+    /// never returned: the worker must keep running jobs.
+    pub(crate) async fn run_ci_sweep_if_due(&self) {
+        use std::sync::atomic::Ordering;
+        let now_ts = now();
+        let due = self.inner.ci_sweep_due.load(Ordering::Relaxed);
+        if now_ts < due
+            || self
+                .inner
+                .ci_sweep_due
+                .compare_exchange(
+                    due,
+                    now_ts + Self::CI_SWEEP_INTERVAL_SECS,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_err()
+        {
+            return;
+        }
+        if let Err(err) = self.sweep_ci_jobs().await {
+            tracing::warn!(error = %err, "CI sweep failed");
+        }
+    }
+
     /// Mints the short-lived, repo-scoped git credential for a claimed or
     /// running job (decision 10): an `sfp_` PAT with `repo:read repo:write`
     /// expiring at `min(job deadline, now + 1h)`. The token id is stored in
@@ -795,16 +886,30 @@ impl Core {
     pub const CLAIM_MAX_ATTEMPTS: usize = 10;
     /// Per-job cap on stored log bytes: 100 MiB.
     pub const MAX_JOB_LOG_BYTES: i64 = 100 * 1024 * 1024;
+    /// Claims per job before a reaped job fails instead of requeueing
+    /// (plan decision 13, `ci.max_attempts`).
+    pub const CI_MAX_ATTEMPTS: i64 = 3;
+    /// How often the job workers sweep CI jobs for expired leases and
+    /// passed deadlines ([`Core::sweep_ci_jobs`]).
+    pub const CI_SWEEP_INTERVAL_SECS: i64 = 30;
+    /// Time past a job's deadline before the sweep fails it. The runner
+    /// enforces the same timeout itself and reports its own result first;
+    /// the sweep only catches a runner that keeps its lease but never
+    /// finishes.
+    pub const CI_DEADLINE_GRACE_SECS: i64 = 60;
 
     /// Claims the oldest due queued job of the runner's repository
     /// (decision 13): `state = 'claimed'` under a fresh per-claim
-    /// `lease_token` fence, and mints the per-job token (`sfj_…`, expiry
-    /// `deadline + 600`) the execution will act with. A job whose
-    /// `runs_on` labels are a non-empty set that is not a subset of the
-    /// runner's labels is released back to `queued` and the next job is
-    /// tried (at most [`Core::CLAIM_MAX_ATTEMPTS`] claims); a job with an
-    /// unparseable spec is released the same way. `None` when no job can
-    /// be claimed for this runner.
+    /// `lease_token` fence, with the deadline measured from this claim
+    /// (the job's timeout, default one hour), and mints the per-job token
+    /// (`sfj_…`, expiry `deadline + 600`) the execution will act with. A
+    /// job that waited in the queue therefore gets its full timeout and a
+    /// live token. A job whose `runs_on` labels are a non-empty set that
+    /// is not a subset of the runner's labels is released back to
+    /// `queued` and the next job is tried (at most
+    /// [`Core::CLAIM_MAX_ATTEMPTS`] claims); a job with an unparseable
+    /// spec is released the same way. `None` when no job can be claimed
+    /// for this runner.
     pub async fn claim_ci_job(&self, runner: &RunnerPrincipal) -> CoreResult<Option<ClaimedCiJob>> {
         for _ in 0..Self::CLAIM_MAX_ATTEMPTS {
             let fence = crypto::random_hex(32);
@@ -816,6 +921,7 @@ impl Core {
                 now_ts,
                 Self::CLAIM_LEASE_SECS,
                 &fence,
+                now_ts + crate::ci_spec::MAX_TIMEOUT.as_secs() as i64,
             )
             .await?
             else {
@@ -837,6 +943,12 @@ impl Core {
                 db_ci::release_ci_job(self.db(), job.id, &fence).await?;
                 continue;
             }
+            let deadline = now_ts + job_timeout_secs(&spec);
+            if !db_ci::set_ci_job_deadline(self.db(), job.id, &fence, deadline).await? {
+                // The claim was lost (canceled or reaped) before the
+                // deadline landed; look for the next job.
+                continue;
+            }
             let job_token = format!("{}{}", JOB_TOKEN_PREFIX, crypto::random_hex(32));
             let hint = &job_token[job_token.len() - 4..];
             db_ci::insert_job_token(
@@ -845,7 +957,7 @@ impl Core {
                     job_id: job.id,
                     token_hash: &crypto::sha256_hex(&job_token),
                     token_hint: hint,
-                    expires_at: job.deadline + 600,
+                    expires_at: deadline + 600,
                     now: now_ts,
                 },
             )
@@ -859,7 +971,7 @@ impl Core {
                 lease_until: job.lease_until.unwrap_or(now_ts + Self::CLAIM_LEASE_SECS),
                 fence,
                 job_token,
-                deadline: job.deadline,
+                deadline,
             }));
         }
         Ok(None)
@@ -1187,6 +1299,15 @@ pub const MAX_ARTIFACT_BYTES: i64 = 1024 * 1024 * 1024;
 pub const ARTIFACT_TTL_SECS: i64 = 30 * 24 * 3600;
 /// Default job deadline when the spec sets no timeout: 1 hour.
 pub const DEFAULT_JOB_TIMEOUT_SECS: i64 = 3600;
+
+/// A job's timeout in seconds: the spec's `timeout`, or
+/// [`DEFAULT_JOB_TIMEOUT_SECS`]. The deadline is this long after a claim.
+fn job_timeout_secs(spec: &CiJobSpec) -> i64 {
+    spec.timeout_duration()
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(DEFAULT_JOB_TIMEOUT_SECS)
+}
+
 /// `ci.allow_secrets_on_refs_for` (plan decision 7): `refs/for` runs get no
 /// secrets unless the repo opts in. The server-wide default is false.
 pub const ALLOW_SECRETS_ON_REFS_FOR: bool = false;
@@ -1458,10 +1579,7 @@ impl Core {
         created_by: Option<i64>,
     ) -> CoreResult<Option<i64>> {
         let now_ts = now();
-        let timeout_secs = job
-            .timeout_duration()
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(DEFAULT_JOB_TIMEOUT_SECS);
+        let timeout_secs = job_timeout_secs(job);
         let spec_json = serde_json::to_string(job).unwrap_or_else(|_| "{}".into());
         let row = match db_ci::insert_ci_job(
             self.db(),
@@ -2562,11 +2680,18 @@ mod tests {
         .await
         .unwrap();
         // Claim it so the job token is live: only claimed/running accept.
-        let claimed =
-            db_ci::claim_next_ci_job(core.db(), runner.id, repo_id, now_ts, 60, "fence-test")
-                .await
-                .unwrap()
-                .unwrap();
+        let claimed = db_ci::claim_next_ci_job(
+            core.db(),
+            runner.id,
+            repo_id,
+            now_ts,
+            60,
+            "fence-test",
+            now_ts + 3600,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(claimed.id, job.id);
         let job_secret = format!("{JOB_TOKEN_PREFIX}{}", crypto::random_hex(32));
         db_ci::insert_job_token(
