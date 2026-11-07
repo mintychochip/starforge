@@ -10,6 +10,9 @@ readme = "../../README.md"
 keywords = ["starforge", "ci", "runner"]
 categories = ["command-line-utilities"]
 
+[package.metadata.dist]
+dist = false
+
 [lints]
 workspace = true
 
