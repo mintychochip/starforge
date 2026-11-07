@@ -12,6 +12,9 @@ Re-sending identical bytes is a safe no-op (`200`); a changed segment at a taken
 `409` with exactly `{"hash": "<stored hex>"}`, and new content on a completed session is `422`.
 Segments cap at 16 MiB (decompression is bounded at 256 MiB against bombs); quotas are
 500 MiB per user per hour, 5 GiB stored per user, and 20 GiB stored per repository.
+The CLI re-sends a session's metadata (title, models, files, end time)
+whenever it changes: ingest compares the spool meta's body hash against
+the last uploaded hash and re-queues the metadata `PUT` on any change.
 
 Every accepted segment is re-scanned server-side with `built_in < repo < site` rules (repo rules
 come from `.starforge/redact.toml`, site rules from `[sessions] site_redact_toml`). A
@@ -119,12 +122,17 @@ Pi/omp records are the real JSONL record structure (one object per line,
 each carrying `type`, `id`, `parentId`, an ISO `timestamp`, and
 `runtime.version`): a `session` header record (with `cwd`, the format
 `version`, and an initial title), `title` / `title_change` records (latest
-wins), `message` records whose `message.role` shapes the event (`user`,
+non-empty wins; the empty placeholder title an untitled session starts
+with is ignored), `message` records whose `message.role` shapes the event (`user`,
 `assistant` with `thinking` / `text` / `toolCall` blocks, `toolResult` with
 an `[image: <mime>]` placeholder for image blocks, `custom`, `developer`),
 `custom_message` context injections (as readable `system` text),
-`compaction` records, and `custom` records, including ones with
+`ttsr_injection` records (rendered as a readable `Rules injected: …`
+`system` line), `compaction` records, and `custom` records, including ones with
 `customType: "session_exit"`, which are skipped as progress markers.
+`session_init` records (every omp subagent session opens with one) are
+skipped: their `task` duplicates the first user message, and the rest is
+runtime configuration (system prompt, tools, output schema).
 omp can resume a session in the same file after a `session_exit`, so
 `session_exit` does not end the session: Pi/omp sessions end only by the
 24 h idle rule. Auxiliary/noise records are skipped

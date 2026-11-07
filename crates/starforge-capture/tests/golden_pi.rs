@@ -65,15 +65,18 @@ fn event_lines(header_events: &[starforge_format::Event]) -> Vec<String> {
         .collect()
 }
 
-/// The fixture's event kinds in order: user, reasoning, assistant text,
-/// tool call, tool result, tool-call-only assistant turn, image tool result,
-/// advisor system message, compaction, unknown-record system fallback.
-/// The `session_exit` record yields no event and no `ended_at` (a skipped
-/// runtime marker); the skipped records (model_usage, mode_change,
-/// credential_pin, tool_execution_start) emit none.
+/// The fixture's event kinds in order: user, ttsr rules system, reasoning,
+/// assistant text, tool call, tool result, tool-call-only assistant turn,
+/// image tool result, advisor system message, compaction, unknown-record
+/// system fallback. The `session_init` record yields no event (its task
+/// duplicates the first user message); the `session_exit` record yields no
+/// event and no `ended_at` (a skipped runtime marker); the skipped records
+/// (model_usage, mode_change, credential_pin, tool_execution_start) emit
+/// none. The empty placeholder `title` yields no header title.
 fn fixture_kinds() -> Vec<&'static str> {
     vec![
         "user_message",
+        "system",
         "reasoning",
         "assistant_message",
         "tool_call",
@@ -120,12 +123,21 @@ fn pi_golden_pinned_version() {
             _ => None,
         })
         .collect();
-    assert_eq!(systems.len(), 2);
+    assert_eq!(systems.len(), 3);
+    assert_eq!(systems[0].text, "Rules injected: rule-alpha, rule-beta");
     assert_eq!(
-        systems[0].text,
+        systems[1].text,
         "Consider running the test suite before finishing."
     );
-    assert!(systems[1].text.contains("\"mystery_record\""));
+    assert!(systems[2].text.contains("\"mystery_record\""));
+    // `session_init` yields no event: none of its distinctive values appear.
+    let all_events = format!("{:?}", out.events) + &format!("{:?}", out.header);
+    assert!(
+        !all_events.contains("SESSION_INIT_MARKER"),
+        "session_init contents must never be captured"
+    );
+    // The first event is the user task (session_init emits nothing).
+    assert_eq!(kind_name(&out.events[0].kind), "user_message");
 
     // `credential_pin` contents never appear anywhere in the output.
     let all = format!("{:?}", out.events) + &format!("{:?}", out.header);
@@ -236,27 +248,28 @@ fn pi_incremental_read_resumes() {
     let found = a.discover(&roots, &HashMap::new());
     assert_eq!(found.len(), 1);
     let first = a.read(&found[0], &Cursor::start(), FALLBACK_TS).unwrap();
-    assert_eq!(first.events.len(), 10);
+    assert_eq!(first.events.len(), 11);
     let next = first.next;
-    // 16 records in the fixture (title, session, title_change, 5 message
-    // records, custom, custom_message, model_usage, mode_change,
-    // credential_pin, compaction, mystery, session_exit). `session_exit`
-    // is a skipped runtime marker: it yields no event and no `ended_at`.
-    assert_eq!(next.lines, 16);
+    // 18 records in the fixture (title, session, title_change, session_init,
+    // 5 message records, ttsr_injection, custom, custom_message,
+    // model_usage, mode_change, credential_pin, compaction, mystery,
+    // session_exit). `session_init` and `session_exit` are skipped runtime
+    // markers: they yield no event and no `ended_at`.
+    assert_eq!(next.lines, 18);
 
     // Empty growth: same cursor back.
     let again = a.read(&found[0], &next, FALLBACK_TS).unwrap();
     assert!(again.events.is_empty());
     assert_eq!(again.next, next);
 
-    // Partial resume across the multi-event assistant record (record index 4
-    // emits reasoning + assistant + tool_call): a cursor after 5 records
-    // holds 4 events, so the tail continues at seq 4 with no reuse, skip,
-    // or reorder.
+    // Partial resume across the multi-event assistant record (record index 6
+    // emits reasoning + assistant + tool_call): a cursor after 7 records
+    // holds 5 events (user task, rules line, and those three), so the tail
+    // continues at seq 5 with no reuse, skip, or reorder.
     let file_len = std::fs::metadata(&found[0].native_path).unwrap().len();
     let raw = std::fs::read(&found[0].native_path).unwrap();
     let mut off = 0u64;
-    for _ in 0..5 {
+    for _ in 0..7 {
         let rel: usize = raw[off as usize..]
             .iter()
             .position(|&b| b == b'\n')
@@ -267,13 +280,13 @@ fn pi_incremental_read_resumes() {
     assert!(off < file_len);
     let mid = Cursor {
         offset: off,
-        lines: 5,
-        events: 4,
+        lines: 7,
+        events: 5,
     };
     let tail = a.read(&found[0], &mid, FALLBACK_TS).unwrap();
     assert_eq!(tail.events.len(), 6);
-    assert_eq!(tail.events[0].seq, 4);
-    assert_eq!(tail.next.lines, 16);
+    assert_eq!(tail.events[0].seq, 5);
+    assert_eq!(tail.next.lines, 18);
     assert_eq!(tail.next.offset, file_len);
 
     // discover with the full cursor reports nothing new.
@@ -392,4 +405,35 @@ fn pi_remove_legacy_preserves_foreign_keys() {
     let before = std::fs::read(&path).unwrap();
     assert!(a.remove_hooks(&roots).unwrap().is_empty());
     assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+/// The empty placeholder `title` (and a whitespace-only `title_change`)
+/// yields no header title; `session_init` before the first user message
+/// yields no event, so the first event is the user task.
+#[test]
+fn pi_empty_placeholder_title_yields_no_title() {
+    let (_tmp, roots, native) = setup_pi("0.5.2");
+    let transcript = concat!(
+        "{\"type\":\"title\",\"v\":1,\"title\":\"\",\"updatedAt\":\"2026-11-04T12:00:00.000Z\",\"pad\":\"   \"}\n",
+        "{\"type\":\"session\",\"version\":3,\"id\":\"placeholder-1\",\"timestamp\":\"2026-11-04T12:00:00.000Z\",\"cwd\":\"/repo\",\"runtime\":{\"version\":\"0.5.2\"}}\n",
+        "{\"type\":\"session_init\",\"id\":\"si1\",\"parentId\":null,\"timestamp\":\"2026-11-04T12:00:01.000Z\",\"runtime\":{\"version\":\"0.5.2\"},\"agent\":\"subagent\",\"task\":\"Do the thing.\",\"systemPrompt\":[\"SESSION_INIT_MARKER_PROMPT\"],\"tools\":[\"SESSION_INIT_MARKER_TOOL\"],\"spawns\":1,\"readOnly\":false,\"resolvedModel\":\"pi-medium\"}\n",
+        "{\"type\":\"title_change\",\"id\":\"t2\",\"parentId\":null,\"timestamp\":\"2026-11-04T12:00:01.500Z\",\"title\":\"   \",\"runtime\":{\"version\":\"0.5.2\"}}\n",
+        "{\"type\":\"message\",\"id\":\"m1\",\"parentId\":null,\"timestamp\":\"2026-11-04T12:00:02.000Z\",\"runtime\":{\"version\":\"0.5.2\"},\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Do the thing.\"}]}}\n",
+    );
+    std::fs::write(&native, transcript).unwrap();
+    let a = PiAdapter;
+    let found = a.discover(&roots, &HashMap::new());
+    assert_eq!(found.len(), 1);
+    let out = a.read(&found[0], &Cursor::start(), FALLBACK_TS).unwrap();
+    assert_eq!(
+        out.header.title, None,
+        "empty/whitespace titles never set the title"
+    );
+    assert_eq!(out.events.len(), 1);
+    assert_eq!(kind_name(&out.events[0].kind), "user_message");
+    let all = format!("{:?}", out.events) + &format!("{:?}", out.header);
+    assert!(
+        !all.contains("SESSION_INIT_MARKER"),
+        "session_init must emit no event"
+    );
 }

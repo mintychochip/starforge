@@ -5,9 +5,10 @@
 //! them, and persists them through [`Spool`]: `append_events` for normalized
 //! JSONL (split at [`DEFAULT_SEGMENT_CAP`](starforge_format::DEFAULT_SEGMENT_CAP)),
 //! [`Spool::write_raw`] for the redacted native slice, `meta.json` updates,
-//! cursor updates, and queue entries (`Meta` once per session, `Segment` per
-//! new segment, `Complete` when the 24 h idle rule fires; `Links` stays with
-//! `post-commit`).
+//! cursor updates, and queue entries (`Meta` whenever the session's
+//! metadata body hash differs from `upload.json`'s `meta_hash`, `Segment`
+//! per new segment, `Complete` when the 24 h idle rule fires; `Links` stays
+//! with `post-commit`).
 //!
 //! Redaction happens BEFORE storage: both the normalized events
 //! ([`redact_event`](starforge_redact::redact_event)) and the raw native slice
@@ -200,6 +201,33 @@ fn queue_complete(
     Ok(())
 }
 
+/// Queue `Meta` whenever the spool meta's body hash differs from
+/// `upload.json`'s `meta_hash` (`None` or different), with the same
+/// `queued` dedupe as the batch path.
+fn queue_meta(
+    spool: &crate::spool::Spool,
+    ulid: &str,
+    meta: &SessionMeta,
+    now_rfc3339: &str,
+    queued: &mut HashSet<(u8, String, Option<u64>)>,
+    stats: &mut IngestStats,
+) -> Result<(), IngestError> {
+    let state = spool.read_upload(ulid)?;
+    let hash = crate::spool::meta_body_hash(meta)?;
+    if state.meta_hash.as_deref() != Some(hash.as_str()) {
+        enqueue_op(
+            spool,
+            crate::queue::QueueOp::Meta,
+            None,
+            ulid,
+            now_rfc3339,
+            queued,
+            stats,
+        )?;
+    }
+    Ok(())
+}
+
 /// File paths carried by one normalized event (mirrors the trailer logic).
 fn event_files(event: &Event) -> Vec<String> {
     match &event.kind {
@@ -360,7 +388,11 @@ pub fn ingest(
                 // Scrub free-text header fields before they reach the spool:
                 // only the redacted copies are ever persisted.
                 if let Some(title) = meta.title.clone() {
-                    meta.title = Some(redact_str(&compiled, &title, &mut meta_counts));
+                    meta.title = if title.trim().is_empty() {
+                        None
+                    } else {
+                        Some(redact_str(&compiled, &title, &mut meta_counts))
+                    };
                 }
                 let version = meta.agent.version.clone();
                 meta.agent.version = redact_str(&compiled, &version, &mut meta_counts);
@@ -517,8 +549,9 @@ pub fn ingest(
                 urls.push(redact_str(&compiled, url, &mut meta_counts));
             }
             meta.repo.remote_urls = urls;
-            if meta.title.is_none()
-                && let Some(title) = &out.header.title
+            // Latest non-empty adapter title wins.
+            if let Some(title) = &out.header.title
+                && !title.trim().is_empty()
             {
                 meta.title = Some(redact_str(&compiled, title, &mut meta_counts));
             }
@@ -546,18 +579,7 @@ pub fn ingest(
             }
             spool.put_session(&meta)?;
 
-            let state = spool.read_upload(&ulid)?;
-            if state.meta_hash.is_none() {
-                enqueue_op(
-                    spool,
-                    crate::queue::QueueOp::Meta,
-                    None,
-                    &ulid,
-                    &now_rfc3339,
-                    &mut queued,
-                    &mut stats,
-                )?;
-            }
+            queue_meta(spool, &ulid, &meta, &now_rfc3339, &mut queued, &mut stats)?;
             for n in &nums {
                 enqueue_op(
                     spool,
@@ -605,6 +627,14 @@ pub fn ingest(
             continue;
         }
         spool.put_session(&meta)?;
+        queue_meta(
+            spool,
+            &rec.ulid,
+            &meta,
+            &now_rfc3339,
+            &mut queued,
+            &mut stats,
+        )?;
         queue_complete(spool, &rec.ulid, &now_rfc3339, &mut queued, &mut stats)?;
     }
     Ok(stats)

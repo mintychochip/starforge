@@ -9,6 +9,9 @@
 //!   [title, titleSource] }` — the header record.
 //! - `title`: `{ v, title, source: "auto", updatedAt, pad }`, usually line 1.
 //!   `title_change`: `{ previousTitle, title, source, trigger }`.
+//!   Empty or whitespace-only titles (the untitled placeholder `title`
+//!   record) never set or clear the header title; the latest non-empty
+//!   title wins.
 //! - `message`: `{ message: {…} }` with `message.timestamp` an int (the
 //!   record-level ISO `timestamp` is used). Roles:
 //!   - `user`: `content: [{ type: "text", text }]` → one `user_message`
@@ -33,6 +36,8 @@
 //!   message injected into the model's context (advisor, goal-mode context,
 //!   etc.) → `system` with readable text (`content` string or joined text
 //!   blocks).
+//! - `ttsr_injection`: `{ injectedRules: [str] }` → `system` with readable
+//!   text `Rules injected: <names joined by ", ">`.
 //! - `compaction`: `{ summary, shortSummary, … }` → `compaction` (`summary`,
 //!   falling back to `shortSummary`).
 //! - `custom` with `customType: "session_exit"` does NOT end the session:
@@ -42,6 +47,9 @@
 //!   sessions end by the 24 h idle rule in ingest.
 //!
 //! Intentionally skipped (no events), by documented rule:
+//! - `session_init` — subagent bootstrap: its `task` duplicates the first
+//!   user message, and the rest (system prompt, tools, output schema) is
+//!   runtime configuration, so it yields no event.
 //! - `model_usage` — auxiliary side calls (job widgets, captions, cache-warm),
 //!   not conversation turns. The header's usage totals are the sum of
 //!   assistant-message usage only.
@@ -55,8 +63,8 @@
 //!   session: omp resumes by appending after an exit in the same file, so
 //!   sessions end only by the 24 h idle rule.
 //! - `session`, `title`, `title_change` — header facts only: `cwd` and the
-//!   initial title come from `session`; the latest `title` / `title_change`
-//!   wins the header title.
+//!   initial title come from `session`; the latest non-empty `title` /
+//!   `title_change` wins the header title.
 //!
 //! Any other record type, or a message role not listed above, keeps the
 //! raw-JSON `system` fallback: never dropped silently, never an error.
@@ -267,15 +275,20 @@ impl HeaderFold {
                 {
                     self.session_id = Some(id.to_string());
                 }
-                // The session title is an initial value; a later `title` /
-                // `title_change` record replaces it.
-                if let Some(title) = record.get("title").and_then(Value::as_str) {
+                // The session title is an initial value; a later non-empty
+                // `title` / `title_change` record replaces it. Empty or
+                // whitespace-only titles never set or clear the title.
+                if let Some(title) = record.get("title").and_then(Value::as_str)
+                    && !title.trim().is_empty()
+                {
                     self.title = Some(title.to_string());
                 }
             }
             "title" | "title_change" => {
-                // The latest title wins.
-                if let Some(title) = record.get("title").and_then(Value::as_str) {
+                // The latest non-empty title wins.
+                if let Some(title) = record.get("title").and_then(Value::as_str)
+                    && !title.trim().is_empty()
+                {
                     self.title = Some(title.to_string());
                 }
             }
@@ -394,6 +407,16 @@ fn record_events(
                 kinds.push(EventKind::System(System { text }));
             }
         }
+        "ttsr_injection" => {
+            let names: Vec<&str> = record
+                .get("injectedRules")
+                .and_then(Value::as_array)
+                .map(|rules| rules.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            kinds.push(EventKind::System(System {
+                text: format!("Rules injected: {}", names.join(", ")),
+            }));
+        }
         "compaction" => {
             let summary = record
                 .get("summary")
@@ -404,11 +427,12 @@ fn record_events(
             }));
         }
         // Header facts only (session/title/title_change), documented skips
-        // (model_usage, mode/model/thinking-level changes, credential_pin,
-        // custom records including session_exit): no events.
+        // (session_init, model_usage, mode/model/thinking-level changes,
+        // credential_pin, custom records including session_exit): no events.
         "session"
         | "title"
         | "title_change"
+        | "session_init"
         | "model_usage"
         | "mode_change"
         | "model_change"

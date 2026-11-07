@@ -13,8 +13,8 @@ use starforge_capture::Roots;
 use starforge_cli::config::CliPaths;
 use starforge_cli::git::common_dir;
 use starforge_cli::ingest::ingest;
-use starforge_cli::queue::{QueueOp, read_queue};
-use starforge_cli::spool::Spool;
+use starforge_cli::queue::{QueueOp, read_queue, rewrite_queue};
+use starforge_cli::spool::{Spool, meta_body_hash};
 use tempfile::TempDir;
 
 fn git_ok(repo: &Path, args: &[&str]) {
@@ -727,4 +727,97 @@ fn evaluate_roots(roots: &BTreeMap<String, Roots>, repo: &Path, spool: &Spool) {
     let now = parse_now("2026-11-04T00:00:00Z");
     let stats = ingest(spool, roots, repo, now).unwrap();
     assert_eq!(stats.sessions, 1, "one opencode session: {stats:?}");
+}
+
+// Live capture: an untitled omp session keeps `meta.title == None` on
+// first ingest; after the first Meta upload, a later rename re-queues
+// `Meta`, and an unchanged meta does not.
+#[test]
+fn omp_title_change_requeues_meta_after_upload() {
+    let (_repo_dir, repo) = init_repo();
+    let home = TempDir::new().unwrap();
+    let cwd = repo.to_string_lossy();
+    let store = home.path().join(".omp/agent/sessions/--x--");
+    std::fs::create_dir_all(&store).unwrap();
+    let native_path = store.join("omp-1.jsonl");
+    let native = format!(
+        "{{\"type\":\"title\",\"v\":1,\"title\":\"\",\"updatedAt\":\"2026-10-01T12:00:00Z\",\"pad\":\"   \"}}\n{{\"type\":\"session\",\"version\":3,\"id\":\"omp-1\",\"timestamp\":\"2026-10-01T12:00:00Z\",\"cwd\":\"{cwd}\",\"runtime\":{{\"version\":\"0.9.1\"}}}}\n{{\"type\":\"session_init\",\"id\":\"si1\",\"parentId\":null,\"timestamp\":\"2026-10-01T12:00:00Z\",\"runtime\":{{\"version\":\"0.9.1\"}},\"agent\":\"subagent\",\"task\":\"hello there\",\"systemPrompt\":[\"p\"],\"tools\":[\"t\"],\"spawns\":1,\"readOnly\":false,\"resolvedModel\":\"m\"}}\n{{\"type\":\"message\",\"id\":\"m1\",\"parentId\":null,\"timestamp\":\"2026-10-01T12:00:00Z\",\"runtime\":{{\"version\":\"0.9.1\"}},\"message\":{{\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":\"hello there\"}}]}}}}\n"
+    );
+    std::fs::write(&native_path, native).unwrap();
+
+    let common = common_dir(&repo).unwrap();
+    let spool = Spool::open(&common);
+    spool.ensure_layout().unwrap();
+    let roots = BTreeMap::from([(
+        "pi".to_string(),
+        Roots {
+            config_dir: home.path().join(".config"),
+            data_dir: home.path().to_path_buf(),
+            worktree: repo.clone(),
+        },
+    )]);
+    let now = parse_now("2026-10-01T13:00:00Z");
+    ingest(&spool, &roots, &repo, now).unwrap();
+    let ulid = spool_ulid(&spool);
+    let meta = spool.read_meta(&ulid).unwrap();
+    assert_eq!(meta.title, None, "empty placeholder title yields no title");
+    assert_eq!(
+        read_queue(&spool)
+            .unwrap()
+            .iter()
+            .filter(|e| e.op == QueueOp::Meta)
+            .count(),
+        1,
+        "first ingest queues Meta"
+    );
+
+    // Simulate the Meta upload, then drop the earlier queue entries.
+    let hash = meta_body_hash(&meta).unwrap();
+    spool.mark_meta_uploaded(&ulid, hash).unwrap();
+    rewrite_queue(&spool, &[]).unwrap();
+
+    // Append a rename plus a message, then ingest again.
+    let appended = "{\"type\":\"title_change\",\"id\":\"t2\",\"parentId\":null,\"timestamp\":\"2026-10-01T12:01:00Z\",\"title\":\"New Title\",\"runtime\":{\"version\":\"0.9.1\"}}\n{\"type\":\"message\",\"id\":\"m2\",\"parentId\":\"m1\",\"timestamp\":\"2026-10-01T12:01:00Z\",\"runtime\":{\"version\":\"0.9.1\"},\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"second\"}]}}\n";
+    std::fs::write(
+        &native_path,
+        format!(
+            "{}{}",
+            std::fs::read_to_string(&native_path).unwrap(),
+            appended
+        ),
+    )
+    .unwrap();
+    ingest(&spool, &roots, &repo, now).unwrap();
+    let meta = spool.read_meta(&ulid).unwrap();
+    assert_eq!(
+        meta.title.as_deref(),
+        Some("New Title"),
+        "latest title wins"
+    );
+    assert_eq!(
+        read_queue(&spool)
+            .unwrap()
+            .iter()
+            .filter(|e| e.op == QueueOp::Meta)
+            .count(),
+        1,
+        "changed meta re-queues Meta"
+    );
+
+    // Mark uploaded again and ingest with no file change: no new Meta.
+    let hash = meta_body_hash(&meta).unwrap();
+    spool.mark_meta_uploaded(&ulid, hash).unwrap();
+    rewrite_queue(&spool, &[]).unwrap();
+    let stats = ingest(&spool, &roots, &repo, now).unwrap();
+    assert_eq!(
+        stats.enqueued, 0,
+        "unchanged meta queues nothing: {stats:?}"
+    );
+    assert!(
+        !read_queue(&spool)
+            .unwrap()
+            .iter()
+            .any(|e| e.op == QueueOp::Meta),
+        "no new Meta op queued"
+    );
 }

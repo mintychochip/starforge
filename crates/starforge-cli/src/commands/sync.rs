@@ -106,13 +106,6 @@ pub async fn sync(
     .await
 }
 
-/// Blake3 of the canonical metadata JSON: the identity `upload.json.meta_hash`
-/// is compared against.
-fn meta_body_hash(meta: &starforge_format::SessionMeta) -> Result<String, UploadError> {
-    let bytes = serde_json::to_vec(meta).map_err(crate::spool::SpoolError::Json)?;
-    Ok(starforge_format::blake3_hex(&bytes))
-}
-
 /// Queue identity for dedupe: op plus `(ulid, segment)`.
 fn entry_key(op: QueueOp, ulid: &str, segment: Option<u64>) -> (u8, String, Option<u64>) {
     let disc = match op {
@@ -196,7 +189,7 @@ fn desired_entries(
             }
         };
         let state = spool.read_upload(&ulid)?;
-        let hash = meta_body_hash(&meta)?;
+        let hash = crate::spool::meta_body_hash(&meta)?;
         if state.meta_hash.as_deref() != Some(hash.as_str()) {
             out.push(QueueEntry {
                 op: QueueOp::Meta,
@@ -499,7 +492,7 @@ async fn settle_entry(
             .await?
             {
                 Driven::Done => {
-                    let hash = meta_body_hash(&meta)?;
+                    let hash = crate::spool::meta_body_hash(&meta)?;
                     spool.mark_meta_uploaded(&entry.ulid, hash)?;
                     Ok(EntryStats::uploaded())
                 }

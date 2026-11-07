@@ -32,6 +32,14 @@ use starforge_capture::Cursor;
 use starforge_format::{SessionMeta, blake3_hex, compress, split_jsonl};
 use starforge_redact::{Compiled, RuleSet};
 
+/// Blake3 of the canonical metadata JSON: the identity
+/// `upload.json.meta_hash` is compared against. Shared by `sync` (marking
+/// the upload) and `ingest` (deciding whether metadata changed).
+pub fn meta_body_hash(meta: &SessionMeta) -> Result<String, SpoolError> {
+    let bytes = serde_json::to_vec(meta)?;
+    Ok(blake3_hex(&bytes))
+}
+
 /// Spool failures.
 #[derive(Debug, thiserror::Error)]
 pub enum SpoolError {

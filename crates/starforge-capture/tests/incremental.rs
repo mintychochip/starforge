@@ -381,7 +381,7 @@ fn pi_growing_transcript_resume() {
     let a = PiAdapter;
     let cand = single_candidate(&a, &roots);
     let first = a.read(&cand, &Cursor::start(), FALLBACK_TS).unwrap();
-    assert_eq!(first.events.len(), 10);
+    assert_eq!(first.events.len(), 11);
     let resume_at = first.next;
 
     let appended = serde_json::json!({
@@ -412,7 +412,7 @@ fn pi_growing_transcript_resume() {
     assert_eq!(user_text(&tail.events[0]), FOLLOW_UP_TEXT);
 
     let fresh = a.read(&cand, &Cursor::start(), FALLBACK_TS).unwrap();
-    assert_eq!(fresh.events.len(), 11);
+    assert_eq!(fresh.events.len(), 12);
     assert_resume_continuity(&first.events, &tail.events, &fresh.events);
 }
 
