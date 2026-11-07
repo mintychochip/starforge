@@ -327,8 +327,30 @@ async fn rpc(
                 tracing::warn!(error = %err, repo_id, "queueing git maintenance failed");
             }
             if let Some((core, repo_id, repo, pusher, nonce, before)) = scan {
-                core.scan_push_changes(repo_id, repo, pusher, nonce, before)
+                let before_ci = before.clone();
+                // Snapshot BEFORE the scan: the push scan deletes the
+                // consumed `refs/for` pseudo-refs during ingest, so a
+                // snapshot taken later would no longer see the Trail
+                // trigger tips.
+                let after = core.snapshot_refs(&repo).await;
+                core.scan_push_changes(repo_id, repo.clone(), pusher.clone(), nonce, before)
                     .await;
+                // CI triggers (M6c C1): the post-push scan ingested the
+                // `refs/for` changes above, so the Trail trigger can find
+                // them; branch pushes enqueue from the new tips. A CI
+                // failure never fails the push — it only warns.
+                if let (Some(before_ci), Some(after)) = (before_ci, after)
+                    && let Err(err) = core
+                        .ci_trigger_push_scan(
+                            repo_id,
+                            pusher.as_ref().map(|user| user.id),
+                            &before_ci,
+                            &after,
+                        )
+                        .await
+                {
+                    tracing::warn!(repo_id, error = %err, "CI trigger failed");
+                }
             }
         }
     });

@@ -432,6 +432,9 @@ impl Core {
         starforged_db::email_tokens::delete_expired(self.db(), ts).await?;
         starforged_db::invites::delete_expired_before(self.db(), ts - 30 * DAY).await?;
         starforged_db::oauth::delete_expired(self.db(), ts).await?;
+        // CI jobs whose runner lease expired: requeue or fail, revoking the
+        // stale attempt's job token and git credential (M6a A6).
+        starforged_db::ci::requeue_expired_ci_jobs(self.db(), ts, 3).await?;
         // Delivery attempts older than 30 days fall out of the log (D5).
         starforged_db::checks::prune_deliveries_before(self.db(), ts - 30 * DAY).await?;
         // Every link in a message is dead 7 days after it was sent (invites live longest), so a failed

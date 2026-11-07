@@ -24,6 +24,7 @@
 //! Errors are [`ProviderError`] JSON with a status taken from the code.
 
 pub mod podman;
+pub mod proxy;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -56,6 +57,14 @@ pub struct DaemonConfig {
     pub max_sandboxes: usize,
     /// Cap on one exec (seconds; `0` = no cap).
     pub exec_timeout_s: u64,
+    /// Egress proxy listen address (e.g. `127.0.0.1:0`); `None` disables
+    /// per-sandbox egress provisioning (pre-B7 behavior).
+    pub egress_listen: Option<std::net::SocketAddr>,
+    /// Directory holding per-sandbox CA certs/keys (keys are `0600`).
+    pub egress_ca_dir: std::path::PathBuf,
+    /// Operator-configured secret bindings for header injection. Values
+    /// never enter the sandbox env/filesystem and are never logged.
+    pub secret_bindings: Vec<proxy::SecretBinding>,
 }
 
 impl Default for DaemonConfig {
@@ -65,6 +74,9 @@ impl Default for DaemonConfig {
             default_ttl_s: 3600,
             max_sandboxes: 0,
             exec_timeout_s: 300,
+            egress_listen: None,
+            egress_ca_dir: std::path::PathBuf::from("/run/starforge/egress-ca"),
+            secret_bindings: Vec::new(),
         }
     }
 }
@@ -76,6 +88,16 @@ struct SandboxRecord {
     deadline_unix: i64,
 }
 
+/// Per-sandbox egress state (proxy task + CA files on the daemon host).
+pub struct SandboxProxy {
+    /// Proxy task (aborted on kill/expire).
+    pub proxy: proxy::EgressProxy,
+    /// CA cert path on the daemon host (installed into the sandbox).
+    pub ca_cert_path: std::path::PathBuf,
+    /// CA key path on the daemon host (`0600`, destroyed on kill/expire).
+    pub ca_key_path: std::path::PathBuf,
+}
+
 /// Shared daemon state (cheap to clone).
 #[derive(Clone)]
 pub struct DaemonState {
@@ -84,6 +106,8 @@ pub struct DaemonState {
     config: DaemonConfig,
     sandboxes: Arc<Mutex<HashMap<String, SandboxRecord>>>,
     idempotency: Arc<Mutex<HashMap<String, String>>>,
+    /// Live per-sandbox egress proxies, keyed by sandbox id.
+    proxies: Arc<Mutex<HashMap<String, SandboxProxy>>>,
 }
 
 impl DaemonState {
@@ -94,11 +118,22 @@ impl DaemonState {
             config,
             sandboxes: Arc::new(Mutex::new(HashMap::new())),
             idempotency: Arc::new(Mutex::new(HashMap::new())),
+            proxies: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     pub fn sandbox_count(&self) -> usize {
         self.sandboxes.lock().unwrap().len()
+    }
+
+    /// Proxy listen address for a live sandbox, if egress is provisioned.
+    pub fn proxy_addr(&self, id: &str) -> Option<std::net::SocketAddr> {
+        self.proxies.lock().unwrap().get(id).map(|p| p.proxy.addr())
+    }
+
+    /// Proxy log buffer for a live sandbox, if egress is provisioned.
+    pub fn proxy_logs(&self, id: &str) -> Option<Arc<proxy::ProxyLog>> {
+        self.proxies.lock().unwrap().get(id).map(|p| p.proxy.logs())
     }
 }
 
@@ -222,12 +257,159 @@ pub async fn sweep_expired(state: &DaemonState, now_unix: i64) -> Vec<String> {
     let mut killed = Vec::new();
     for id in expired {
         let _ = state.runtime.remove(&id).await;
+        teardown_egress(state, &id);
         state.sandboxes.lock().unwrap().remove(&id);
         killed.push(id);
     }
     killed
 }
 
+// -------------------------------------------------------- egress (B7) ----
+
+/// Workspace-relative path of the installed CA cert inside every sandbox.
+pub const PROXY_CA_PATH: &str = ".starforge-proxy/ca.pem";
+
+/// Build the per-sandbox egress policy from the create request's network
+/// policy and the daemon's secret bindings. Only bindings whose host is
+/// named in `secret_headers` (and allowlisted) become injectable.
+pub fn egress_policy(
+    network: &starforge_sandbox_protocol::NetworkPolicy,
+    daemon_bindings: &[proxy::SecretBinding],
+) -> proxy::EgressPolicy {
+    let bindings = daemon_bindings
+        .iter()
+        .filter_map(|b| {
+            network
+                .secret_headers
+                .get(&b.host)
+                .map(|header| proxy::SecretBinding {
+                    host: b.host.clone(),
+                    header: header.clone(),
+                    value: b.value.clone(),
+                })
+        })
+        .collect();
+    proxy::EgressPolicy {
+        allow_out: network.allow_out.clone(),
+        deny_out: network.deny_out.clone(),
+        bindings,
+        cidr_allow: Vec::new(),
+    }
+}
+
+/// Start egress for a sandbox (CA + proxy). No container contact: must run
+/// BEFORE `runtime.create` so the proxy env can be injected at create time.
+pub async fn start_egress(
+    state: &DaemonState,
+    id: &str,
+    policy: &proxy::EgressPolicy,
+) -> Result<(), ProviderError> {
+    let Some(listen) = state.config.egress_listen else {
+        return Ok(());
+    };
+    let ca = proxy::CaMaterial::generate(&policy.allow_out)
+        .map_err(|e| ProviderError::new("internal", format!("egress CA: {e}")))?;
+    let (ca_cert_path, ca_key_path) = proxy::ca_paths(&state.config.egress_ca_dir, id);
+    proxy::write_ca_key(&ca_key_path, &ca.key_pem)
+        .map_err(|e| ProviderError::new("internal", format!("CA key: {e}")))?;
+    if let Some(parent) = ca_cert_path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    if std::fs::write(&ca_cert_path, &ca.cert_pem).is_err() {
+        proxy::destroy_ca_key(&ca_key_path);
+        return Err(ProviderError::new("internal", "failed to write CA cert"));
+    }
+    let proxy_inst = proxy::start_proxy(listen, Arc::new(ca), Arc::new(policy.clone()), None, None)
+        .await
+        .map_err(|e| ProviderError::new("internal", format!("egress proxy: {e}")))?;
+    state.proxies.lock().unwrap().insert(
+        id.to_owned(),
+        SandboxProxy {
+            proxy: proxy_inst,
+            ca_cert_path,
+            ca_key_path,
+        },
+    );
+    Ok(())
+}
+
+/// Install the CA cert into a created sandbox's trust store (podman-cp
+/// backed file write, plus system bundle registration best effort).
+pub async fn install_ca(state: &DaemonState, id: &str) -> Result<(), ProviderError> {
+    let (cert_pem, ca_key_path) = {
+        let guard = state.proxies.lock().unwrap();
+        let entry = guard
+            .get(id)
+            .ok_or_else(|| ProviderError::new("internal", "egress not provisioned"))?;
+        let pem = std::fs::read_to_string(&entry.ca_cert_path)
+            .map_err(|e| ProviderError::new("internal", format!("CA cert read: {e}")))?;
+        (pem, entry.ca_key_path.clone())
+    };
+    if state
+        .runtime
+        .file_write(id, PROXY_CA_PATH, cert_pem.as_bytes())
+        .await
+        .is_err()
+    {
+        return Err(ProviderError::new(
+            "internal",
+            "failed to install egress CA cert",
+        ));
+    }
+    let install = starforge_sandbox_protocol::ExecRequest {
+        command: vec![
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            format!(
+                "cp /workspace/{PROXY_CA_PATH} /usr/local/share/ca-certificates/starforge-proxy-ca.crt 2>/dev/null && update-ca-certificates 2>/dev/null; true"
+            ),
+        ],
+        ..Default::default()
+    };
+    if state.runtime.exec(id, &install).await.is_err() {
+        proxy::destroy_ca_key(&ca_key_path);
+        return Err(ProviderError::new(
+            "internal",
+            "failed to initialize egress",
+        ));
+    }
+    Ok(())
+}
+
+/// Tear down a sandbox's egress: abort the proxy task and destroy the CA
+/// key. Idempotent.
+pub fn teardown_egress(state: &DaemonState, id: &str) {
+    if let Some(entry) = state.proxies.lock().unwrap().remove(id) {
+        drop(entry.proxy);
+        proxy::destroy_ca_key(&entry.ca_key_path);
+        let _ = std::fs::remove_file(&entry.ca_cert_path);
+    }
+}
+
+/// Env vars pointing a sandbox at its egress proxy (injected into the
+/// create request's env, or usable by future exec callers).
+pub fn proxy_env(state: &DaemonState, id: &str) -> Vec<(String, String)> {
+    match state.proxy_addr(id) {
+        Some(addr) => {
+            let url = format!("http://{addr}");
+            vec![
+                ("HTTPS_PROXY".to_owned(), url.clone()),
+                ("https_proxy".to_owned(), url.clone()),
+                ("HTTP_PROXY".to_owned(), url.clone()),
+                ("http_proxy".to_owned(), url),
+                (
+                    "SSL_CERT_FILE".to_owned(),
+                    format!("/workspace/{PROXY_CA_PATH}"),
+                ),
+                (
+                    "NODE_EXTRA_CA_CERTS".to_owned(),
+                    format!("/workspace/{PROXY_CA_PATH}"),
+                ),
+            ]
+        }
+        None => Vec::new(),
+    }
+}
 // -------------------------------------------------------------- middleware --
 
 async fn auth_middleware(
@@ -308,7 +490,28 @@ async fn create_sandbox(
             format!("failed to generate sandbox id: {e}")
         ))?
     );
-    state.runtime.create(&id, &req).await?;
+    // Egress (B7): start the per-sandbox proxy + CA first so its env can be
+    // injected into the container at create time, then create, then install
+    // the CA into the trust store.
+    let policy = egress_policy(&req.network, &state.config.secret_bindings);
+    if let Err(err) = start_egress(&state, &id, &policy).await {
+        return Err(ApiError(err));
+    }
+    let mut req = req;
+    for (key, value) in proxy_env(&state, &id) {
+        req.envs.insert(key, value);
+    }
+    if let Err(err) = state.runtime.create(&id, &req).await {
+        teardown_egress(&state, &id);
+        return Err(ApiError(err));
+    }
+    if state.proxy_addr(&id).is_some()
+        && let Err(err) = install_ca(&state, &id).await
+    {
+        let _ = state.runtime.remove(&id).await;
+        teardown_egress(&state, &id);
+        return Err(ApiError(err));
+    }
 
     let now = now_unix();
     let record = SandboxRecord {
@@ -345,6 +548,7 @@ async fn delete_sandbox(
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     let known = state.sandboxes.lock().unwrap().remove(&id).is_some();
+    teardown_egress(&state, &id);
     if known {
         state.runtime.remove(&id).await?;
     }
@@ -977,5 +1181,82 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert!(url["url"].as_str().unwrap().contains("8080"));
+    }
+
+    #[tokio::test]
+    async fn create_provisions_proxy_ca_env_and_kill_cleans_up() {
+        let dir =
+            std::env::temp_dir().join(format!("starforge-egress-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = DaemonConfig {
+            images: vec!["docker.io/library/rust".to_owned()],
+            egress_listen: Some(([127, 0, 0, 1], 0).into()),
+            egress_ca_dir: dir.clone(),
+            secret_bindings: vec![proxy::SecretBinding {
+                host: "bound.test".to_owned(),
+                header: "Authorization".to_owned(),
+                value: "wire-secret-123".to_owned(),
+            }],
+            ..DaemonConfig::default()
+        };
+        let runtime = Arc::new(FakeRuntime::new());
+        let state = DaemonState::new(
+            Arc::clone(&runtime) as Arc<dyn Runtime>,
+            "test-token".to_owned(),
+            config,
+        );
+        let (status, body) = req(
+            &state,
+            "POST",
+            "/sandboxes",
+            Some("test-token"),
+            Some(serde_json::json!({
+                "template": "docker.io/library/rust",
+                "network": {
+                    "allow_out": ["bound.test"],
+                    "secret_headers": { "bound.test": "Authorization" },
+                },
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "create body: {body}");
+        let id = body["id"].as_str().unwrap().to_owned();
+        // Proxy is live, env was injected at create time (no secret in env).
+        assert!(state.proxy_addr(&id).is_some());
+        let (_, created_req) = &runtime.created()[0];
+        assert!(
+            created_req.envs.contains_key("HTTPS_PROXY"),
+            "env: {:?}",
+            created_req.envs
+        );
+        assert!(created_req.envs.contains_key("SSL_CERT_FILE"));
+        assert!(
+            !created_req.envs.values().any(|v| v.contains("wire-secret")),
+            "secret must not be in env"
+        );
+        // CA cert installed into the sandbox workspace (podman-cp path).
+        let ca_bytes = runtime.file_read(&id, PROXY_CA_PATH).await.unwrap();
+        assert!(String::from_utf8_lossy(&ca_bytes).contains("BEGIN CERTIFICATE"));
+        // CA key exists 0600 on the daemon host.
+        let (_, key_path) = proxy::ca_paths(&dir, &id);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&key_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        // Kill: proxy gone, CA key destroyed.
+        let (status, _) = req(
+            &state,
+            "DELETE",
+            &format!("/sandboxes/{id}"),
+            Some("test-token"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(state.proxy_addr(&id).is_none());
+        assert!(!key_path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

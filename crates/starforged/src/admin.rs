@@ -57,6 +57,7 @@ pub async fn open_core(config: &Config, hook_exe: PathBuf) -> anyhow::Result<Cor
             login_per_account_per_hour: config.limits.login_per_account_per_hour,
             api_per_token_per_hour: config.limits.api_per_token_per_hour,
             refs_for_new_changes_per_hour: config.limits.refs_for_new_changes_per_hour,
+            sandbox: config.sandbox.clone(),
         },
     ))
 }

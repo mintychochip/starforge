@@ -88,6 +88,41 @@ impl Core {
         Ok(db_ci::session_ci_job_id(self.db(), session_id).await?)
     }
 
+    /// The last `max_len` bytes (char-boundary aligned) of the most recently
+    /// stored segment of the session, or empty when there is no readable
+    /// predecessor. The CI redaction overlap window: a secret split across
+    /// the previous segment's tail and the incoming segment is only fully
+    /// visible in `tail + incoming`.
+    async fn prev_segment_tail(&self, session_id: i64, max_len: usize) -> String {
+        let segments = db_sessions::segments_of(self.db(), session_id)
+            .await
+            .unwrap_or_default();
+        let Some(last) = segments.last() else {
+            return String::new();
+        };
+        let bytes = self
+            .config()
+            .blob_store
+            .get_by_hash(&last.blob_hash)
+            .await
+            .unwrap_or_default();
+        let limit = usize::try_from(self.config().max_decompressed_bytes).unwrap_or(usize::MAX);
+        let Ok(raw) = decompress_bounded(&bytes, limit) else {
+            return String::new();
+        };
+        let Ok(text) = String::from_utf8(raw) else {
+            return String::new();
+        };
+        if text.len() <= max_len {
+            return text;
+        }
+        let mut start = text.len() - max_len;
+        while start < text.len() && !text.is_char_boundary(start) {
+            start += 1;
+        }
+        text[start..].to_owned()
+    }
+
     /// Session-write guard: the uploader or a repo admin may mutate the
     /// session (metadata, segments, lifecycle, links). A CI job execution
     /// may mutate only sessions bound to its own job (`sessions.ci_job_id`).
@@ -203,7 +238,25 @@ impl Core {
         // rule set as the segment path; the redacted values are what get
         // stored below, never the raw secrets.
         let compiled = self.scan_rules_for(repo_id).await?;
-        let meta_scan = crate::rescan::scan_session_meta(&compiled, meta);
+        let mut meta_scan = crate::rescan::scan_session_meta(&compiled, meta);
+        // CI value-based redaction (M6c C6): job-bound sessions also redact
+        // the job's sealed CI secret values from every stored metadata
+        // string, so they never render in the viewer or listings.
+        if let IngestAuth::CiJob(principal) = auth {
+            let values = self.ci_secret_values_for_job(principal.job_id).await;
+            if !values.is_empty() {
+                meta_scan.title = crate::ci::redact_ci_secrets(&meta_scan.title, &values);
+                meta_scan.agent_version =
+                    crate::ci::redact_ci_secrets(&meta_scan.agent_version, &values);
+                meta_scan.branch = crate::ci::redact_ci_secrets(&meta_scan.branch, &values);
+                for model in &mut meta_scan.models {
+                    *model = crate::ci::redact_ci_secrets(model, &values);
+                }
+                for file in &mut meta_scan.files_touched {
+                    *file = crate::ci::redact_ci_secrets(file, &values);
+                }
+            }
+        }
         let models = match meta.get("models") {
             None | Some(serde_json::Value::Null) => String::new(),
             Some(_) => serde_json::to_string(&meta_scan.models).unwrap_or_default(),
@@ -427,6 +480,29 @@ impl Core {
             }
         }
         let text = decompress_segment_text(self.config(), bytes)?;
+        // CI value-based dynamic redaction (M6c C6): for job-bound sessions,
+        // redact the job's sealed CI secret values — exact plus base64,
+        // URL-encoded, hex and JSON-escaped forms, and forms split across
+        // the previous segment's tail — from the segment text BEFORE it is
+        // stored, so no session route (page, raw segment, events, download)
+        // and no search index ever carries the value. The claimed-hash
+        // check above ran on the uploaded bytes; the stored blob holds the
+        // redacted JSONL (identical for sessions without CI secrets). Its
+        // hash is what idempotency compares, so a re-upload of raw bytes
+        // containing a secret reports the stored hash on the boundary.
+        let store_text = if let Some(job_id) = self.session_ci_job_id(session.id).await? {
+            let values = self.ci_secret_values_for_job(job_id).await;
+            if values.is_empty() {
+                text.clone()
+            } else {
+                let tail = self
+                    .prev_segment_tail(session.id, crate::ci::ci_variant_len(&values))
+                    .await;
+                crate::ci::redact_ci_secrets_with_history(&text, &tail, &values)
+            }
+        } else {
+            text.clone()
+        };
         let (seq_start, seq_end) = segment_seq_range(&text)?;
         if let Some(prev_end) = stored_segments.iter().map(|s| s.seq_end).max()
             && seq_start <= prev_end
@@ -435,13 +511,17 @@ impl Core {
                 "segment sequence range {seq_start}..={seq_end} overlaps stored events ending at {prev_end}"
             )));
         }
-        // The re-scan runs on the decompressed, already-validated JSONL before
+        // The re-scan runs on the redacted, already-validated JSONL before
         // the segment row is committed; a hit quarantines the session below
         // without rejecting the bytes.
         let compiled = self.scan_rules_for(repo_id).await?;
-        let scan = crate::rescan::scan_segment_text(&compiled, &text, n);
-        let stored = self.store_segment(bytes).await?;
-        debug_assert_eq!(stored.hash, actual_hex);
+        let scan = crate::rescan::scan_segment_text(&compiled, &store_text, n);
+        let stored_bytes: Vec<u8> = if store_text != text {
+            starforge_format::compress(store_text.as_bytes())
+        } else {
+            bytes.to_vec()
+        };
+        let stored = self.store_segment(&stored_bytes).await?;
         match db_sessions::insert_segment(
             self.db(),
             session.id,
@@ -449,7 +529,7 @@ impl Core {
             seq_start,
             seq_end,
             &stored.hash,
-            i64::try_from(bytes.len()).unwrap_or(i64::MAX),
+            i64::try_from(stored_bytes.len()).unwrap_or(i64::MAX),
         )
         .await
         {

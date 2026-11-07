@@ -30,6 +30,7 @@ pub mod protection;
 pub mod redirects;
 pub mod remotes;
 pub mod repos;
+pub mod sandboxes;
 pub mod sessions;
 pub mod sshkeys;
 pub mod tokens;

@@ -328,9 +328,24 @@ pub async fn show(
     };
     // Sessions never reach search indexes (spec §11.1). The transcript is
     // attacker-influenced, so the viewer also carries the strict CSP (it
-    // wins over the middleware default, which uses `or_insert`).
+    // wins over the middleware default, which uses `or_insert`). Session
+    // routes must never be stored (M6c C6): `no-store, private`, `no-cache`,
+    // and `Vary: Cookie, Authorization` — the page, search hits, and the
+    // transcript preview are per-viewer and secret-bearing.
     let mut headers = HeaderMap::new();
     headers.insert("x-robots-tag", HeaderValue::from_static("noindex"));
+    headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store, private"),
+    );
+    headers.insert(
+        axum::http::header::PRAGMA,
+        HeaderValue::from_static("no-cache"),
+    );
+    headers.insert(
+        axum::http::header::VARY,
+        HeaderValue::from_static("Cookie, Authorization"),
+    );
     headers.insert(
         axum::http::header::CONTENT_SECURITY_POLICY,
         HeaderValue::from_static(STRICT_CSP),
@@ -532,6 +547,19 @@ pub async fn download(
         .unwrap_or(HeaderValue::from_static("attachment")),
     );
     headers.insert("x-robots-tag", HeaderValue::from_static("noindex"));
+    // M6c C6: one of the session routes — never stored by any cache.
+    headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store, private"),
+    );
+    headers.insert(
+        axum::http::header::PRAGMA,
+        HeaderValue::from_static("no-cache"),
+    );
+    headers.insert(
+        axum::http::header::VARY,
+        HeaderValue::from_static("Cookie, Authorization"),
+    );
     headers.insert(
         axum::http::header::CONTENT_SECURITY_POLICY,
         HeaderValue::from_static(STRICT_CSP),

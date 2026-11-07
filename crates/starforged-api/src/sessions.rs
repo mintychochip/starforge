@@ -54,10 +54,25 @@ fn session_json(id: i64, ulid: &str, lifecycle: &str, quarantine: &str) -> Value
 }
 
 /// Sessions never reach search indexes (spec §11.1): every session response
-/// carries the header, including these JSON endpoints.
+/// carries `x-robots-tag: noindex`. Session routes must never be stored by
+/// any cache (M6c C6): `no-store, private`, `no-cache`, and
+/// `Vary: Cookie, Authorization` — responses are per-viewer and may carry
+/// redacted transcripts.
 fn noindex_headers() -> HeaderMap {
     let mut headers = HeaderMap::new();
     headers.insert("x-robots-tag", HeaderValue::from_static("noindex"));
+    headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store, private"),
+    );
+    headers.insert(
+        axum::http::header::PRAGMA,
+        HeaderValue::from_static("no-cache"),
+    );
+    headers.insert(
+        axum::http::header::VARY,
+        HeaderValue::from_static("Cookie, Authorization"),
+    );
     headers
 }
 

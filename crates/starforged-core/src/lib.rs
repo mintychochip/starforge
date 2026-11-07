@@ -39,6 +39,7 @@ pub mod repolock;
 pub mod repos;
 pub mod rescan;
 pub mod sandboxes;
+pub mod sandboxes_e2b;
 pub mod scan;
 pub mod search;
 pub mod sessions;
@@ -150,6 +151,9 @@ pub struct CoreConfig {
     /// New `refs/for` changes per user per hour (`[limits]`, spec §11.6); `0`
     /// disables.
     pub refs_for_new_changes_per_hour: u64,
+    /// The `[sandbox]` section (plan M6b): provider selection, local
+    /// daemon socket/token, E2B endpoint, quotas, default TTL.
+    pub sandbox: sandboxes::SandboxConfig,
 }
 
 /// The 32-byte key sealing webhook secrets at rest.
@@ -410,6 +414,7 @@ pub(crate) mod testing {
             login_per_account_per_hour: 20,
             api_per_token_per_hour: 5000,
             refs_for_new_changes_per_hour: 30,
+            sandbox: crate::sandboxes::SandboxConfig::default(),
         };
         configure(&mut config, dir.path());
         (Core::new(db.db.clone(), config), Fixture { _db: db, dir })

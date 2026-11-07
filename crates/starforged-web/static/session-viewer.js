@@ -66,6 +66,10 @@ async function switchSplit(link, event) {
     const response = await fetch(link.href, {
       headers: { Accept: "text/html" },
       credentials: "same-origin",
+      // M6c C6: session routes are `no-store, private` on the server; the
+      // viewer must not cache the fetched page either. It only swaps the
+      // server-rendered split column — never assembles a transcript.
+      cache: "no-store",
     });
     if (!response.ok) {
       window.location.href = link.href;

@@ -20,8 +20,8 @@
 //! ([`JOB_TOKEN_PREFIX`]), PAT `sfp_` ([`crate::tokens::TOKEN_PREFIX`]).
 
 use starforged_db::{
-    checks as db_checks, ci as db_ci, now, repos as db_repos, sessions as db_sessions,
-    tokens as db_tokens,
+    changes as db_changes, checks as db_checks, ci as db_ci, now, repos as db_repos,
+    sessions as db_sessions, tokens as db_tokens,
 };
 
 use crate::checks::{StatusDto, status_dto, validate_status};
@@ -985,6 +985,1296 @@ impl Core {
         .await
     }
 }
+// ===== CI triggers, artifacts, and secrets (M6c C1–C3) =====
+/// Current time in unix seconds (re-export for the API layer, which only
+/// depends on `starforged-core`).
+pub fn now_secs() -> i64 {
+    now()
+}
+
+/// Bearer prefix of a one-time artifact upload/download token (`sfa_…`).
+pub const ARTIFACT_TOKEN_PREFIX: &str = "sfa_";
+/// Lifetime of an artifact upload token: 10 minutes.
+pub const ARTIFACT_TOKEN_TTL_SECS: i64 = 600;
+/// Per-artifact size cap: 1 GiB.
+pub const MAX_ARTIFACT_BYTES: i64 = 1024 * 1024 * 1024;
+/// Artifact retention window: 30 days.
+pub const ARTIFACT_TTL_SECS: i64 = 30 * 24 * 3600;
+/// Default job deadline when the spec sets no timeout: 1 hour.
+pub const DEFAULT_JOB_TIMEOUT_SECS: i64 = 3600;
+/// `ci.allow_secrets_on_refs_for` (plan decision 7): `refs/for` runs get no
+/// secrets unless the repo opts in. The server-wide default is false.
+pub const ALLOW_SECRETS_ON_REFS_FOR: bool = false;
+/// `ci.env_secrets` (plan decision 7): env injection of secrets is an
+/// explicit per-repo opt-in for providers without an egress proxy. The
+/// server-wide default is false; resolution below returns values to the
+/// runner for proxy header injection, never to the sandbox environment.
+pub const ENV_SECRETS: bool = false;
+
+/// A CI run as listed to repository users.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CiRunView {
+    pub job_id: i64,
+    pub repo_id: i64,
+    pub commit_sha: String,
+    pub job_name: String,
+    pub state: String,
+    pub created_by: Option<i64>,
+    pub created_at: i64,
+    pub finished_at: Option<i64>,
+}
+
+impl From<starforged_db::ci::CiJobRow> for CiRunView {
+    fn from(row: starforged_db::ci::CiJobRow) -> Self {
+        CiRunView {
+            job_id: row.id,
+            repo_id: row.repo_id,
+            commit_sha: row.commit_sha,
+            job_name: row.job_name,
+            state: row.state,
+            created_by: row.created_by,
+            created_at: row.created_at,
+            finished_at: row.finished_at,
+        }
+    }
+}
+
+/// Run detail: the job plus its artifact metadata and linked sessions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CiRunDetail {
+    pub run: CiRunView,
+    pub artifacts: Vec<ArtifactView>,
+    pub sessions: Vec<String>,
+}
+
+/// An artifact of a CI job: CAS identity (BLAKE3) plus the optional
+/// client-provided SHA-256. No filesystem path is ever exposed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactView {
+    pub id: i64,
+    pub job_id: i64,
+    pub name: String,
+    pub size: i64,
+    pub blake3: String,
+    pub sha256: Option<String>,
+    pub expires_at: i64,
+}
+
+impl From<starforged_db::ci::CiArtifactRow> for ArtifactView {
+    fn from(row: starforged_db::ci::CiArtifactRow) -> Self {
+        ArtifactView {
+            id: row.id,
+            job_id: row.job_id,
+            name: row.name,
+            size: row.size,
+            blake3: row.blake3,
+            sha256: row.sha256,
+            expires_at: row.expires_at,
+        }
+    }
+}
+
+/// A repository secret as listed to administrators: metadata only, never
+/// the sealed value and never the plaintext.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecretView {
+    pub id: i64,
+    pub repo_id: i64,
+    pub name: String,
+    pub redact_in_sessions: bool,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+impl From<starforged_db::ci::CiSecretRow> for SecretView {
+    fn from(row: starforged_db::ci::CiSecretRow) -> Self {
+        SecretView {
+            id: row.id,
+            repo_id: row.repo_id,
+            name: row.name,
+            redact_in_sessions: row.redact_in_sessions,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        }
+    }
+}
+
+/// One secret resolved for a running job, held in memory only for
+/// egress-proxy header injection. `Debug` redacts the value so a stray log
+/// line can never carry it.
+pub struct ResolvedSecret {
+    pub name: String,
+    pub value: String,
+}
+
+impl std::fmt::Debug for ResolvedSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedSecret")
+            .field("name", &self.name)
+            .field("value", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Validates one artifact name (plan security model: traversal): relative,
+/// non-empty, at most 256 chars, no `..`/`.`/empty segments, no backslashes,
+/// no whitespace or control characters.
+pub fn validate_artifact_name(name: &str) -> CoreResult<()> {
+    if name.is_empty() || name.len() > 256 {
+        return Err(CoreError::Invalid(
+            "artifact name must be 1-256 characters".into(),
+        ));
+    }
+    for segment in name.split('/') {
+        if segment.is_empty() || segment == "." || segment == ".." {
+            return Err(CoreError::Invalid(format!(
+                "artifact name `{name}` must be a relative path without `.` or `..` segments"
+            )));
+        }
+    }
+    if name
+        .chars()
+        .any(|c| c <= ' ' || c == '\\' || c.is_control())
+    {
+        return Err(CoreError::Invalid(format!(
+            "artifact name `{name}` must not contain whitespace or control characters"
+        )));
+    }
+    Ok(())
+}
+
+/// Validates one secret name: 1–128 chars of `[A-Za-z0-9_]` (the `ci_spec`
+/// rule, enforced here too so the API rejects names a spec cannot carry).
+pub fn validate_secret_name(name: &str) -> CoreResult<()> {
+    if name.is_empty() || name.len() > 128 {
+        return Err(CoreError::Invalid(
+            "secret name must be 1-128 characters".into(),
+        ));
+    }
+    if !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+        return Err(CoreError::Invalid(
+            "secret name may only contain [A-Za-z0-9_]".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Glob match for artifact names: `**` matches across `/`, `*` matches
+/// within one segment, `?` matches one non-`/` character.
+pub fn artifact_glob_matches(pattern: &str, name: &str) -> bool {
+    if !pattern.contains(['*', '?']) {
+        return pattern == name;
+    }
+    let pat: Vec<char> = pattern.chars().collect();
+    let text: Vec<char> = name.chars().collect();
+    glob_match(&pat, &text)
+}
+
+fn glob_match(pat: &[char], text: &[char]) -> bool {
+    if pat.is_empty() {
+        return text.is_empty();
+    }
+    if pat.len() >= 2 && pat[0] == '*' && pat[1] == '*' {
+        // `**` consumes any run of characters including `/` (and an
+        // optional following `/`).
+        let rest = &pat[2..];
+        let rest = if rest.first() == Some(&'/') {
+            &rest[1..]
+        } else {
+            rest
+        };
+        for skip in 0..=text.len() {
+            if glob_match(rest, &text[skip..]) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if pat[0] == '*' {
+        for skip in 0..=text.len() {
+            if skip > 0 && text[skip - 1] == '/' {
+                break;
+            }
+            if glob_match(&pat[1..], &text[skip..]) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if text.is_empty() {
+        return false;
+    }
+    if pat[0] == '?' {
+        if text[0] == '/' {
+            return false;
+        }
+        return glob_match(&pat[1..], &text[1..]);
+    }
+    pat[0] == text[0] && glob_match(&pat[1..], &text[1..])
+}
+
+impl Core {
+    /// Reads and parses `.starforge/ci.toml` at `commit_sha` from the
+    /// repository's git tree (never the worktree). `Ok(None)` when the
+    /// repository has no spec at that commit; a malformed spec is
+    /// `Invalid` and, when `creator` is known, also records a `ci/spec`
+    /// error check on the commit.
+    pub async fn read_ci_spec_at_commit(
+        &self,
+        repo_id: i64,
+        commit_sha: &str,
+        creator: Option<i64>,
+    ) -> CoreResult<Option<crate::ci_spec::CiSpec>> {
+        let path = self.repo_path(repo_id);
+        let blob = starforged_git::read::blob_bytes(&path, commit_sha, ".starforge/ci.toml")
+            .map_err(|e| CoreError::Git(e.to_string()))?;
+        let Some(bytes) = blob else {
+            return Ok(None);
+        };
+        let text = String::from_utf8(bytes)
+            .map_err(|_| CoreError::Invalid("ci.toml is not UTF-8".into()))?;
+        match crate::ci_spec::CiSpec::parse(&text) {
+            Ok(spec) => Ok(Some(spec)),
+            Err(err) => {
+                if let Some(user_id) = creator {
+                    let _ = db_checks::insert_check(
+                        self.db(),
+                        repo_id,
+                        commit_sha,
+                        "ci/spec",
+                        "error",
+                        None,
+                        Some(&err.to_string()),
+                        Some(user_id),
+                        now(),
+                    )
+                    .await;
+                }
+                Err(err)
+            }
+        }
+    }
+
+    /// Enqueues one job of `spec` for `commit_sha`, deduplicating on the
+    /// `(repo, commit, job)` partial unique index (a collision means an
+    /// active job already exists). Writes the `pending` `ci/<job>` check
+    /// and dispatches the `ci` queued webhook. Returns the new job id, or
+    /// `None` when an active job already covers this `(repo, commit, job)`.
+    #[allow(clippy::too_many_arguments)]
+    async fn enqueue_ci_job(
+        &self,
+        repo_id: i64,
+        trail_id: Option<i64>,
+        change_id: Option<i64>,
+        revision_id: Option<i64>,
+        commit_sha: &str,
+        base_sha: Option<&str>,
+        job: &crate::ci_spec::CiJobSpec,
+        created_by: Option<i64>,
+    ) -> CoreResult<Option<i64>> {
+        let now_ts = now();
+        let timeout_secs = job
+            .timeout_duration()
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(DEFAULT_JOB_TIMEOUT_SECS);
+        let spec_json = serde_json::to_string(job).unwrap_or_else(|_| "{}".into());
+        let row = match db_ci::insert_ci_job(
+            self.db(),
+            &db_ci::NewCiJob {
+                repo_id,
+                trail_id,
+                change_id,
+                revision_id,
+                commit_sha,
+                base_sha,
+                job_name: &job.name,
+                spec: &spec_json,
+                run_at: now_ts,
+                deadline: now_ts + timeout_secs,
+                created_by,
+                now: now_ts,
+            },
+        )
+        .await
+        {
+            Ok(row) => row,
+            Err(err) if err.is_unique_violation() => return Ok(None),
+            Err(err) => return Err(err.into()),
+        };
+        // The `pending` check gates the commit until the job reports.
+        let _ = db_checks::insert_check(
+            self.db(),
+            repo_id,
+            commit_sha,
+            &format!("ci/{}", job.name),
+            "pending",
+            None,
+            None,
+            created_by,
+            now_ts,
+        )
+        .await;
+        let sender = match created_by {
+            Some(user_id) => self.sender_of(user_id).await,
+            None => None,
+        };
+        self.dispatch_event(
+            repo_id,
+            HookEvent {
+                event: "ci",
+                action: Some("queued"),
+                cause: None,
+                sender,
+                subject: serde_json::json!({
+                    "ci_job_id": row.id,
+                    "job_name": job.name,
+                    "commit_sha": commit_sha,
+                    "state": "queued",
+                    "created_by": created_by,
+                }),
+            },
+        )
+        .await;
+        self.audit(
+            created_by,
+            "ci.job.enqueue",
+            &format!("ci_job:{}", row.id),
+            &format!("repo_id={repo_id} job={} commit={commit_sha}", job.name),
+        )
+        .await?;
+        Ok(Some(row.id))
+    }
+
+    /// Push trigger (C1): enqueues every job of the spec at `commit_sha`
+    /// whose push trigger matches `branch`. `created_by` is the pusher.
+    pub async fn ci_trigger_push(
+        &self,
+        repo_id: i64,
+        branch: &str,
+        commit_sha: &str,
+        pusher: Option<i64>,
+    ) -> CoreResult<Vec<i64>> {
+        let Some(spec) = self
+            .read_ci_spec_at_commit(repo_id, commit_sha, pusher)
+            .await?
+        else {
+            return Ok(Vec::new());
+        };
+        if !spec
+            .triggers
+            .push
+            .iter()
+            .any(|pattern| starforged_git::refpolicy::pattern_matches(Some(pattern), branch))
+        {
+            return Ok(Vec::new());
+        }
+        let mut ids = Vec::new();
+        for job in &spec.jobs {
+            if let Some(id) = self
+                .enqueue_ci_job(repo_id, None, None, None, commit_sha, None, job, pusher)
+                .await?
+            {
+                ids.push(id);
+            }
+        }
+        Ok(ids)
+    }
+
+    /// Trail trigger (C1): enqueues every job of the spec at the change's
+    /// current head when `action` (`opened`/`updated`) is in the spec's
+    /// trail triggers. Supersedes the change's other active jobs first (a
+    /// new revision cancels queued/claimed/running jobs of older
+    /// revisions). `created_by` is the Trail author (the change creator,
+    /// falling back to `actor`).
+    pub async fn ci_trigger_trail(
+        &self,
+        repo_id: i64,
+        action: &str,
+        commit_sha: &str,
+        actor: Option<i64>,
+    ) -> CoreResult<Vec<i64>> {
+        let Some(spec) = self
+            .read_ci_spec_at_commit(repo_id, commit_sha, actor)
+            .await?
+        else {
+            return Ok(Vec::new());
+        };
+        if !spec.triggers.trail.iter().any(|entry| entry == action) {
+            return Ok(Vec::new());
+        }
+        let mut ids = Vec::new();
+        for change in db_changes::changes_with_current_head(self.db(), repo_id, commit_sha).await? {
+            for stale in db_ci::active_ci_jobs_for_change(self.db(), repo_id, change.id).await? {
+                db_ci::cancel_ci_job(self.db(), stale.id, None, now()).await?;
+            }
+            let created_by = change.creator_id.or(actor);
+            for job in &spec.jobs {
+                if let Some(id) = self
+                    .enqueue_ci_job(
+                        repo_id,
+                        Some(change.trail_id),
+                        Some(change.id),
+                        change.current_revision_id,
+                        commit_sha,
+                        None,
+                        job,
+                        created_by,
+                    )
+                    .await?
+                {
+                    ids.push(id);
+                }
+            }
+        }
+        Ok(ids)
+    }
+
+    /// Manual trigger (C1): `POST /repos/{owner}/{repo}/ci/runs` with
+    /// `{ref, job?}`. Resolves `ref` in the repository (default: the
+    /// default branch), reads the spec at that commit (trigger filters do
+    /// not apply to a manual run), and enqueues the named job or all jobs.
+    /// The caller must hold at least `Write` on the repository.
+    pub async fn ci_trigger_manual(
+        &self,
+        user: &crate::accounts::User,
+        owner: &str,
+        repo: &str,
+        reference: Option<&str>,
+        job_name: Option<&str>,
+    ) -> CoreResult<Vec<i64>> {
+        let access = self
+            .require_repo(Some(user), owner, repo, Permission::Write)
+            .await?;
+        let path = self.repo_path(access.repo.id);
+        let reference = reference
+            .map(str::to_owned)
+            .unwrap_or_else(|| access.repo.default_branch.clone());
+        let resolved = starforged_git::read::resolve(&path, &reference)
+            .map_err(|e| CoreError::Git(e.to_string()))?
+            .ok_or_else(|| CoreError::Invalid(format!("unknown ref `{reference}`")))?;
+        let Some(spec) = self
+            .read_ci_spec_at_commit(access.repo.id, &resolved.commit_id, Some(user.id))
+            .await?
+        else {
+            return Err(CoreError::Invalid(
+                "no .starforge/ci.toml at the requested ref".into(),
+            ));
+        };
+        let jobs: Vec<&crate::ci_spec::CiJobSpec> = match job_name {
+            Some(name) => {
+                let Some(job) = spec.jobs.iter().find(|job| job.name == name) else {
+                    return Err(CoreError::Invalid(format!("unknown CI job `{name}`")));
+                };
+                vec![job]
+            }
+            None => spec.jobs.iter().collect(),
+        };
+        let mut ids = Vec::new();
+        for job in jobs {
+            if let Some(id) = self
+                .enqueue_ci_job(
+                    access.repo.id,
+                    None,
+                    None,
+                    None,
+                    &resolved.commit_id,
+                    None,
+                    job,
+                    Some(user.id),
+                )
+                .await?
+            {
+                ids.push(id);
+            }
+        }
+        Ok(ids)
+    }
+
+    /// Post-receive scan trigger (C1, called by the git transports after a
+    /// successful push, alongside `scan_push_changes`): for every changed
+    /// branch tip, the push trigger; for every changed `refs/for/*` tip,
+    /// the Trail trigger whose action is `opened` for revision 1 and
+    /// `updated` for later revisions. Failures are returned so the
+    /// transport can warn-log; a push never fails because of CI.
+    pub async fn ci_trigger_push_scan(
+        &self,
+        repo_id: i64,
+        pusher: Option<i64>,
+        before: &std::collections::BTreeMap<String, String>,
+        after: &std::collections::BTreeMap<String, String>,
+    ) -> CoreResult<()> {
+        for (name, tip) in after {
+            if before.get(name) == Some(tip) {
+                continue;
+            }
+            if let Some(branch) = name.strip_prefix("refs/heads/") {
+                self.ci_trigger_push(repo_id, branch, tip, pusher).await?;
+            } else if name.starts_with("refs/for/") {
+                let action = match db_changes::changes_with_current_head(self.db(), repo_id, tip)
+                    .await?
+                    .into_iter()
+                    .next()
+                {
+                    Some(change) => match change.current_revision_id {
+                        Some(revision_id) => {
+                            match db_changes::revision_by_id(self.db(), revision_id).await? {
+                                Some(revision) if revision.number > 1 => "updated",
+                                _ => "opened",
+                            }
+                        }
+                        None => "opened",
+                    },
+                    None => continue,
+                };
+                self.ci_trigger_trail(repo_id, action, tip, pusher).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Lists the repository's CI runs (jobs), newest first. Callers need at
+    /// least `Read` on the repo.
+    pub async fn list_ci_runs(
+        &self,
+        viewer: Option<&crate::accounts::User>,
+        owner: &str,
+        repo: &str,
+        limit: i64,
+    ) -> CoreResult<Vec<CiRunView>> {
+        let access = self
+            .require_repo(viewer, owner, repo, Permission::Read)
+            .await?;
+        let limit = limit.clamp(1, 200);
+        Ok(
+            db_ci::list_ci_jobs_for_repo(self.db(), access.repo.id, limit)
+                .await?
+                .into_iter()
+                .map(CiRunView::from)
+                .collect(),
+        )
+    }
+
+    /// One CI run with its artifact metadata and linked sessions. Callers
+    /// need at least `Read` on the repository; a job of another repository
+    /// is `NotFound`.
+    pub async fn get_ci_run(
+        &self,
+        viewer: Option<&crate::accounts::User>,
+        owner: &str,
+        repo: &str,
+        job_id: i64,
+    ) -> CoreResult<CiRunDetail> {
+        let access = self
+            .require_repo(viewer, owner, repo, Permission::Read)
+            .await?;
+        let job = db_ci::ci_job_by_id(self.db(), job_id)
+            .await?
+            .ok_or(CoreError::NotFound)?;
+        if job.repo_id != access.repo.id {
+            return Err(CoreError::NotFound);
+        }
+        let artifacts = db_ci::artifacts_for_job(self.db(), job_id)
+            .await?
+            .into_iter()
+            .map(ArtifactView::from)
+            .collect();
+        let sessions = db_ci::job_sessions_for_job(self.db(), job_id)
+            .await?
+            .into_iter()
+            .map(|row| row.session_ulid)
+            .collect();
+        Ok(CiRunDetail {
+            run: CiRunView::from(job),
+            artifacts,
+            sessions,
+        })
+    }
+
+    /// The secret-trust rule (plan decision 7) for one job: secrets resolve
+    /// only on a protected branch or a Trail change with maintainer
+    /// approval. `refs/for` runs are only trusted when
+    /// [`ALLOW_SECRETS_ON_REFS_FOR`] is set (false by default).
+    pub async fn secrets_trusted_for_job(
+        &self,
+        job: &starforged_db::ci::CiJobRow,
+    ) -> CoreResult<bool> {
+        if let Some(change_id) = job.change_id {
+            // Trail/`refs/for` job: trusted only with an approval, or with
+            // the explicit per-repo opt-in.
+            if ALLOW_SECRETS_ON_REFS_FOR {
+                return Ok(true);
+            }
+            let reviews = db_changes::reviews_of_change(self.db(), change_id).await?;
+            return Ok(reviews.iter().any(|review| review.verdict == "approved"));
+        }
+        // Branch job: trusted when a protected branch currently points at
+        // the job's commit (a gate rule whose pattern matches that branch).
+        let path = self.repo_path(job.repo_id);
+        let branches =
+            starforged_git::read::branch_list(&path).map_err(|e| CoreError::Git(e.to_string()))?;
+        let patterns: Vec<Option<String>> = db_checks::gate_rules_for_repo(self.db(), job.repo_id)
+            .await?
+            .into_iter()
+            .map(|rule| rule.pattern)
+            .collect();
+        Ok(branches
+            .iter()
+            .filter(|branch| branch.tip.id == job.commit_sha)
+            .any(|branch| {
+                patterns.iter().any(|pattern| {
+                    starforged_git::refpolicy::pattern_matches(pattern.as_deref(), &branch.name)
+                })
+            }))
+    }
+
+    /// Creates or rotates one repository secret (decision 7): the value is
+    /// sealed with [`CiSecretBox`] (`ci-secrets-v1`) and only the ciphertext
+    /// is stored. The caller must hold at least `Admin` on the repo. The
+    /// plaintext never reaches the database, the audit trail, or logs —
+    /// the audit row carries the secret name only.
+    pub async fn create_ci_secret(
+        &self,
+        user: &crate::accounts::User,
+        owner: &str,
+        repo: &str,
+        name: &str,
+        value: &str,
+        redact_in_sessions: bool,
+    ) -> CoreResult<SecretView> {
+        let access = self
+            .require_repo(Some(user), owner, repo, Permission::Admin)
+            .await?;
+        validate_secret_name(name)?;
+        if value.is_empty() {
+            return Err(CoreError::Invalid("secret value must not be empty".into()));
+        }
+        let sealed = self.seal_ci_secret(value);
+        let row = db_ci::upsert_secret(
+            self.db(),
+            access.repo.id,
+            name,
+            &sealed,
+            redact_in_sessions,
+            Some(user.id),
+            now(),
+        )
+        .await?;
+        self.audit(
+            Some(user.id),
+            "ci.secret.create",
+            &format!("ci_secret:{}", row.id),
+            &format!("repo={} name={name}", access.repo.full_name()),
+        )
+        .await?;
+        Ok(SecretView::from(row))
+    }
+
+    /// Lists a repository's secret names (callers need at least `Admin`).
+    /// Views never carry sealed values or plaintexts.
+    pub async fn list_ci_secrets(
+        &self,
+        user: &crate::accounts::User,
+        owner: &str,
+        repo: &str,
+    ) -> CoreResult<Vec<SecretView>> {
+        let access = self
+            .require_repo(Some(user), owner, repo, Permission::Admin)
+            .await?;
+        Ok(db_ci::secrets_for_repo(self.db(), access.repo.id)
+            .await?
+            .into_iter()
+            .map(SecretView::from)
+            .collect())
+    }
+
+    /// Deletes a repository secret. The caller must hold at least `Admin`
+    /// on the repo; `ci_job_secrets` rows cascade away with the secret.
+    pub async fn delete_ci_secret(
+        &self,
+        user: &crate::accounts::User,
+        owner: &str,
+        repo: &str,
+        name: &str,
+    ) -> CoreResult<()> {
+        let access = self
+            .require_repo(Some(user), owner, repo, Permission::Admin)
+            .await?;
+        if !db_ci::delete_secret(self.db(), access.repo.id, name).await? {
+            return Err(CoreError::NotFound);
+        }
+        self.audit(
+            Some(user.id),
+            "ci.secret.delete",
+            &format!("ci_secret:{name}"),
+            &format!("repo={}", access.repo.full_name()),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Resolves the secrets a claimed job named in its spec, for
+    /// egress-proxy header injection (decision 7). The runner must own the
+    /// claim and present the current fence. Each resolved secret is
+    /// recorded in `ci_job_secrets` (so the server can decrypt it in memory
+    /// for dynamic session redaction). Under the trust rule
+    /// ([`Core::secrets_trusted_for_job`]) no values are returned at all,
+    /// and spec-named secrets that do not exist for the job's repository
+    /// are skipped. Values are never stored in the spec, the database, or
+    /// logs — they exist only in this return value.
+    pub async fn resolve_runner_job_secrets(
+        &self,
+        runner: &RunnerPrincipal,
+        job_id: i64,
+        fence: &str,
+    ) -> CoreResult<Vec<ResolvedSecret>> {
+        let job = match self.checked_claim(runner, job_id, fence).await? {
+            Ok(job) => job,
+            Err(ClaimGate::NotFound) => return Err(CoreError::NotFound),
+            Err(ClaimGate::FenceMismatch) => {
+                return Err(CoreError::Conflict("stale runner fence".into()));
+            }
+            Err(ClaimGate::Canceled) => {
+                return Err(CoreError::Invalid("job is canceled".into()));
+            }
+        };
+        if !self.secrets_trusted_for_job(&job).await? {
+            return Ok(Vec::new());
+        }
+        let spec: CiJobSpec = serde_json::from_str(&job.spec)
+            .map_err(|_| CoreError::Invalid("job spec is not parseable".into()))?;
+        let mut resolved = Vec::new();
+        let mut names = Vec::new();
+        for name in &spec.secrets {
+            if let Some(row) = db_ci::secret_by_name(self.db(), job.repo_id, name).await? {
+                let value = self.open_ci_secret(&row.sealed_value)?;
+                db_ci::insert_job_secret(self.db(), job.id, row.id, now()).await?;
+                names.push(name.clone());
+                resolved.push(ResolvedSecret {
+                    name: name.clone(),
+                    value,
+                });
+            }
+        }
+        self.audit(
+            job.created_by,
+            "ci.job.secrets.resolve",
+            &format!("ci_job:{}", job.id),
+            &format!("secrets=[{}]", names.join(",")),
+        )
+        .await?;
+        Ok(resolved)
+    }
+
+    /// Mints a one-time artifact upload token ([`ARTIFACT_TOKEN_PREFIX`])
+    /// bound to `(job, name, size, sha256)`. The runner must own the claim
+    /// and present the current fence; `name` must match one of the job's
+    /// declared artifact globs. The token's SHA-256 is stored; the token
+    /// secret is returned once and expires in 10 minutes.
+    pub async fn authorize_artifact_upload(
+        &self,
+        runner: &RunnerPrincipal,
+        job_id: i64,
+        fence: &str,
+        name: &str,
+        size: i64,
+        sha256: &str,
+    ) -> CoreResult<String> {
+        let job = match self.checked_claim(runner, job_id, fence).await? {
+            Ok(job) => job,
+            Err(ClaimGate::NotFound) => return Err(CoreError::NotFound),
+            Err(ClaimGate::FenceMismatch) => {
+                return Err(CoreError::Conflict("stale runner fence".into()));
+            }
+            Err(ClaimGate::Canceled) => {
+                return Err(CoreError::Invalid("job is canceled".into()));
+            }
+        };
+        validate_artifact_name(name)?;
+        if !(0..=MAX_ARTIFACT_BYTES).contains(&size) {
+            return Err(CoreError::Invalid(format!(
+                "artifact size {size} exceeds the {MAX_ARTIFACT_BYTES}-byte cap"
+            )));
+        }
+        let sha256 = sha256.to_ascii_lowercase();
+        if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(CoreError::Invalid(
+                "sha256 must be 64 hex characters".into(),
+            ));
+        }
+        let spec: CiJobSpec = serde_json::from_str(&job.spec)
+            .map_err(|_| CoreError::Invalid("job spec is not parseable".into()))?;
+        if !spec
+            .artifacts
+            .iter()
+            .any(|glob| artifact_glob_matches(glob, name))
+        {
+            return Err(CoreError::Forbidden);
+        }
+        let token = format!("{}{}", ARTIFACT_TOKEN_PREFIX, crypto::random_hex(32));
+        db_ci::insert_artifact_token(
+            self.db(),
+            job.id,
+            &crypto::sha256_hex(&token),
+            name,
+            size,
+            &sha256,
+            now() + ARTIFACT_TOKEN_TTL_SECS,
+            now(),
+        )
+        .await?;
+        Ok(token)
+    }
+
+    /// The outstanding artifact token row for `token`, checked against the
+    /// job and name and against expiry. Download does not consume the
+    /// token; upload does (see [`Core::upload_ci_artifact`]).
+    async fn checked_artifact_token(
+        &self,
+        token: &str,
+        job_id: i64,
+        name: &str,
+    ) -> CoreResult<starforged_db::ci::ArtifactTokenRow> {
+        if !token.starts_with(ARTIFACT_TOKEN_PREFIX) {
+            return Err(CoreError::Unauthenticated);
+        }
+        let row = db_ci::artifact_token_by_hash(self.db(), &crypto::sha256_hex(token))
+            .await?
+            .ok_or(CoreError::Unauthenticated)?;
+        if row.job_id != job_id || row.artifact_name != name {
+            return Err(CoreError::Forbidden);
+        }
+        if row.expires_at <= now() {
+            return Err(CoreError::Unauthenticated);
+        }
+        Ok(row)
+    }
+
+    /// Uploads one artifact with an authorized one-time token: the token's
+    /// `(job, name, size, sha256)` binding must match exactly, the bytes
+    /// must hash to the bound SHA-256, and the size cap applies. The bytes
+    /// go to the BLAKE3 CAS blob store (refcounts are the `ci_artifacts`
+    /// rows per hash), expire after 30 days, and consume the token — a
+    /// replay is refused.
+    pub async fn upload_ci_artifact(
+        &self,
+        token: &str,
+        job_id: i64,
+        name: &str,
+        bytes: &[u8],
+        sha256: &str,
+    ) -> CoreResult<ArtifactView> {
+        validate_artifact_name(name)?;
+        if bytes.len() as i64 > MAX_ARTIFACT_BYTES {
+            return Err(CoreError::Invalid(format!(
+                "artifact exceeds the {MAX_ARTIFACT_BYTES}-byte cap"
+            )));
+        }
+        let row = self.checked_artifact_token(token, job_id, name).await?;
+        if row.used_at.is_some() {
+            return Err(CoreError::Conflict("artifact token already used".into()));
+        }
+        if row.size != bytes.len() as i64 || row.sha256 != sha256.to_ascii_lowercase() {
+            return Err(CoreError::Forbidden);
+        }
+        use sha2::Digest as _;
+        let actual_sha256 = hex::encode(sha2::Sha256::digest(bytes));
+        if actual_sha256 != row.sha256 {
+            return Err(CoreError::Invalid(
+                "artifact bytes do not match the authorized sha256".into(),
+            ));
+        }
+        let blob = self
+            .config()
+            .blob_store
+            .put(bytes)
+            .await
+            .map_err(|e| CoreError::Internal(format!("artifact blob store: {e}")))?;
+        let artifact = db_ci::insert_artifact(
+            self.db(),
+            &db_ci::NewArtifact {
+                job_id,
+                name,
+                size: bytes.len() as i64,
+                blake3: &blob.hash,
+                sha256: Some(&row.sha256),
+                expires_at: now() + ARTIFACT_TTL_SECS,
+                now: now(),
+            },
+        )
+        .await?;
+        if !db_ci::consume_artifact_token(self.db(), row.id, now()).await? {
+            return Err(CoreError::Conflict("artifact token already used".into()));
+        }
+        Ok(ArtifactView::from(artifact))
+    }
+
+    /// Downloads one artifact's bytes: the caller presents either an
+    /// authorized artifact token for `(job, name)` or the job token of the
+    /// executing job ([`JobPrincipal`] built from `ci_jobs`). Expired
+    /// artifacts read as missing.
+    pub async fn download_ci_artifact(
+        &self,
+        job_id: i64,
+        name: &str,
+        download: &ArtifactDownloadAuth,
+    ) -> CoreResult<(Vec<u8>, ArtifactView)> {
+        validate_artifact_name(name)?;
+        match download {
+            ArtifactDownloadAuth::Token(token) => {
+                self.checked_artifact_token(token, job_id, name).await?;
+            }
+            ArtifactDownloadAuth::Job(principal) => {
+                if principal.job_id != job_id {
+                    return Err(CoreError::Forbidden);
+                }
+            }
+        }
+        let row = db_ci::artifact_by_name(self.db(), job_id, name, now())
+            .await?
+            .ok_or(CoreError::NotFound)?;
+        let bytes = self
+            .config()
+            .blob_store
+            .get_by_hash(&row.blake3)
+            .await
+            .map_err(|e| CoreError::Internal(format!("reading artifact blob: {e}")))?;
+        Ok((bytes, ArtifactView::from(row)))
+    }
+
+    /// Deletes expired artifact rows and collects blobs whose CAS refcount
+    /// dropped to zero. Returns the deleted artifact ids.
+    pub async fn gc_expired_artifacts(&self) -> CoreResult<Vec<i64>> {
+        let expired = db_ci::expired_artifacts(self.db(), now(), 1000).await?;
+        let mut ids = Vec::new();
+        for row in expired {
+            if db_ci::delete_artifact(self.db(), row.id).await?
+                && db_ci::artifact_refcount(self.db(), &row.blake3).await? == 0
+            {
+                let _ = self
+                    .config()
+                    .blob_store
+                    .delete(&starforged_blob::BlobRef {
+                        hash: row.blake3.clone(),
+                        size: row.size as u64,
+                        key: row.blake3.clone(),
+                    })
+                    .await;
+            }
+            ids.push(row.id);
+        }
+        Ok(ids)
+    }
+}
+
+/// How a caller authenticates an artifact download.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArtifactDownloadAuth {
+    /// An authorized `sfa_…` artifact token bound to `(job, name)`.
+    Token(String),
+    /// The executing job's token principal.
+    Job(JobPrincipal),
+}
+
+// ===== CI secret value-based redaction (M6c C6) =====
+
+/// The sealed box for CI secret values (plan M6 decision 7): XChaCha20-Poly1305
+/// under an HKDF key derived from the server `secret_key` with info
+/// `"ci-secrets-v1"`. The existing [`CoreConfig`] carries no raw secret-key
+/// bytes, so the key material is the already-derived webhook key bytes —
+/// itself an HKDF output of `secret_key` — re-derived into the CI domain.
+/// `c1:`-prefixed sealed strings. The derived key never renders in `Debug`.
+#[derive(Clone)]
+pub struct CiSecretBox {
+    key: [u8; 32],
+}
+
+impl CiSecretBox {
+    /// Derives the CI-secret key from the webhook-key bytes (domain-separated
+    /// by the `ci-secrets-v1` HKDF info).
+    pub fn for_webhook_key(webhook_key: &[u8; 32]) -> Self {
+        use ring::hkdf::{HKDF_SHA256, Salt};
+        let salt = Salt::new(HKDF_SHA256, b"starforge");
+        let prk = salt.extract(webhook_key);
+        let mut okm = [0_u8; 32];
+        prk.expand(&[b"ci-secrets-v1".as_slice()], HKDF_SHA256)
+            .expect("hkdf expand to 32 bytes")
+            .fill(&mut okm)
+            .expect("hkdf fill of a 32-byte buffer");
+        CiSecretBox { key: okm }
+    }
+
+    fn cipher(&self) -> chacha20poly1305::XChaCha20Poly1305 {
+        use chacha20poly1305::{Key, XChaCha20Poly1305, aead::KeyInit};
+        let key = Key::try_from(&self.key[..]).expect("32-byte XChaCha key");
+        XChaCha20Poly1305::new(&key)
+    }
+
+    /// Seals `plain` with a fresh random nonce. Panics only if the OS random
+    /// number generator is unavailable, matching [`crypto::random_hex`].
+    pub fn seal(&self, plain: &[u8]) -> String {
+        use base64::Engine as _;
+        use chacha20poly1305::{
+            XNonce,
+            aead::{Aead as _, Payload},
+        };
+        let mut nonce = [0_u8; 24];
+        getrandom::fill(&mut nonce).expect("the OS random number generator is available");
+        let ciphertext = self
+            .cipher()
+            .encrypt(
+                &XNonce::try_from(&nonce[..]).expect("24-byte XChaCha nonce"),
+                Payload {
+                    msg: plain,
+                    aad: b"",
+                },
+            )
+            .expect("XChaCha20-Poly1305 encryption does not fail");
+        let mut packed = nonce.to_vec();
+        packed.extend_from_slice(&ciphertext);
+        format!(
+            "c1:{}",
+            base64::engine::general_purpose::STANDARD.encode(&packed)
+        )
+    }
+
+    /// Opens a value produced by [`CiSecretBox::seal`]. Any malformed or
+    /// tampered input is an error, never a plain fallback.
+    pub fn open(&self, sealed: &str) -> CoreResult<Vec<u8>> {
+        use base64::Engine as _;
+        use chacha20poly1305::{
+            XNonce,
+            aead::{Aead as _, Payload},
+        };
+        let b64 = sealed
+            .strip_prefix("c1:")
+            .ok_or_else(|| CoreError::Invalid("unknown CI secret format".into()))?;
+        let packed = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .map_err(|_| CoreError::Invalid("corrupt sealed CI secret".into()))?;
+        if packed.len() < 24 + 16 {
+            return Err(CoreError::Invalid("corrupt sealed CI secret".into()));
+        }
+        let (nonce, ciphertext) = packed.split_at(24);
+        self.cipher()
+            .decrypt(
+                &XNonce::try_from(nonce)
+                    .map_err(|_| CoreError::Invalid("corrupt sealed CI secret".into()))?,
+                Payload {
+                    msg: ciphertext,
+                    aad: b"",
+                },
+            )
+            .map_err(|_| CoreError::Invalid("cannot decrypt the sealed CI secret".into()))
+    }
+}
+
+impl std::fmt::Debug for CiSecretBox {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CiSecretBox(<redacted>)")
+    }
+}
+
+/// Marker written in place of a CI secret value (and every encoded form of
+/// it) in session text.
+pub const CI_REDACTION: &str = "[redacted]";
+
+/// Percent-encodes every byte outside the unreserved set as uppercase `%XX`.
+fn url_encode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for &b in value.as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// Every text form a CI secret value can take in a transcript: the exact
+/// value, its base64 (standard and URL-safe, padded and unpadded), hex
+/// (lower and upper), JSON-string-escaped forms, and URL percent-encoded
+/// form. Transcripts are JSONL, so a secret planted in text reaches the
+/// stored bytes once-escaped; a secret planted in already-escaped form
+/// reaches them twice-escaped (`\"` becomes `\\"`). Successive escaping
+/// levels are emitted (three deep: decoded text, one wire decode, two wire
+/// decodes). Longest first, so overlapping matches redact the longest span.
+pub fn secret_variants(value: &str) -> Vec<String> {
+    fn push(out: &mut Vec<String>, candidate: String) {
+        if !candidate.is_empty() && !out.contains(&candidate) {
+            out.push(candidate);
+        }
+    }
+    let mut out = Vec::new();
+    push(&mut out, value.to_owned());
+    {
+        use base64::Engine as _;
+        let std = base64::engine::general_purpose::STANDARD.encode(value.as_bytes());
+        let url = base64::engine::general_purpose::URL_SAFE.encode(value.as_bytes());
+        for encoded in [&std, &url] {
+            push(&mut out, encoded.clone());
+            push(&mut out, encoded.trim_end_matches('=').to_owned());
+        }
+    }
+    let hex: String = value.bytes().map(|b| format!("{b:02x}")).collect();
+    push(&mut out, hex.clone());
+    push(&mut out, hex.to_uppercase());
+    // Successive JSON-string-escaping levels: each level matches one more
+    // layer of JSON encoding between the planted text and the stored bytes.
+    let mut escaped = value.to_owned();
+    for _ in 0..3 {
+        let Ok(json) = serde_json::to_string(&escaped) else {
+            break;
+        };
+        let Some(inner) = json
+            .strip_prefix('"')
+            .and_then(|text| text.strip_suffix('"'))
+        else {
+            break;
+        };
+        push(&mut out, inner.to_owned());
+        escaped = inner.to_owned();
+    }
+    push(&mut out, url_encode(value));
+    out.sort_by_key(|variant| std::cmp::Reverse(variant.len()));
+    out
+}
+
+/// All variants of every value, deduplicated, longest first.
+pub fn all_variants(values: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for value in values {
+        for variant in secret_variants(value) {
+            if !out.contains(&variant) {
+                out.push(variant);
+            }
+        }
+    }
+    out.sort_by_key(|variant| std::cmp::Reverse(variant.len()));
+    out
+}
+
+/// The longest variant length across `values` (0 when empty): the overlap
+/// window a newly ingested segment needs from its predecessor.
+pub fn ci_variant_len(values: &[String]) -> usize {
+    all_variants(values)
+        .iter()
+        .map(|variant| variant.len())
+        .max()
+        .unwrap_or(0)
+}
+
+/// Replaces every CI secret value (exact + base64/URL-encoded/hex/JSON-escaped
+/// forms) in `text` with [`CI_REDACTION`].
+pub fn redact_ci_secrets(text: &str, values: &[String]) -> String {
+    let mut out = text.to_owned();
+    for variant in all_variants(values) {
+        if out.contains(&variant) {
+            out = out.replace(&variant, CI_REDACTION);
+        }
+    }
+    out
+}
+
+/// Like [`redact_ci_secrets`], except it also redacts values split across the
+/// boundary between the previous segment's tail (`prev_tail`, the last
+/// [`ci_variant_len`] bytes of the predecessor) and `text`: any variant
+/// occurring across that boundary has its in-`text` portion redacted. Each
+/// segment stands alone afterwards — no single stored segment, page, search
+/// preview, or index entry ever carries the value, and the concatenation of
+/// rendered text cannot re-derive it across the seam either.
+pub fn redact_ci_secrets_with_history(text: &str, prev_tail: &str, values: &[String]) -> String {
+    if prev_tail.is_empty() {
+        return redact_ci_secrets(text, values);
+    }
+    let tail_len = prev_tail.len();
+    let mut adjusted = text.to_owned();
+    for variant in all_variants(values) {
+        let combined = format!("{prev_tail}{adjusted}");
+        let mut spans = Vec::new();
+        for (start, _) in combined.match_indices(variant.as_str()) {
+            let end = start + variant.len();
+            if start < tail_len && end > tail_len {
+                spans.push((start, end));
+            }
+        }
+        // Rightmost first, so earlier positions stay valid as ranges shift.
+        for (start, end) in spans.into_iter().rev() {
+            let local_start = start.saturating_sub(tail_len);
+            let local_end = (end - tail_len).min(adjusted.len());
+            if local_start < local_end
+                && adjusted.is_char_boundary(local_start)
+                && adjusted.is_char_boundary(local_end)
+            {
+                adjusted.replace_range(local_start..local_end, CI_REDACTION);
+            }
+        }
+    }
+    redact_ci_secrets(&adjusted, values)
+}
+
+impl Core {
+    /// Seals one CI secret value for storage in `ci_secrets.sealed_value`
+    /// (C3's create/rotate path calls this; tests seal fixtures with it).
+    pub fn seal_ci_secret(&self, value: &str) -> String {
+        CiSecretBox::for_webhook_key(&self.config().webhook_key.0).seal(value.as_bytes())
+    }
+
+    /// Opens a sealed CI secret value in memory. Tries the CI box first,
+    /// then the mirror-credential box, then the webhook box, so values
+    /// sealed under any of the server boxes open. The plaintext is returned
+    /// to the caller only; it is never logged.
+    pub fn open_ci_secret(&self, sealed: &str) -> CoreResult<String> {
+        let bytes = CiSecretBox::for_webhook_key(&self.config().webhook_key.0)
+            .open(sealed)
+            .or_else(|_| self.config().credential_box.open(sealed))
+            .or_else(|_| {
+                crate::webhooks::open_secret(&self.config().webhook_key.0, sealed)
+                    .map(|text| text.into_bytes())
+            })?;
+        String::from_utf8(bytes)
+            .map_err(|_| CoreError::Internal("decrypted CI secret is not UTF-8".into()))
+    }
+
+    /// The in-memory plaintext values of every redaction-enabled secret
+    /// resolved for `job_id` (`ci_job_secrets -> ci_secrets`). Undecryptable
+    /// rows are skipped. A missing secrets schema (migration 0038 not yet
+    /// applied) yields no values rather than an error, so ingest never
+    /// breaks on it.
+    pub async fn ci_secret_values_for_job(&self, job_id: i64) -> Vec<String> {
+        let rows = match db_ci::job_secrets_for_job(self.db(), job_id).await {
+            Ok(rows) => rows,
+            Err(err) => {
+                tracing::debug!(job_id, error = %err, "CI secret resolution unavailable");
+                return Vec::new();
+            }
+        };
+        let mut values = Vec::new();
+        for row in rows {
+            if !row.redact_in_sessions {
+                continue;
+            }
+            match self.open_ci_secret(&row.sealed_value) {
+                Ok(value) if !value.is_empty() => values.push(value),
+                _ => {}
+            }
+        }
+        values
+    }
+
+    /// The in-memory plaintext values for the secrets of the job that
+    /// uploaded `session_id` (`sessions.ci_job_id`), empty for non-CI
+    /// sessions.
+    pub async fn ci_secret_values_for_session(&self, session_id: i64) -> Vec<String> {
+        let Some(job_id) = db_ci::session_ci_job_id(self.db(), session_id)
+            .await
+            .unwrap_or(None)
+        else {
+            return Vec::new();
+        };
+        self.ci_secret_values_for_job(job_id).await
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1372,5 +2662,109 @@ mod tests {
             core.authenticate_job(&s.job_secret).await,
             Err(CoreError::Unauthenticated)
         ));
+    }
+
+    #[test]
+    fn ci_secret_box_round_trips_and_debug_redacts() {
+        let bx = CiSecretBox::for_webhook_key(&[7_u8; 32]);
+        let sealed = bx.seal(b"ci-secret-value");
+        assert!(sealed.starts_with("c1:"), "{sealed}");
+        assert_eq!(bx.open(&sealed).unwrap(), b"ci-secret-value");
+        assert!(bx.open(&sealed.replace(&sealed[3..4], "A")).is_err());
+        assert_eq!(format!("{bx:?}"), "CiSecretBox(<redacted>)");
+    }
+
+    #[test]
+    fn redact_ci_secrets_covers_all_forms() {
+        let secret = "Sk-live\"9f3A\\!@#";
+        let values = vec![secret.to_owned()];
+        let variants = secret_variants(secret);
+        assert!(variants.contains(&secret.to_owned()));
+        let text = variants
+            .iter()
+            .map(|variant| format!("x {variant} y"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let redacted = redact_ci_secrets(&text, &values);
+        for variant in &variants {
+            assert!(!redacted.contains(variant), "leaked {variant:?}");
+        }
+        assert!(redacted.contains(CI_REDACTION));
+        assert_eq!(redacted.matches(CI_REDACTION).count(), variants.len());
+    }
+
+    #[test]
+    fn redact_ci_secrets_with_history_covers_split_values() {
+        let secret = "twelve-character-secret";
+        let values = vec![secret.to_owned()];
+        let split_at = 9;
+        // Head of the value at the end of the previous segment, tail at the
+        // start of the next: only the in-segment portion is redacted, but
+        // neither side carries the full value afterwards.
+        let redacted = redact_ci_secrets_with_history(
+            &format!("{} tail rest", &secret[split_at..]),
+            &format!("head {}", &secret[..split_at]),
+            &values,
+        );
+        assert!(!redacted.contains(secret), "{redacted}");
+        assert!(!redacted.contains(&secret[split_at..]), "{redacted}");
+        // Unsplitted occurrences in the same segment redact as usual.
+        let redacted = redact_ci_secrets_with_history(&format!("a {secret} b"), "", &values);
+        assert!(!redacted.contains(secret), "{redacted}");
+        assert!(redacted.contains(CI_REDACTION));
+    }
+
+    #[test]
+    fn ci_variant_len_is_longest_variant() {
+        let values = vec!["abc".to_owned(), "longer-secret".to_owned()];
+        assert!(ci_variant_len(&values) >= "longer-secret".len());
+        assert_eq!(ci_variant_len(&[]), 0);
+    }
+
+    #[tokio::test]
+    async fn ci_secret_seal_open_round_trip_and_tamper() {
+        let (core, _f) = test_core().await;
+        let sealed = core.seal_ci_secret("super-secret-value");
+        assert!(sealed.starts_with("c1:"), "{sealed}");
+        assert!(
+            !sealed.contains("super-secret-value"),
+            "no plaintext at rest"
+        );
+        assert_eq!(core.open_ci_secret(&sealed).unwrap(), "super-secret-value");
+        // Tampering is an error, never a plaintext fallback.
+        let tampered = format!("{}A", &sealed[..sealed.len() - 1]);
+        assert!(core.open_ci_secret(&tampered).is_err());
+        assert!(core.open_ci_secret("not-sealed").is_err());
+        // The mirror box keys differently (domain separation).
+        let mirror_sealed = core.config().credential_box.seal(b"v");
+        assert!(
+            CiSecretBox::for_webhook_key(&core.config().webhook_key.0)
+                .open(&mirror_sealed)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn artifact_name_and_glob_rules() {
+        assert!(validate_artifact_name("out.bin").is_ok());
+        assert!(validate_artifact_name("target/debug/app").is_ok());
+        for bad in [
+            "../evil", "a/../b", "/abs", "a//b", "a/./b", "", "a b", "a\\b",
+        ] {
+            assert!(validate_artifact_name(bad).is_err(), "{bad}");
+        }
+        assert!(artifact_glob_matches("target/**", "target/debug/app"));
+        assert!(artifact_glob_matches("*.bin", "out.bin"));
+        assert!(!artifact_glob_matches("*.bin", "a/b.bin"));
+        assert!(artifact_glob_matches("out.bin", "out.bin"));
+        assert!(!artifact_glob_matches("out.bin", "other.bin"));
+    }
+
+    #[test]
+    fn secret_name_rule_matches_spec() {
+        assert!(validate_secret_name("CARGO_REGISTRY_TOKEN").is_ok());
+        assert!(validate_secret_name("has-dash").is_err());
+        assert!(validate_secret_name("").is_err());
+        assert!(validate_secret_name(&"A".repeat(129)).is_err());
     }
 }

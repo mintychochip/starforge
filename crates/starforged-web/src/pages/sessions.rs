@@ -175,5 +175,18 @@ pub async fn list(
     };
     let mut headers = HeaderMap::new();
     headers.insert("x-robots-tag", HeaderValue::from_static("noindex"));
+    // M6c C6: session routes are never stored by any cache.
+    headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store, private"),
+    );
+    headers.insert(
+        axum::http::header::PRAGMA,
+        HeaderValue::from_static("no-cache"),
+    );
+    headers.insert(
+        axum::http::header::VARY,
+        HeaderValue::from_static("Cookie, Authorization"),
+    );
     Ok((headers, view))
 }

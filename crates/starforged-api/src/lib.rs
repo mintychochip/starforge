@@ -13,6 +13,7 @@ mod oauth;
 pub mod openapi;
 mod orgs;
 mod repos;
+mod sandboxes;
 mod search;
 mod sessions;
 mod sshkeys;
@@ -373,6 +374,50 @@ pub fn router(core: Core, base_url: String) -> Router {
         .route(
             "/repos/{owner}/{repo}/ci/runs/{id}/cancel",
             post(ci::cancel_run),
+        )
+        .route(
+            "/repos/{owner}/{repo}/ci/runs",
+            get(ci::list_runs).post(ci::trigger_run),
+        )
+        .route("/repos/{owner}/{repo}/ci/runs/{id}", get(ci::get_run))
+        .route(
+            "/runners/jobs/{id}/artifacts/authorize",
+            post(ci::authorize_artifact),
+        )
+        .route(
+            "/runners/jobs/{id}/artifacts/{*name}",
+            put(ci::upload_artifact).get(ci::download_artifact),
+        )
+        .route("/runners/jobs/{id}/secrets", post(ci::resolve_job_secrets))
+        .route(
+            "/repos/{owner}/{repo}/ci/secrets",
+            get(ci::list_secrets).post(ci::create_secret),
+        )
+        .route(
+            "/repos/{owner}/{repo}/ci/secrets/{name}",
+            delete(ci::delete_secret),
+        )
+        .route("/sandboxes", post(sandboxes::create_sandbox))
+        .route(
+            "/sandboxes/{id}",
+            get(sandboxes::get_sandbox).delete(sandboxes::kill_sandbox),
+        )
+        .route("/sandboxes/{id}/pause", post(sandboxes::pause_sandbox))
+        .route("/sandboxes/{id}/resume", post(sandboxes::resume_sandbox))
+        .route(
+            "/sandboxes/{id}/timeout",
+            post(sandboxes::set_sandbox_timeout),
+        )
+        .route("/sandboxes/{id}/exec", post(sandboxes::exec_sandbox))
+        .route(
+            "/sandboxes/{id}/files",
+            get(sandboxes::get_sandbox_file)
+                .put(sandboxes::put_sandbox_file)
+                .delete(sandboxes::delete_sandbox_file),
+        )
+        .route(
+            "/sandboxes/{id}/ports/{port}/url",
+            get(sandboxes::sandbox_port_url),
         )
         .fallback(|| async { ApiError::NotFound })
         .layer(axum::middleware::from_fn_with_state(

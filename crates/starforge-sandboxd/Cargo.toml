@@ -18,11 +18,15 @@ axum.workspace = true
 base64.workspace = true
 clap.workspace = true
 nix = { version = "0.31", features = ["process", "socket", "user"] }
+rcgen = "0.14"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8"
 serde.workspace = true
 serde_json.workspace = true
 starforge-sandbox-protocol = { path = "../starforge-sandbox-protocol", version = "0.1.0" }
 thiserror.workspace = true
 tokio.workspace = true
+tokio-rustls = "0.26"
 tracing.workspace = true
 
 [dev-dependencies]

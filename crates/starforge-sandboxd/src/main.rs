@@ -41,6 +41,18 @@ struct Args {
     /// podman binary path.
     #[arg(long, default_value = "podman")]
     podman: PathBuf,
+    /// Egress proxy listen address (default: loopback ephemeral port).
+    #[arg(long, default_value = "127.0.0.1:0")]
+    egress_listen: std::net::SocketAddr,
+    /// Directory for per-sandbox CA certs/keys (keys are 0600; destroyed
+    /// with the sandbox).
+    #[arg(long, default_value = "/run/starforge/egress-ca")]
+    egress_ca_dir: PathBuf,
+    /// Secret binding `HOST=HEADER=VALUE` for egress header injection
+    /// (repeatable). Values are never logged; prefer operator secret
+    /// management over plaintext CLI use.
+    #[arg(long = "secret-binding")]
+    secret_bindings: Vec<String>,
 }
 
 /// Peer uid of an accepted Unix-stream connection (SO_PEERCRED on Linux).
@@ -169,10 +181,35 @@ async fn run() -> io::Result<()> {
         std::fs::set_permissions(&args.socket, std::fs::Permissions::from_mode(0o600))?;
     }
 
+    let secret_bindings = args
+        .secret_bindings
+        .iter()
+        .map(|spec| {
+            let mut parts = spec.splitn(3, '=');
+            match (parts.next(), parts.next(), parts.next()) {
+                (Some(host), Some(header), Some(value))
+                    if !host.is_empty() && !header.is_empty() =>
+                {
+                    Ok(starforge_sandboxd::proxy::SecretBinding {
+                        host: host.to_owned(),
+                        header: header.to_owned(),
+                        value: value.to_owned(),
+                    })
+                }
+                _ => Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "secret-binding must be HOST=HEADER=VALUE",
+                )),
+            }
+        })
+        .collect::<io::Result<Vec<_>>>()?;
     let config = DaemonConfig {
         images: args.images,
         default_ttl_s: args.default_ttl,
         max_sandboxes: args.max_sandboxes,
+        egress_listen: Some(args.egress_listen),
+        egress_ca_dir: args.egress_ca_dir,
+        secret_bindings,
         ..DaemonConfig::default()
     };
     let runtime = Arc::new(PodmanRuntime::new(args.podman));

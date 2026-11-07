@@ -927,6 +927,293 @@ pub async fn session_ci_job_id(db: &Db, session_id: i64) -> DbResult<Option<i64>
             .await?;
     Ok(ci_job_id.flatten())
 }
+/// One sealed CI secret of a repository. `sealed_value` holds ciphertext
+/// only (see the core `ci-secrets-v1` box); readers that need the value
+/// must open it and must never log or persist the plaintext.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CiSecretRow {
+    pub id: i64,
+    pub repo_id: i64,
+    pub name: String,
+    pub sealed_value: String,
+    pub redact_in_sessions: bool,
+    pub created_by: Option<i64>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// Creates or replaces the secret named `name` in one repository (the
+/// rotation path writes the same shape). Returns the stored row.
+pub async fn upsert_secret(
+    db: &Db,
+    repo_id: i64,
+    name: &str,
+    sealed_value: &str,
+    redact_in_sessions: bool,
+    created_by: Option<i64>,
+    now_ts: i64,
+) -> DbResult<CiSecretRow> {
+    let row = sqlx::query(
+        "INSERT INTO ci_secrets (repo_id, name, sealed_value, redact_in_sessions, created_by, created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7) \
+         ON CONFLICT (repo_id, name) DO UPDATE SET sealed_value = EXCLUDED.sealed_value, \
+         redact_in_sessions = EXCLUDED.redact_in_sessions, created_by = EXCLUDED.created_by, \
+         updated_at = EXCLUDED.updated_at \
+         RETURNING id, repo_id, name, sealed_value, redact_in_sessions, created_by, created_at, updated_at",
+    )
+    .bind(repo_id)
+    .bind(name)
+    .bind(sealed_value)
+    .bind(i64::from(redact_in_sessions))
+    .bind(created_by)
+    .bind(now_ts)
+    .bind(now_ts)
+    .fetch_one(db.pool())
+    .await?;
+    secret_from_row(&row)
+}
+
+fn secret_from_row(row: &AnyRow) -> DbResult<CiSecretRow> {
+    Ok(CiSecretRow {
+        id: row.try_get("id")?,
+        repo_id: row.try_get("repo_id")?,
+        name: row.try_get("name")?,
+        sealed_value: row.try_get("sealed_value")?,
+        redact_in_sessions: row.try_get::<i64, _>("redact_in_sessions")? != 0,
+        created_by: row.try_get("created_by")?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+    })
+}
+
+/// The repository secret with this name, if any. Cross-repository lookups
+/// always miss: the caller scopes every read by `repo_id` first.
+pub async fn secret_by_name(db: &Db, repo_id: i64, name: &str) -> DbResult<Option<CiSecretRow>> {
+    let row = sqlx::query(
+        "SELECT id, repo_id, name, sealed_value, redact_in_sessions, created_by, created_at, updated_at \
+         FROM ci_secrets WHERE repo_id = $1 AND name = $2",
+    )
+    .bind(repo_id)
+    .bind(name)
+    .fetch_optional(db.read_pool())
+    .await?;
+    row.as_ref().map(secret_from_row).transpose()
+}
+
+/// All secrets of the repository in name order. Views derived from these
+/// rows must not carry `sealed_value`.
+pub async fn secrets_for_repo(db: &Db, repo_id: i64) -> DbResult<Vec<CiSecretRow>> {
+    let rows = sqlx::query(
+        "SELECT id, repo_id, name, sealed_value, redact_in_sessions, created_by, created_at, updated_at \
+         FROM ci_secrets WHERE repo_id = $1 ORDER BY name ASC",
+    )
+    .bind(repo_id)
+    .fetch_all(db.read_pool())
+    .await?;
+    rows.iter().map(secret_from_row).collect()
+}
+
+/// Deletes the repository secret with this name; false when it did not
+/// exist. `ci_job_secrets` rows cascade away with the secret.
+pub async fn delete_secret(db: &Db, repo_id: i64, name: &str) -> DbResult<bool> {
+    let done = sqlx::query("DELETE FROM ci_secrets WHERE repo_id = $1 AND name = $2")
+        .bind(repo_id)
+        .bind(name)
+        .execute(db.pool())
+        .await?;
+    Ok(done.rows_affected() > 0)
+}
+
+/// Records that `job_id` resolved secret `secret_id` (idempotent on the
+/// `(job_id, secret_id)` PK). Rows are read back so the server can decrypt
+/// the values in memory for dynamic session redaction.
+pub async fn insert_job_secret(db: &Db, job_id: i64, secret_id: i64, now_ts: i64) -> DbResult<()> {
+    sqlx::query(
+        "INSERT INTO ci_job_secrets (job_id, secret_id, created_at) VALUES ($1, $2, $3) \
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(job_id)
+    .bind(secret_id)
+    .bind(now_ts)
+    .execute(db.pool())
+    .await?;
+    Ok(())
+}
+
+/// The sealed secrets a job resolved, name order.
+pub async fn job_secrets_for_job(db: &Db, job_id: i64) -> DbResult<Vec<CiSecretRow>> {
+    let rows = sqlx::query(
+        "SELECT ci_secrets.id, ci_secrets.repo_id, ci_secrets.name, ci_secrets.sealed_value, \
+         ci_secrets.redact_in_sessions, ci_secrets.created_by, ci_secrets.created_at, \
+         ci_secrets.updated_at \
+         FROM ci_job_secrets \
+         JOIN ci_secrets ON ci_secrets.id = ci_job_secrets.secret_id \
+         WHERE ci_job_secrets.job_id = $1 ORDER BY ci_secrets.name ASC",
+    )
+    .bind(job_id)
+    .fetch_all(db.read_pool())
+    .await?;
+    rows.iter().map(secret_from_row).collect()
+}
+
+/// One artifact of the job by name, if it exists and has not expired at
+/// `now_ts` (expired rows read as missing; expiry GC deletes them).
+pub async fn artifact_by_name(
+    db: &Db,
+    job_id: i64,
+    name: &str,
+    now_ts: i64,
+) -> DbResult<Option<CiArtifactRow>> {
+    let row = sqlx::query(select_artifact!(
+        "WHERE job_id = $1 AND name = $2 AND expires_at > $3"
+    ))
+    .bind(job_id)
+    .bind(name)
+    .bind(now_ts)
+    .fetch_optional(db.read_pool())
+    .await?;
+    row.as_ref().map(artifact_from_row).transpose()
+}
+
+/// How many artifact rows reference the blob `blake3`: the CAS refcount.
+/// GC only collects blobs whose count is zero.
+pub async fn artifact_refcount(db: &Db, blake3: &str) -> DbResult<i64> {
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM ci_artifacts WHERE blake3 = $1 AND expires_at > $2",
+    )
+    .bind(blake3)
+    .bind(now())
+    .fetch_one(db.read_pool())
+    .await?;
+    Ok(count)
+}
+
+/// Artifact rows whose retention window ended before `now_ts`, oldest
+/// first, at most `limit` rows (expiry GC).
+pub async fn expired_artifacts(db: &Db, now_ts: i64, limit: i64) -> DbResult<Vec<CiArtifactRow>> {
+    let rows = sqlx::query(select_artifact!(
+        "WHERE expires_at <= $1 ORDER BY id ASC LIMIT $2"
+    ))
+    .bind(now_ts)
+    .bind(limit)
+    .fetch_all(db.read_pool())
+    .await?;
+    rows.iter().map(artifact_from_row).collect()
+}
+
+/// Deletes one artifact row; false when it was already gone.
+pub async fn delete_artifact(db: &Db, id: i64) -> DbResult<bool> {
+    let done = sqlx::query("DELETE FROM ci_artifacts WHERE id = $1")
+        .bind(id)
+        .execute(db.pool())
+        .await?;
+    Ok(done.rows_affected() > 0)
+}
+
+/// One outstanding artifact token by its SHA-256 hash (plaintext never
+/// stored). The row carries the `(job, name, size, sha256)` binding the
+/// upload must satisfy, the expiry, and whether the token was used.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactTokenRow {
+    pub id: i64,
+    pub token_hash: String,
+    pub job_id: i64,
+    pub artifact_name: String,
+    pub size: i64,
+    pub sha256: String,
+    pub expires_at: i64,
+    pub used_at: Option<i64>,
+    pub created_at: i64,
+}
+
+fn artifact_token_from_row(row: &AnyRow) -> DbResult<ArtifactTokenRow> {
+    Ok(ArtifactTokenRow {
+        id: row.try_get("id")?,
+        token_hash: row.try_get("token_hash")?,
+        job_id: row.try_get("job_id")?,
+        artifact_name: row.try_get("artifact_name")?,
+        size: row.try_get("size")?,
+        sha256: row.try_get("sha256")?,
+        expires_at: row.try_get("expires_at")?,
+        used_at: row.try_get("used_at")?,
+        created_at: row.try_get("created_at")?,
+    })
+}
+
+/// Inserts an outstanding one-time artifact token; `token_hash` is the
+/// SHA-256 of the token (plaintext shown once at authorize time).
+#[allow(clippy::too_many_arguments)]
+pub async fn insert_artifact_token(
+    db: &Db,
+    job_id: i64,
+    token_hash: &str,
+    artifact_name: &str,
+    size: i64,
+    sha256: &str,
+    expires_at: i64,
+    now_ts: i64,
+) -> DbResult<ArtifactTokenRow> {
+    let row = sqlx::query(
+        "INSERT INTO ci_artifact_tokens (token_hash, job_id, artifact_name, size, sha256, expires_at, created_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7) \
+         RETURNING id, token_hash, job_id, artifact_name, size, sha256, expires_at, used_at, created_at",
+    )
+    .bind(token_hash)
+    .bind(job_id)
+    .bind(artifact_name)
+    .bind(size)
+    .bind(sha256)
+    .bind(expires_at)
+    .bind(now_ts)
+    .fetch_one(db.pool())
+    .await?;
+    artifact_token_from_row(&row)
+}
+
+/// The outstanding token with this hash, if any.
+pub async fn artifact_token_by_hash(
+    db: &Db,
+    token_hash: &str,
+) -> DbResult<Option<ArtifactTokenRow>> {
+    let row = sqlx::query(
+        "SELECT id, token_hash, job_id, artifact_name, size, sha256, expires_at, used_at, created_at \
+         FROM ci_artifact_tokens WHERE token_hash = $1",
+    )
+    .bind(token_hash)
+    .fetch_optional(db.read_pool())
+    .await?;
+    row.as_ref().map(artifact_token_from_row).transpose()
+}
+
+/// Marks a one-time artifact token used (one-time consumption); false when
+/// it was already used or missing, so a replay loses the race.
+pub async fn consume_artifact_token(db: &Db, id: i64, now_ts: i64) -> DbResult<bool> {
+    let done =
+        sqlx::query("UPDATE ci_artifact_tokens SET used_at = $1 WHERE id = $2 AND used_at IS NULL")
+            .bind(now_ts)
+            .bind(id)
+            .execute(db.pool())
+            .await?;
+    Ok(done.rows_affected() > 0)
+}
+
+/// Active jobs queued for one Trail change, newest first. The Trail
+/// trigger supersedes these when a newer revision arrives.
+pub async fn active_ci_jobs_for_change(
+    db: &Db,
+    repo_id: i64,
+    change_id: i64,
+) -> DbResult<Vec<CiJobRow>> {
+    let rows = sqlx::query(select_ci_job!(
+        "WHERE repo_id = $1 AND change_id = $2 AND state IN ('queued', 'claimed', 'running') \
+         ORDER BY id DESC"
+    ))
+    .bind(repo_id)
+    .bind(change_id)
+    .fetch_all(db.read_pool())
+    .await?;
+    rows.iter().map(ci_job_from_row).collect()
+}
 
 /// Current time helper re-export for callers that only import this module.
 pub fn now_ts() -> i64 {
@@ -1281,6 +1568,94 @@ mod tests {
         assert_eq!(
             ci_job_by_id(&t.db, job.id).await.unwrap().unwrap().state,
             "canceled"
+        );
+    }
+
+    #[tokio::test]
+    async fn secrets_upsert_cross_repo_artifact_token_once() {
+        let (t, alice, repo_id) = setup().await;
+        let other = repos::insert(&t.db, &repo(alice, "ci-other"))
+            .await
+            .unwrap();
+        let first = upsert_secret(
+            &t.db,
+            repo_id,
+            "TOKEN",
+            "x1:AAA",
+            true,
+            Some(alice),
+            1_700_000_000,
+        )
+        .await
+        .unwrap();
+        let rotated = upsert_secret(
+            &t.db,
+            repo_id,
+            "TOKEN",
+            "x1:BBB",
+            true,
+            Some(alice),
+            1_700_000_010,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.id, rotated.id, "rotation reuses the row");
+        assert_eq!(rotated.sealed_value, "x1:BBB");
+        assert!(
+            secret_by_name(&t.db, other, "TOKEN")
+                .await
+                .unwrap()
+                .is_none(),
+            "cross-repo misses"
+        );
+        assert_eq!(secrets_for_repo(&t.db, repo_id).await.unwrap().len(), 1);
+        let job = insert_ci_job(&t.db, &ci_job(repo_id, alice, "test", 1_700_000_000))
+            .await
+            .unwrap();
+        insert_job_secret(&t.db, job.id, rotated.id, 1_700_000_020)
+            .await
+            .unwrap();
+        insert_job_secret(&t.db, job.id, rotated.id, 1_700_000_020)
+            .await
+            .unwrap();
+        assert_eq!(
+            job_secrets_for_job(&t.db, job.id).await.unwrap().len(),
+            1,
+            "idempotent"
+        );
+        assert!(delete_secret(&t.db, repo_id, "TOKEN").await.unwrap());
+        assert_eq!(
+            job_secrets_for_job(&t.db, job.id).await.unwrap().len(),
+            0,
+            "cascades"
+        );
+        let tok = insert_artifact_token(
+            &t.db,
+            job.id,
+            "tokhash",
+            "out.bin",
+            3,
+            "abc",
+            1_700_000_600,
+            1_700_000_000,
+        )
+        .await
+        .unwrap();
+        let found = artifact_token_by_hash(&t.db, "tokhash")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.id, tok.id);
+        assert!(
+            consume_artifact_token(&t.db, tok.id, 1_700_000_100)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !consume_artifact_token(&t.db, tok.id, 1_700_000_200)
+                .await
+                .unwrap(),
+            "one-time"
         );
     }
 }
