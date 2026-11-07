@@ -438,13 +438,18 @@ impl Core {
         // and emits the `ci` event; a requeued job does neither.
         let reaped = starforged_db::ci::requeue_expired_ci_jobs(self.db(), ts, 3).await?;
         for id in reaped {
-            let Some(job) = starforged_db::ci::ci_job_by_id(self.db(), id).await? else {
-                continue;
+            let job = match starforged_db::ci::ci_job_by_id(self.db(), id).await {
+                Ok(Some(job)) => job,
+                Ok(None) => continue,
+                Err(err) => {
+                    tracing::warn!(job_id = id, error = %err, "reading a reaped CI job failed");
+                    continue;
+                }
             };
-            match job.state.as_str() {
+            let outcome = match job.state.as_str() {
                 "canceled" => {
                     self.terminate_ci_job(&job, "canceled", "error", "canceled", None)
-                        .await?;
+                        .await
                 }
                 "failed" => {
                     self.terminate_ci_job(
@@ -454,9 +459,12 @@ impl Core {
                         "the runner stopped before finishing",
                         None,
                     )
-                    .await?;
+                    .await
                 }
-                _ => {}
+                _ => Ok(()),
+            };
+            if let Err(err) = outcome {
+                tracing::warn!(job_id = id, error = %err, "recording a reaped CI job failed");
             }
         }
         // Expired sandboxes are killed and marked (M6b B5).

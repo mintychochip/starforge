@@ -421,7 +421,13 @@ impl Core {
     /// Emits the `ci` webhook for one lifecycle transition (decision 14:
     /// `queued`/`started`/`finished`/`canceled`). The `check` event still
     /// covers status transitions; this event carries the run identity.
-    async fn emit_ci_event(&self, job: &db_ci::CiJobRow, action: &'static str, state: &str) {
+    async fn emit_ci_event(
+        &self,
+        job: &db_ci::CiJobRow,
+        action: &'static str,
+        state: &str,
+        exit_code: Option<i64>,
+    ) {
         let sender = match job.created_by {
             Some(user_id) => self.sender_of(user_id).await,
             None => None,
@@ -439,7 +445,7 @@ impl Core {
                     "commit_sha": job.commit_sha,
                     "state": state,
                     "runner_id": job.runner_id,
-                    "exit_code": job.exit_code,
+                    "exit_code": exit_code,
                     "created_by": job.created_by,
                 }),
             },
@@ -533,7 +539,8 @@ impl Core {
         } else {
             "finished"
         };
-        self.emit_ci_event(job, action, job_state).await;
+        self.emit_ci_event(job, action, job_state, job.exit_code)
+            .await;
         Ok(())
     }
 
@@ -843,7 +850,7 @@ impl Core {
                 },
             )
             .await?;
-            self.emit_ci_event(&job, "started", "claimed").await;
+            self.emit_ci_event(&job, "started", "claimed", None).await;
             return Ok(Some(ClaimedCiJob {
                 job_id: job.id,
                 job_name: job.job_name.clone(),
@@ -1031,7 +1038,7 @@ impl Core {
         {
             return Ok(FinishOutcome::FenceMismatch);
         }
-        self.emit_ci_event(&job, "finished", state).await;
+        self.emit_ci_event(&job, "finished", state, exit_code).await;
         self.revoke_job_credentials(job.id).await?;
         self.audit(
             job.created_by,
@@ -1454,7 +1461,7 @@ impl Core {
             now_ts,
         )
         .await;
-        self.emit_ci_event(&row, "queued", "queued").await;
+        self.emit_ci_event(&row, "queued", "queued", None).await;
         self.audit(
             created_by,
             "ci.job.enqueue",

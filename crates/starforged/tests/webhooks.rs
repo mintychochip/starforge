@@ -594,6 +594,10 @@ async fn ci_lifecycle_emits_started_finished_canceled() {
     let body = check_delivery(&hits[1], &secret);
     assert_eq!(body["action"], "finished");
     assert_eq!(body["ci"]["state"], "succeeded");
+    assert_eq!(
+        body["ci"]["exit_code"], 0,
+        "the finish payload carries the exit code"
+    );
 
     let job2 = starforged_db::ci::insert_ci_job(
         c.s.core.db(),

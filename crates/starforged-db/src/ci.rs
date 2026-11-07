@@ -730,7 +730,10 @@ pub async fn requeue_expired_ci_jobs(
         .collect::<DbResult<Vec<_>>>()?;
     let mut ids = Vec::with_capacity(jobs.len());
     for job in &jobs {
-        sqlx::query(
+        // Re-check the state and lease in the UPDATE: a runner may have
+        // finished or re-claimed the job between the SELECT and here. Only
+        // the transition that actually happened may revoke credentials.
+        let affected = sqlx::query(
             "UPDATE ci_jobs SET state = CASE \
                  WHEN cancel_requested = 1 THEN 'canceled' \
                  WHEN attempts >= $1 THEN 'failed' \
@@ -743,13 +746,18 @@ pub async fn requeue_expired_ci_jobs(
              finished_at = CASE \
                  WHEN cancel_requested = 1 OR attempts >= $1 THEN $2 \
                  ELSE finished_at END \
-             WHERE id = $3",
+             WHERE id = $3 AND state IN ('claimed', 'running') AND lease_until < $4",
         )
         .bind(max_attempts)
         .bind(now_ts)
         .bind(job.id)
+        .bind(now_ts)
         .execute(db.pool())
-        .await?;
+        .await?
+        .rows_affected();
+        if affected != 1 {
+            continue;
+        }
         revoke_job_tokens_for_job(db, job.id, now_ts).await?;
         if let (Some(token_id), Some(user_id)) = (job.git_token_id, job.created_by) {
             crate::tokens::revoke(db, user_id, token_id).await?;
