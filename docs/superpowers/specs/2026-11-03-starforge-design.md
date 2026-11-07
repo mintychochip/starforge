@@ -65,6 +65,8 @@ It ships as two programs:
 | D12 | Web UI | Server-rendered (axum + askama) with htmx and one plain-JavaScript module for the session viewer | Single toolchain; no bundler |
 | D13 | CI | No runners; external CI via a GitHub-compatible commit status endpoint and webhooks | User: CI runners are a separate concern |
 
+> **M6 amendment (2026-11-06):** CI runners and sandboxed agent execution are an additive M6 milestone (plan: `docs/superpowers/plans/2026-11-06-starforge-m6-ci-sandboxes.md`). D13's external-CI path (statuses + webhooks) remains supported. Untrusted code runs only in external sandboxes; the server still executes no job code and makes no LLM calls.
+
 ## 4. Research basis
 
 The brainstorming session ran a nine-item research review and a six-item adversarial verification (2026-11-03). Findings that shaped this design:
