@@ -248,14 +248,25 @@ async fn push_runner_status_gate_artifact_and_secret_paths() {
         .unwrap()
         .unwrap();
     assert_eq!(job.created_by, Some(alice.id));
-    let checks = starforged_db::checks::latest_checks_for_sha(s.db(), repo.id, &job.commit_sha)
-        .await
-        .unwrap();
-    assert!(
-        checks
+    // The trigger inserts the job row, then writes its pending check: poll
+    // for the check rather than racing the second statement.
+    let start = Instant::now();
+    loop {
+        let checks = starforged_db::checks::latest_checks_for_sha(s.db(), repo.id, &job.commit_sha)
+            .await
+            .unwrap();
+        if checks
             .iter()
             .any(|c| c.context == "ci/test" && c.state == "pending")
-    );
+        {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "no pending ci/test check: {checks:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     // The scripted runner: claim, secrets, logs, artifact, finish.
     let runner = register_runner(&s, &pat).await;

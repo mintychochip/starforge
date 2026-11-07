@@ -153,15 +153,25 @@ async fn push_enqueues_job_from_commit_spec_and_dedupes() {
         .unwrap();
     assert_eq!(job.repo_id, repo.id);
     assert_eq!(job.created_by, Some(alice.id), "created_by is the pusher");
-    // The pending check is visible on the commit.
-    let checks = starforged_db::checks::latest_checks_for_sha(s.db(), repo.id, &job.commit_sha)
-        .await
-        .unwrap();
-    assert!(
-        checks
+    // The pending check is visible on the commit. The trigger inserts the
+    // job row, then writes the check: poll rather than race it.
+    let start = Instant::now();
+    loop {
+        let checks = starforged_db::checks::latest_checks_for_sha(s.db(), repo.id, &job.commit_sha)
+            .await
+            .unwrap();
+        if checks
             .iter()
             .any(|c| c.context == "ci/test" && c.state == "pending")
-    );
+        {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "no pending ci/test check: {checks:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     // Pushing the same commit to another matching branch dedupes.
     git_ok(
