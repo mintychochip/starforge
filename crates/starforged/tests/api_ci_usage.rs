@@ -260,6 +260,24 @@ async fn native_minutes_are_metered_per_attempt_and_the_quota_refuses_new_runs()
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{value}");
     assert!(value.to_string().contains("CI minutes quota"), "{value}");
+
+    // Re-triggering the commit that already ran leaves its result alone: a
+    // refusal never overwrites an existing check.
+    let first = starforged_db::ci::ci_job_by_id(s.db(), job_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let ids = s
+        .core
+        .ci_trigger_push(repo.id, "main", &first.commit_sha, Some(alice.id))
+        .await
+        .unwrap();
+    assert!(ids.is_empty(), "the quota refuses the re-trigger");
+    let checks = starforged_db::checks::latest_checks_for_sha(s.db(), repo.id, &first.commit_sha)
+        .await
+        .unwrap();
+    let check = checks.iter().find(|c| c.context == "ci/test").unwrap();
+    assert_eq!(check.state, "success", "{checks:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -274,46 +292,76 @@ async fn artifact_storage_quota_refuses_an_upload_past_it() {
     let runner = register_runner(&s, &pat).await;
     let (job_id, fence) = claim(&s, &runner).await;
     let client = s.browser();
-    let authorize = |name: &str, size: usize, sha256: &str| {
-        client
-            .post(s.url(&format!(
-                "/api/v1/runners/jobs/{job_id}/artifacts/authorize"
-            )))
-            .bearer_auth(&runner)
-            .header("X-Starforge-Fence", &fence)
-            .json(&json!({ "name": name, "size": size, "sha256": sha256 }))
-            .send()
+    // Authorizes `bytes` as `name` and returns the one-time upload token.
+    let authorize = |name: &'static str, bytes: &'static [u8]| {
+        let client = client.clone();
+        let url = s.url(&format!(
+            "/api/v1/runners/jobs/{job_id}/artifacts/authorize"
+        ));
+        let (runner, fence) = (runner.clone(), fence.clone());
+        async move {
+            let sha256 = hex::encode(sha2::Sha256::digest(bytes));
+            client
+                .post(url)
+                .bearer_auth(&runner)
+                .header("X-Starforge-Fence", &fence)
+                .json(&json!({ "name": name, "size": bytes.len(), "sha256": sha256 }))
+                .send()
+                .await
+                .unwrap()
+        }
     };
+    let upload = |name: &'static str, bytes: &'static [u8], token: String| {
+        let client = client.clone();
+        let url = s.url(&format!("/api/v1/runners/jobs/{job_id}/artifacts/{name}"));
+        async move {
+            client
+                .put(url)
+                .bearer_auth(&token)
+                .header(
+                    "X-Starforge-Sha256",
+                    hex::encode(sha2::Sha256::digest(bytes)),
+                )
+                .body(bytes.to_vec())
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+    let token_of = |resp: reqwest::Response| async move {
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        resp.json::<Value>().await.unwrap()["token"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    const FIFTEEN: &[u8] = b"fifteen bytes!\n";
+    const TEN: &[u8] = b"ten bytes\n";
+    const FIVE: &[u8] = b"five\n";
 
-    // Fifteen bytes fit the twenty-byte quota.
-    let bytes = b"fifteen bytes!\n";
-    let sha256 = hex::encode(sha2::Sha256::digest(bytes));
-    let resp = authorize("out/a.bin", bytes.len(), &sha256).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::CREATED);
-    let token = resp.json::<Value>().await.unwrap()["token"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    let resp = client
-        .put(s.url(&format!(
-            "/api/v1/runners/jobs/{job_id}/artifacts/out/a.bin"
-        )))
-        .bearer_auth(&token)
-        .header("X-Starforge-Sha256", &sha256)
-        .body(bytes.to_vec())
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::CREATED);
+    // Nothing is stored yet, so three uploads authorize in parallel even
+    // though together they exceed the twenty-byte quota.
+    let a = token_of(authorize("out/a.bin", FIFTEEN).await).await;
+    let b = token_of(authorize("out/b.bin", TEN).await).await;
+    let c = token_of(authorize("out/c.bin", FIVE).await).await;
 
-    // Ten more would not.
-    let resp = authorize("out/b.bin", 10, &"0".repeat(64)).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    let body = resp.text().await.unwrap();
+    // The bytes are checked again on arrival: fifteen fit, ten more do not,
+    // and five more reach the quota exactly.
+    assert_eq!(
+        upload("out/a.bin", FIFTEEN, a).await.status(),
+        StatusCode::CREATED
+    );
+    let refused = upload("out/b.bin", TEN, b).await;
+    assert_eq!(refused.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let body = refused.text().await.unwrap();
     assert!(body.contains("artifact storage quota"), "{body}");
-    // Five still fit.
-    let resp = authorize("out/c.bin", 5, &"0".repeat(64)).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert_eq!(
+        upload("out/c.bin", FIVE, c).await.status(),
+        StatusCode::CREATED
+    );
+    // With the quota full, a new authorization is refused up front.
+    let resp = authorize("out/d.bin", FIVE).await;
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
 
     let (_, usage) = api(
         &s.browser(),
@@ -324,7 +372,7 @@ async fn artifact_storage_quota_refuses_an_upload_past_it() {
     )
     .await;
     let stored = metric(supplier(&usage, "native"), "artifact_bytes");
-    assert_eq!(stored["used"], 15.0);
+    assert_eq!(stored["used"], 20.0);
     assert_eq!(stored["limit"], 20.0);
 }
 

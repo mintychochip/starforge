@@ -811,7 +811,9 @@ pub async fn requeue_expired_ci_jobs(
         if affected != 1 {
             continue;
         }
-        record_attempt_usage(db, job, now_ts).await?;
+        // The runner stopped renewing by its lease end, not at sweep time.
+        let ended_at = job.lease_until.map_or(now_ts, |lease| lease.min(now_ts));
+        record_attempt_usage(db, job, ended_at).await?;
         revoke_job_tokens_for_job(db, job.id, now_ts).await?;
         if let (Some(token_id), Some(user_id)) = (job.git_token_id, job.created_by) {
             crate::tokens::revoke(db, user_id, token_id).await?;
@@ -1940,16 +1942,20 @@ mod tests {
         record_attempt_usage(&t.db, &attempt1, 999).await.unwrap();
         assert_eq!(usage_seconds_since(&t.db, repo_id, 0).await.unwrap(), 60);
 
-        // A second attempt is a separate row; the window filters by end.
+        // A second attempt is a separate row. The reaper ends an expired
+        // attempt at its lease end (360), not at sweep time (1000).
         requeue_expired_ci_jobs(&t.db, 161, 3).await.unwrap();
         claim_next_ci_job(&t.db, r.id, repo_id, 300, 60, "fence-2", 300 + 14_400)
             .await
             .unwrap()
             .unwrap();
-        let attempt2 = ci_job_by_id(&t.db, job.id).await.unwrap().unwrap();
-        record_attempt_usage(&t.db, &attempt2, 330).await.unwrap();
-        assert_eq!(usage_seconds_since(&t.db, repo_id, 0).await.unwrap(), 90);
+        assert_eq!(
+            requeue_expired_ci_jobs(&t.db, 1000, 3).await.unwrap(),
+            [job.id]
+        );
+        assert_eq!(usage_seconds_since(&t.db, repo_id, 0).await.unwrap(), 120);
         assert_eq!(usage_attempts_since(&t.db, repo_id, 0).await.unwrap(), 2);
-        assert_eq!(usage_seconds_since(&t.db, repo_id, 200).await.unwrap(), 30);
+        // The window filters by end time.
+        assert_eq!(usage_seconds_since(&t.db, repo_id, 200).await.unwrap(), 60);
     }
 }

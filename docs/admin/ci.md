@@ -151,8 +151,11 @@ CI usage and its limits belong to whoever runs the compute:
   repository's unexpired artifacts. It enforces `[ci.limits]` per
   repository: `minutes_per_month` (calendar month, UTC) when a run is
   queued — a refused run gets an `error` `ci/<job>` check naming the reset
-  date, and a manual trigger answers `422` — and `artifact_bytes` when an
-  upload is authorized (`422`). Runs already queued still finish.
+  date unless the commit already has that check, and a manual trigger
+  answers `422` — and `artifact_bytes` when an upload is authorized and
+  again when its bytes arrive (`422`). The minutes quota is best-effort:
+  an attempt counts when it ends (a reaped attempt at its lease end), so
+  runs already queued or running when it fills still finish and count.
 - **Depot.** A repository admin links the repository
   (`PUT /api/v1/repos/{owner}/{repo}/ci/suppliers/depot` with its Depot
   name, `owner/name`). Starforge reads its usage from Depot's

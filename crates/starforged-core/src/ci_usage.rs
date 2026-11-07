@@ -381,7 +381,9 @@ impl Core {
     /// The minutes quota check for a run about to be queued: when the
     /// repository's native runner minutes for this month are used up,
     /// returns the message to report (naming the reset date); `None` when
-    /// the run may be queued.
+    /// the run may be queued. Best-effort: an attempt's minutes count once
+    /// it ends, so runs already queued or running when the quota fills
+    /// still finish and are counted afterwards.
     pub(crate) async fn ci_minutes_quota_exhausted(
         &self,
         repo_id: i64,
@@ -392,7 +394,8 @@ impl Core {
         }
         let (start, end) = month_bounds(now());
         let used = db_ci::usage_seconds_since(self.db(), repo_id, start).await?;
-        if used < limit as i64 * 60 {
+        let limit_secs = i64::try_from(limit).unwrap_or(i64::MAX).saturating_mul(60);
+        if used < limit_secs {
             return Ok(None);
         }
         Ok(Some(format!(
@@ -402,7 +405,10 @@ impl Core {
     }
 
     /// Writes the quota refusal as the job's `ci/<job>` check, so a gate
-    /// that requires it shows why the run did not start.
+    /// that requires it shows why the run did not start. A check that
+    /// already exists for the commit is left alone: `pending` means an
+    /// active run already covers it, and a terminal state is a past result
+    /// a refusal must not overwrite.
     pub(crate) async fn record_ci_quota_refusal(
         &self,
         repo_id: i64,
@@ -411,11 +417,16 @@ impl Core {
         message: &str,
         created_by: Option<i64>,
     ) -> CoreResult<()> {
+        let context = format!("ci/{job_name}");
+        let existing = db_checks::latest_checks_for_sha(self.db(), repo_id, commit_sha).await?;
+        if existing.iter().any(|check| check.context == context) {
+            return Ok(());
+        }
         db_checks::insert_check(
             self.db(),
             repo_id,
             commit_sha,
-            &format!("ci/{job_name}"),
+            &context,
             "error",
             None,
             Some(message),
@@ -433,14 +444,16 @@ impl Core {
     }
 
     /// Refuses an artifact that would take the repository's unexpired CI
-    /// artifacts past the artifact storage quota.
+    /// artifacts past the artifact storage quota. Checked when an upload is
+    /// authorized and again when its bytes arrive, so parallel
+    /// authorizations cannot together overshoot the quota.
     pub(crate) async fn check_artifact_quota(&self, repo_id: i64, size: i64) -> CoreResult<()> {
         let limit = self.config().ci.limits.artifact_bytes;
         if limit == 0 {
             return Ok(());
         }
         let stored = db_ci::live_artifact_bytes(self.db(), repo_id, now()).await?;
-        if stored + size > limit as i64 {
+        if stored.saturating_add(size) > i64::try_from(limit).unwrap_or(i64::MAX) {
             return Err(CoreError::Invalid(format!(
                 "the CI artifact storage quota ({limit} bytes) would be exceeded: {stored} bytes are stored"
             )));

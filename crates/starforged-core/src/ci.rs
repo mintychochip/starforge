@@ -544,6 +544,20 @@ impl Core {
         Ok(())
     }
 
+    /// After canceling a job last read as `queued`, records the attempt a
+    /// runner claimed in between, which the cancel ended. A job still on
+    /// the attempt read before (no new claim) records nothing: its
+    /// `claimed_at` is a label-mismatch bounce or an attempt already
+    /// recorded at requeue.
+    async fn record_attempt_claimed_since(&self, before: &db_ci::CiJobRow) -> CoreResult<()> {
+        if let Some(after) = db_ci::ci_job_by_id(self.db(), before.id).await?
+            && after.attempts > before.attempts
+        {
+            db_ci::record_attempt_usage(self.db(), &after, now()).await?;
+        }
+        Ok(())
+    }
+
     /// Sweeps CI jobs whose runner stopped serving them (decision 13).
     /// Claimed or running jobs whose lease expired go back to `queued`, or
     /// end `failed` once out of attempts (`canceled` when a cancel was
@@ -1231,6 +1245,7 @@ impl Core {
             if !db_ci::cancel_ci_job(self.db(), job_id, None, now()).await? {
                 return Err(CoreError::NotFound);
             }
+            self.record_attempt_claimed_since(&job).await?;
             self.terminate_ci_job(&job, "canceled", "error", &description, Some(user.id))
                 .await?;
         } else {
@@ -1700,9 +1715,9 @@ impl Core {
         for change in db_changes::changes_with_current_head(self.db(), repo_id, commit_sha).await? {
             for stale in db_ci::active_ci_jobs_for_change(self.db(), repo_id, change.id).await? {
                 if db_ci::cancel_ci_job(self.db(), stale.id, None, now()).await? {
-                    // A queued job's `claimed_at` may be a label-mismatch
-                    // bounce or an attempt already recorded at requeue.
-                    if stale.state != "queued" {
+                    if stale.state == "queued" {
+                        self.record_attempt_claimed_since(&stale).await?;
+                    } else {
                         db_ci::record_attempt_usage(self.db(), &stale, now()).await?;
                     }
                     self.terminate_ci_job(
@@ -2231,6 +2246,13 @@ impl Core {
                 "artifact bytes do not match the authorized sha256".into(),
             ));
         }
+        // The storage quota is checked again with the bytes in hand: tokens
+        // authorized in parallel must not together overshoot it.
+        let job = db_ci::ci_job_by_id(self.db(), job_id)
+            .await?
+            .ok_or(CoreError::NotFound)?;
+        self.check_artifact_quota(job.repo_id, bytes.len() as i64)
+            .await?;
         let blob = self
             .config()
             .blob_store

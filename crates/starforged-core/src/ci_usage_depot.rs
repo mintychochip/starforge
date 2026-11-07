@@ -4,15 +4,24 @@
 //! Depot meters and enforces its own limits; this adapter only reports
 //! what the API returns.
 
+use std::sync::LazyLock;
 use std::time::Duration;
 
 /// The default Depot API base URL.
 pub const DEFAULT_API_URL: &str = "https://api.depot.dev";
 
+/// The HTTP client shared by every Depot call (one connection pool), or
+/// why it could not be built.
+static HTTP: LazyLock<Result<reqwest::Client, String>> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| e.to_string())
+});
+
 /// A client for Depot's usage API.
 #[derive(Clone)]
 pub struct DepotUsageClient {
-    client: reqwest::Client,
     api_url: String,
     token: String,
 }
@@ -31,10 +40,6 @@ impl DepotUsageClient {
     /// authenticates with the organization `token`.
     pub fn new(api_url: &str, token: &str) -> Self {
         Self {
-            client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(10))
-                .build()
-                .expect("reqwest client builder"),
             api_url: api_url.trim_end_matches('/').to_owned(),
             token: token.to_owned(),
         }
@@ -56,8 +61,11 @@ impl DepotUsageClient {
             message: format!("encoding depot request: {e}"),
         })?;
         let url = format!("{}/depot.core.v1.UsageService/GetUsage", self.api_url);
-        let resp = self
-            .client
+        let http = HTTP.as_ref().map_err(|e| DepotError {
+            code: "internal".to_owned(),
+            message: format!("building the HTTP client: {e}"),
+        })?;
+        let resp = http
             .post(url)
             .header(
                 reqwest::header::AUTHORIZATION,

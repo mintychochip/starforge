@@ -147,8 +147,11 @@ compute:
   job attempt's runner time and the repository's unexpired artifacts. The
   server operator may set quotas (`[ci.limits]`): when the month's runner
   minutes are used up, new runs are not queued and the job's `ci/<job>`
-  check says why and when the quota resets; an artifact upload past the
-  storage quota is refused. Runs already queued still finish.
+  check says why and when the quota resets (an existing check on that
+  commit is left as it is); an artifact upload past the storage quota is
+  refused. The minutes quota is best-effort: an attempt's minutes count
+  when it ends, so runs already queued or running when it fills still
+  finish and count toward it.
 - **Depot**: a repository admin links the repository to its name in
   Depot (`owner/name`). Starforge then reads that repository's usage from
   Depot's API. Depot's plan allowances and usage caps apply and are
