@@ -20,10 +20,12 @@
 //! ([`JOB_TOKEN_PREFIX`]), PAT `sfp_` ([`crate::tokens::TOKEN_PREFIX`]).
 
 use starforged_db::{
-    checks as db_checks, ci as db_ci, now, repos as db_repos, tokens as db_tokens,
+    checks as db_checks, ci as db_ci, now, repos as db_repos, sessions as db_sessions,
+    tokens as db_tokens,
 };
 
 use crate::checks::{StatusDto, status_dto, validate_status};
+use crate::ci_spec::CiJobSpec;
 use crate::permission::Permission;
 use crate::repos::to_repo;
 use crate::tokens::{self, Scope, format_scopes};
@@ -114,6 +116,55 @@ impl From<starforged_db::ci::RunnerRow> for RunnerView {
     }
 }
 
+/// A job claimed by a runner ([`Core::claim_ci_job`]): the parsed spec, the
+/// per-claim lease fence the runner must present on every later call, and
+/// the per-job token (`sfj_…`, shown once) the job execution acts with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimedCiJob {
+    pub job_id: i64,
+    pub job_name: String,
+    pub commit_sha: String,
+    pub spec: CiJobSpec,
+    /// The per-claim `lease_token` fence (`X-Starforge-Fence`).
+    pub fence: String,
+    /// The per-job token secret, shown once; only its hash is stored.
+    pub job_token: String,
+    pub deadline: i64,
+    pub lease_until: i64,
+}
+
+/// The outcome of one [`Core::trace_ci_job`] append.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TraceOutcome {
+    /// The chunk was appended (or was an exact retry of an appended chunk).
+    Accepted,
+    /// The range does not continue the stored log; the API answers 416.
+    RangeMismatch,
+    /// The job is missing.
+    NotFound,
+    /// The runner does not own the claim, the fence is stale, or the job is
+    /// no longer claimed/running; the API answers 409.
+    FenceMismatch,
+    /// The job was canceled (or a cancel was requested): cancel wins.
+    Canceled,
+    /// The append would exceed the 100 MiB per-job log cap.
+    PayloadTooLarge,
+}
+
+/// The outcome of one [`Core::finish_ci_job`] report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FinishOutcome {
+    /// The job finished; its terminal state is recorded.
+    Finished,
+    /// The job is missing.
+    NotFound,
+    /// The runner does not own the claim, the fence is stale, or the job is
+    /// no longer claimed/running; the API answers 409.
+    FenceMismatch,
+    /// The job was canceled (or a cancel was requested): cancel wins.
+    Canceled,
+}
+
 /// The label rules shared with CI job specs ([`crate::ci_spec`]): 1–64 chars
 /// of `[A-Za-z0-9_-]`, at most 16 per runner, no duplicates.
 fn validate_runner_labels(labels: &[String]) -> CoreResult<()> {
@@ -145,6 +196,70 @@ fn validate_runner_labels(labels: &[String]) -> CoreResult<()> {
         }
     }
     Ok(())
+}
+
+/// The gate outcome of [`Core::checked_claim`], shared by the trace,
+/// finish, and git-credential paths so every one of them rejects stale
+/// fences and honors cancel the same way.
+enum ClaimGate {
+    NotFound,
+    FenceMismatch,
+    Canceled,
+}
+
+/// Strips ANSI escape sequences and control characters from a log chunk
+/// before it is stored (plan security model: log injection). Keeps tab,
+/// newline, and carriage return, which a terminal log legitimately uses;
+/// drops every other byte below 0x20 and DEL, plus CSI/OSC sequences.
+fn strip_log_bytes(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            0x1b => {
+                // ESC: drop the escape sequence (CSI: ESC [ ... final byte;
+                // OSC: ESC ] ... terminated by BEL or ESC \; single char
+                // otherwise).
+                if i + 1 >= bytes.len() {
+                    break;
+                }
+                match bytes[i + 1] {
+                    b'[' => {
+                        let mut j = i + 2;
+                        while j < bytes.len() && !(0x40..=0x7e).contains(&bytes[j]) {
+                            j += 1;
+                        }
+                        i = (j + 1).min(bytes.len());
+                    }
+                    b']' => {
+                        let mut j = i + 2;
+                        while j < bytes.len()
+                            && bytes[j] != 0x07
+                            && !(bytes[j] == 0x1b && j + 1 < bytes.len() && bytes[j + 1] == b'\\')
+                        {
+                            j += 1;
+                        }
+                        i = if j < bytes.len() && bytes[j] == 0x07 {
+                            j + 1
+                        } else {
+                            (j + 2).min(bytes.len())
+                        };
+                    }
+                    _ => i += 2,
+                }
+            }
+            b'\t' | b'\n' | b'\r' => {
+                out.push(bytes[i]);
+                i += 1;
+            }
+            b if b < 0x20 || b == 0x7f => i += 1,
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    out
 }
 
 impl Core {
@@ -503,7 +618,10 @@ impl Core {
 
     /// Revokes a runner: the caller must hold at least `Admin` on the
     /// runner's repository. A revoked runner stops authenticating
-    /// immediately ([`Core::authenticate_runner`]).
+    /// immediately ([`Core::authenticate_runner`]), and every job it was
+    /// executing is released back to `queued` with that attempt's
+    /// credentials revoked ([`Core::revoke_job_credentials`]), so the job
+    /// token and git PAT it was given stop working at once.
     pub async fn revoke_runner(
         &self,
         user: &crate::accounts::User,
@@ -528,6 +646,12 @@ impl Core {
         if !db_ci::revoke_runner(self.db(), runner_id, now()).await? {
             return Err(CoreError::NotFound);
         }
+        for job in db_ci::ci_jobs_for_runner(self.db(), runner_id).await? {
+            self.revoke_job_credentials(job.id).await?;
+            if let Some(fence) = job.lease_token.as_deref() {
+                db_ci::release_ci_job(self.db(), job.id, fence).await?;
+            }
+        }
         self.audit(
             Some(user.id),
             "ci.runner.revoke",
@@ -536,6 +660,329 @@ impl Core {
         )
         .await?;
         Ok(())
+    }
+
+    /// Lease granted to a claimed job, in seconds (plan decision 13).
+    pub const CLAIM_LEASE_SECS: i64 = 60;
+    /// Claim attempts before giving up on label routing (a job whose spec
+    /// or labels never match would otherwise be re-released forever).
+    pub const CLAIM_MAX_ATTEMPTS: usize = 10;
+    /// Per-job cap on stored log bytes: 100 MiB.
+    pub const MAX_JOB_LOG_BYTES: i64 = 100 * 1024 * 1024;
+
+    /// Claims the oldest due queued job of the runner's repository
+    /// (decision 13): `state = 'claimed'` under a fresh per-claim
+    /// `lease_token` fence, and mints the per-job token (`sfj_…`, expiry
+    /// `deadline + 600`) the execution will act with. A job whose
+    /// `runs_on` labels are a non-empty set that is not a subset of the
+    /// runner's labels is released back to `queued` and the next job is
+    /// tried (at most [`Core::CLAIM_MAX_ATTEMPTS`] claims); a job with an
+    /// unparseable spec is released the same way. `None` when no job can
+    /// be claimed for this runner.
+    pub async fn claim_ci_job(&self, runner: &RunnerPrincipal) -> CoreResult<Option<ClaimedCiJob>> {
+        for _ in 0..Self::CLAIM_MAX_ATTEMPTS {
+            let fence = crypto::random_hex(32);
+            let now_ts = now();
+            let Some(job) = db_ci::claim_next_ci_job(
+                self.db(),
+                runner.runner_id,
+                runner.repo_id,
+                now_ts,
+                Self::CLAIM_LEASE_SECS,
+                &fence,
+            )
+            .await?
+            else {
+                return Ok(None);
+            };
+            let spec: CiJobSpec = match serde_json::from_str(&job.spec) {
+                Ok(spec) => spec,
+                Err(_) => {
+                    db_ci::release_ci_job(self.db(), job.id, &fence).await?;
+                    continue;
+                }
+            };
+            if !spec.runs_on.is_empty()
+                && !spec
+                    .runs_on
+                    .iter()
+                    .all(|label| runner.labels.contains(label))
+            {
+                db_ci::release_ci_job(self.db(), job.id, &fence).await?;
+                continue;
+            }
+            let job_token = format!("{}{}", JOB_TOKEN_PREFIX, crypto::random_hex(32));
+            let hint = &job_token[job_token.len() - 4..];
+            db_ci::insert_job_token(
+                self.db(),
+                &db_ci::NewCiJobToken {
+                    job_id: job.id,
+                    token_hash: &crypto::sha256_hex(&job_token),
+                    token_hint: hint,
+                    expires_at: job.deadline + 600,
+                    now: now_ts,
+                },
+            )
+            .await?;
+            return Ok(Some(ClaimedCiJob {
+                job_id: job.id,
+                job_name: job.job_name.clone(),
+                commit_sha: job.commit_sha.clone(),
+                spec,
+                lease_until: job.lease_until.unwrap_or(now_ts + Self::CLAIM_LEASE_SECS),
+                fence,
+                job_token,
+                deadline: job.deadline,
+            }));
+        }
+        Ok(None)
+    }
+
+    /// The running/fence/cancel pre-check shared by the trace and finish
+    /// paths: the runner must own the claim and present the current fence,
+    /// and a requested cancel is applied terminally here (cancel wins).
+    /// Returns the job row when the call may proceed.
+    async fn checked_claim(
+        &self,
+        runner: &RunnerPrincipal,
+        job_id: i64,
+        fence: &str,
+    ) -> CoreResult<Result<starforged_db::ci::CiJobRow, ClaimGate>> {
+        let Some(job) = db_ci::ci_job_by_id(self.db(), job_id).await? else {
+            return Ok(Err(ClaimGate::NotFound));
+        };
+        if job.repo_id != runner.repo_id
+            || job.runner_id != Some(runner.runner_id)
+            || job.lease_token.as_deref() != Some(fence)
+        {
+            return Ok(Err(ClaimGate::FenceMismatch));
+        }
+        if job.state == "canceled" || job.cancel_requested != 0 {
+            if job.state != "canceled" {
+                db_ci::cancel_ci_job(self.db(), job_id, Some(fence), now()).await?;
+            }
+            return Ok(Err(ClaimGate::Canceled));
+        }
+        if job.state != "claimed" && job.state != "running" {
+            return Ok(Err(ClaimGate::FenceMismatch));
+        }
+        Ok(Ok(job))
+    }
+
+    /// Appends one log chunk for a claimed job: the runner's claim and
+    /// fence must match, a requested cancel is applied terminally (cancel
+    /// wins), and the range must continue the stored log — `start` must
+    /// equal the current end, or match an already-stored chunk exactly
+    /// (idempotent retry). Chunks are capped at 100 MiB of offsets per
+    /// job; ANSI escapes and control characters are stripped before the
+    /// bytes go to the CAS blob store, and the chunk row records the
+    /// blob's BLAKE3.
+    pub async fn trace_ci_job(
+        &self,
+        runner: &RunnerPrincipal,
+        job_id: i64,
+        fence: &str,
+        start: i64,
+        end: i64,
+        bytes: &[u8],
+    ) -> CoreResult<TraceOutcome> {
+        let _job = match self.checked_claim(runner, job_id, fence).await? {
+            Ok(job) => job,
+            Err(ClaimGate::NotFound) => return Ok(TraceOutcome::NotFound),
+            Err(ClaimGate::FenceMismatch) => return Ok(TraceOutcome::FenceMismatch),
+            Err(ClaimGate::Canceled) => return Ok(TraceOutcome::Canceled),
+        };
+        // The first accepted trace marks the job running (the runner is
+        // executing it); later traces keep the state.
+        db_ci::set_ci_job_running(self.db(), job_id, fence).await?;
+        if end < start || end - start != bytes.len() as i64 {
+            return Ok(TraceOutcome::RangeMismatch);
+        }
+        let chunks = db_ci::log_chunks_for_job(self.db(), job_id).await?;
+        let current_end = db_ci::log_end_offset(self.db(), job_id).await?;
+        if chunks
+            .iter()
+            .any(|c| c.start_offset == start && c.end_offset == end)
+        {
+            return Ok(TraceOutcome::Accepted);
+        }
+        if start != current_end {
+            return Ok(TraceOutcome::RangeMismatch);
+        }
+        if end > Self::MAX_JOB_LOG_BYTES {
+            return Ok(TraceOutcome::PayloadTooLarge);
+        }
+        let stripped = strip_log_bytes(bytes);
+        let blob = self
+            .config()
+            .blob_store
+            .put(&stripped)
+            .await
+            .map_err(|e| CoreError::Internal(format!("log blob store: {e}")))?;
+        db_ci::append_log_chunk(
+            self.db(),
+            &db_ci::NewLogChunk {
+                job_id,
+                start_offset: start,
+                end_offset: end,
+                blake3: &blob.hash,
+                now: now(),
+            },
+        )
+        .await?;
+        Ok(TraceOutcome::Accepted)
+    }
+
+    /// Finishes a claimed job (decision 9): writes the `ci/<job_name>`
+    /// check through [`Core::submit_ci_status`], links the job's sessions,
+    /// and records the terminal state under the lease fence. A requested
+    /// cancel is applied instead (cancel wins) and answers
+    /// [`FinishOutcome::Canceled`]; a stale fence answers
+    /// [`FinishOutcome::FenceMismatch`]. `state` must be `succeeded`,
+    /// `failed`, or `error`; a job without `created_by` (system-triggered)
+    /// cannot write a status and answers `Invalid`.
+    #[allow(clippy::too_many_arguments)] // one call site (the runner finish route)
+    pub async fn finish_ci_job(
+        &self,
+        runner: &RunnerPrincipal,
+        job_id: i64,
+        fence: &str,
+        state: &str,
+        exit_code: Option<i64>,
+        checksum: Option<&str>,
+        session_ulids: &[String],
+    ) -> CoreResult<FinishOutcome> {
+        let job = match self.checked_claim(runner, job_id, fence).await? {
+            Ok(job) => job,
+            Err(ClaimGate::NotFound) => return Ok(FinishOutcome::NotFound),
+            Err(ClaimGate::FenceMismatch) => return Ok(FinishOutcome::FenceMismatch),
+            Err(ClaimGate::Canceled) => return Ok(FinishOutcome::Canceled),
+        };
+        let check_state = match state {
+            "succeeded" => "success",
+            "failed" => "failure",
+            "error" => "error",
+            other => {
+                return Err(CoreError::Invalid(format!(
+                    "finish state `{other}` must be succeeded, failed, or error"
+                )));
+            }
+        };
+        let user_id = job
+            .created_by
+            .ok_or_else(|| CoreError::Invalid("job has no triggering user".into()))?;
+        let principal = JobPrincipal {
+            job_id: job.id,
+            user_id,
+            repo_id: job.repo_id,
+            commit_sha: job.commit_sha.clone(),
+        };
+        self.submit_ci_status(
+            &principal,
+            &job.commit_sha,
+            check_state,
+            &format!("ci/{}", job.job_name),
+            None,
+            checksum,
+        )
+        .await?;
+        for ulid in session_ulids {
+            if let Some(session) =
+                db_sessions::session_by_ulid(self.db(), job.repo_id, ulid).await?
+            {
+                db_ci::insert_job_session(self.db(), job.id, ulid, now()).await?;
+                db_ci::set_session_ci_job(self.db(), session.id, job.id).await?;
+            }
+        }
+        if !db_ci::finish_ci_job(
+            self.db(),
+            job.id,
+            fence,
+            state,
+            exit_code,
+            checksum,
+            "",
+            now(),
+        )
+        .await?
+        {
+            return Ok(FinishOutcome::FenceMismatch);
+        }
+        self.revoke_job_credentials(job.id).await?;
+        self.audit(
+            job.created_by,
+            "ci.job.finish",
+            &format!("ci_job:{}", job.id),
+            &format!("state={state} exit_code={exit_code:?}"),
+        )
+        .await?;
+        Ok(FinishOutcome::Finished)
+    }
+
+    /// Requests the cancellation of one run (decision: cancel is a user
+    /// request, the runner observes it on its next trace/finish call and
+    /// cancel wins the race). The caller must hold at least `Write` on the
+    /// repository, and the job must belong to that repository. Audited.
+    pub async fn cancel_ci_job(
+        &self,
+        user: &crate::accounts::User,
+        owner: &str,
+        repo: &str,
+        job_id: i64,
+    ) -> CoreResult<()> {
+        let access = self
+            .require_repo(Some(user), owner, repo, Permission::Write)
+            .await?;
+        let job = db_ci::ci_job_by_id(self.db(), job_id)
+            .await?
+            .ok_or(CoreError::NotFound)?;
+        if job.repo_id != access.repo.id {
+            return Err(CoreError::NotFound);
+        }
+        if !db_ci::request_cancel_ci_job(self.db(), job_id, now()).await? {
+            return Err(CoreError::NotFound);
+        }
+        self.audit(
+            Some(user.id),
+            "ci.job.cancel",
+            &format!("ci_job:{job_id}"),
+            &format!("repo={}", access.repo.full_name()),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Mints the short-lived git credential for a job claimed by this
+    /// runner (decision 10): the runner must own the claim and present the
+    /// current fence, then the mint runs as the job's principal so the
+    /// usual job-state and deadline checks apply. The secret is returned
+    /// once (the API serves it with a 201).
+    pub async fn git_credential_for_runner(
+        &self,
+        runner: &RunnerPrincipal,
+        job_id: i64,
+        fence: &str,
+    ) -> CoreResult<MintedGitCredential> {
+        let job = match self.checked_claim(runner, job_id, fence).await? {
+            Ok(job) => job,
+            Err(ClaimGate::NotFound) => return Err(CoreError::NotFound),
+            Err(ClaimGate::FenceMismatch) => {
+                return Err(CoreError::Conflict("stale runner fence".into()));
+            }
+            Err(ClaimGate::Canceled) => {
+                return Err(CoreError::Invalid("job is canceled".into()));
+            }
+        };
+        let user_id = job
+            .created_by
+            .ok_or_else(|| CoreError::Invalid("job has no triggering user".into()))?;
+        self.mint_git_credential(&JobPrincipal {
+            job_id: job.id,
+            user_id,
+            repo_id: job.repo_id,
+            commit_sha: job.commit_sha,
+        })
+        .await
     }
 }
 

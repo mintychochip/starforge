@@ -17,5 +17,6 @@ axum.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 starforged-core = { path = "../starforged-core" }
+tokio.workspace = true
 tracing.workspace = true
 utoipa.workspace = true

@@ -1,0 +1,29 @@
+[package]
+name = "starforge-sandboxd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "MIT OR Apache-2.0"
+publish = true
+description = "Local sandbox provider daemon: Unix-socket HTTP control plane over rootless podman (plan M6b B2)"
+readme = "../../README.md"
+keywords = ["starforge", "sandbox", "daemon"]
+categories = ["command-line-utilities"]
+
+[lints]
+workspace = true
+
+[dependencies]
+axum.workspace = true
+base64.workspace = true
+clap.workspace = true
+nix = { version = "0.31", features = ["process", "socket", "user"] }
+serde.workspace = true
+serde_json.workspace = true
+starforge-sandbox-protocol = { path = "../starforge-sandbox-protocol", version = "0.1.0" }
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tower = "0.5"

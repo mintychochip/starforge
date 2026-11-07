@@ -26,7 +26,7 @@ CREATE TABLE runners (
     revoked_at BIGINT
 );
 CREATE INDEX runners_repo ON runners (repo_id);
-CREATE INDEX runners_token_hash ON runners (token_hash);
+CREATE UNIQUE INDEX runners_token_hash ON runners (token_hash);
 
 CREATE TABLE runner_registration_tokens (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -38,7 +38,7 @@ CREATE TABLE runner_registration_tokens (
     used_at BIGINT,
     created_at BIGINT NOT NULL
 );
-CREATE INDEX runner_registration_tokens_hash ON runner_registration_tokens (token_hash);
+CREATE UNIQUE INDEX runner_registration_tokens_hash ON runner_registration_tokens (token_hash);
 CREATE INDEX runner_registration_tokens_repo ON runner_registration_tokens (repo_id);
 
 CREATE TABLE ci_jobs (
@@ -111,7 +111,7 @@ CREATE TABLE ci_job_tokens (
     expires_at BIGINT NOT NULL,
     revoked_at BIGINT
 );
-CREATE INDEX ci_job_tokens_hash ON ci_job_tokens (token_hash);
+CREATE UNIQUE INDEX ci_job_tokens_hash ON ci_job_tokens (token_hash);
 CREATE INDEX ci_job_tokens_job ON ci_job_tokens (job_id);
 
 ALTER TABLE sessions ADD COLUMN ci_job_id BIGINT REFERENCES ci_jobs (id) ON DELETE SET NULL;

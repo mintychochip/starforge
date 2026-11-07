@@ -90,11 +90,13 @@ impl FixedWindows {
     }
 }
 
-/// The in-memory counters: per-IP login attempts (1-minute window) and
-/// per-token API requests (1-hour window).
+/// The in-memory counters: per-IP login attempts (1-minute window),
+/// per-token API requests (1-hour window), and unauthenticated runner
+/// registration attempts per IP (1-minute window).
 #[derive(Debug, Default)]
 pub struct Limiters {
     pub login_ip: FixedWindows,
+    pub register_ip: FixedWindows,
     pub api_token: FixedWindows,
 }
 
@@ -107,6 +109,19 @@ impl Core {
             &token_id.to_string(),
             3600,
             self.config().api_per_token_per_hour,
+            starforged_db::now(),
+        )
+    }
+
+    /// Counts one unauthenticated runner-registration attempt for `ip`
+    /// against the per-IP fixed window (1 minute), reporting the decision
+    /// (allowed, limit, remaining, reset). The budget reuses the login
+    /// per-IP setting (`login_per_ip_per_minute`); `0` disables the limit.
+    pub fn check_register_rate(&self, ip: &str) -> RateDecision {
+        self.inner.limits.register_ip.check(
+            ip,
+            60,
+            self.config().login_per_ip_per_minute,
             starforged_db::now(),
         )
     }

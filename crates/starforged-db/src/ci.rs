@@ -549,6 +549,79 @@ pub async fn claim_next_ci_job(
     }
 }
 
+/// Releases a claim back to `queued` under its lease fence: clears the
+/// runner, lease, and fence so another runner (or the same one, after a
+/// label retry) can claim the job again. The job is deferred until its
+/// old lease end (`run_at = lease_until`) so a runner that just released
+/// it as non-matching does not immediately re-claim it ahead of jobs
+/// queued behind it. Returns false on a stale fence or a job that is not
+/// claimed/running. Used by the claim path when a job's `runs_on` labels
+/// do not match the claiming runner.
+pub async fn release_ci_job(db: &Db, id: i64, lease_token: &str) -> DbResult<bool> {
+    let affected = sqlx::query(
+        "UPDATE ci_jobs SET state = 'queued', runner_id = NULL, lease_until = NULL, lease_token = NULL, \
+         run_at = COALESCE(lease_until, run_at) \
+         WHERE id = $1 AND lease_token = $2 AND state IN ('claimed', 'running')",
+    )
+    .bind(id)
+    .bind(lease_token)
+    .execute(db.pool())
+    .await?
+    .rows_affected();
+    Ok(affected == 1)
+}
+
+/// Marks a claimed job `running` under its lease fence (the runner started
+/// executing it; trace/finish keep accepting the fence). Returns false on a
+/// stale fence or a job that is not `claimed`.
+pub async fn set_ci_job_running(db: &Db, id: i64, lease_token: &str) -> DbResult<bool> {
+    let affected = sqlx::query(
+        "UPDATE ci_jobs SET state = 'running' WHERE id = $1 AND lease_token = $2 AND state = 'claimed'",
+    )
+    .bind(id)
+    .bind(lease_token)
+    .execute(db.pool())
+    .await?
+    .rows_affected();
+    Ok(affected == 1)
+}
+
+/// CI jobs of the repo, newest first, at most `limit` rows.
+pub async fn list_ci_jobs_for_repo(db: &Db, repo_id: i64, limit: i64) -> DbResult<Vec<CiJobRow>> {
+    let rows = sqlx::query(select_ci_job!(
+        "WHERE repo_id = $1 ORDER BY id DESC LIMIT $2"
+    ))
+    .bind(repo_id)
+    .bind(limit)
+    .fetch_all(db.read_pool())
+    .await?;
+    rows.iter().map(ci_job_from_row).collect()
+}
+
+/// Claimed/running jobs currently assigned to the runner, oldest first.
+/// Used when a runner is revoked or disappears so its attempts are
+/// requeued and their credentials revoked.
+pub async fn ci_jobs_for_runner(db: &Db, runner_id: i64) -> DbResult<Vec<CiJobRow>> {
+    let rows = sqlx::query(select_ci_job!(
+        "WHERE runner_id = $1 AND state IN ('claimed', 'running') ORDER BY id ASC"
+    ))
+    .bind(runner_id)
+    .fetch_all(db.read_pool())
+    .await?;
+    rows.iter().map(ci_job_from_row).collect()
+}
+
+/// The current log end offset for the job: `MAX(end_offset)` over its
+/// chunks, or 0 when it has no chunks yet.
+pub async fn log_end_offset(db: &Db, job_id: i64) -> DbResult<i64> {
+    let end: Option<i64> =
+        sqlx::query_scalar("SELECT MAX(end_offset) FROM ci_job_logs WHERE job_id = $1")
+            .bind(job_id)
+            .fetch_one(db.read_pool())
+            .await?;
+    Ok(end.unwrap_or(0))
+}
+
 /// Finishes a claimed/running job under its lease fence: sets the terminal
 /// `state`, exit code, checksum, and error, stamps `finished_at`, and
 /// revokes the job's tokens. Returns false on a stale/missing fence or a
@@ -636,21 +709,46 @@ pub async fn cancel_ci_job(
 
 /// Claimed/running jobs whose lease ended before `now_ts` belonged to a
 /// runner that stopped. They go back to `queued`, or to `failed` once they
-/// have used `max_attempts`. Returns how many rows changed.
-pub async fn requeue_expired_ci_jobs(db: &Db, now_ts: i64, max_attempts: i64) -> DbResult<u64> {
-    let result = sqlx::query(
-        "UPDATE ci_jobs SET state = CASE WHEN attempts >= $1 THEN 'failed' ELSE 'queued' END, \
-         lease_until = NULL, lease_token = NULL, runner_id = NULL, \
-         last_error = CASE WHEN attempts >= $1 THEN last_error ELSE 'the runner stopped before finishing' END, \
-         finished_at = CASE WHEN attempts >= $1 THEN $2 ELSE finished_at END \
-         WHERE state IN ('claimed', 'running') AND lease_until < $3",
-    )
-    .bind(max_attempts)
+/// have used `max_attempts`. Every stale attempt's credentials are revoked
+/// first — its `ci_job_tokens` and the short-lived git PAT referenced by
+/// `git_token_id` — so a revived runner cannot keep acting on them.
+/// Returns the ids of the requeued/failed jobs.
+pub async fn requeue_expired_ci_jobs(
+    db: &Db,
+    now_ts: i64,
+    max_attempts: i64,
+) -> DbResult<Vec<i64>> {
+    let rows = sqlx::query(select_ci_job!(
+        "WHERE state IN ('claimed', 'running') AND lease_until < $1 ORDER BY id ASC"
+    ))
     .bind(now_ts)
-    .bind(now_ts)
-    .execute(db.pool())
+    .fetch_all(db.read_pool())
     .await?;
-    Ok(result.rows_affected())
+    let jobs = rows
+        .iter()
+        .map(ci_job_from_row)
+        .collect::<DbResult<Vec<_>>>()?;
+    let mut ids = Vec::with_capacity(jobs.len());
+    for job in &jobs {
+        sqlx::query(
+            "UPDATE ci_jobs SET state = CASE WHEN attempts >= $1 THEN 'failed' ELSE 'queued' END, \
+             lease_until = NULL, lease_token = NULL, runner_id = NULL, \
+             last_error = CASE WHEN attempts >= $1 THEN last_error ELSE 'the runner stopped before finishing' END, \
+             finished_at = CASE WHEN attempts >= $1 THEN $2 ELSE finished_at END \
+             WHERE id = $3",
+        )
+        .bind(max_attempts)
+        .bind(now_ts)
+        .bind(job.id)
+        .execute(db.pool())
+        .await?;
+        revoke_job_tokens_for_job(db, job.id, now_ts).await?;
+        if let (Some(token_id), Some(user_id)) = (job.git_token_id, job.created_by) {
+            crate::tokens::revoke(db, user_id, token_id).await?;
+        }
+        ids.push(job.id);
+    }
+    Ok(ids)
 }
 
 /// Inserts a per-job token; `token_hash` is the SHA-256 of the token
@@ -1058,7 +1156,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(requeue_expired_ci_jobs(&t.db, 71, 3).await.unwrap(), 1);
+        assert_eq!(
+            requeue_expired_ci_jobs(&t.db, 71, 3).await.unwrap(),
+            [stuck.id]
+        );
         assert_eq!(
             ci_job_by_id(&t.db, stuck.id).await.unwrap().unwrap().state,
             "queued"
@@ -1067,12 +1168,18 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(requeue_expired_ci_jobs(&t.db, 141, 3).await.unwrap(), 1);
+        assert_eq!(
+            requeue_expired_ci_jobs(&t.db, 141, 3).await.unwrap(),
+            [stuck.id]
+        );
         claim_next_ci_job(&t.db, r.id, repo_id, 200, 60, "fence-11")
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(requeue_expired_ci_jobs(&t.db, 261, 3).await.unwrap(), 1);
+        assert_eq!(
+            requeue_expired_ci_jobs(&t.db, 261, 3).await.unwrap(),
+            [stuck.id]
+        );
         assert_eq!(
             ci_job_by_id(&t.db, stuck.id).await.unwrap().unwrap().state,
             "failed"

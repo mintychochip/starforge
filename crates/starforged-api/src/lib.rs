@@ -366,6 +366,14 @@ pub fn router(core: Core, base_url: String) -> Router {
         .route("/repos/{owner}/{repo}/runners", get(ci::list_runners))
         .route("/runners/register", post(ci::register_runner))
         .route("/runners/{id}", delete(ci::revoke_runner))
+        .route("/runners/jobs/request", post(ci::request_job))
+        .route("/runners/jobs/{id}/trace", patch(ci::trace_job))
+        .route("/runners/jobs/{id}", put(ci::finish_job))
+        .route("/ci/jobs/{id}/git-credential", post(ci::git_credential))
+        .route(
+            "/repos/{owner}/{repo}/ci/runs/{id}/cancel",
+            post(ci::cancel_run),
+        )
         .fallback(|| async { ApiError::NotFound })
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),

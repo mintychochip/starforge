@@ -1042,3 +1042,46 @@ async fn meta_round_trip_stores_cli_fields() {
     assert_eq!(row.lifecycle, "receiving");
     assert_eq!(row.quarantine, "none");
 }
+
+/// A PAT upload spends the hourly per-token budget: with a limit of one, the
+/// first session-meta PUT succeeds and the second is refused with 429 —
+/// the `SessionAuth` PAT arm reuses the rate-limit decision parked by the
+/// middleware instead of authenticating again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pat_upload_rate_limited_after_budget_spent() {
+    let s = TestServer::start_with(|config| {
+        config.limits.api_per_token_per_hour = 1;
+    })
+    .await;
+    let alice = s.user("alice").await;
+    s.repo(
+        &alice,
+        "proj",
+        starforged_core::permission::Visibility::Private,
+    )
+    .await;
+    let upload = s.token(&alice, &[Scope::SessionUpload]).await;
+    let client = reqwest::Client::new();
+
+    let first = client
+        .put(meta_url(&s, ULID_A))
+        .bearer_auth(&upload)
+        .json(&meta_body(ULID_A))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), 201);
+
+    let second = client
+        .put(meta_url(&s, ULID_B))
+        .bearer_auth(&upload)
+        .json(&meta_body(ULID_B))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second.status(), 429);
+    assert_eq!(
+        second.json::<Value>().await.unwrap()["error"]["code"],
+        "rate_limited"
+    );
+}

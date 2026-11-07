@@ -281,6 +281,11 @@ const ROUTES: &[(&str, &str)] = &[
     ("get", "/api/v1/repos/{owner}/{repo}/runners"),
     ("post", "/api/v1/runners/register"),
     ("delete", "/api/v1/runners/{id}"),
+    ("post", "/api/v1/runners/jobs/request"),
+    ("patch", "/api/v1/runners/jobs/{id}/trace"),
+    ("put", "/api/v1/runners/jobs/{id}"),
+    ("post", "/api/v1/ci/jobs/{id}/git-credential"),
+    ("post", "/api/v1/repos/{owner}/{repo}/ci/runs/{id}/cancel"),
 ];
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

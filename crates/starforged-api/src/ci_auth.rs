@@ -12,6 +12,7 @@
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
 use starforged_core::ci::{JOB_TOKEN_PREFIX, JobPrincipal, RUNNER_TOKEN_PREFIX, RunnerPrincipal};
+use starforged_core::limits::RateDecision;
 use starforged_core::tokens::{TOKEN_PREFIX, TokenAuth};
 
 use crate::ApiState;
@@ -63,6 +64,8 @@ impl FromRequestParts<ApiState> for JobAuth {
 /// job execution uploading its own sessions (M6-0 F3). Runner tokens are
 /// refused here: they belong to runner routes only.
 pub enum SessionAuth {
+    /// A PAT caller; the middleware's rate-limit decision was already
+    /// checked by the extractor.
     Pat(TokenAuth),
     Job(JobPrincipal),
 }
@@ -78,9 +81,24 @@ impl FromRequestParts<ApiState> for SessionAuth {
             .ok_or(ApiError::Unauthenticated)?
             .to_owned();
         if token.starts_with(TOKEN_PREFIX) {
-            Ok(SessionAuth::Pat(
-                state.core.authenticate_token(&token).await?,
-            ))
+            // The rate-limit middleware already authenticated the token and
+            // parked the result in the request extensions: reuse it instead
+            // of authenticating twice per request (same pattern as `ApiAuth`).
+            let auth = match parts.extensions.get::<TokenAuth>() {
+                Some(auth) => auth.clone(),
+                None => state.core.authenticate_token(&token).await?,
+            };
+            let decision = match parts.extensions.get::<RateDecision>() {
+                Some(decision) => *decision,
+                None => state.core.check_api_rate(auth.token_id),
+            };
+            if !decision.allowed {
+                return Err(ApiError::RateLimited {
+                    retry_after: (decision.reset_at - starforged_core::limits::now_secs()).max(1),
+                    decision,
+                });
+            }
+            Ok(SessionAuth::Pat(auth))
         } else if token.starts_with(JOB_TOKEN_PREFIX) {
             Ok(SessionAuth::Job(state.core.authenticate_job(&token).await?))
         } else {

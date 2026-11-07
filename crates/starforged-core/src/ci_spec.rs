@@ -35,7 +35,8 @@ const MAX_LABEL_LEN: usize = 64;
 const MAX_TRIGGERS: usize = 100;
 const MAX_PATTERN_LEN: usize = 256;
 
-/// What enqueues a run: branch pushes and/or Trail change actions.
+/// What enqueues a run: branch pushes and/or Trail change actions. Both
+/// empty means the spec is manual-only.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CiTriggers {
@@ -235,12 +236,6 @@ fn validate_triggers(triggers: &CiTriggers) -> CoreResult<()> {
                 "ci.toml: duplicate trail action `{action}`"
             )));
         }
-    }
-    if triggers.push.is_empty() && triggers.trail.is_empty() {
-        return Err(invalid(
-            "ci.toml: no triggers (at least one push pattern or trail action is required)"
-                .to_owned(),
-        ));
     }
     Ok(())
 }
@@ -564,9 +559,11 @@ commands = ["cargo clippy"]
         assert!(err(text).contains("no jobs"));
     }
     #[test]
-    fn missing_triggers_is_rejected() {
+    fn manual_only_spec_without_triggers_parses() {
         let text = "version = 1\n\n[[jobs]]\nname = \"test\"\nimage = \"rust:1.85\"\ncommands = [\"make\"]\n";
-        assert!(err(text).contains("no triggers"));
+        let spec = CiSpec::parse(text).expect("no triggers means manual-only");
+        assert!(spec.triggers.push.is_empty());
+        assert!(spec.triggers.trail.is_empty());
     }
 
     #[test]

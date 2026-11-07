@@ -38,6 +38,49 @@ async fn api(
     (status, value)
 }
 
+async fn api_raw(
+    client: &reqwest::Client,
+    method: &str,
+    url: &str,
+    token: &str,
+    body: Option<Value>,
+) -> (StatusCode, reqwest::header::HeaderMap, Value) {
+    let req = match method {
+        "GET" => client.get(url),
+        "POST" => client.post(url),
+        "DELETE" => client.delete(url),
+        _ => unreachable!(),
+    };
+    let req = if token.is_empty() {
+        req
+    } else {
+        req.bearer_auth(token)
+    };
+    let resp = req.json(&body.unwrap_or(json!({}))).send().await.unwrap();
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    let text = resp.text().await.unwrap();
+    let value = if text.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_str(&text).unwrap_or(Value::String(text))
+    };
+    (status, headers, value)
+}
+
+fn assert_no_store(headers: &reqwest::header::HeaderMap) {
+    assert_eq!(
+        headers.get(reqwest::header::CACHE_CONTROL).unwrap(),
+        "no-store",
+        "{headers:?}"
+    );
+    assert_eq!(
+        headers.get(reqwest::header::PRAGMA).unwrap(),
+        "no-cache",
+        "{headers:?}"
+    );
+}
+
 async fn mint(s: &TestServer, token: &str, owner: &str, repo: &str) -> (StatusCode, Value) {
     api(
         &s.browser(),
@@ -337,4 +380,58 @@ async fn runner_cannot_widen_token_labels() {
     )
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn secret_responses_are_not_stored() {
+    let s = TestServer::start().await;
+    let alice = s.user("alice").await;
+    s.repo(&alice, "proj", Visibility::Private).await;
+    let token = s.token(&alice, &[Scope::RepoWrite]).await;
+
+    let (status, headers, body) = api_raw(
+        &s.browser(),
+        "POST",
+        &s.url("/api/v1/repos/alice/proj/runners/registration-token"),
+        &token,
+        Some(json!({ "labels": ["linux"], "ephemeral": false })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_no_store(&headers);
+    let registration_token = body["token"].as_str().unwrap().to_owned();
+
+    let (status, headers, body) = api_raw(
+        &s.browser(),
+        "POST",
+        &s.url("/api/v1/runners/register"),
+        "",
+        Some(json!({
+            "registration_token": registration_token,
+            "name": "r1",
+            "labels": ["linux"],
+            "version": "1.0",
+            "ephemeral": false,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_no_store(&headers);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn register_is_rate_limited_per_ip() {
+    let s = TestServer::start_with(|config| {
+        config.limits.login_per_ip_per_minute = 2;
+    })
+    .await;
+
+    // Two attempts are counted (and fail with 401 for the unknown token);
+    // the third is refused with 429 without ever checking the token.
+    for _ in 0..2 {
+        let (status, _) = register(&s, "sfrt_doesnotexist").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+    let (status, body) = register(&s, "sfrt_doesnotexist").await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
 }

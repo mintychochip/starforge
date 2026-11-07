@@ -171,6 +171,11 @@ impl Modify for SecurityAddon {
         crate::ci::register_runner,
         crate::ci::list_runners,
         crate::ci::revoke_runner,
+        crate::ci::request_job,
+        crate::ci::trace_job,
+        crate::ci::finish_job,
+        crate::ci::git_credential,
+        crate::ci::cancel_run,
         crate::openapi::openapi_json,
     ),
     components(schemas(
@@ -249,6 +254,11 @@ impl Modify for SecurityAddon {
         crate::ci::RegisterRunnerBody,
         crate::ci::RegisteredRunnerJson,
         crate::ci::RunnerJson,
+        crate::ci::ClaimedJobJson,
+        crate::ci::FinishJobBody,
+        crate::ci::FinishedJobJson,
+        crate::ci::GitCredentialJson,
+        crate::ci::CancelRunJson,
     )),
     modifiers(&SecurityAddon),
 )]
