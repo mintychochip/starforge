@@ -205,6 +205,17 @@ impl Core {
         }
     }
 
+    /// Revoke the token row with the given stored hash (RFC 7009). Returns
+    /// `true` when a live row was revoked; an unknown or already-revoked
+    /// hash is `false`. Callers answer 200 either way so token existence
+    /// never leaks.
+    pub async fn revoke_token_hash(&self, token_hash: &str) -> CoreResult<bool> {
+        Ok(
+            starforged_db::tokens::revoke_by_hash(self.db(), token_hash, starforged_db::now())
+                .await?,
+        )
+    }
+
     /// Mints the access (1 h) + refresh (90 d) pair for an approved code and
     /// consumes the code so it can never grant twice. Consumption is a
     /// compare-and-swap inside the same transaction as the token inserts, so

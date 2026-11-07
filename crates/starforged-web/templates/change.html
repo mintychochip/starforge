@@ -6,7 +6,7 @@
 <h2>Change {{ k }} <span class="badge">{{ kind }}</span> <span class="badge">{{ state }}</span></h2>
 <p class="muted">current revision r{{ current_revision }}</p>
 <p class="muted">on <a href="/{{ head.owner }}/{{ head.name }}/trails/{{ trail_number }}">trail #{{ trail_number }}</a>
-{% if let Some(h) = head_branch %} · head <code>{{ h }}</code>{% endif %} · base <code>{{ base_branch }}</code>
+{% if let Some(h) = head_branch %} · head <code>{{ h }}</code>{% else if let Some(t) = topic %} · head <code>for/{{ t }}</code>{% endif %} · base <code>{{ base_branch }}</code>
  · opened by {% if let Some(a) = creator_imported_author %}{{ a }} (imported){% else if creator_handle == "deleted user" %}deleted user{% else %}<a href="/{{ creator_handle }}">{{ creator_handle }}</a>{% endif %}
  · <span class="muted">{{ created }} · updated {{ updated }}</span></p>
 {% if let Some(e) = error %}<p class="notice">{{ e }}</p>{% endif %}

@@ -44,7 +44,8 @@ pub struct RepoHead {
     pub visibility: &'static str,
     /// The repository is archived: read-only, pushes refused.
     pub archived: bool,
-    /// The highlighted tab: `code`, `commits`, `branches`, `tags`, or `settings`; any other value highlights none.
+    /// The highlighted tab: `code`, `commits`, `branches`, `tags`, `trails`,
+    /// `sessions`, or `settings`; any other value highlights none.
     pub tab: &'static str,
     /// The Commits tab: the history of the ref being viewed, or `/{owner}/{repo}/commits`.
     pub commits_href: String,
@@ -110,6 +111,16 @@ pub fn format_time(unix: i64) -> String {
             .ok()
         })
         .unwrap_or_default()
+}
+
+/// The title to show for a session: untitled captures fall back to a
+/// placeholder rather than an empty link.
+pub fn display_title(title: &str) -> String {
+    if title.trim().is_empty() {
+        "Untitled session".to_owned()
+    } else {
+        title.to_owned()
+    }
 }
 
 /// How long ago `then` was, seen at `now` (unix seconds): "just now", "5 minutes ago", "1 day ago", …
@@ -414,6 +425,8 @@ pub struct GatePanel {
     pub csrf: String,
     pub kind: String,
     pub head_branch: Option<String>,
+    /// The `refs/for` push topic for `agit` changes; `None` otherwise.
+    pub topic: Option<String>,
     pub base_branch: String,
     pub state: String,
     pub current_revision: i64,

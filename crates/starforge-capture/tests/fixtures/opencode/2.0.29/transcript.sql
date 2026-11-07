@@ -98,6 +98,16 @@ INSERT INTO session_message(id, session_id, type, seq, time_created, time_update
   VALUES('msg_asst_1', '01ARZ3NDEKTSV4RRFFQ69G5FAY', 'assistant', 1, 1793793605000, 1793793610000, '{"agent":"build","model":{"id":"claude-sonnet-4-5","providerID":"anthropic"},"content":[{"type":"text","text":"I will start by reading the auth module."},{"type":"reasoning","text":"The auth module has tangled session logic; check src/auth.rs first."},{"type":"tool","id":"call_abc","name":"edit","state":{"status":"completed","input":{"file_path":"/repo/src/auth.rs"},"content":[{"type":"text","text":"Edited /repo/src/auth.rs"}]}}],"tokens":{"input":1200,"output":60,"reasoning":0,"cache":{"read":0,"write":0}},"cost":0.01,"time":{"created":1793793605000}}');
 INSERT INTO session_message(id, session_id, type, seq, time_created, time_updated, data)
   VALUES('msg_comp_1', '01ARZ3NDEKTSV4RRFFQ69G5FAY', 'compaction', 2, 1793793615000, 1793793615000, '{"status":"completed","reason":"auto","summary":"Refactored the auth module.","recent":"","time":{"created":1793793615000}}');
+INSERT INTO session_message(id, session_id, type, seq, time_created, time_updated, data)
+  VALUES('msg_synth_1', '01ARZ3NDEKTSV4RRFFQ69G5FAY', 'synthetic', 3, 1793793620000, 1793793620000, '{"text":"Synthetic retry hint.","description":"Retry","time":{"created":1793793620000}}');
+INSERT INTO session_message(id, session_id, type, seq, time_created, time_updated, data)
+  VALUES('msg_sys_1', '01ARZ3NDEKTSV4RRFFQ69G5FAY', 'system', 4, 1793793625000, 1793793625000, '{"description":"Notice","text":"Engine restarted.","metadata":{},"time":{"created":1793793625000}}');
+INSERT INTO session_message(id, session_id, type, seq, time_created, time_updated, data)
+  VALUES('msg_sw_1', '01ARZ3NDEKTSV4RRFFQ69G5FAY', 'agent-switched', 5, 1793793630000, 1793793630000, '{"agent":"plan","previous":"build","time":{"created":1793793630000}}');
+INSERT INTO session_message(id, session_id, type, seq, time_created, time_updated, data)
+  VALUES('msg_idle_1', '01ARZ3NDEKTSV4RRFFQ69G5FAY', 'idle', 6, 1793793635000, 1793793635000, '{"outcome":"completed","time":{"created":1793793635000}}');
+INSERT INTO session_message(id, session_id, type, seq, time_created, time_updated, data)
+  VALUES('msg_asst_2', '01ARZ3NDEKTSV4RRFFQ69G5FAY', 'assistant', 7, 1793793640000, 1793793645000, '{"agent":"plan","model":{"id":"claude-sonnet-4-5","providerID":"anthropic"},"content":[{"type":"tool","id":"call_path","name":"edit","state":{"status":"completed","input":{"path":"/repo/src/modern.rs"},"content":[{"type":"text","text":"Edited /repo/src/modern.rs"}]}},{"type":"tool","id":"call_legacy","name":"edit","state":{"status":"completed","input":{"filePath":"/repo/src/legacy.rs"},"content":[{"type":"text","text":"Edited /repo/src/legacy.rs"}]}}],"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},"cost":0,"time":{"created":1793793640000}}');
 INSERT INTO session_part(message_id, session_id, ordinal, type, call_id, time_created, time_updated, data)
   VALUES('msg_asst_1', '01ARZ3NDEKTSV4RRFFQ69G5FAY', 0, 'text', NULL, 1793793605000, 1793793610000, '{"type":"text","text":"I will start by reading the auth module."}');
 INSERT INTO session_part(message_id, session_id, ordinal, type, call_id, time_created, time_updated, data)
@@ -106,6 +116,10 @@ INSERT INTO session_part(message_id, session_id, ordinal, type, call_id, time_cr
   VALUES('msg_asst_1', '01ARZ3NDEKTSV4RRFFQ69G5FAY', 2, 'tool', 'call_abc', 1793793605000, 1793793610000, '{"type":"tool","id":"call_abc","name":"edit","state":{"status":"completed","input":{"file_path":"/repo/src/auth.rs"},"content":[{"type":"text","text":"Edited /repo/src/auth.rs"}]}}');
 INSERT INTO session_part(message_id, session_id, ordinal, type, call_id, time_created, time_updated, data)
   VALUES('msg_asst_1', '01ARZ3NDEKTSV4RRFFQ69G5FAY', 3, 'future-part', NULL, 1793793605000, 1793793610000, '{"type":"future-part","weird":true}');
+INSERT INTO session_part(message_id, session_id, ordinal, type, call_id, time_created, time_updated, data)
+  VALUES('msg_asst_2', '01ARZ3NDEKTSV4RRFFQ69G5FAY', 0, 'tool', 'call_path', 1793793640000, 1793793645000, '{"type":"tool","id":"call_path","name":"edit","state":{"status":"completed","input":{"path":"/repo/src/modern.rs"},"content":[{"type":"text","text":"Edited /repo/src/modern.rs"}]}}');
+INSERT INTO session_part(message_id, session_id, ordinal, type, call_id, time_created, time_updated, data)
+  VALUES('msg_asst_2', '01ARZ3NDEKTSV4RRFFQ69G5FAY', 1, 'tool', 'call_legacy', 1793793640000, 1793793645000, '{"type":"tool","id":"call_legacy","name":"edit","state":{"status":"completed","input":{"filePath":"/repo/src/legacy.rs"},"content":[{"type":"text","text":"Edited /repo/src/legacy.rs"}]}}');
 -- Each filtered session still holds a message, so discovery filtering
 -- (not emptiness) is what excludes them.
 INSERT INTO session_message(id, session_id, type, seq, time_created, time_updated, data)

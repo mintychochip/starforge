@@ -292,7 +292,14 @@ fn change_line(detail: &Value, status: Option<&Value>) -> String {
         head = change
             .get("head_branch")
             .and_then(Value::as_str)
-            .unwrap_or("?"),
+            .map(str::to_owned)
+            .or_else(|| {
+                change
+                    .get("topic")
+                    .and_then(Value::as_str)
+                    .map(|topic| format!("for/{topic}"))
+            })
+            .unwrap_or_else(|| "?".to_string()),
         state = str_of(change, "state"),
         rev = change
             .get("current_revision")
@@ -636,6 +643,28 @@ mod tests {
             out.contains("gates: failing (needs 1 more approval)"),
             "{out}"
         );
+    }
+
+    #[test]
+    fn show_renders_agit_topic_as_source() {
+        let mut agit = detail();
+        agit["change"]["kind"] = json!("agit");
+        agit["change"]["head_branch"] = Value::Null;
+        agit["change"]["topic"] = json!("feat-x");
+        let out = render_show_text(&trail(), &[(agit, Some(status()))], "u");
+        assert!(
+            out.contains("1  agit  main \u{2190} for/feat-x  open  rev 2  mergeable"),
+            "{out}"
+        );
+        assert!(!out.contains("\u{2190} ?"), "{out}");
+    }
+
+    #[test]
+    fn show_renders_question_mark_only_when_neither_source() {
+        let mut bare = detail();
+        bare["change"]["head_branch"] = Value::Null;
+        let out = render_show_text(&trail(), &[(bare, None)], "u");
+        assert!(out.contains("main \u{2190} ?"), "{out}");
     }
 
     #[test]

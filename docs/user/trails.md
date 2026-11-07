@@ -201,6 +201,13 @@ branch), `GET`/`PATCH .../changes/{k}` (close/reopen; `merged` is refused), `...
 and `.../threads` (`POST .../{t}/resolve`, `.../{t}/comments`). Reads need `repo:read`,
 mutations need `trail:write`; strangers get `404` so change numbers stay undiscoverable.
 
+Each change JSON carries its source in one of two fields: `head_branch` for a
+branch change, or `topic` (the `refs/for/<base>/<topic>` push topic, the
+pusher's handle when the push named none) for a `refs/for` change —
+`head_branch` is `null` for the latter. The CLI, the web pages, and `trail
+show` all render `base ← head_branch` or `base ← for/<topic>` from these;
+`?` appears only when the server reports neither.
+
 ### Pending reviews
 
 A signed-in reader holds at most one pending (draft) review per change. Posting a

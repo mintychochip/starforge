@@ -266,6 +266,25 @@ fn redact_str(
     redacted
 }
 
+/// Fallback title from the first `user_message` with non-blank text: its
+/// first non-blank line, trimmed, at most 80 chars (cut on a char boundary,
+/// `…` appended when cut).
+fn fallback_title(events: &[Event]) -> Option<String> {
+    let text = events.iter().find_map(|event| match &event.kind {
+        EventKind::UserMessage(msg) if !msg.text.trim().is_empty() => Some(msg.text.clone()),
+        _ => None,
+    })?;
+    let line = text.lines().map(str::trim).find(|l| !l.is_empty())?;
+    if line.chars().count() <= 80 {
+        return Some(line.to_string());
+    }
+    let mut cut = String::new();
+    for ch in line.chars().take(80) {
+        cut.push(ch);
+    }
+    Some(format!("{cut}…"))
+}
+
 /// Whether raw native slices may be captured for `agent`.
 ///
 /// Raw slices are byte ranges `[cursor.offset, next.offset)` into an
@@ -308,6 +327,12 @@ pub fn ingest(
     let (rules, compiled) = crate::spool::Spool::load_rules(repo_root)?;
     let fingerprint = starforge_redact::fingerprint(&rules);
     let records = spool.cursor_records()?;
+    // `"<agent>/<session_key>"` → spool ULID, updated as each candidate is
+    // ingested so a child ingested after its parent resolves immediately.
+    let mut ulid_by_key: HashMap<String, String> = records
+        .iter()
+        .map(|(key, rec)| (key.clone(), rec.ulid.clone()))
+        .collect();
     let mut queued: HashSet<(u8, String, Option<u64>)> = crate::queue::read_queue(spool)?
         .iter()
         .map(|e| {
@@ -353,6 +378,7 @@ pub fn ingest(
                     None,
                 ),
             };
+            ulid_by_key.insert(key.clone(), ulid.clone());
             let first_sight = spool.read_meta(&ulid).is_err();
             // Per-candidate failures must not starve later candidates or
             // adapters: warn and move on. Only genuinely global spool/queue
@@ -372,6 +398,7 @@ pub fn ingest(
                         out.next,
                         &candidate.native_path.to_string_lossy(),
                         None,
+                        candidate.parent_session_key.clone(),
                     )?;
                 }
                 continue;
@@ -529,7 +556,12 @@ pub fn ingest(
             for f in &meta.files_touched {
                 files.insert(redact_str(&compiled, f, &mut meta_counts));
             }
-            // Derive from REDACTED events so no unredacted path reaches the spool.
+            // Seed from the adapter header: adapters normalize paths the
+            // event stream does not carry (Pi hashline `[PATH#TAG]` headers,
+            // OpenCode `filePath`), so `event_files` alone loses them.
+            for f in &out.header.files_touched {
+                files.insert(redact_str(&compiled, f, &mut meta_counts));
+            }
             for event in &redacted_events {
                 for f in event_files(event) {
                     files.insert(redact_str(&compiled, &f, &mut meta_counts));
@@ -554,6 +586,21 @@ pub fn ingest(
                 && !title.trim().is_empty()
             {
                 meta.title = Some(redact_str(&compiled, title, &mut meta_counts));
+            }
+            // Fallback title: only when the session still has none, from
+            // the first `user_message`'s first non-blank line (≤80 chars).
+            let has_title = meta.title.as_ref().is_some_and(|t| !t.trim().is_empty());
+            if !has_title && let Some(fallback) = fallback_title(&out.events) {
+                meta.title = Some(redact_str(&compiled, &fallback, &mut meta_counts));
+            }
+            // Resolve a natively nested parent whose spool ULID is known
+            // yet; parents ingested later are resolved in the sweep below.
+            if meta.parent_id.is_none()
+                && let Some(parent_key) = &candidate.parent_session_key
+                && let Some(parent_ulid) = ulid_by_key.get(&format!("{agent}/{parent_key}"))
+                && let Ok(parsed) = parent_ulid.parse()
+            {
+                meta.parent_id = Some(parsed);
             }
             for (k, v) in &meta_counts {
                 *meta.redaction.counts.entry(k.clone()).or_insert(0) += v;
@@ -606,9 +653,49 @@ pub fn ingest(
                     out.next,
                     &candidate.native_path.to_string_lossy(),
                     merged_last.clone(),
+                    candidate.parent_session_key.clone(),
                 )?;
             }
         }
+    }
+    // Parent resolution: discovery order varies, so a child ingested
+    // before its parent still has `parent_id == None` after the batch
+    // path. Resolve every still-unresolved parent now that every
+    // candidate of this run has been persisted.
+    let all_records = spool.cursor_records()?;
+    for (key, rec) in &all_records {
+        let Some(parent_key) = rec.parent_session_key.as_deref() else {
+            continue;
+        };
+        let Some((agent, _)) = key.split_once('/') else {
+            continue;
+        };
+        let parent_lookup = format!("{agent}/{parent_key}");
+        let Some(parent_ulid) = all_records
+            .get(&parent_lookup)
+            .map(|parent| parent.ulid.clone())
+        else {
+            continue;
+        };
+        let Ok(mut meta) = spool.read_meta(&rec.ulid) else {
+            continue;
+        };
+        if meta.parent_id.is_some() {
+            continue;
+        }
+        let Ok(parsed) = parent_ulid.parse() else {
+            continue;
+        };
+        meta.parent_id = Some(parsed);
+        spool.put_session(&meta)?;
+        queue_meta(
+            spool,
+            &rec.ulid,
+            &meta,
+            &now_rfc3339,
+            &mut queued,
+            &mut stats,
+        )?;
     }
     // Idle sweep: discovery skips ungrown transcripts, so sessions
     // ingested while active would otherwise stay `receiving` forever once

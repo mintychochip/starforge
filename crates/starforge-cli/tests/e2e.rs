@@ -89,6 +89,7 @@ fn seed_spool_from_fixture(spool: &Spool, repo: &Path) -> (String, String) {
         native_path: native.clone(),
         agent_version: String::new(),
         workdir: PathBuf::from("/work/repo"),
+        parent_session_key: None,
     };
     let out = PiAdapter
         .read(&candidate, &Cursor::start(), "2026-10-01T12:03:00Z")
@@ -327,6 +328,9 @@ fn enable_disable_wire_agent_hooks() {
     let (_dir, repo) = init_repo();
     let home = TempDir::new().unwrap();
     let paths = CliPaths::from_home(home.path().to_path_buf());
+    // `enable` only writes agent config for detected agents; give Claude a
+    // store marker so its hooks are wired.
+    std::fs::create_dir_all(home.path().join(".claude").join("projects").join("proj")).unwrap();
 
     let (out, code) = hooks::enable(&repo, &paths, false);
     assert_eq!(code, 0, "enable output: {out}");

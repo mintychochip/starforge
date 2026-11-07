@@ -375,6 +375,73 @@ pub fn log(
     Ok(commits)
 }
 
+/// Object id of the entry at `path` in `commit_id` (blob or tree); `None` when missing.
+fn entry_id(repo: &gix::Repository, commit_id: &str, path: &str) -> Option<String> {
+    let id = repo
+        .rev_parse_single(format!("{commit_id}:{path}").as_str())
+        .ok()?
+        .detach();
+    Some(id.to_string())
+}
+
+/// Whether `path` exists in `commit_id` — a blob, a tree, or a submodule
+/// gitlink. The empty path never exists.
+pub fn path_exists(repo: &Path, commit_id: &str, path: &str) -> Result<bool, GitError> {
+    if path.is_empty() {
+        return Ok(false);
+    }
+    let r = open(repo)?;
+    Ok(entry_id(&r, commit_id, path).is_some())
+}
+
+/// Up to `limit` commits reachable from `commit_id` that touched `path` (a file or a
+/// directory), newest first (by commit time), after skipping `skip` matches. A commit
+/// touches `path` when the entry at `path` differs from its first parent's (a root
+/// commit touches every path it contains), matching `git log -- <path>`: a deletion
+/// (or the old side of a rename) is listed. Renames are not followed.
+pub fn log_path(
+    repo: &Path,
+    commit_id: &str,
+    path: &str,
+    skip: usize,
+    limit: usize,
+) -> Result<Vec<CommitInfo>, GitError> {
+    let r = open(repo)?;
+    let start = r.rev_parse_single(commit_id).map_err(gix_err)?.detach();
+    let walk = r
+        .rev_walk([start])
+        .sorting(gix::revision::walk::Sorting::ByCommitTime(
+            Default::default(),
+        ))
+        .all()
+        .map_err(gix_err)?;
+    let mut commits = Vec::new();
+    let mut matched = 0_usize;
+    for info in walk {
+        let commit = info.map_err(gix_err)?.object().map_err(gix_err)?;
+        let info = commit_info(&commit)?;
+        let entry = entry_id(&r, &info.id, path);
+        let touched = match info.parents.first() {
+            Some(parent) => entry_id(&r, parent, path) != entry,
+            None => entry.is_some(),
+        };
+        if !touched {
+            continue;
+        }
+        if matched < skip {
+            matched += 1;
+            continue;
+        }
+        matched += 1;
+        if commits.len() < limit {
+            commits.push(info);
+        } else {
+            break;
+        }
+    }
+    Ok(commits)
+}
+
 /// The commit with full object id `id`; `None` for anything else.
 pub fn commit(repo: &Path, id: &str) -> Result<Option<CommitInfo>, GitError> {
     if !is_object_id(id) {
@@ -731,6 +798,41 @@ mod tests {
         assert!(commit(p, &"0".repeat(40)).unwrap().is_none());
     }
     #[test]
+    fn path_history_lists_only_commits_touching_the_path() {
+        let f = fixture();
+        let p = f.path();
+        let main = resolve(p, "main").unwrap().unwrap().commit_id;
+        let feature = resolve(p, "feature/x").unwrap().unwrap().commit_id;
+        let summaries =
+            |commits: Vec<CommitInfo>| commits.into_iter().map(|c| c.summary).collect::<Vec<_>>();
+        assert_eq!(
+            summaries(log_path(p, &main, "src/lib.rs", 0, 10).unwrap()),
+            vec!["first"]
+        );
+        assert_eq!(
+            summaries(log_path(p, &main, "docs", 0, 10).unwrap()),
+            vec!["second"]
+        );
+        assert_eq!(
+            summaries(log_path(p, &main, "README.md", 0, 10).unwrap()),
+            vec!["first"]
+        );
+        assert_eq!(
+            summaries(log_path(p, &feature, "feature.txt", 0, 10).unwrap()),
+            vec!["feature"]
+        );
+        assert!(
+            log_path(p, &main, "nope.txt", 0, 10).unwrap().is_empty(),
+            "missing path touches nothing"
+        );
+        // Pagination applies to matches, not to all reachable commits.
+        assert!(
+            log_path(p, &feature, "src/lib.rs", 1, 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+    #[test]
     fn range_logs_list_what_head_adds_to_base() {
         let f = fixture();
         let p = f.path();
@@ -788,6 +890,127 @@ mod tests {
         assert_eq!(
             tags[0].commit_id, main,
             "an annotated tag leads to its commit"
+        );
+    }
+    #[test]
+    fn path_exists_covers_submodules() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        git(p, &["init", "-q", "-b", "main", "."], None);
+        std::fs::write(p.join("README.md"), "# Demo\n").unwrap();
+        git(p, &["add", "-A"], None);
+        git(
+            p,
+            &["commit", "-q", "-m", "first"],
+            Some("2024-01-01T00:00:00Z"),
+        );
+        let head = String::from_utf8(
+            Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(p)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_owned();
+        git(
+            p,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{head},sub"),
+            ],
+            None,
+        );
+        git(
+            p,
+            &["commit", "-q", "-m", "add submodule"],
+            Some("2024-01-02T00:00:00Z"),
+        );
+        let main = resolve(p, "main").unwrap().unwrap().commit_id;
+        assert!(path_exists(p, &main, "sub").unwrap());
+        assert!(path_exists(p, &main, "README.md").unwrap());
+        assert!(!path_exists(p, &main, "missing").unwrap());
+        assert!(!path_exists(p, &main, "").unwrap());
+        assert!(blob_ref(p, &main, "sub").unwrap().is_none());
+        assert!(tree(p, &main, "sub").unwrap().is_none());
+    }
+    #[test]
+    fn path_history_does_not_follow_renames() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        git(p, &["init", "-q", "-b", "main", "."], None);
+        std::fs::write(p.join("old.txt"), "one\n").unwrap();
+        git(p, &["add", "-A"], None);
+        git(
+            p,
+            &["commit", "-q", "-m", "first"],
+            Some("2024-01-01T00:00:00Z"),
+        );
+        git(p, &["mv", "old.txt", "new.txt"], None);
+        git(
+            p,
+            &["commit", "-q", "-m", "rename"],
+            Some("2024-01-02T00:00:00Z"),
+        );
+        let main = resolve(p, "main").unwrap().unwrap().commit_id;
+        let summaries =
+            |commits: Vec<CommitInfo>| commits.into_iter().map(|c| c.summary).collect::<Vec<_>>();
+        assert_eq!(
+            summaries(log_path(p, &main, "new.txt", 0, 10).unwrap()),
+            vec!["rename"]
+        );
+        // The old side of the rename is a deletion at that path, so it is
+        // listed exactly like `git log -- old.txt` would list it.
+        assert_eq!(
+            summaries(log_path(p, &main, "old.txt", 0, 10).unwrap()),
+            vec!["rename", "first"]
+        );
+    }
+    #[test]
+    fn path_history_lists_merge_commit_once_via_first_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        git(p, &["init", "-q", "-b", "main", "."], None);
+        std::fs::write(p.join("f.txt"), "base\n").unwrap();
+        git(p, &["add", "-A"], None);
+        git(
+            p,
+            &["commit", "-q", "-m", "base"],
+            Some("2024-01-01T00:00:00Z"),
+        );
+        git(p, &["checkout", "-q", "-b", "side"], None);
+        std::fs::write(p.join("f.txt"), "side\n").unwrap();
+        git(p, &["add", "-A"], None);
+        git(
+            p,
+            &["commit", "-q", "-m", "side"],
+            Some("2024-01-02T00:00:00Z"),
+        );
+        git(p, &["checkout", "-q", "main"], None);
+        std::fs::write(p.join("g.txt"), "main\n").unwrap();
+        git(p, &["add", "-A"], None);
+        git(
+            p,
+            &["commit", "-q", "-m", "main work"],
+            Some("2024-01-03T00:00:00Z"),
+        );
+        git(
+            p,
+            &["merge", "-q", "--no-ff", "side", "-m", "merge side"],
+            Some("2024-01-04T00:00:00Z"),
+        );
+        let main = resolve(p, "main").unwrap().unwrap().commit_id;
+        let commits = log_path(p, &main, "f.txt", 0, 10).unwrap();
+        let summaries: Vec<&str> = commits.iter().map(|c| c.summary.as_str()).collect();
+        assert_eq!(summaries, vec!["merge side", "side", "base"]);
+        assert_eq!(
+            summaries.iter().filter(|s| **s == "merge side").count(),
+            1,
+            "the merge commit is listed once"
         );
     }
 }

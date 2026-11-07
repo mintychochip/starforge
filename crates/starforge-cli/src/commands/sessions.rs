@@ -57,6 +57,8 @@ struct SessionRow {
     events: u64,
     segments: u64,
     uploaded: u64,
+    /// Local blobs pruned (`spool prune`): the transcript lives on the server.
+    pruned: bool,
 }
 
 fn agent_name(name: &starforge_format::AgentName) -> &'static str {
@@ -104,6 +106,7 @@ fn row_for(spool: &Spool, ulid: &str) -> Option<SessionRow> {
         events,
         segments,
         uploaded,
+        pruned: spool.is_pruned(ulid),
     })
 }
 
@@ -145,7 +148,16 @@ pub fn list(repo: &Path, dry_run: bool) -> (String, u8) {
         match row_for(&spool, ulid) {
             Some(row) => out.push_str(&format!(
                 "\n{} {} {} {} {} {}",
-                row.ulid, row.agent, row.title, row.events, row.segments, row.uploaded
+                row.ulid,
+                row.agent,
+                row.title,
+                row.events,
+                if row.pruned {
+                    "pruned".to_string()
+                } else {
+                    row.segments.to_string()
+                },
+                row.uploaded
             )),
             None => out.push_str(&format!("\n{ulid} ? ? 0 0 0")),
         }
@@ -186,6 +198,11 @@ pub fn show(repo: &Path, ulid_prefix: &str, dry_run: bool) -> (String, u8) {
         "\nlinks: {}",
         serde_json::to_string(&links).expect("links serialize")
     ));
+    if spool.is_pruned(&ulid) {
+        out.push_str(
+            "\ncontent: pruned locally; the transcript lives on the server (view it at the session URL)",
+        );
+    }
     (out, 0)
 }
 
@@ -263,44 +280,274 @@ pub fn link(repo: &Path, ulid_prefix: &str, commit: Option<&str>, dry_run: bool)
             0,
         );
     }
-    let (seq_start, seq_end) = session_seq_range(&spool, &ulid);
-    if let Err(err) = spool.record_link(&LinkEntry {
-        ulid: ulid.clone(),
-        commit: commit.clone(),
-        source: LinkSource::CliClaim,
-        confidence: LinkConfidence::Exact,
-        seq_start,
-        seq_end,
-    }) {
-        return (format!("error: cannot record link: {err}"), 1);
+    if let Err(err) = record_claim(&spool, &ulid, &commit) {
+        return (format!("error: {err}"), 1);
     }
-    if let Err(err) = enqueue(
-        &spool,
+    (format!("linked {ulid} to {commit}"), 0)
+}
+
+/// Record one (`cli_claim`/`exact`) link for an already-resolved `ulid`:
+/// a `links.jsonl` entry, a `Links` queue entry, and the link watermark.
+/// Shared by `sessions link` and `sessions backfill-links` so both claim
+/// through the identical path.
+fn record_claim(spool: &Spool, ulid: &str, commit: &str) -> Result<(), String> {
+    let (seq_start, seq_end) = session_seq_range(spool, ulid);
+    spool
+        .record_link(&LinkEntry {
+            ulid: ulid.to_string(),
+            commit: commit.to_string(),
+            source: LinkSource::CliClaim,
+            confidence: LinkConfidence::Exact,
+            seq_start,
+            seq_end,
+        })
+        .map_err(|err| format!("cannot record link: {err}"))?;
+    enqueue(
+        spool,
         QueueEntry {
             op: QueueOp::Links,
-            ulid: ulid.clone(),
+            ulid: ulid.to_string(),
             repo: String::new(),
             segment: None,
             attempts: 0,
             not_before: "1970-01-01T00:00:00Z".to_string(),
         },
-    ) {
-        return (format!("error: cannot enqueue links upload: {err}"), 1);
-    }
+    )
+    .map_err(|err| format!("cannot enqueue links upload: {err}"))?;
     let now = time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_default();
-    if let Err(err) = spool.write_link_watermark(
-        &ulid,
-        &crate::spool::LinkWatermark {
-            last_linked_seq: seq_end,
-            last_linked_at: now,
-        },
-    ) {
-        return (format!("error: cannot write link watermark: {err}"), 1);
-    }
+    spool
+        .write_link_watermark(
+            ulid,
+            &crate::spool::LinkWatermark {
+                last_linked_seq: seq_end,
+                last_linked_at: now,
+            },
+        )
+        .map_err(|err| format!("cannot write link watermark: {err}"))?;
     tracing::debug!("sessions link: {ulid} -> {commit} (seq {seq_start}..{seq_end})");
-    (format!("linked {ulid} to {commit}"), 0)
+    Ok(())
+}
+
+/// Grace period after a session's last activity during which a commit
+/// touching one of its files still counts as its work.
+const BACKFILL_GRACE_SECS: i64 = 30 * 60;
+
+/// Parse an RFC 3339 timestamp to unix seconds; `None` if unparseable.
+fn ts_unix(ts: &str) -> Option<i64> {
+    time::OffsetDateTime::parse(ts, &time::format_description::well_known::Rfc3339)
+        .ok()
+        .map(|t| t.unix_timestamp())
+}
+
+/// Parse `--since <YYYY-MM-DD>` to the unix seconds of that day's UTC
+/// midnight; `None` if the value is not a valid calendar date.
+fn since_unix(date: &str) -> Option<i64> {
+    ts_unix(&format!("{date}T00:00:00Z"))
+}
+
+/// Normalize one recorded `files_touched` path to a repo-relative path: an
+/// absolute path is stripped of the longest matching worktree root (the
+/// working-tree root, or any linked-worktree root); relative paths stay
+/// as-is. Returns `None` for absolute paths outside every root and for
+/// empty paths.
+fn normalize_touch(path: &str, roots: &[std::path::PathBuf]) -> Option<String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let p = std::path::Path::new(trimmed);
+    if p.is_absolute() {
+        let (_, rel) = roots
+            .iter()
+            .filter_map(|root| p.strip_prefix(root).ok().map(|rel| (root, rel)))
+            .max_by_key(|(root, _)| root.components().count())?;
+        let rel = rel.to_string_lossy().replace('\\', "/");
+        if rel.is_empty() {
+            return None;
+        }
+        Some(rel.trim_start_matches('/').to_string())
+    } else {
+        Some(
+            trimmed
+                .replace('\\', "/")
+                .trim_start_matches("./")
+                .to_string(),
+        )
+    }
+}
+
+/// Every spooled session ULID in sorted order (invalid names skipped).
+fn spooled_ulids(spool: &Spool) -> Vec<String> {
+    let mut ulids = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(spool.root.join("sessions")) {
+        for entry in entries.flatten() {
+            if entry.path().is_dir()
+                && entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.parse::<ulid::Ulid>().is_ok())
+            {
+                ulids.push(entry.file_name().to_string_lossy().into_owned());
+            }
+        }
+    }
+    ulids.sort();
+    ulids
+}
+
+fn activity_window(
+    meta: &starforge_format::SessionMeta,
+    last_event: Option<i64>,
+) -> Option<(i64, i64)> {
+    let start = ts_unix(&meta.started_at)?;
+    let last = meta
+        .ended_at
+        .as_deref()
+        .and_then(ts_unix)
+        .or(last_event)
+        .unwrap_or(start);
+    Some((start, last))
+}
+
+/// Backfill commit links for historical sessions that carry none: for every
+/// spooled session with non-empty `files_touched`, link every commit
+/// reachable from `HEAD` whose committer time falls inside
+/// `[started_at, last_activity + 30 minutes]` AND whose changed paths
+/// include a normalized `files_touched` path. `last_activity` is `ended_at`,
+/// else the cursor `last_event_at`, else `started_at`. `--since <YYYY-MM-DD>`
+/// considers only commits on or after that day's UTC midnight. Pairs
+/// already linked locally are skipped, so a second run records nothing new.
+///
+/// `--dry-run` prints `ulid  sha  matched-path` lines plus the count and
+/// writes nothing; a real run records each pair via [`record_claim`] (the
+/// same claim path as `sessions link`, so the next `sync` uploads it) and
+/// prints the count.
+pub fn backfill_links(repo: &Path, since: Option<&str>, dry_run: bool) -> (String, u8) {
+    let common = match common_dir(repo) {
+        Ok(common) => common,
+        Err(err) => return (format!("error: {err}"), 1),
+    };
+    let spool = Spool::open(&common);
+    let since = match since {
+        None => None,
+        Some(date) => match since_unix(date) {
+            Some(unix) => Some(unix),
+            None => {
+                return (
+                    format!("error: invalid --since date `{date}` (want YYYY-MM-DD)"),
+                    1,
+                );
+            }
+        },
+    };
+    let roots = match repo_roots(repo) {
+        Ok(roots) => roots,
+        Err(err) => return (format!("error: {err}"), 1),
+    };
+    let commits = match crate::git::commit_log(repo) {
+        Ok(commits) => commits,
+        Err(err) => return (format!("error: {err}"), 1),
+    };
+    let commits: Vec<crate::git::CommitRecord> = commits
+        .into_iter()
+        .filter(|c| since.is_none_or(|since| c.time >= since))
+        .collect();
+    let linked: std::collections::HashSet<(String, String)> = match spool.links() {
+        Ok(all) => all.into_iter().map(|l| (l.ulid, l.commit)).collect(),
+        Err(err) => return (format!("error: {err}"), 1),
+    };
+    // Newest cursor last_event_at per session ULID.
+    let last_event: std::collections::HashMap<String, i64> = match spool.cursor_records() {
+        Ok(records) => records
+            .values()
+            .filter_map(|rec| {
+                rec.last_event_at
+                    .as_deref()
+                    .and_then(ts_unix)
+                    .map(|unix| (rec.ulid.clone(), unix))
+            })
+            .fold(std::collections::HashMap::new(), |mut map, (ulid, unix)| {
+                map.entry(ulid)
+                    .and_modify(|cur| *cur = (*cur).max(unix))
+                    .or_insert(unix);
+                map
+            }),
+        Err(_) => std::collections::HashMap::new(),
+    };
+    // (ulid, sha, matched-path) for every new matching pair.
+    let mut pairs: Vec<(String, String, String)> = Vec::new();
+    for ulid in spooled_ulids(&spool) {
+        let meta = match spool.read_meta(&ulid) {
+            Ok(meta) => meta,
+            Err(_) => continue,
+        };
+        if meta.files_touched.is_empty() {
+            continue;
+        }
+        let Some((start, last)) = activity_window(&meta, last_event.get(&ulid).copied()) else {
+            continue;
+        };
+        let touches: std::collections::HashSet<String> = meta
+            .files_touched
+            .iter()
+            .filter_map(|p| normalize_touch(p, &roots))
+            .collect();
+        if touches.is_empty() {
+            continue;
+        }
+        for commit in &commits {
+            if commit.time < start || commit.time > last + BACKFILL_GRACE_SECS {
+                continue;
+            }
+            if linked.contains(&(ulid.clone(), commit.sha.clone())) {
+                continue;
+            }
+            if let Some(matched) = commit.files.iter().filter(|f| touches.contains(*f)).min() {
+                pairs.push((ulid.clone(), commit.sha.clone(), matched.clone()));
+            }
+        }
+    }
+    pairs.sort();
+    pairs.dedup();
+    if dry_run {
+        let mut out: Vec<String> = pairs
+            .iter()
+            .map(|(ulid, sha, path)| format!("{ulid}  {sha}  {path}"))
+            .collect();
+        out.push(format!("would link {} pair(s)", pairs.len()));
+        (out.join("\n"), 0)
+    } else {
+        for (ulid, sha, _) in &pairs {
+            if let Err(err) = record_claim(&spool, ulid, sha) {
+                return (format!("error: {err}"), 1);
+            }
+        }
+        (format!("linked {} pair(s)", pairs.len()), 0)
+    }
+}
+
+/// Every working-tree root stripped from absolute `files_touched` paths:
+/// the `repo` root plus every root from `git worktree list`.
+fn repo_roots(repo: &Path) -> Result<Vec<std::path::PathBuf>, String> {
+    use std::collections::BTreeSet;
+    let mut set = BTreeSet::new();
+    match crate::git::toplevel(repo) {
+        Ok(top) => {
+            set.insert(top);
+        }
+        Err(err) => return Err(err.to_string()),
+    }
+    match crate::git::worktrees(repo) {
+        Ok(list) => {
+            for root in list {
+                set.insert(root);
+            }
+        }
+        Err(err) => return Err(err.to_string()),
+    }
+    Ok(set.into_iter().collect())
 }
 
 /// Remove `links.jsonl` lines matching (`ulid`, `commit`), rewriting the file

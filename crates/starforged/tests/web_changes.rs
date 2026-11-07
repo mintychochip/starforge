@@ -241,6 +241,8 @@ async fn change_page_renders_revision_diff_and_mergeability() {
         page.contains(r#"name="method""#),
         "merge method select:\n{page}"
     );
+    assert!(page.contains("for/feat"), "pinned web topic:\n{page}");
+    assert!(!page.contains("← ?"), "unpinned topic marker:\n{page}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

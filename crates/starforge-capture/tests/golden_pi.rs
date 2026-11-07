@@ -437,3 +437,37 @@ fn pi_empty_placeholder_title_yields_no_title() {
         "session_init must emit no event"
     );
 }
+
+/// omp `edit` calls usually carry no `path`: the edited files appear as
+/// `[PATH#TAG]` hashline headers in `input` (absolute and relative); `write`
+/// carries `path` directly. Absolute paths inside the workdir become
+/// repo-relative; absolute paths outside it stay absolute; relative paths
+/// stay as-is. `read`/`grep`/`glob`/`bash` never count.
+#[test]
+fn pi_edit_input_headers_and_write_paths_populate_files_touched() {
+    let (_tmp, roots, native) = setup_pi("0.5.2");
+    let transcript = concat!(
+        "{\"type\":\"session\",\"version\":3,\"id\":\"files-1\",\"timestamp\":\"2026-11-04T12:00:00.000Z\",\"cwd\":\"/repo\",\"runtime\":{\"version\":\"0.5.2\"}}\n",
+        "{\"type\":\"message\",\"id\":\"m1\",\"parentId\":null,\"timestamp\":\"2026-11-04T12:00:01.000Z\",\"runtime\":{\"version\":\"0.5.2\"},\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"edit things\"}]}}\n",
+        "{\"type\":\"message\",\"id\":\"m2\",\"parentId\":null,\"timestamp\":\"2026-11-04T12:00:02.000Z\",\"runtime\":{\"version\":\"0.5.2\"},\"message\":{\"role\":\"assistant\",\"model\":\"pi-medium\",\"usage\":{\"input\":1,\"output\":1},\"content\":[{\"type\":\"toolCall\",\"id\":\"tool-1\",\"name\":\"edit\",\"arguments\":{\"i\":1,\"input\":\"[/repo/src/a.rs#1A2B]\\n- old\\n+ new\\n[crates/x/src/lib.rs#BE01]\\n- old\\n+ new\"}}]}}\n",
+        "{\"type\":\"message\",\"id\":\"m3\",\"parentId\":null,\"timestamp\":\"2026-11-04T12:00:03.000Z\",\"runtime\":{\"version\":\"0.5.2\"},\"message\":{\"role\":\"assistant\",\"model\":\"pi-medium\",\"usage\":{\"input\":1,\"output\":1},\"content\":[{\"type\":\"toolCall\",\"id\":\"tool-2\",\"name\":\"write\",\"arguments\":{\"i\":1,\"path\":\"/repo/src/b.rs\",\"content\":\"hi\"}}]}}\n",
+        "{\"type\":\"message\",\"id\":\"m4\",\"parentId\":null,\"timestamp\":\"2026-11-04T12:00:04.000Z\",\"runtime\":{\"version\":\"0.5.2\"},\"message\":{\"role\":\"assistant\",\"model\":\"pi-medium\",\"usage\":{\"input\":1,\"output\":1},\"content\":[{\"type\":\"toolCall\",\"id\":\"tool-3\",\"name\":\"Write\",\"arguments\":{\"path\":\"/other/outside.rs\",\"content\":\"hi\"}}]}}\n",
+        "{\"type\":\"message\",\"id\":\"m5\",\"parentId\":null,\"timestamp\":\"2026-11-04T12:00:05.000Z\",\"runtime\":{\"version\":\"0.5.2\"},\"message\":{\"role\":\"assistant\",\"model\":\"pi-medium\",\"usage\":{\"input\":1,\"output\":1},\"content\":[{\"type\":\"toolCall\",\"id\":\"tool-4\",\"name\":\"Read\",\"arguments\":{\"file_path\":\"/repo/src/ignored.rs\"}}]}}\n",
+    );
+    std::fs::write(&native, transcript).unwrap();
+    let a = PiAdapter;
+    let found = a.discover(&roots, &HashMap::new());
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].parent_session_key, None);
+    let out = a.read(&found[0], &Cursor::start(), FALLBACK_TS).unwrap();
+    assert_eq!(
+        out.header.files_touched,
+        vec![
+            "src/a.rs".to_string(),
+            "crates/x/src/lib.rs".to_string(),
+            "src/b.rs".to_string(),
+            "/other/outside.rs".to_string(),
+        ],
+        "edit headers (absolute→relative, relative as-is), write.path, and outside-absolute",
+    );
+}

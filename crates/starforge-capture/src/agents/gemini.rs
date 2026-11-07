@@ -478,6 +478,7 @@ impl Adapter for GeminiAdapter {
                         native_path,
                         agent_version: version.unwrap_or_default(),
                         workdir,
+                        parent_session_key: None,
                     });
                 }
             }

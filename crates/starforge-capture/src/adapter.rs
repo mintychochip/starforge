@@ -26,6 +26,8 @@ pub struct Candidate {
     pub agent_version: String,
     /// Session working directory (prefix-matched against `Roots.worktree`).
     pub workdir: PathBuf,
+    /// Native session key of the parent session, when natively nested.
+    pub parent_session_key: Option<String>,
 }
 
 /// What `read` returns: new events plus the advanced cursor plus the header.

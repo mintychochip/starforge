@@ -172,6 +172,7 @@ async fn branch_change_create_list_close_reopen() {
     assert_eq!(created["trail"], n);
     assert_eq!(created["kind"], "branch");
     assert_eq!(created["head_branch"], "feature/x");
+    assert!(created["topic"].is_null(), "{created}");
     assert_eq!(created["base_branch"], "main");
     assert_eq!(created["current_revision"], 1);
     assert_eq!(created["state"], "open");
@@ -1620,6 +1621,11 @@ async fn changes_lookup_by_head_sha() {
     assert_eq!(found.len(), 1, "{body}");
     assert_eq!(found[0]["trail"], trail.number, "{body}");
     assert_eq!(found[0]["k"], 1, "{body}");
+    // The `refs/for/main` push named no topic, so the pusher's handle is the
+    // source: `head_branch` stays null and `topic` carries it.
+    assert_eq!(found[0]["kind"], "agit", "{body}");
+    assert!(found[0]["head_branch"].is_null(), "{body}");
+    assert_eq!(found[0]["topic"], "alice", "{body}");
 
     // An unknown SHA gives an empty list.
     let res = client

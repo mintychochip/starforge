@@ -124,6 +124,22 @@ impl Core {
         blocking(move || read::log(&repo, &commit_id, skip, limit)).await
     }
 
+    /// Up to `limit` commits reachable from `commit_id` that touched `path`,
+    /// newest first, after skipping `skip` matches; renames are not followed.
+    pub async fn log_path(
+        &self,
+        access: &RepoAccess,
+        commit_id: &str,
+        path: &str,
+        skip: usize,
+        limit: usize,
+    ) -> CoreResult<Vec<CommitInfo>> {
+        let repo = self.repo_path(access.repo.id);
+        let commit_id = commit_id.to_owned();
+        let path = path.to_owned();
+        blocking(move || read::log_path(&repo, &commit_id, &path, skip, limit)).await
+    }
+
     pub async fn commit(&self, access: &RepoAccess, id: &str) -> CoreResult<CommitInfo> {
         let repo = self.repo_path(access.repo.id);
         let id = id.to_owned();

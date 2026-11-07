@@ -434,6 +434,8 @@ pub struct TrailChangeItem {
     k: i64,
     kind: String,
     head_branch: Option<String>,
+    /// The `refs/for` push topic for `agit` changes; `None` otherwise.
+    topic: Option<String>,
     base_branch: String,
     current_revision: i64,
     state: String,
@@ -487,6 +489,8 @@ pub struct ChangeListItem {
     k: i64,
     kind: String,
     head_branch: Option<String>,
+    /// The `refs/for` push topic for `agit` changes; `None` otherwise.
+    topic: Option<String>,
     base_branch: String,
     current_revision: i64,
     state: String,
@@ -624,6 +628,7 @@ pub(crate) async fn header_data(
                 k: c.k,
                 kind: c.kind,
                 head_branch: c.head_branch,
+                topic: c.topic,
                 base_branch: c.base_branch,
                 current_revision: c.current_revision,
                 state: c.state,
@@ -896,6 +901,7 @@ pub(crate) async fn changes_view(
             k: c.k,
             kind: c.kind,
             head_branch: c.head_branch,
+            topic: c.topic,
             base_branch: c.base_branch,
             current_revision: c.current_revision,
             state: c.state,

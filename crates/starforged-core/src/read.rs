@@ -179,6 +179,27 @@ pub struct SessionSummary {
     pub started_at: i64,
 }
 
+/// Narrowing for one repository sessions list page. Only rows the viewer
+/// may read under §6.4 are ever considered, so filters never reveal
+/// unreadable sessions.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RepoSessionFilter {
+    /// Keep only top-level sessions (no readable parent in this repo).
+    pub top_level_only: bool,
+    /// Exact `agent_name` match, when set.
+    pub agent: Option<String>,
+    /// Exact `lifecycle` match (`receiving` or `complete`), when set.
+    pub state: Option<String>,
+}
+
+/// One row of the repository sessions list: the readable session plus how
+/// many readable direct subagent sessions name it as `parent_ulid`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoSessionItem {
+    pub session: SessionRow,
+    pub subagent_count: usize,
+}
+
 /// Dashboard candidate cap (D8): Core filters these through the §6.4 read
 /// check for the viewer, then truncates.
 const DASHBOARD_SESSION_CANDIDATES: i64 = 100;
@@ -466,6 +487,191 @@ impl Core {
             }
         }
         Ok((out, truncated))
+    }
+
+    /// Sessions of `access.repo` readable by `viewer`, newest first by
+    /// `started_at`, narrowed by a [`RepoSessionFilter`] and paged
+    /// (`page` is 1-based; `per_page` rows).
+    ///
+    /// Returns the page plus the total filtered count. Readability is the
+    /// same per-row [`Core::authorize_session_read`] check as
+    /// [`Core::list_readable_sessions`]; only the in-memory ordering,
+    /// filtering, child counts, and slicing are new here.
+    /// Sessions of `access.repo` readable by `viewer`, newest first by
+    /// `started_at`, narrowed by a [`RepoSessionFilter`] and paged
+    /// (`page` is 1-based; `per_page` rows).
+    ///
+    /// Returns the page plus the total filtered count. Readability is the
+    /// same per-row [`Core::authorize_session_read`] check as
+    /// [`Core::list_readable_sessions`]; only the in-memory ordering,
+    /// filtering, child counts, and slicing are new here.
+    pub async fn list_repo_sessions_page(
+        &self,
+        viewer: Option<&User>,
+        access: &RepoAccess,
+        filter: &RepoSessionFilter,
+        page: i64,
+        per_page: usize,
+    ) -> CoreResult<(Vec<RepoSessionItem>, i64)> {
+        self.list_repo_sessions_page_capped(
+            viewer,
+            access,
+            filter,
+            page,
+            per_page,
+            READABLE_SESSION_LIST_LIMIT,
+        )
+        .await
+    }
+
+    /// [`Core::list_repo_sessions_page`] with an explicit candidate cap.
+    /// Candidates are the newest sessions first (see
+    /// [`db_sessions::sessions_of_repo_newest`]), so a repository past the
+    /// cap still shows its newest *readable* sessions instead of letting
+    /// old unreadable rows crowd them out. `total` counts the filtered
+    /// matches within the cap.
+    pub async fn list_repo_sessions_page_capped(
+        &self,
+        viewer: Option<&User>,
+        access: &RepoAccess,
+        filter: &RepoSessionFilter,
+        page: i64,
+        per_page: usize,
+        cap: i64,
+    ) -> CoreResult<(Vec<RepoSessionItem>, i64)> {
+        let candidates =
+            db_sessions::sessions_of_repo_newest(self.db(), access.repo.id, cap.saturating_add(1))
+                .await?;
+        let mut readable = Vec::with_capacity(candidates.len());
+        for row in candidates {
+            if self
+                .authorize_session_read(viewer, &access.repo, &row)
+                .await
+                .is_ok()
+            {
+                readable.push(row);
+            }
+        }
+        let readable_ulids: std::collections::HashSet<&str> =
+            readable.iter().map(|row| row.ulid.as_str()).collect();
+        let mut child_counts: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        for row in &readable {
+            if let Some(parent) = row.parent_ulid.as_deref() {
+                *child_counts.entry(parent).or_insert(0) += 1;
+            }
+        }
+        let mut filtered: Vec<&SessionRow> = readable
+            .iter()
+            .filter(|row| {
+                if filter.top_level_only
+                    && let Some(parent) = row.parent_ulid.as_deref()
+                    && readable_ulids.contains(parent)
+                {
+                    return false;
+                }
+                if let Some(agent) = &filter.agent
+                    && row.agent_name != *agent
+                {
+                    return false;
+                }
+                if let Some(state) = &filter.state
+                    && row.lifecycle != *state
+                {
+                    return false;
+                }
+                true
+            })
+            .collect();
+        filtered.sort_by(|a, b| {
+            b.started_at
+                .cmp(&a.started_at)
+                .then_with(|| b.id.cmp(&a.id))
+        });
+        let total = filtered.len() as i64;
+        let page = page.max(1);
+        let start = (page - 1).saturating_mul(per_page as i64) as usize;
+        let items: Vec<RepoSessionItem> = if start >= filtered.len() {
+            Vec::new()
+        } else {
+            let end = (start + per_page).min(filtered.len());
+            filtered[start..end]
+                .iter()
+                .map(|row| RepoSessionItem {
+                    subagent_count: child_counts.get(row.ulid.as_str()).copied().unwrap_or(0),
+                    session: (*row).clone(),
+                })
+                .collect()
+        };
+        Ok((items, total))
+    }
+
+    /// Whether `path` exists in `commit_id` (blob, tree, or submodule
+    /// gitlink). Submodules are neither blobs nor trees, so the
+    /// history page gates on this instead of `blob`/`tree`.
+    pub async fn path_exists(
+        &self,
+        access: &RepoAccess,
+        commit_id: &str,
+        path: &str,
+    ) -> CoreResult<bool> {
+        let repo = self.repo_path(access.repo.id);
+        let (commit_id, path) = (commit_id.to_owned(), path.to_owned());
+        tokio::task::spawn_blocking(move || {
+            starforged_git::read::path_exists(&repo, &commit_id, &path)
+        })
+        .await
+        .map_err(|e| CoreError::Internal(e.to_string()))?
+        .map_err(CoreError::from)
+    }
+
+    /// The readable parent of `session`, if it names one (`parent_ulid`)
+    /// that `viewer` may read in `access.repo`. A missing, cross-repo, or
+    /// unreadable parent is `None`, never an error.
+    pub async fn readable_parent_session(
+        &self,
+        viewer: Option<&User>,
+        access: &RepoAccess,
+        session: &SessionRow,
+    ) -> CoreResult<Option<SessionRow>> {
+        let Some(parent_ulid) = session.parent_ulid.as_deref() else {
+            return Ok(None);
+        };
+        let Some(parent) =
+            db_sessions::session_by_ulid(self.db(), access.repo.id, parent_ulid).await?
+        else {
+            return Ok(None);
+        };
+        if self
+            .authorize_session_read(viewer, &access.repo, &parent)
+            .await
+            .is_err()
+        {
+            return Ok(None);
+        }
+        Ok(Some(parent))
+    }
+
+    /// Direct subagent sessions of `ulid` in `access.repo` that `viewer`
+    /// may read, oldest first by `started_at`.
+    pub async fn readable_child_sessions(
+        &self,
+        viewer: Option<&User>,
+        access: &RepoAccess,
+        ulid: &str,
+    ) -> CoreResult<Vec<SessionRow>> {
+        let candidates = db_sessions::sessions_by_parent(self.db(), access.repo.id, ulid).await?;
+        let mut out = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            if self
+                .authorize_session_read(viewer, &access.repo, &candidate)
+                .await
+                .is_ok()
+            {
+                out.push(candidate);
+            }
+        }
+        Ok(out)
     }
 
     /// The exact stored bytes of segment `n` of `session_id` (the compressed

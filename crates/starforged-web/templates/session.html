@@ -4,6 +4,7 @@
 {% include "repo_head.html" %}
 <h2>Session <code>{{ ulid }}</code></h2>
 {% if !title.is_empty() %}<p>{{ title }}</p>{% endif %}
+{% if let Some(p) = parent %}<p><a href="/{{ head.owner }}/{{ head.name }}/sessions/{{ p.ulid }}">Subagent of {{ p.title }}</a></p>{% endif %}
 {% if quarantined %}
 <div class="notice">
   <strong>quarantined for review:</strong> {{ quarantine_reason }} · {{ quarantine_detail }}
@@ -59,6 +60,16 @@
   <dt>Capture mode</dt><dd>{{ capture_mode }}</dd>
   <dt>Visibility</dt><dd>{{ visibility }}</dd>
 </dl>
+{% if !children.is_empty() %}
+<section class="subagents" aria-label="Subagent sessions">
+<h3>Subagent sessions ({{ children.len() }})</h3>
+<ul>
+{% for c in children %}
+<li><a href="/{{ head.owner }}/{{ head.name }}/sessions/{{ c.ulid }}">{{ c.title }}</a> <span class="muted">{{ c.agent_name }}</span> <span class="badge">{{ c.lifecycle }}</span></li>
+{% endfor %}
+</ul>
+</section>
+{% endif %}
 <form method="get" class="session-search">
   <label>Search in session <input type="search" name="q" value="{{ q }}"></label>
   <button type="submit">Search</button>

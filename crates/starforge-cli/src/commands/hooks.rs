@@ -4,16 +4,18 @@
 //! and prints every file it changes, one path per line. `disable` removes
 //! only marker-bearing dispatchers and restores `.starforge-orig` backups.
 //!
-//! Agent adapter hooks (C7): `enable` also calls every `starforge_capture`
-//! adapter's `install_hooks` (and `disable` their `remove_hooks`), printing
-//! every touched path. Per-agent [`Roots`](starforge_capture::Roots) are
-//! resolved by [`adapter_roots_for`] (base = `paths.home`; see its docs for
-//! the per-agent table and env overrides), and every adapter runs with its
-//! own roots (same `worktree` = repo root).
+//! Agent adapter hooks (C7): `enable` installs hooks only for adapters whose
+//! `detect` reports the agent present (so it never creates config for an
+//! agent that is not installed), and prints configured/skipped agents with a
+//! hint to re-run `enable` after installing an agent. `disable` runs every
+//! adapter's `remove_hooks` unconditionally, printing every touched path.
+//! Per-agent [`Roots`](starforge_capture::Roots) are resolved by
+//! [`adapter_roots_for`] (base = `paths.home`; see its docs for the per-agent
+//! table and env overrides), and every adapter runs with its own roots (same
+//! `worktree` = repo root).
 //!
-//! A non-existent agent store is not an error: adapters decide via `detect`
-//! what to do, and the no-hook-surface adapters (codex, gemini, opencode)
-//! report no paths in either direction.
+//! A non-existent agent store is not an error: the no-hook-surface adapters
+//! (codex, gemini, opencode) report no paths in either direction.
 //!
 //! The `prepare-commit-msg` handler appends one `Starforge-Session: <ULID>`
 //! trailer per linked session (never rewriting existing trailers) and
@@ -246,6 +248,7 @@ fn all_adapters() -> Vec<Box<dyn DynAdapter>> {
 /// hook wiring (discovery/reading stay on the concrete types).
 trait DynAdapter {
     fn id(&self) -> &'static str;
+    fn detect(&self, roots: &starforge_capture::Roots) -> bool;
     fn install_hooks(&self, roots: &starforge_capture::Roots) -> std::io::Result<Vec<PathBuf>>;
     fn remove_hooks(&self, roots: &starforge_capture::Roots) -> std::io::Result<Vec<PathBuf>>;
 }
@@ -255,6 +258,9 @@ macro_rules! dyn_adapter {
         impl DynAdapter for $t {
             fn id(&self) -> &'static str {
                 $name
+            }
+            fn detect(&self, roots: &starforge_capture::Roots) -> bool {
+                <Self as starforge_capture::Adapter>::detect(self, roots)
             }
             fn install_hooks(
                 &self,
@@ -278,14 +284,37 @@ dyn_adapter!(starforge_capture::agents::PiAdapter, "pi");
 dyn_adapter!(starforge_capture::agents::OpencodeAdapter, "opencode");
 dyn_adapter!(starforge_capture::agents::GeminiAdapter, "gemini");
 
-/// Install all three dispatchers (+ spool layout) and every agent adapter's
-/// hooks. Returns the human-readable output (one changed path per line) and
-/// the exit code.
+/// Partition every capture adapter into (detected, not detected) via
+/// `detect`, so `enable` never writes config for an agent that is not
+/// installed. `disable` deliberately skips this gate (it removes hooks
+/// from any agent config that has them).
+fn partition_adapters(
+    paths: &crate::config::CliPaths,
+    repo: &Path,
+) -> (Vec<Box<dyn DynAdapter>>, Vec<String>) {
+    let mut detected = Vec::new();
+    let mut skipped = Vec::new();
+    for adapter in all_adapters() {
+        let roots = adapter_roots_for(adapter.id(), paths, repo);
+        if adapter.detect(&roots) {
+            detected.push(adapter);
+        } else {
+            skipped.push(adapter.id().to_string());
+        }
+    }
+    (detected, skipped)
+}
+
+/// Install all three dispatchers (+ spool layout) and agent hooks only for
+/// adapters whose `detect` reports the agent present. Returns the
+/// human-readable output (one changed path per line, plus a configured /
+/// skipped agent summary) and the exit code.
 pub fn enable(repo: &Path, paths: &crate::config::CliPaths, dry_run: bool) -> (String, u8) {
     let common = match common_dir(repo) {
         Ok(common) => common,
         Err(err) => return (format!("error: {err}"), 1),
     };
+    let (detected, skipped) = partition_adapters(paths, repo);
     if dry_run {
         let mut lines = Vec::new();
         for hook in HOOKS {
@@ -294,10 +323,15 @@ pub fn enable(repo: &Path, paths: &crate::config::CliPaths, dry_run: bool) -> (S
                 common.join("hooks").join(hook).display()
             ));
         }
-        lines.push(
-            "would install agent hooks for claude-code, codex, pi, opencode, gemini under their per-agent config dirs"
-                .to_string(),
-        );
+        if detected.is_empty() {
+            lines.push("would skip agent hooks for all agents (none detected)".to_string());
+        } else {
+            let ids: Vec<&str> = detected.iter().map(|a| a.id()).collect();
+            lines.push(format!(
+                "would install agent hooks for {} under their per-agent config dirs",
+                ids.join(", ")
+            ));
+        }
         return (lines.join("\n"), 0);
     }
     let spool = Spool::open(&common);
@@ -324,7 +358,8 @@ pub fn enable(repo: &Path, paths: &crate::config::CliPaths, dry_run: bool) -> (S
             Err(err) => return (format!("error: cannot install {hook}: {err}"), 1),
         }
     }
-    for adapter in all_adapters() {
+    let configured: Vec<String> = detected.iter().map(|a| a.id().to_string()).collect();
+    for adapter in &detected {
         let roots = adapter_roots_for(adapter.id(), paths, repo);
         match adapter.install_hooks(&roots) {
             Ok(written) => {
@@ -341,6 +376,18 @@ pub fn enable(repo: &Path, paths: &crate::config::CliPaths, dry_run: bool) -> (S
                 tracing::warn!("enable: {} hooks skipped: {err}", adapter.id());
             }
         }
+    }
+    if !configured.is_empty() {
+        changed.push(format!(
+            "configured agent hooks for: {}",
+            configured.join(", ")
+        ));
+    }
+    if !skipped.is_empty() {
+        changed.push(format!(
+            "skipped agent hooks for not-detected agents: {}; re-run 'starforge enable' after installing an agent to add its hooks",
+            skipped.join(", ")
+        ));
     }
     tracing::debug!(
         "enable: {} path(s) changed in {}",

@@ -198,7 +198,7 @@ async fn stranger_sees_no_chips_but_page_renders() {
     let html = get_text(&bob, &s.url("/alice/proj/blame/file.txt?at=main")).await;
     assert!(html.contains(&sha3[..8]), "page did not render in:\n{html}");
     assert!(!html.contains(ULID_BLAME), "ULID leaked in:\n{html}");
-    assert!(!html.contains("session"), "chip leaked in:\n{html}");
+    assert!(!html.contains("session-chips"), "chip leaked in:\n{html}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

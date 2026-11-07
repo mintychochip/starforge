@@ -117,6 +117,7 @@ fn seed_session(spool: &Spool, ulid: &str, files: &[&str], extra_events: &str) {
             starforge_capture::Cursor::start(),
             "/tmp/native.jsonl",
             None,
+            None,
         )
         .unwrap();
 }
@@ -194,6 +195,97 @@ fn enable_installs_three_marked_dispatchers_and_prints_them() {
             "enable prints {hook}; got:\n{out}"
         );
     }
+}
+
+// `enable` never creates agent config for an agent that is not installed:
+// with no agent dirs present, no `.claude/settings.json` appears and the
+// output lists every agent as skipped with the re-run hint.
+#[test]
+fn enable_without_detected_agents_creates_no_agent_config() {
+    let (_dir, repo) = init_repo();
+    let (_home, paths) = test_paths();
+    let (out, code) = enable(&repo, &paths, false);
+    assert_eq!(code, 0, "{out}");
+    assert!(
+        !paths.home.join(".claude").join("settings.json").exists(),
+        "no Claude config for an undetected agent; output:\n{out}"
+    );
+    assert!(
+        out.contains("skipped agent hooks for not-detected agents: claude-code"),
+        "skipped agents are listed; output:\n{out}"
+    );
+    assert!(
+        out.contains("re-run 'starforge enable'"),
+        "re-run hint is present; output:\n{out}"
+    );
+    assert!(
+        !out.contains("configured agent hooks for:"),
+        "no agent is reported configured; output:\n{out}"
+    );
+}
+
+// With a Claude store marker present, `enable` installs the Claude hooks and
+// reports Claude as configured; the other agents stay skipped.
+#[test]
+fn enable_with_detected_claude_installs_claude_hooks() {
+    let (_dir, repo) = init_repo();
+    let (_home, paths) = test_paths();
+    std::fs::create_dir_all(paths.home.join(".claude").join("projects").join("proj")).unwrap();
+    let (out, code) = enable(&repo, &paths, false);
+    assert_eq!(code, 0, "{out}");
+    let settings = paths.home.join(".claude").join("settings.json");
+    assert!(
+        settings.is_file(),
+        "Claude hooks installed for a detected agent; output:\n{out}"
+    );
+    assert!(
+        std::fs::read_to_string(&settings)
+            .unwrap()
+            .contains("starforge"),
+        "settings.json carries the starforge hooks"
+    );
+    assert!(
+        out.contains(&settings.to_string_lossy().into_owned()),
+        "enable prints the settings path; output:\n{out}"
+    );
+    assert!(
+        out.contains("configured agent hooks for: claude-code"),
+        "Claude is reported configured; output:\n{out}"
+    );
+    assert!(
+        out.contains("skipped agent hooks for not-detected agents: codex"),
+        "undetected agents stay skipped; output:\n{out}"
+    );
+}
+
+// Dry run lists only detected agents: with none present it says so, and with
+// Claude present it names only Claude.
+#[test]
+fn enable_dry_run_lists_only_detected_agents() {
+    let (_dir, repo) = init_repo();
+    let (_home, paths) = test_paths();
+    let (out, code) = enable(&repo, &paths, true);
+    assert_eq!(code, 0, "{out}");
+    assert!(
+        out.contains("would skip agent hooks for all agents (none detected)"),
+        "dry run with no agents says so; output:\n{out}"
+    );
+    assert!(
+        !paths.home.join(".claude").exists(),
+        "dry run writes nothing"
+    );
+
+    std::fs::create_dir_all(paths.home.join(".claude").join("projects").join("proj")).unwrap();
+    let (out, code) = enable(&repo, &paths, true);
+    assert_eq!(code, 0, "{out}");
+    assert!(
+        out.contains("would install agent hooks for claude-code"),
+        "dry run names the detected agent; output:\n{out}"
+    );
+    assert!(
+        !out.contains("codex") && !out.contains("opencode") && !out.contains("gemini"),
+        "dry run lists only detected agents; output:\n{out}"
+    );
 }
 
 // (b) pre-existing hook still runs; message gains exactly one trailer (exact).
@@ -811,8 +903,11 @@ fn pre_push_dispatcher_propagates_orig_exit_status() {
 fn installed_hook_commands_parse_with_real_cli() {
     let (_dir, repo) = init_repo();
     let (_home, paths) = test_paths();
+    // `enable` only writes agent config for detected agents; give Claude a
+    // store marker (`<config>/projects/<dir>`) so its hooks are installed.
+    std::fs::create_dir_all(paths.home.join(".claude").join("projects").join("proj")).unwrap();
     let (_out, code) = enable(&repo, &paths, false);
-    assert_eq!(code, 0);
+    assert_eq!(code, 0, "{_out}");
 
     let mut commands: Vec<String> = Vec::new();
 

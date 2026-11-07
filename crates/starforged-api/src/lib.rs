@@ -109,6 +109,7 @@ pub fn router(core: Core, base_url: String) -> Router {
         )
         .route("/oauth/device/code", post(oauth::device_code))
         .route("/oauth/token", post(oauth::token))
+        .route("/oauth/revoke", post(oauth::revoke))
         .route(
             "/repos/{owner}/{repo}",
             get(repos::show).patch(repos::patch),

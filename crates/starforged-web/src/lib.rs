@@ -411,6 +411,7 @@ fn page_routes() -> Router<AppState> {
             get(pages::history::commits),
         )
         .route("/{owner}/{repo}/commit/{id}", get(pages::history::commit))
+        .route("/{owner}/{repo}/sessions", get(pages::sessions::list))
         .route("/{owner}/{repo}/sessions/{ulid}", get(pages::session::show))
         .route(
             "/{owner}/{repo}/sessions/{ulid}/download",

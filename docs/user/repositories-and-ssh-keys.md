@@ -12,8 +12,11 @@ visibility, manage collaborators, rename, archive, and delete.
   days; then a daily job removes them for good.
 
 The code views show branches, tags, comparisons between two refs (`/{owner}/{repo}/compare/{base}...{head}`), and
-syntax-highlighted files with linkable line numbers (`#L42`). After each push, a background job runs
-`git maintenance run --auto` for the repository.
+syntax-highlighted files with linkable line numbers (`#L42`). A file page's **History** link (beside Blame) and a
+directory tree's **History** link open the commits that touched that path
+(`/{owner}/{repo}/commits/{ref}/{path}`), newest first, with the same pagination as the full history; the page
+notes that renames are not followed, and a path that does not exist at the ref answers `404`. After each push, a
+background job runs `git maintenance run --auto` for the repository.
 
 Repositories are also reachable over SSH, served by an embedded server on `ssh.listen` (default `0.0.0.0:2222`, `ssh.enabled = true`). The server starts beside the HTTP listener and stops with it; `starforged init` and first start write the host key (`ssh.host_key_path`, default `<data_dir>/ssh_host_ed25519_key`) with mode `0600` when it is missing — the private key is never logged or rendered. Every knob is overridable as `STARFORGE__SSH__*`, e.g. `STARFORGE__SSH__LISTEN=127.0.0.1:2222`.
 

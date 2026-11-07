@@ -224,15 +224,49 @@ fn is_error(v: &Value) -> bool {
     v.get("isError").and_then(Value::as_bool).unwrap_or(false)
 }
 
-/// `file_path` carried by an `Edit`/`Write` tool call's arguments, if any.
-fn edit_path(tool_name: &str, input: &Value) -> Option<String> {
-    if tool_name != "Edit" && tool_name != "Write" {
-        return None;
+/// Every `[PATH#TAG]` hashline header line in `text` (TAG is 4 hex digits).
+fn hashline_paths(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if !line.starts_with('[') || !line.ends_with(']') || line.len() < 8 {
+            continue;
+        }
+        let inner = &line[1..line.len() - 1];
+        let Some(hash) = inner.rfind('#') else {
+            continue;
+        };
+        let (path, tag) = inner.split_at(hash);
+        let tag = &tag[1..];
+        if path.is_empty() || tag.len() != 4 || !tag.bytes().all(|b| b.is_ascii_hexdigit()) {
+            continue;
+        }
+        out.push(path.to_string());
     }
-    input
-        .get("file_path")
-        .and_then(Value::as_str)
-        .map(str::to_string)
+    out
+}
+
+/// Paths carried by an `edit`/`write` tool call: the direct `path` (omp)
+/// or `file_path` (Pi) argument, plus every `[PATH#TAG]` header in an
+/// `edit` call's `input` (hashline), which is how omp usually names the
+/// edited files when there is no `path` argument.
+fn tool_paths(tool_name: &str, input: &Value) -> Vec<String> {
+    let lower = tool_name.to_ascii_lowercase();
+    if lower != "edit" && lower != "write" {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for key in ["path", "file_path"] {
+        if let Some(path) = input.get(key).and_then(Value::as_str) {
+            out.push(path.to_string());
+        }
+    }
+    if lower == "edit"
+        && let Some(text) = input.get("input").and_then(Value::as_str)
+    {
+        out.extend(hashline_paths(text));
+    }
+    out
 }
 
 /// Fold one parsed record into the session header accumulator.
@@ -314,10 +348,18 @@ impl HeaderFold {
     }
 
     fn note_file(&mut self, workdir: &str, path: &str) {
-        if let Some(rel) = crate::repo_relative(std::path::Path::new(workdir), path)
-            && !self.files_touched.iter().any(|f| f == &rel)
-        {
-            self.files_touched.push(rel);
+        let path = path.trim();
+        if path.is_empty() {
+            return;
+        }
+        let stored = if std::path::Path::new(path).is_absolute() {
+            crate::repo_relative(std::path::Path::new(workdir), path)
+                .unwrap_or_else(|| path.to_string())
+        } else {
+            path.to_string()
+        };
+        if !stored.is_empty() && !self.files_touched.iter().any(|f| f == &stored) {
+            self.files_touched.push(stored);
         }
     }
 }
@@ -490,7 +532,7 @@ fn assistant_block_kinds(
             "toolCall" => {
                 let name = b.get("name").and_then(Value::as_str).unwrap_or("unknown");
                 let input = b.get("arguments").cloned().unwrap_or(Value::Null);
-                if let Some(path) = edit_path(name, &input) {
+                for path in tool_paths(name, &input) {
                     fold.note_file(workdir, &path);
                 }
                 kinds.push(EventKind::ToolCall(ToolCall {
@@ -573,13 +615,14 @@ fn is_omp_store(native_path: &std::path::Path) -> bool {
 }
 
 /// Format a raw `runtime.version` for reporting: omp-store files report
-/// `omp-<version>` (`omp-unknown` with none); Pi-store files report it as-is.
+/// `omp-<version>` (`omp-unknown` with none); Pi-store files report it as-is
+/// (`unknown` with none: Pi itself records no `runtime` in its sessions).
 fn format_version(raw: Option<&str>, is_omp: bool) -> String {
     match (raw, is_omp) {
         (Some(v), true) => format!("omp-{v}"),
         (None, true) => "omp-unknown".to_string(),
         (Some(v), false) => v.to_string(),
-        (None, false) => String::new(),
+        (None, false) => "unknown".to_string(),
     }
 }
 
@@ -639,6 +682,16 @@ impl Adapter for PiAdapter {
         let mut out = Vec::new();
         // Both stores are recursive; session keys are the path relative to
         // `data_dir` joined with `/` (stable and unique across stores).
+        let session_key_for = |path: &std::path::Path| {
+            path.strip_prefix(&roots.data_dir)
+                .map(|rel| {
+                    rel.components()
+                        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                        .collect::<Vec<_>>()
+                        .join("/")
+                })
+                .unwrap_or_default()
+        };
         for store in [".pi/agent/sessions", ".omp/agent/sessions"] {
             let dir = roots.data_dir.join(store);
             if !dir.is_dir() {
@@ -647,15 +700,25 @@ impl Adapter for PiAdapter {
             let mut files = Vec::new();
             collect_jsonl(&dir, &mut files);
             for native_path in files {
-                let session_key = native_path
-                    .strip_prefix(&roots.data_dir)
-                    .map(|rel| {
-                        rel.components()
-                            .map(|c| c.as_os_str().to_string_lossy().into_owned())
-                            .collect::<Vec<_>>()
-                            .join("/")
+                let session_key = session_key_for(&native_path);
+                // A subagent session lives inside a directory named after its
+                // parent's file stem: the parent of `<D>/<name>.jsonl` is the
+                // sibling file `<D>.jsonl`, when it exists.
+                let parent_session_key = native_path
+                    .parent()
+                    .and_then(|parent_dir| {
+                        let stem = parent_dir.file_name()?.to_string_lossy().into_owned();
+                        let parent_file = parent_dir.parent()?.join(format!("{stem}.jsonl"));
+                        // The parent file must live inside the scanned store
+                        // dir: a file directly under the store (e.g.
+                        // `<store>/x.jsonl`) must not link to a decoy
+                        // `<store>/../x.jsonl` outside it.
+                        if !parent_file.starts_with(&dir) {
+                            return None;
+                        }
+                        parent_file.is_file().then(|| session_key_for(&parent_file))
                     })
-                    .unwrap_or_default();
+                    .filter(|key| !key.is_empty() && key != &session_key);
                 let (workdir, version) = scan_identity(&native_path);
                 // Privacy rule: unknown cwd (missing/empty) is skipped,
                 // never defaulted to this worktree.
@@ -677,6 +740,7 @@ impl Adapter for PiAdapter {
                     native_path,
                     agent_version,
                     workdir,
+                    parent_session_key,
                 });
             }
         }
@@ -813,5 +877,58 @@ impl Adapter for PiAdapter {
             next,
             header,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_version_covers_both_stores_and_the_missing_version() {
+        assert_eq!(format_version(Some("1.2.3"), true), "omp-1.2.3");
+        assert_eq!(format_version(None, true), "omp-unknown");
+        assert_eq!(format_version(Some("1.2.3"), false), "1.2.3");
+        // Pi itself records no `runtime`; the session is still captured.
+        assert_eq!(format_version(None, false), "unknown");
+    }
+
+    #[test]
+    fn hashline_paths_reads_only_tagged_header_lines() {
+        let text = "[src/auth.rs#a1b2]\n-old\n+new\n[README.md#00ff]\n";
+        assert_eq!(
+            hashline_paths(text),
+            vec!["src/auth.rs".to_string(), "README.md".to_string()]
+        );
+        assert!(hashline_paths("[not a path]\n[src/x.rs#zzzz]\n[]").is_empty());
+    }
+
+    #[test]
+    fn file_directly_under_store_does_not_link_to_decoy_parent_outside() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let worktree = tmp.path().join("worktree");
+        let store = data_dir.join(".pi/agent/sessions");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::create_dir_all(&worktree).unwrap();
+        let line = format!(
+            "{{\"type\":\"session\",\"version\":3,\"id\":\"s1\",\"timestamp\":\"2026-11-04T12:00:00Z\",\"cwd\":\"{}\",\"runtime\":{{\"version\":\"0.5.2\"}}}}\n",
+            worktree.to_string_lossy()
+        );
+        // Decoy parent file OUTSIDE the store (`<store>/../sessions.jsonl`).
+        std::fs::write(data_dir.join(".pi/agent/sessions.jsonl"), &line).unwrap();
+        // A file directly under the store would derive that decoy as parent.
+        std::fs::write(store.join("x.jsonl"), &line).unwrap();
+        let roots = Roots {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: data_dir.clone(),
+            worktree: worktree.clone(),
+        };
+        let found = PiAdapter.discover(&roots, &HashMap::new());
+        assert_eq!(found.len(), 1, "one session discovered: {found:?}");
+        assert_eq!(
+            found[0].parent_session_key, None,
+            "no parent link to a file outside the store dir"
+        );
     }
 }

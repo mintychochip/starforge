@@ -292,6 +292,11 @@ pub fn logout_host(paths: &CliPaths, host: &str, dry_run: bool) -> Result<bool, 
 /// `admin`.
 pub const CLI_SCOPES: &str = "repo:read trail:write session:upload";
 
+/// The single scope `starforge auth ssh-key add` requests: `repo:write` is
+/// what `POST /api/v1/user/keys` requires. The token from this flow is used
+/// for exactly one key registration and is never stored.
+pub const SSH_KEY_SCOPE: &str = "repo:write";
+
 /// OAuth device flow against `{base_url}/api/v1/oauth/device/code` and
 /// `/api/v1/oauth/token` (RFC 8628 grant), requesting [`CLI_SCOPES`].
 ///
@@ -327,7 +332,21 @@ impl DeviceFlow {
         sleeper: &impl Sleeper,
         now: time::OffsetDateTime,
     ) -> Result<Credentials, AuthError> {
-        let device = self.request_device_code().await?;
+        self.login_with_scopes(sleeper, now, CLI_SCOPES).await
+    }
+
+    /// Run the device flow requesting an explicit `scope` (space-separated)
+    /// instead of [`CLI_SCOPES`]. Same polling contract as [`Self::login`].
+    /// Callers must not store the returned credentials unless the user
+    /// asked for a login (e.g. `auth ssh-key add` uses the token once and
+    /// discards it).
+    pub async fn login_with_scopes(
+        &self,
+        sleeper: &impl Sleeper,
+        now: time::OffsetDateTime,
+        scope: &str,
+    ) -> Result<Credentials, AuthError> {
+        let device = self.request_device_code(scope).await?;
         println!("To authorize, visit: {}", device.verification_uri);
         println!("Enter code: {}", device.user_code);
 
@@ -337,7 +356,7 @@ impl DeviceFlow {
             if elapsed >= device.expires_in {
                 return Err(AuthError::Expired);
             }
-            match self.poll_token(&device.device_code).await? {
+            match self.poll_token(&device.device_code, scope).await? {
                 PollOutcome::Success(creds, expires_in) => {
                     let expires_at = now + time::Duration::seconds(expires_in);
                     let expires_at = expires_at
@@ -364,12 +383,12 @@ impl DeviceFlow {
         }
     }
 
-    async fn request_device_code(&self) -> Result<DeviceCode, AuthError> {
+    async fn request_device_code(&self, scope: &str) -> Result<DeviceCode, AuthError> {
         let url = format!("{}/api/v1/oauth/device/code", self.base_url);
         let resp = self
             .client
             .post(&url)
-            .form(&[("client_id", "starforge-cli"), ("scope", CLI_SCOPES)])
+            .form(&[("client_id", "starforge-cli"), ("scope", scope)])
             .send()
             .await
             .map_err(|err| AuthError::Http(err.to_string()))?;
@@ -384,7 +403,11 @@ impl DeviceFlow {
         DeviceCode::parse(&body)
     }
 
-    async fn poll_token(&self, device_code: &str) -> Result<PollOutcome, AuthError> {
+    async fn poll_token(
+        &self,
+        device_code: &str,
+        expected_scope: &str,
+    ) -> Result<PollOutcome, AuthError> {
         let url = format!("{}/api/v1/oauth/token", self.base_url);
         let resp = self
             .client
@@ -402,6 +425,26 @@ impl DeviceFlow {
             .await
             .map_err(|err| AuthError::Http(err.to_string()))?;
         if let Some(access) = body.get("access_token").and_then(|v| v.as_str()) {
+            let token_type = body
+                .get("token_type")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| AuthError::Http("token response missing token_type".to_string()))?;
+            if !token_type.eq_ignore_ascii_case("Bearer") {
+                return Err(AuthError::Rejected(format!(
+                    "unexpected token_type {token_type:?}: only Bearer is supported"
+                )));
+            }
+            if let Some(granted) = body.get("scope").and_then(|v| v.as_str()) {
+                let granted_set: std::collections::BTreeSet<&str> =
+                    granted.split_whitespace().collect();
+                let expected_set: std::collections::BTreeSet<&str> =
+                    expected_scope.split_whitespace().collect();
+                if granted_set != expected_set {
+                    return Err(AuthError::Rejected(format!(
+                        "granted scope {granted:?} does not match requested scope {expected_scope:?}"
+                    )));
+                }
+            }
             let refresh = body
                 .get("refresh_token")
                 .and_then(|v| v.as_str())

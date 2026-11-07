@@ -1,6 +1,6 @@
 <section class="gate-panel" id="gates-change-{{ panel.k }}">
 <h3>Gates — change {{ panel.k }} <span class="badge">{{ panel.kind }}</span> <span class="badge">{{ panel.state }}</span></h3>
-<p class="muted">current revision r{{ panel.current_revision }} · Mergeability: <span class="badge">{{ panel.mergeability }}</span>{% if let Some(h) = panel.head_branch %} · head <code>{{ h }}</code>{% endif %} · base <code>{{ panel.base_branch }}</code></p>
+<p class="muted">current revision r{{ panel.current_revision }} · Mergeability: <span class="badge">{{ panel.mergeability }}</span>{% if let Some(h) = panel.head_branch %} · head <code>{{ h }}</code>{% else if let Some(t) = panel.topic %} · head <code>for/{{ t }}</code>{% endif %} · base <code>{{ panel.base_branch }}</code></p>
 {% if !panel.conflict_paths.is_empty() %}<p class="muted">conflicting paths:</p>
 <ul>{% for p in panel.conflict_paths %}<li><code>{{ p }}</code></li>{% endfor %}</ul>{% endif %}
 <p id="approvals-change-{{ panel.k }}">Approvals: {{ panel.approvals }} · Requesting changes: {{ panel.request_changes }} (only reviews from writers and above count)</p>

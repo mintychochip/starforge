@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+{% block title %}Sessions · {{ head.owner }}/{{ head.name }}{% endblock %}
+{% block content %}
+{% include "repo_head.html" %}
+<h2>Sessions</h2>
+<form method="get" action="/{{ head.owner }}/{{ head.name }}/sessions" class="filters">
+  <label>Agent <input type="text" name="agent" value="{{ agent }}"></label>
+  <label>State
+    <select name="state">
+      <option value=""{% if state.is_empty() %} selected{% endif %}>all</option>
+      <option value="receiving"{% if state == "receiving" %} selected{% endif %}>receiving</option>
+      <option value="complete"{% if state == "complete" %} selected{% endif %}>complete</option>
+    </select>
+  </label>
+  <label><input type="checkbox" name="all" value="1"{% if all %} checked{% endif %}> All sessions (including subagents)</label>
+  <button type="submit">Filter</button>
+</form>
+{% if rows.is_empty() %}
+<p class="muted">No sessions yet.</p>
+{% else %}
+<table class="list"><thead><tr><th>Session</th><th>Agent</th><th>Started</th><th>Ended</th><th>Turns</th><th>Tool calls</th><th>Subagents</th></tr></thead><tbody>
+{% for s in rows %}
+<tr><td><a href="/{{ head.owner }}/{{ head.name }}/sessions/{{ s.ulid }}">{{ s.title }}</a></td>
+<td>{{ s.agent_name }} {{ s.agent_version }}</td>
+<td>{{ s.started }}</td>
+<td>{{ s.ended }}</td>
+<td>{{ s.turns }}</td>
+<td>{{ s.tool_calls }}</td>
+<td>{{ s.subagent_count }}</td></tr>
+{% endfor %}
+</tbody></table>
+<nav class="pager muted">Page {{ page }} of {{ pages }} · {{ total }} sessions{% if let Some(href) = prev_href %} · <a href="{{ href }}">Previous</a>{% endif %}{% if let Some(href) = next_href %} · <a href="{{ href }}">Next</a>{% endif %}</nav>
+{% endif %}
+{% endblock %}

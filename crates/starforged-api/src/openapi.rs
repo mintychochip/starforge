@@ -75,6 +75,7 @@ impl Modify for SecurityAddon {
         crate::search::search_code,
         crate::oauth::device_code,
         crate::oauth::token,
+        crate::oauth::revoke,
         crate::repos::show,
         crate::repos::patch,
         crate::repos::list_collaborators,

@@ -729,9 +729,10 @@ fn evaluate_roots(roots: &BTreeMap<String, Roots>, repo: &Path, spool: &Spool) {
     assert_eq!(stats.sessions, 1, "one opencode session: {stats:?}");
 }
 
-// Live capture: an untitled omp session keeps `meta.title == None` on
-// first ingest; after the first Meta upload, a later rename re-queues
-// `Meta`, and an unchanged meta does not.
+// Live capture: an untitled omp session gets a fallback title from its
+// first user message on first ingest; after the first Meta upload, a later
+// rename (non-empty adapter title) replaces it and re-queues `Meta`, and an
+// unchanged meta does not.
 #[test]
 fn omp_title_change_requeues_meta_after_upload() {
     let (_repo_dir, repo) = init_repo();
@@ -760,7 +761,11 @@ fn omp_title_change_requeues_meta_after_upload() {
     ingest(&spool, &roots, &repo, now).unwrap();
     let ulid = spool_ulid(&spool);
     let meta = spool.read_meta(&ulid).unwrap();
-    assert_eq!(meta.title, None, "empty placeholder title yields no title");
+    assert_eq!(
+        meta.title.as_deref(),
+        Some("hello there"),
+        "empty placeholder title falls back to the first user message"
+    );
     assert_eq!(
         read_queue(&spool)
             .unwrap()
@@ -819,5 +824,279 @@ fn omp_title_change_requeues_meta_after_upload() {
             .iter()
             .any(|e| e.op == QueueOp::Meta),
         "no new Meta op queued"
+    );
+}
+
+fn omp_session_native(cwd: &str, id: &str, user_text: &str) -> String {
+    let title = serde_json::json!({"type": "title", "v": 1, "title": "", "updatedAt": "2026-10-01T12:00:00Z", "pad": "   "});
+    let session = serde_json::json!({"type": "session", "version": 3, "id": id, "timestamp": "2026-10-01T12:00:00Z", "cwd": cwd, "runtime": {"version": "0.9.1"}});
+    let message = serde_json::json!({"type": "message", "id": format!("m1-{id}"), "parentId": null, "timestamp": "2026-10-01T12:00:00Z", "runtime": {"version": "0.9.1"}, "message": {"role": "user", "content": [{"type": "text", "text": user_text}]}});
+    format!("{title}\n{session}\n{message}\n")
+}
+// Parent-first: the parent is ingested alone; the child appears later and
+// resolves immediately to the parent's spool ULID.
+#[test]
+fn omp_subagent_parent_link_parent_first() {
+    let (_repo_dir, repo) = init_repo();
+    let home = TempDir::new().unwrap();
+    let cwd = repo.to_string_lossy().into_owned();
+    let store = home.path().join(".omp/agent/sessions/--x--");
+    std::fs::create_dir_all(&store).unwrap();
+    let parent_path = store.join("parent.jsonl");
+    std::fs::write(
+        &parent_path,
+        omp_session_native(&cwd, "parent", "parent task"),
+    )
+    .unwrap();
+    let common = common_dir(&repo).unwrap();
+    let spool = Spool::open(&common);
+    spool.ensure_layout().unwrap();
+    let roots = BTreeMap::from([(
+        "pi".to_string(),
+        Roots {
+            config_dir: home.path().join(".config"),
+            data_dir: home.path().to_path_buf(),
+            worktree: repo.clone(),
+        },
+    )]);
+    let now = parse_now("2026-10-01T13:00:00Z");
+    ingest(&spool, &roots, &repo, now).unwrap();
+    let parent_ulid = spool
+        .cursor_records()
+        .unwrap()
+        .get("pi/.omp/agent/sessions/--x--/parent.jsonl")
+        .expect("parent cursor")
+        .ulid
+        .clone();
+
+    let child_dir = store.join("parent");
+    std::fs::create_dir_all(&child_dir).unwrap();
+    std::fs::write(
+        child_dir.join("child.jsonl"),
+        omp_session_native(&cwd, "child", "child task"),
+    )
+    .unwrap();
+    ingest(&spool, &roots, &repo, now).unwrap();
+    let records = spool.cursor_records().unwrap();
+    let child_rec = records
+        .get("pi/.omp/agent/sessions/--x--/parent/child.jsonl")
+        .expect("child cursor");
+    assert_eq!(
+        child_rec.parent_session_key.as_deref(),
+        Some(".omp/agent/sessions/--x--/parent.jsonl"),
+        "child cursor carries the native parent key"
+    );
+    let child_meta = spool.read_meta(&child_rec.ulid).unwrap();
+    assert_eq!(
+        child_meta
+            .parent_id
+            .as_ref()
+            .map(ToString::to_string)
+            .as_deref(),
+        Some(parent_ulid.as_str()),
+        "child meta parents to the parent ULID"
+    );
+    let parent_meta = spool.read_meta(&parent_ulid).unwrap();
+    assert_eq!(parent_meta.parent_id, None, "parent stays top-level");
+}
+
+// Child-first: parent and child are spooled in one ingest. The nested
+// child discovers before its parent file, so the link only resolves in
+// the end-of-ingest pass — but must still end with the parent ULID.
+#[test]
+fn omp_subagent_parent_link_child_first() {
+    let (_repo_dir, repo) = init_repo();
+    let home = TempDir::new().unwrap();
+    let cwd = repo.to_string_lossy().into_owned();
+    let store = home.path().join(".omp/agent/sessions/--x--");
+    let child_dir = store.join("parent");
+    std::fs::create_dir_all(&child_dir).unwrap();
+    std::fs::write(
+        store.join("parent.jsonl"),
+        omp_session_native(&cwd, "parent", "parent task"),
+    )
+    .unwrap();
+    std::fs::write(
+        child_dir.join("child.jsonl"),
+        omp_session_native(&cwd, "child", "child task"),
+    )
+    .unwrap();
+    let common = common_dir(&repo).unwrap();
+    let spool = Spool::open(&common);
+    spool.ensure_layout().unwrap();
+    let roots = BTreeMap::from([(
+        "pi".to_string(),
+        Roots {
+            config_dir: home.path().join(".config"),
+            data_dir: home.path().to_path_buf(),
+            worktree: repo.clone(),
+        },
+    )]);
+    ingest(&spool, &roots, &repo, parse_now("2026-10-01T13:00:00Z")).unwrap();
+    let records = spool.cursor_records().unwrap();
+    let parent_ulid = &records["pi/.omp/agent/sessions/--x--/parent.jsonl"].ulid;
+    let child_rec = &records["pi/.omp/agent/sessions/--x--/parent/child.jsonl"];
+    assert_eq!(
+        child_rec.parent_session_key.as_deref(),
+        Some(".omp/agent/sessions/--x--/parent.jsonl")
+    );
+    let child_meta = spool.read_meta(&child_rec.ulid).unwrap();
+    assert_eq!(
+        child_meta
+            .parent_id
+            .as_ref()
+            .map(ToString::to_string)
+            .as_deref(),
+        Some(parent_ulid.as_str()),
+        "child-first discovery still resolves the parent ULID"
+    );
+}
+
+// Untitled session: fallback title is the first user message's first
+// non-blank line, trimmed, cut at 80 chars on a char boundary with `…`;
+// a later non-empty adapter title replaces it.
+#[test]
+fn fallback_title_truncates_long_first_message_then_real_title_wins() {
+    let (_repo_dir, repo) = init_repo();
+    let home = TempDir::new().unwrap();
+    let cwd = repo.to_string_lossy().into_owned();
+    let store = home.path().join(".omp/agent/sessions/--x--");
+    std::fs::create_dir_all(&store).unwrap();
+    let native_path = store.join("long-1.jsonl");
+    // 79 ASCII + 1 multibyte + padding: the 80-char cut lands after `é`.
+    let long_line = format!("{}é{}", "a".repeat(79), "b".repeat(30));
+    let user_text = format!("  \n\n{long_line}  \nsecond line");
+    let session = serde_json::json!({"type": "session", "version": 3, "id": "long-1", "timestamp": "2026-10-01T12:00:00Z", "cwd": cwd, "runtime": {"version": "0.9.1"}});
+    let message = serde_json::json!({"type": "message", "id": "m1", "parentId": null, "timestamp": "2026-10-01T12:00:00Z", "runtime": {"version": "0.9.1"}, "message": {"role": "user", "content": [{"type": "text", "text": user_text}]}});
+    let native = format!(
+        "{}\n{}\n{}\n",
+        serde_json::json!({"type": "title", "v": 1, "title": "", "updatedAt": "2026-10-01T12:00:00Z", "pad": "   "}),
+        session,
+        message
+    );
+    std::fs::write(&native_path, &native).unwrap();
+    let common = common_dir(&repo).unwrap();
+    let spool = Spool::open(&common);
+    spool.ensure_layout().unwrap();
+    let roots = BTreeMap::from([(
+        "pi".to_string(),
+        Roots {
+            config_dir: home.path().join(".config"),
+            data_dir: home.path().to_path_buf(),
+            worktree: repo.clone(),
+        },
+    )]);
+    let now = parse_now("2026-10-01T13:00:00Z");
+    ingest(&spool, &roots, &repo, now).unwrap();
+    let ulid = spool_ulid(&spool);
+    let meta = spool.read_meta(&ulid).unwrap();
+    let expected = format!("{}é…", "a".repeat(79));
+    assert_eq!(
+        meta.title.as_deref(),
+        Some(expected.as_str()),
+        "fallback is the first non-blank line, ≤80 chars + `…`"
+    );
+    assert_eq!(meta.title.as_ref().unwrap().chars().count(), 81);
+    let appended = "{\"type\":\"title_change\",\"id\":\"t2\",\"parentId\":null,\"timestamp\":\"2026-10-01T12:01:00Z\",\"title\":\"Real Title\",\"runtime\":{\"version\":\"0.9.1\"}}\n{\"type\":\"message\",\"id\":\"m2\",\"parentId\":\"m1\",\"timestamp\":\"2026-10-01T12:01:00Z\",\"runtime\":{\"version\":\"0.9.1\"},\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"second\"}]}}\n";
+    let mut combined = std::fs::read_to_string(&native_path).unwrap();
+    combined.push_str(appended);
+    std::fs::write(&native_path, combined).unwrap();
+    ingest(&spool, &roots, &repo, now).unwrap();
+    let meta = spool.read_meta(&ulid).unwrap();
+    assert_eq!(
+        meta.title.as_deref(),
+        Some("Real Title"),
+        "a later non-empty adapter title replaces the fallback"
+    );
+}
+
+// Adapter-header `files_touched` seed ingest: Pi hashline `[PATH#TAG]`
+// edits carry no path key the event stream exposes, so without seeding
+// from `out.header.files_touched` the spooled meta loses them.
+#[test]
+fn ingest_seeds_files_touched_from_pi_hashline_header() {
+    let (_repo_dir, repo) = init_repo();
+    let home = TempDir::new().unwrap();
+    let _paths = CliPaths::from_home(home.path().to_path_buf());
+    let store = home.path().join(".pi/agent/sessions/--x--");
+    std::fs::create_dir_all(&store).unwrap();
+    let cwd = repo.to_string_lossy();
+    let native = format!(
+        "{{\"type\":\"session\",\"version\":3,\"id\":\"hash-1\",\"timestamp\":\"2026-10-01T12:00:00Z\",\"cwd\":\"{cwd}\",\"runtime\":{{\"version\":\"0.5.2\"}}}}\n{{\"type\":\"message\",\"id\":\"m1\",\"parentId\":null,\"timestamp\":\"2026-10-01T12:00:00Z\",\"runtime\":{{\"version\":\"0.5.2\"}},\"message\":{{\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":\"edit it\"}}]}}}}\n{{\"type\":\"message\",\"id\":\"m2\",\"parentId\":\"m1\",\"timestamp\":\"2026-10-01T12:01:00Z\",\"runtime\":{{\"version\":\"0.5.2\"}},\"message\":{{\"role\":\"assistant\",\"model\":\"m\",\"usage\":{{\"input\":1,\"output\":1}},\"content\":[{{\"type\":\"toolCall\",\"id\":\"t1\",\"name\":\"edit\",\"arguments\":{{\"input\":\"[src/hashline.rs#abcd]\\n-old\\n+new\"}}}}]}}}}\n"
+    );
+    std::fs::write(store.join("hash-1.jsonl"), native).unwrap();
+    let common = common_dir(&repo).unwrap();
+    let spool = Spool::open(&common);
+    spool.ensure_layout().unwrap();
+    let roots = BTreeMap::from([(
+        "pi".to_string(),
+        Roots {
+            config_dir: home.path().join(".config"),
+            data_dir: home.path().to_path_buf(),
+            worktree: repo.clone(),
+        },
+    )]);
+    let stats = ingest(&spool, &roots, &repo, parse_now("2026-10-01T13:00:00Z")).unwrap();
+    assert_eq!(stats.sessions, 1, "one pi session: {stats:?}");
+    let ulid = spool_ulid(&spool);
+    let meta = spool.read_meta(&ulid).unwrap();
+    assert_eq!(
+        meta.files_touched,
+        vec!["src/hashline.rs".to_string()],
+        "hashline path lands in spooled meta.files_touched"
+    );
+}
+
+// Same seed for OpenCode: the legacy `filePath` input key normalizes into
+// the adapter header but is invisible to `event_files`.
+#[test]
+fn ingest_seeds_files_touched_from_opencode_filepath_header() {
+    let (_repo_dir, repo) = init_repo();
+    let (_home, roots, spool) = opencode_spool_root(&repo);
+    let db = roots["opencode"].data_dir.join("opencode.db");
+    std::fs::create_dir_all(db.parent().expect("db has parent")).unwrap();
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE project(id TEXT PRIMARY KEY, worktree TEXT NOT NULL, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL);\
+         CREATE TABLE session_v2(id TEXT PRIMARY KEY, project_id TEXT NOT NULL, directory TEXT NOT NULL DEFAULT '', version TEXT NOT NULL DEFAULT '', parent_id TEXT, title TEXT, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, time_archived INTEGER);\
+         CREATE TABLE session_message(id TEXT PRIMARY KEY, session_id TEXT NOT NULL, type TEXT NOT NULL, seq INTEGER NOT NULL, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL);\
+         CREATE TABLE session_part(message_id TEXT NOT NULL, session_id TEXT NOT NULL, ordinal INTEGER NOT NULL, type TEXT NOT NULL, call_id TEXT, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL);",
+    )
+    .unwrap();
+    let repo_str = repo.to_string_lossy().into_owned();
+    conn.execute(
+        "INSERT INTO project VALUES('p1', ?1, 1, 1)",
+        rusqlite::params![repo_str],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO session_v2(id, project_id, directory, version, title, time_created, time_updated) VALUES('sess1', 'p1', ?1, '2.0.29', 't', 1793793600000, 1793793615000)",
+        rusqlite::params![repo_str],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO session_message VALUES('m1', 'sess1', 'user', 0, 1793793600000, 1793793600000, ?1)",
+        rusqlite::params![serde_json::json!({"text": "hello"}).to_string()],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO session_message VALUES('m2', 'sess1', 'assistant', 1, 1793793605000, 1793793610000, ?1)",
+        rusqlite::params![serde_json::json!({"agent": "build", "model": {"id": "m", "providerID": "anthropic"}, "tokens": {"input": 1, "output": 1, "reasoning": 0, "cache": {"read": 0, "write": 0}}}).to_string()],
+    )
+    .unwrap();
+    let tool_file = format!("{repo_str}/src/legacy.rs");
+    conn.execute(
+        "INSERT INTO session_part VALUES('m2', 'sess1', 0, 'tool', 'c1', 1793793605000, 1793793610000, ?1)",
+        rusqlite::params![serde_json::json!({"type": "tool", "id": "c1", "name": "edit", "state": {"status": "completed", "input": {"filePath": tool_file}, "content": [{"type": "text", "text": "done"}]}}).to_string()],
+    )
+    .unwrap();
+    drop(conn);
+    evaluate_roots(&roots, &repo, &spool);
+    let ulid = spool_ulid(&spool);
+    let meta = spool.read_meta(&ulid).unwrap();
+    assert_eq!(
+        meta.files_touched,
+        vec!["src/legacy.rs".to_string()],
+        "filePath edit lands in spooled meta.files_touched"
     );
 }

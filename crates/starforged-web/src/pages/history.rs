@@ -10,7 +10,8 @@ use crate::auth::MaybeUser;
 use crate::error::WebError;
 use crate::pages::code::default_ref;
 use crate::views::{
-    CommitRow, FileView, NavUser, RepoHead, SessionChip, file_views, format_time, nav,
+    CommitRow, Crumb, FileView, NavUser, RepoHead, SessionChip, crumbs, file_views, format_time,
+    nav,
 };
 
 pub const PER_PAGE: usize = 50;
@@ -27,9 +28,19 @@ pub struct CommitsPage {
     head: RepoHead,
     /// Empty when the repository has no commits yet.
     ref_name: String,
+    /// The history of one path, when filtered; `None` is the full history.
+    path_history: Option<PathHistory>,
     commits: Vec<CommitRow>,
     page: usize,
     has_next: bool,
+}
+
+/// Header of a per-path history: the path's breadcrumb (directory levels link to
+/// their trees; the last segment is plain) and the full-history href.
+pub struct PathHistory {
+    crumbs: Vec<Crumb>,
+    name: String,
+    history_href: String,
 }
 
 #[derive(Template, WebTemplate)]
@@ -61,14 +72,27 @@ pub async fn commits(
         .repo_for(session.as_ref().map(|s| &s.user), &owner, &repo)
         .await?;
     let resolved = state.core.resolve(&access, &rest).await?;
-    if !resolved.path.is_empty() {
-        return Err(WebError::NotFound);
-    }
+    let path = if resolved.path.is_empty() {
+        None
+    } else {
+        // A path missing at this ref is 404, whatever the full history shows.
+        // `path_exists` covers submodule gitlinks, which `blob` and `tree`
+        // both reject.
+        let exists = state
+            .core
+            .path_exists(&access, &resolved.commit_id, &resolved.path)
+            .await?;
+        if !exists {
+            return Err(WebError::NotFound);
+        }
+        Some(resolved.path.clone())
+    };
     commits_page(
         &state,
         session.as_ref(),
         &access,
         Some((resolved.ref_name, resolved.commit_id)),
+        path,
         query.page,
     )
     .await
@@ -92,29 +116,37 @@ pub async fn default_commits(
         }
         None => None,
     };
-    commits_page(&state, session.as_ref(), &access, target, query.page).await
+    commits_page(&state, session.as_ref(), &access, target, None, query.page).await
 }
 
 /// One page of the history of `target` (ref name, commit id); `None` lists nothing.
+/// With `path`, only commits that touched it are listed.
 async fn commits_page(
     state: &AppState,
     session: Option<&WebSession>,
     access: &RepoAccess,
     target: Option<(String, String)>,
+    path: Option<String>,
     page: Option<usize>,
 ) -> Result<CommitsPage, WebError> {
     let page = page.unwrap_or(1).max(1);
     let (ref_name, mut commits) = match target {
         Some((ref_name, commit_id)) => {
-            let commits = state
-                .core
-                .log(
-                    access,
-                    &commit_id,
-                    (page - 1).saturating_mul(PER_PAGE),
-                    PER_PAGE + 1,
-                )
-                .await?;
+            let skip = (page - 1).saturating_mul(PER_PAGE);
+            let commits = match &path {
+                Some(path) => {
+                    state
+                        .core
+                        .log_path(access, &commit_id, path, skip, PER_PAGE + 1)
+                        .await?
+                }
+                None => {
+                    state
+                        .core
+                        .log(access, &commit_id, skip, PER_PAGE + 1)
+                        .await?
+                }
+            };
             (ref_name, commits)
         }
         None => (String::new(), Vec::new()),
@@ -131,10 +163,19 @@ async fn commits_page(
         "commits",
         Some(ref_name.as_str()).filter(|r| !r.is_empty()),
     );
+    let path_history = path.map(|path| {
+        let (dir, name) = path.rsplit_once('/').unwrap_or(("", path.as_str()));
+        PathHistory {
+            crumbs: crumbs(&access.repo.owner, &access.repo.name, &ref_name, dir),
+            name: name.to_owned(),
+            history_href: head.commits_href.clone(),
+        }
+    });
     Ok(CommitsPage {
         nav_user: nav(session),
         head,
         ref_name,
+        path_history,
         commits: commits
             .into_iter()
             .map(|c| {

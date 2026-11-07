@@ -1177,6 +1177,11 @@ pub struct ChangeView {
     pub k: i64,
     pub kind: String,
     pub head_branch: Option<String>,
+    /// The `refs/for/<base>/<topic>` push topic for `agit` changes (the
+    /// pusher's handle when the push named no topic); `None` for branch and
+    /// imported changes, whose `head_branch` names the source instead. The
+    /// stored column is `''` for those kinds; the view maps it to `None`.
+    pub topic: Option<String>,
     pub base_branch: String,
     pub current_revision: i64,
     pub state: String,
@@ -1389,6 +1394,7 @@ impl Core {
             k: row.number,
             kind: row.kind.clone(),
             head_branch: row.head_branch.clone(),
+            topic: (!row.topic.is_empty()).then(|| row.topic.clone()),
             base_branch: row.base_branch.clone(),
             current_revision,
             state: row.state.clone(),

@@ -98,6 +98,88 @@ pub fn head_commit_time(repo: &Path) -> Result<Option<i64>, GitError> {
     let text = stdout_utf8(output, "HEAD time")?;
     Ok(text.trim().parse::<i64>().ok())
 }
+/// `git rev-parse --show-toplevel`: the working-tree root of `repo` (a
+/// linked worktree resolves to its own root).
+pub fn toplevel(repo: &Path) -> Result<std::path::PathBuf, GitError> {
+    let output = git_output(repo, &["rev-parse", "--show-toplevel"])?;
+    if !output.status.success() {
+        return Err(GitError::Failed(format!(
+            "git rev-parse --show-toplevel failed in {}",
+            repo.display()
+        )));
+    }
+    let text = stdout_utf8(output, "toplevel")?;
+    Ok(std::path::PathBuf::from(text.trim()))
+}
+
+/// `git worktree list --porcelain`: the working-tree root of every worktree
+/// (the main worktree plus any linked ones), in list order.
+pub fn worktrees(repo: &Path) -> Result<Vec<std::path::PathBuf>, GitError> {
+    let output = git_output(repo, &["worktree", "list", "--porcelain"])?;
+    if !output.status.success() {
+        return Err(GitError::Failed(format!(
+            "git worktree list failed in {}",
+            repo.display()
+        )));
+    }
+    let text = stdout_utf8(output, "worktree list")?;
+    let mut out = Vec::new();
+    for line in text.lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            out.push(std::path::PathBuf::from(path.trim()));
+        }
+    }
+    Ok(out)
+}
+
+/// One commit reachable from `HEAD`: its SHA, committer time (unix seconds),
+/// and the repo-relative paths it changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitRecord {
+    pub sha: String,
+    pub time: i64,
+    pub files: Vec<String>,
+}
+
+/// `git log --format=<RS>%H %ct --name-only HEAD`: every commit reachable
+/// from `HEAD`, newest first. The `%x1e` record separator delimits commits
+/// so a changed path can never be mistaken for a header. An unborn HEAD
+/// (no commits yet) yields an empty vec, never an error.
+pub fn commit_log(repo: &Path) -> Result<Vec<CommitRecord>, GitError> {
+    let output = git_output(repo, &["log", "--format=%x1e%H %ct", "--name-only", "HEAD"])?;
+    if !output.status.success() {
+        return Ok(Vec::new());
+    }
+    let text = stdout_utf8(output, "git log")?;
+    let mut out = Vec::new();
+    for chunk in text.split('\u{001e}') {
+        if chunk.trim().is_empty() {
+            continue;
+        }
+        let mut lines = chunk.lines();
+        let Some(header) = lines.next() else {
+            continue;
+        };
+        let mut iter = header.split_whitespace();
+        let (Some(sha), Some(time)) = (iter.next(), iter.next()) else {
+            continue;
+        };
+        let Ok(time) = time.parse::<i64>() else {
+            continue;
+        };
+        let files: Vec<String> = lines
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect();
+        out.push(CommitRecord {
+            sha: sha.to_string(),
+            time,
+            files,
+        });
+    }
+    Ok(out)
+}
 
 /// `git config --get <key>`: `Ok(None)` when the key is unset (exit status 1),
 /// `Err` only when git itself fails.

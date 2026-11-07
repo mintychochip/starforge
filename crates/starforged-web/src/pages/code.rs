@@ -36,6 +36,7 @@ pub struct TreePage {
     empty: bool,
     ref_name: String,
     crumbs: Vec<Crumb>,
+    history_href: Option<String>,
     entries: Vec<EntryRow>,
     readme_html: Option<String>,
     import_state: String,
@@ -56,6 +57,7 @@ pub struct BlobPage {
     crumbs: Vec<Crumb>,
     raw_href: String,
     blame_href: String,
+    history_href: String,
     size: usize,
     lines: Vec<String>,
     highlighted: bool,
@@ -220,6 +222,13 @@ pub async fn blob(
             percent_encoding::NON_ALPHANUMERIC,
         )
     );
+    let history_href = content_href(
+        &repo.owner,
+        &repo.name,
+        "commits",
+        &resolved.ref_name,
+        &resolved.path,
+    );
     Ok(BlobPage {
         nav_user: nav(session.as_ref()),
         head: RepoHead::new(&access, "code", Some(&resolved.ref_name)),
@@ -234,6 +243,7 @@ pub async fn blob(
             &resolved.path,
         ),
         blame_href,
+        history_href,
         path: resolved.path.clone(),
         size,
         lines,
@@ -396,6 +406,9 @@ async fn tree_page(
         empty: ref_name.is_none(),
         ref_name: current.to_owned(),
         crumbs: crumbs(&repo.owner, &repo.name, current, dir),
+        history_href: ref_name
+            .filter(|_| !dir.is_empty())
+            .map(|r| content_href(&repo.owner, &repo.name, "commits", r, dir)),
         entries,
         readme_html,
         import_state: import

@@ -83,6 +83,7 @@ const ROUTES: &[(&str, &str)] = &[
     ("get", "/api/v1/repos/{owner}/{repo}/search/code"),
     ("post", "/api/v1/oauth/device/code"),
     ("post", "/api/v1/oauth/token"),
+    ("post", "/api/v1/oauth/revoke"),
     ("get", "/api/v1/repos/{owner}/{repo}"),
     ("patch", "/api/v1/repos/{owner}/{repo}"),
     ("get", "/api/v1/repos/{owner}/{repo}/collaborators"),
@@ -458,7 +459,7 @@ fn security_optionality_matches_auth() {
             // no security requirement at all.
             if !optional && !required {
                 assert!(
-                    matches!(name, "device_code" | "token" | "openapi_json"),
+                    matches!(name, "device_code" | "token" | "revoke" | "openapi_json"),
                     "{file}::{name} declares no security requirement"
                 );
                 assert!(

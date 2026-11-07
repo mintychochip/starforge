@@ -24,6 +24,7 @@ pub mod repo_new;
 pub mod repo_settings;
 pub mod search;
 pub mod session;
+pub mod sessions;
 pub mod settings;
 pub mod settings_2fa;
 pub mod sshkeys;

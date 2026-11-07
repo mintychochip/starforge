@@ -673,6 +673,7 @@ impl Adapter for ClaudeAdapter {
                     native_path,
                     agent_version: version.unwrap_or_default(),
                     workdir,
+                    parent_session_key: None,
                 });
             }
         }

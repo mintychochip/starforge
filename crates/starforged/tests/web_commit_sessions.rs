@@ -138,7 +138,10 @@ async fn commit_panel_shows_readable_link_with_confidence_and_deep_link() {
     // The session is unpublished (`inherit`); the owner still reads it.
     let (alice_client, _) = s.login("alice").await;
     let html = get_text(&alice_client, &s.url(&format!("/alice/proj/commit/{sha}"))).await;
-    assert!(html.contains("Sessions"), "panel missing in:\n{html}");
+    assert!(
+        html.contains("id=\"sessions\""),
+        "panel missing in:\n{html}"
+    );
     assert!(html.contains("pi"), "agent missing in:\n{html}");
     assert!(html.contains("exact"), "confidence missing in:\n{html}");
     assert!(html.contains("cli_claim"), "source missing in:\n{html}");
@@ -177,13 +180,16 @@ async fn stranger_sees_no_chip_and_no_ulid_leak() {
     .unwrap();
     let (bob, _) = s.login("bob").await;
     let html = get_text(&bob, &s.url(&format!("/alice/proj/commit/{sha}"))).await;
-    assert!(!html.contains("Sessions"), "panel leaked in:\n{html}");
+    assert!(
+        !html.contains("id=\"sessions\""),
+        "panel leaked in:\n{html}"
+    );
     assert!(!html.contains(ULID_LINKED), "ULID leaked in:\n{html}");
 
     // The commits list shows no count badge and no ULID either.
     let list = get_text(&bob, &s.url("/alice/proj/commits/main")).await;
     assert!(!list.contains(ULID_LINKED), "ULID leaked in list:\n{list}");
-    assert!(!list.contains("session"), "count leaked in list:\n{list}");
+    assert!(!list.contains("#sessions"), "count leaked in list:\n{list}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -255,7 +261,7 @@ async fn commit_without_links_shows_no_card() {
     let (sha, _tmp) = push_repo_with_message(&s, "plain work").await;
     let (alice_client, _) = s.login("alice").await;
     let html = get_text(&alice_client, &s.url(&format!("/alice/proj/commit/{sha}"))).await;
-    assert!(!html.contains("Sessions"), "empty panel in:\n{html}");
+    assert!(!html.contains("id=\"sessions\""), "empty panel in:\n{html}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -277,7 +283,7 @@ async fn trailer_only_link_shows_no_card() {
     let (alice_client, _) = s.login("alice").await;
     let html = get_text(&alice_client, &s.url(&format!("/alice/proj/commit/{sha}"))).await;
     assert!(
-        !html.contains("Sessions"),
+        !html.contains("id=\"sessions\""),
         "trailer placeholder in:\n{html}"
     );
     assert!(
@@ -324,7 +330,7 @@ async fn quarantined_link_omitted_for_member_shown_for_admin() {
     let (bob_client, _) = s.login("bob").await;
     let html = get_text(&bob_client, &s.url(&format!("/alice/proj/commit/{sha}"))).await;
     assert!(
-        !html.contains("Sessions"),
+        !html.contains("id=\"sessions\""),
         "quarantined panel leaked in:\n{html}"
     );
     assert!(
@@ -335,7 +341,10 @@ async fn quarantined_link_omitted_for_member_shown_for_admin() {
     // Alice (owner/admin) still reads it under review.
     let (alice_client, _) = s.login("alice").await;
     let html = get_text(&alice_client, &s.url(&format!("/alice/proj/commit/{sha}"))).await;
-    assert!(html.contains("Sessions"), "admin panel missing in:\n{html}");
+    assert!(
+        html.contains("id=\"sessions\""),
+        "admin panel missing in:\n{html}"
+    );
     assert!(html.contains(ULID_QUAR), "admin link missing in:\n{html}");
 }
 

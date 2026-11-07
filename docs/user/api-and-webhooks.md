@@ -8,6 +8,9 @@ push `refs/for/*`, maintain+), and
 with the new location.
 `GET`/`POST /user/keys` and `DELETE /user/keys/{id}` manage the caller's SSH keys (the same keys as **Settings → Keys**); `GET`/`POST /repos/{owner}/{repo}/keys` (with `"read_write"`) and `DELETE /repos/{owner}/{repo}/keys/{id}` manage that repository's deploy keys (admin only; below-threshold callers get `403`, non-readers `404`; archived repositories refuse adds). Key lists carry `id`, `title`, `algorithm`, `fingerprint`, and (for deploy keys) `read_write`.
 Errors use `{"error": {"code", "message"}}`.
+`POST /api/v1/oauth/revoke` (form body `token=<value>`, RFC 7009) revokes the access
+or refresh token whose SHA-256 hash matches and always answers `200`, even for
+unknown or already-revoked tokens.
 The whole API is described by an OpenAPI 3.1 document generated from the code
 with [utoipa](https://github.com/juharris/utoipa) and served unauthenticated at
 `GET /api/v1/openapi.json` (every route in the router appears in `paths`, with
@@ -107,8 +110,13 @@ Not yet: per-context soft gates, check retries, deployments, and mirrors.
 
 `starforge` (in `crates/starforge-cli`, MIT OR Apache-2.0) links local agent
 sessions to commits and uploads them. `starforge enable` installs git-hook
-dispatchers plus the Claude Code and Pi agent hooks and prints every file it
-touches (`disable` removes them); `status` shows the resolved server, hook
+dispatchers plus agent hooks for the agents it detects under their per-agent config dirs
+(Claude Code's `~/.claude/settings.json`, for example), prints every file it
+touches together with the agents it configured and the agents it skipped as not
+detected, and suggests re-running `starforge enable` after installing an agent
+to pick up its hooks — it never creates config for an agent that is not
+installed (`disable` removes them from any agent config, whether or not the
+agent is still detected); `status` shows the resolved server, hook
 markers, spooled sessions, queue depth, and credential hosts; `doctor` checks
 git, hooks, spool, credentials, adapters, and server reachability, one
 `ok`/`fail` line each. `sessions list`/`show`/`link`/`unlink` manage the
@@ -137,6 +145,15 @@ use authenticates with the remote's own credentials, and the CLI never hands
 its token to git. Use a token in the remote URL (`http://me:<token>@host/…`),
 a git credential helper, or an SSH remote.
 
+To enable git pushes after `auth login` with an SSH remote, register your
+public key with `starforge auth ssh-key add [<public-key-path>] [--server <host>] [--title <title>]`
+(the default key is the first of `~/.ssh/id_ed25519.pub`, `~/.ssh/id_ecdsa.pub`, `~/.ssh/id_rsa.pub`).
+It runs a one-time device-flow approval requesting only `repo:write`, posts `POST /api/v1/user/keys`
+with the approval token, then revokes the one-time refresh token via `POST /api/v1/oauth/revoke`
+and discards both tokens — the stored login token is never replaced or
+touched. Point your git remote at the printed SSH URL (`ssh://git@<host>:<port>/<owner>/<repo>.git`)
+and `git push` authenticates with the registered key; no token is handed to git.
+
 ### Command reference
 
 | Command | Meaning and flags |
@@ -144,7 +161,8 @@ a git credential helper, or an SSH remote.
 | `starforge auth login <server>` | Device-flow login against a server host or URL |
 | `starforge auth logout [server]` | Delete stored credentials (default: the single stored host) |
 | `starforge auth status` | Show auth status |
-| `starforge enable` / `disable` | Install / remove git hooks and repo config |
+| `starforge auth ssh-key add [<public-key-path>] [--server <host>] [--title <title>]` | Register a public key via a one-time `repo:write` approval (enables `git push` over SSH; stored login token untouched) |
+| `starforge enable` / `disable` | Install / remove git hooks and agent hooks for detected agents (`enable` skips undetected agents and never creates their config) |
 | `starforge status` | Repo, session, and upload status |
 | `starforge doctor` | Environment, config, and connectivity checks |
 | `starforge sync` | Upload queued sessions (exit `2` while items remain queued) |
@@ -152,6 +170,8 @@ a git credential helper, or an SSH remote.
 | `starforge sessions show <ulid>` | Show a session's metadata (unambiguous prefix works) |
 | `starforge sessions link <ulid> [--commit <sha>]` | Link a session to a commit (default: `HEAD`) |
 | `starforge sessions unlink <ulid> --commit <sha>` | Remove a session's link to a commit |
+| `starforge sessions backfill-links [--since <YYYY-MM-DD>] [--dry-run]` | Link historical sessions to commits by activity window and `files_touched` |
+| `starforge spool prune [--older-than <days>] [--dry-run]` | Delete local segment/raw blobs for fully uploaded, completed sessions (default 30 days) |
 | `starforge sessions publish <ulid> [--repo <owner/repo>]` | Publish a server-side session (public repositories only) |
 | `starforge sessions unpublish <ulid> [--repo <owner/repo>]` | Unpublish a server-side session (`published` → `inherit`) |
 | `starforge sessions delete <ulid> [--repo <owner/repo>] --yes` | Delete a server-side session and its segments and links |

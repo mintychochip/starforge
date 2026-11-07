@@ -15,8 +15,13 @@ upstream stores them.
 The captured session holds a user message, one assistant message whose
 parts cover text + reasoning + a completed `edit` tool call/result pair
 (keyed by `call_id`) + the step token totals on the message, an unknown
-`future-part` part (maps to `system`, never dropped), and a completed
-compaction. Three sibling sessions exercise the filters: a child
+`future-part` part (maps to `system`, never dropped), a completed
+compaction, a `synthetic` message with `description` + `text`, a
+`system` message with `description` + `text`, an `agent-switched`
+message, an `idle` message (skipped, no event), and a second assistant
+message with two completed `edit` pairs whose inputs use `path` and
+`filePath` respectively (so `files_touched` holds three repo-relative
+paths). Three sibling sessions exercise the filters: a child
 (`parent_id` set), an archived row (`time_archived` set), and a session
 whose `directory` is outside the worktree — each with one message so the
 filter (not emptiness) excludes them. Session ids, version, token

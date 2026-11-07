@@ -535,24 +535,24 @@ fn opencode_growing_transcript_resume() {
     let a = OpencodeAdapter;
     let cand = single_candidate(&a, &roots);
     let first = a.read(&cand, &Cursor::start(), FALLBACK_TS).unwrap();
-    assert_eq!(first.events.len(), 7);
+    assert_eq!(first.events.len(), 14);
     let resume_at = first.next;
     // Seq cursor: offset is the last message seq consumed.
-    assert_eq!(resume_at.offset, 2);
-    assert_eq!(resume_at.lines, 3);
+    assert_eq!(resume_at.offset, 7);
+    assert_eq!(resume_at.lines, 8);
 
-    opencode_insert_user(&db, FOLLOW_UP_TEXT, 3, 1_793_793_630_000);
+    opencode_insert_user(&db, FOLLOW_UP_TEXT, 8, 1_793_793_630_000);
 
     let tail = a.read(&cand, &resume_at, FALLBACK_TS).unwrap();
     assert_eq!(tail.events.len(), 1);
     assert_eq!(tail.events[0].seq, resume_at.next_seq());
     assert_eq!(kind_name(&tail.events[0].kind), "user_message");
     assert_eq!(user_text(&tail.events[0]), FOLLOW_UP_TEXT);
-    assert_eq!(tail.next.offset, 3);
+    assert_eq!(tail.next.offset, 8);
     assert_eq!(tail.next.lines, resume_at.lines + 1);
 
     let fresh = a.read(&cand, &Cursor::start(), FALLBACK_TS).unwrap();
-    assert_eq!(fresh.events.len(), 8);
+    assert_eq!(fresh.events.len(), 15);
     assert_resume_continuity(&first.events, &tail.events, &fresh.events);
 }
 
@@ -564,7 +564,7 @@ fn opencode_compaction_boundary() {
     let first = a.read(&cand, &Cursor::start(), FALLBACK_TS).unwrap();
     let resume_at = first.next;
 
-    opencode_insert_compaction(&db, COMPACTION_TEXT, 3, 1_793_793_635_000);
+    opencode_insert_compaction(&db, COMPACTION_TEXT, 8, 1_793_793_635_000);
 
     let tail = a.read(&cand, &resume_at, FALLBACK_TS).unwrap();
     assert_eq!(tail.events.len(), 1);
@@ -586,7 +586,7 @@ fn opencode_discover_incremental() {
     known.insert(cand.session_key.clone(), first.next);
     assert!(a.discover(&roots, &known).is_empty());
 
-    opencode_insert_user(&db, FOLLOW_UP_TEXT, 3, 1_793_793_630_000);
+    opencode_insert_user(&db, FOLLOW_UP_TEXT, 8, 1_793_793_630_000);
 
     let regrown = a.discover(&roots, &known);
     assert_eq!(regrown.len(), 1);

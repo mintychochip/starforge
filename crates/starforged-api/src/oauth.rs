@@ -29,6 +29,11 @@ pub struct TokenForm {
     client_id: String,
 }
 
+#[derive(Deserialize, utoipa::ToSchema)]
+pub struct RevokeForm {
+    token: String,
+}
+
 /// `POST /api/v1/oauth/device/code`: starts a device flow for `starforge-cli`.
 #[utoipa::path(
     post,
@@ -113,6 +118,24 @@ pub async fn token(State(state): State<ApiState>, Form(form): Form<TokenForm>) -
         Err(CoreError::Invalid(_)) => oauth_error("invalid_grant"),
         Err(other) => crate::error::ApiError::from(other).into_response(),
     }
+}
+
+/// `POST /api/v1/oauth/revoke`: RFC 7009 token revocation. The form body
+/// carries `token` (access or refresh); the SHA-256 hash identifies the
+/// row. Always answers `200`, even for unknown or already-revoked tokens,
+/// so callers never learn whether a token existed.
+#[utoipa::path(
+    post,
+    path = "/api/v1/oauth/revoke",
+    request_body(content = RevokeForm, content_type = "application/x-www-form-urlencoded"),
+    responses(
+        (status = 200, description = "Revocation accepted (idempotent)", body = serde_json::Value),
+    ),
+)]
+pub async fn revoke(State(state): State<ApiState>, Form(form): Form<RevokeForm>) -> Response {
+    let hash = starforged_core::crypto::sha256_hex(&form.token);
+    let _ = state.core.revoke_token_hash(&hash).await;
+    StatusCode::OK.into_response()
 }
 
 fn oauth_error(error: &str) -> Response {

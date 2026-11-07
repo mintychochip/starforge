@@ -7,6 +7,8 @@ pub mod hook;
 pub mod hooks;
 pub mod session_admin;
 pub mod sessions;
+pub mod spool;
+pub mod sshkey;
 pub mod status;
 pub mod sync;
 pub mod trail;

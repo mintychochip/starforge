@@ -111,6 +111,19 @@ pub async fn revoke_for_user(db: &Db, user_id: i64) -> DbResult<u64> {
     Ok(result.rows_affected())
 }
 
+/// Revokes the token with the given stored hash (RFC 7009 revocation: the
+/// `false` when no live token has that hash (unknown or already revoked).
+pub async fn revoke_by_hash(db: &Db, token_hash: &str, revoked_at: i64) -> DbResult<bool> {
+    let result = sqlx::query(
+        "UPDATE access_tokens SET revoked_at = $1 WHERE token_hash = $2 AND revoked_at IS NULL",
+    )
+    .bind(revoked_at)
+    .bind(token_hash)
+    .execute(db.pool())
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
 pub async fn touch(db: &Db, token_id: i64) -> DbResult<()> {
     sqlx::query("UPDATE access_tokens SET last_used_at = $1 WHERE id = $2")
         .bind(now())

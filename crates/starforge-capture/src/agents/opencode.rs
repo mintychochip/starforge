@@ -29,10 +29,19 @@
 //! event per part (`text` → `assistant_message` with the step model and
 //! usage, `reasoning` → `reasoning`, `tool` → `tool_call` plus, when the
 //! state finished, a `tool_result` immediately after it — pairs ordered by
-//! the part's `call_id`/ordinal); `compaction` messages → `compaction`.
+//! the part's `call_id`/ordinal); `compaction` messages → `compaction`;
+//! `synthetic`/`system` messages → `system` with readable text (a
+//! non-empty `description`, when present, prefixes the text as
+//! `<description>: <text>`); `agent-switched` messages → `system`
+//! (`Agent switched from <previous> to <agent>`).
 //! Every other message or part type (including v1-era part types that
 //! survive in `data` such as `step-start`/`step-finish`) falls back to
 //! `system { text: <raw JSON> }`: never dropped, never an error.
+//!
+//! Intentionally skipped (no events), by documented rule:
+//! - `idle` — runtime bookkeeping (`{outcome, time}`): it marks the
+//!   end-of-turn idle state, not conversation, so it yields no event
+//!   (the same runtime-marker rule as Pi/omp's skipped progress markers).
 //!
 //! Cursor semantics: `offset` is the largest `session_message.seq` consumed
 //! (`seq` starts at 0 upstream — the v1→v2 migration numbers migrated
@@ -155,16 +164,26 @@ fn content_to_string(v: &Value) -> String {
     }
 }
 
-/// `file_path` carried by an `edit`/`write` tool input, if any.
+/// `path` carried by a file-modifying tool input (`edit`, `write`,
+/// `patch`/`apply_patch`, `multiedit`), if any. Newer releases use `path`;
+/// older releases used `filePath` (the very oldest used `file_path`, still
+/// honoured for stored fixtures). Read-only tools never add paths.
 fn edit_path(tool_name: &str, input: &Value) -> Option<String> {
     let lowered = tool_name.to_lowercase();
-    if lowered != "edit" && lowered != "write" {
+    if !matches!(
+        lowered.as_str(),
+        "edit" | "write" | "patch" | "apply_patch" | "multiedit"
+    ) {
         return None;
     }
-    input
-        .get("file_path")
-        .and_then(Value::as_str)
-        .map(str::to_string)
+    for key in ["path", "filePath", "file_path"] {
+        if let Some(path) = input.get(key).and_then(Value::as_str)
+            && !path.trim().is_empty()
+        {
+            return Some(path.to_string());
+        }
+    }
+    None
 }
 
 /// Fold one parsed message into the session header accumulator.
@@ -191,10 +210,23 @@ impl HeaderFold {
     }
 
     fn note_file(&mut self, workdir: &str, path: &str) {
-        if let Some(rel) = crate::repo_relative(std::path::Path::new(workdir), path)
-            && !self.files_touched.iter().any(|f| f == &rel)
-        {
-            self.files_touched.push(rel);
+        let path = path.trim();
+        if path.is_empty() {
+            return;
+        }
+        // Trace Format v1 documents `files_touched` as repo-relative
+        // paths: absolute paths inside the workdir are stored relative
+        // to it, absolute paths outside stay absolute, and relative
+        // paths stay as-is (the same normalization the Pi adapter
+        // applies relative to the candidate's workdir).
+        let stored = if std::path::Path::new(path).is_absolute() {
+            crate::repo_relative(std::path::Path::new(workdir), path)
+                .unwrap_or_else(|| path.to_string())
+        } else {
+            path.to_string()
+        };
+        if !stored.is_empty() && !self.files_touched.iter().any(|f| f == &stored) {
+            self.files_touched.push(stored);
         }
     }
 }
@@ -399,10 +431,45 @@ fn message_events(
                     .map(str::to_string),
             }));
         }
+        "synthetic" | "system" => {
+            // Readable injected context: `{text, [description], ...}`.
+            // A non-empty description, when present, prefixes the text.
+            let text = msg.data.get("text").and_then(Value::as_str).unwrap_or("");
+            let description = msg
+                .data
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let rendered = if description.is_empty() || text.is_empty() {
+                if text.is_empty() {
+                    description.to_string()
+                } else {
+                    text.to_string()
+                }
+            } else {
+                format!("{description}: {text}")
+            };
+            if !rendered.is_empty() {
+                kinds.push(EventKind::System(System { text: rendered }));
+            }
+        }
+        "agent-switched" => {
+            let agent = msg.data.get("agent").and_then(Value::as_str).unwrap_or("");
+            let previous = msg
+                .data
+                .get("previous")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            kinds.push(EventKind::System(System {
+                text: format!("Agent switched from {previous} to {agent}"),
+            }));
+        }
+        "idle" => {
+            // Runtime bookkeeping (`{outcome, time}`): skipped, no event.
+        }
         _ => {
-            // Unmapped message type (system, synthetic, skill, shell, idle,
-            // *-switched, or unknown): raw JSON into `system`.
-            // Never dropped, never an error.
+            // Unmapped message type (skill, shell, or unknown): raw JSON
+            // into `system`. Never dropped, never an error.
             kinds.push(EventKind::System(System {
                 text: raw_message(msg),
             }));
@@ -543,6 +610,7 @@ impl Adapter for OpencodeAdapter {
                 native_path: db.clone(),
                 agent_version: version,
                 workdir,
+                parent_session_key: None,
             });
         }
         out.sort_by(|a, b| a.session_key.cmp(&b.session_key));

@@ -504,6 +504,16 @@ async fn settle_entry(
                 tracing::warn!("sync: segment op without a number for `{}`", entry.ulid);
                 return Ok(EntryStats::kept());
             };
+            if spool.is_pruned(&entry.ulid)
+                && spool
+                    .read_upload(&entry.ulid)
+                    .map(|state| state.uploaded_segments.contains_key(&n))
+                    .unwrap_or(false)
+            {
+                // `spool prune` deleted the uploaded blob: the segment is
+                // already on the server, so this entry is settled.
+                return Ok(EntryStats::skipped());
+            }
             let bytes = match spool.segment_bytes(&entry.ulid, n) {
                 Ok(bytes) => bytes,
                 Err(err) => {

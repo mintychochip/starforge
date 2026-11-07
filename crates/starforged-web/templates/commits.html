@@ -5,7 +5,13 @@
 {% if ref_name.is_empty() %}
 <p class="muted">No commits yet.</p>
 {% else %}
+{% if let Some(ph) = path_history %}
+<p class="crumbs"><span class="badge">{{ ref_name }}</span>{% for c in ph.crumbs %} / <a href="{{ c.href }}">{{ c.name }}</a>{% endfor %} / {{ ph.name }} · <a href="{{ ph.history_href }}">Full history</a></p>
+<h2>History of <code>{{ ph.name }}</code></h2>
+<p class="muted">Commits that touched this path. Renames are not followed.</p>
+{% else %}
 <h2>Commits on <span class="badge">{{ ref_name }}</span></h2>
+{% endif %}
 <ol class="commits">
 {% for c in commits %}
 <li><a href="/{{ head.owner }}/{{ head.name }}/commit/{{ c.id }}"><code>{{ c.short_id }}</code></a> {{ c.summary }} <span class="muted">{{ c.author }} · {{ c.when }}</span>{% if c.session_count > 0 %} <a href="/{{ head.owner }}/{{ head.name }}/commit/{{ c.id }}#sessions" class="badge">{{ c.session_count }} session{% if c.session_count > 1 %}s{% endif %}</a>{% endif %}</li>

@@ -84,6 +84,11 @@ pub struct CursorRecord {
     /// CLIs; those sessions are left alone by the sweep.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_event_at: Option<String>,
+    /// Native parent session key, when the adapter natively nests this
+    /// session (omp subagents). Resolved to the parent's spool ULID at
+    /// ingest; absent for top-level sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_key: Option<String>,
 }
 
 /// Whole `cursors.json` file.
@@ -161,6 +166,17 @@ pub struct UploadState {
     /// Blake3 hashes of raw `links.jsonl` lines already POSTed.
     #[serde(default)]
     pub sent_links: Vec<String>,
+}
+/// One session eligible for [`Spool::prune_session`]: fully uploaded,
+/// server-completed, and idle past the caller's threshold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PruneCandidate {
+    /// Session ULID.
+    pub ulid: String,
+    /// Bytes the prune would free (segments + raw file sizes).
+    pub bytes: u64,
+    /// Last activity timestamp (RFC 3339) that qualified the session.
+    pub last_activity: String,
 }
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -369,7 +385,8 @@ impl Spool {
             .join(format!("{n}.zst")))
     }
 
-    fn existing_segments(&self, ulid: &str) -> Result<Vec<u64>, SpoolError> {
+    /// Sorted segment numbers with a blob on disk (empty for a pruned session).
+    pub fn existing_segments(&self, ulid: &str) -> Result<Vec<u64>, SpoolError> {
         let dir = self.known_session_dir(ulid)?.join("segments");
         let mut out = Vec::new();
         let entries = match std::fs::read_dir(&dir) {
@@ -442,6 +459,8 @@ impl Spool {
         if blobs.is_empty() {
             return Ok(Vec::new());
         }
+        // `prune_session` removes these dirs: recreate so re-ingest works.
+        create_dir_private(&dir.join("segments"))?;
         let next = self
             .existing_segments(ulid)?
             .last()
@@ -483,6 +502,7 @@ impl Spool {
     /// Compress `raw` (a redacted native slice) with the standard helper and
     /// store it as `raw/<n>.zst` under the same numbering as segments.
     pub fn write_raw(&self, ulid: &str, n: u64, raw: &[u8]) -> Result<(), SpoolError> {
+        create_dir_private(&self.known_session_dir(ulid)?.join("raw"))?;
         let blob = compress(raw);
         atomic_write(&self.raw_path(ulid, n)?, &blob)?;
         Ok(())
@@ -632,7 +652,9 @@ impl Spool {
     /// (read-modify-write of the whole `cursors.json`). `last_event_at` is
     /// the newest event timestamp ingested in this write; `None` preserves
     /// the stored value so a cursor write carrying no new events never
-    /// erases it.
+    /// erases it. `parent_session_key` is the native parent key (omp
+    /// subagents); `None` likewise preserves a stored value so resumes
+    /// never erase a previously recorded parent.
     pub fn write_cursor(
         &self,
         key: &str,
@@ -640,20 +662,27 @@ impl Spool {
         cursor: Cursor,
         native_path: &str,
         last_event_at: Option<String>,
+        parent_session_key: Option<String>,
     ) -> Result<(), SpoolError> {
         let mut file = self.read_cursors()?;
-        let preserved = file
+        let preserved_last = file
             .sessions
             .get(key)
             .and_then(|rec| rec.last_event_at.clone());
-        let stored = last_event_at.or(preserved);
+        let preserved_parent = file
+            .sessions
+            .get(key)
+            .and_then(|rec| rec.parent_session_key.clone());
+        let stored_last = last_event_at.or(preserved_last);
+        let stored_parent = parent_session_key.or(preserved_parent);
         file.sessions.insert(
             key.to_string(),
             CursorRecord {
                 ulid: ulid.to_string(),
                 cursor,
                 native_path: native_path.to_string(),
-                last_event_at: stored,
+                last_event_at: stored_last,
+                parent_session_key: stored_parent,
             },
         );
         atomic_write(
@@ -729,5 +758,228 @@ impl Spool {
                 .as_slice(),
         )?;
         Ok(())
+    }
+
+    /// All session ULIDs with a directory under `sessions/`, sorted.
+    pub fn session_ulids(&self) -> Result<Vec<String>, SpoolError> {
+        let mut out = Vec::new();
+        match std::fs::read_dir(self.root.join("sessions")) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = entry?;
+                    // `file_type` does not follow links: a symlinked
+                    // session dir is never listed (never pruned through).
+                    if !entry.file_type()?.is_dir() {
+                        continue;
+                    }
+                    if let Some(name) = entry.file_name().to_str()
+                        && name.parse::<ulid::Ulid>().is_ok()
+                    {
+                        out.push(name.to_string());
+                    }
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(SpoolError::Io(e)),
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    /// True when `ulid`'s segment and raw blobs were both pruned: the
+    /// session dir (meta, upload state) survives, the bulk dirs do not.
+    /// Readers that open segments must degrade gracefully for these.
+    pub fn is_pruned(&self, ulid: &str) -> bool {
+        match self.session_dir(ulid) {
+            Ok(dir) => !dir.join("segments").exists() && !dir.join("raw").exists(),
+            Err(_) => false,
+        }
+    }
+
+    /// Bytes held by `ulid`'s `segments/` and `raw/` files (0 when absent).
+    pub fn session_data_bytes(&self, ulid: &str) -> u64 {
+        let dir = match self.session_dir(ulid) {
+            Ok(dir) => dir,
+            Err(_) => return 0,
+        };
+        let mut total = 0u64;
+        for sub in ["segments", "raw"] {
+            if let Ok(entries) = std::fs::read_dir(dir.join(sub)) {
+                for entry in entries.flatten() {
+                    if let Ok(md) = entry.metadata()
+                        && md.is_file()
+                    {
+                        total += md.len();
+                    }
+                }
+            }
+        }
+        total
+    }
+
+    /// Delete `ulid`'s `segments/` and `raw/` directories, returning the
+    /// bytes freed, or `None` when the session changed since the caller's
+    /// [`Spool::prune_candidates`] scan (nothing deleted). `meta.json`,
+    /// `upload.json`, and the cursor record are never touched, so re-ingest
+    /// reuses this ULID instead of minting a new session.
+    ///
+    /// The scan is re-validated immediately before deleting: `upload.json`
+    /// must still record `complete`, the stored `meta_hash` must still match
+    /// the current meta body, every present segment must still be recorded
+    /// as uploaded, and no queue entry for the ULID may be pending. A
+    /// symlinked session dir or `segments`/`raw` component is refused
+    /// (never deleted through).
+    pub fn prune_session(&self, ulid: &str) -> Result<Option<u64>, SpoolError> {
+        let dir = self.session_dir(ulid)?;
+        let md = match std::fs::symlink_metadata(&dir) {
+            Ok(md) => md,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return Err(SpoolError::UnknownSession(ulid.to_string()));
+            }
+            Err(e) => return Err(SpoolError::Io(e)),
+        };
+        if md.file_type().is_symlink() {
+            return Err(SpoolError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("refusing to prune symlinked session dir `{ulid}`"),
+            )));
+        }
+        if !md.is_dir() {
+            return Err(SpoolError::UnknownSession(ulid.to_string()));
+        }
+        for sub in ["segments", "raw"] {
+            let path = dir.join(sub);
+            match std::fs::symlink_metadata(&path) {
+                Ok(md) if md.file_type().is_symlink() => {
+                    return Err(SpoolError::Io(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("refusing to prune through symlinked `{sub}` for `{ulid}`"),
+                    )));
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(SpoolError::Io(e)),
+            }
+        }
+        // Re-validate the scan: anything doubtful skips (never deletes).
+        let eligible = (|| {
+            let state = self.read_upload(ulid).ok()?;
+            if !state.complete {
+                return None;
+            }
+            let present = self.existing_segments(ulid).ok()?;
+            if !present
+                .iter()
+                .all(|n| state.uploaded_segments.contains_key(n))
+            {
+                return None;
+            }
+            let meta = self.read_meta(ulid).ok()?;
+            let hash = meta_body_hash(&meta).ok()?;
+            if state.meta_hash.as_deref() != Some(hash.as_str()) {
+                return None;
+            }
+            let queue = crate::queue::read_queue(self).ok()?;
+            if queue.iter().any(|e| e.ulid == ulid) {
+                return None;
+            }
+            Some(())
+        })();
+        if eligible.is_none() {
+            return Ok(None);
+        }
+        let bytes = self.session_data_bytes(ulid);
+        for sub in ["segments", "raw"] {
+            let path = dir.join(sub);
+            if path.exists() {
+                std::fs::remove_dir_all(&path)?;
+            }
+        }
+        Ok(Some(bytes))
+    }
+
+    /// Sessions whose local blobs may be pruned at `now`: `upload.json`
+    /// records the server's `complete` acknowledgement, every present
+    /// segment is recorded as uploaded, the recorded `meta_hash` matches
+    /// the current metadata body (no changed metadata still awaiting
+    /// upload), no queue entry for the session is still pending, and the
+    /// last activity (`meta.ended_at`, else the cursor's `last_event_at`)
+    /// is older than `older_than_days`. Anything doubtful — unreadable
+    /// meta/upload state, unparseable or missing timestamps, a wholly
+    /// unreadable queue — excludes the session rather than failing the
+    /// sweep.
+    pub fn prune_candidates(
+        &self,
+        now: time::OffsetDateTime,
+        older_than_days: u64,
+    ) -> Result<Vec<PruneCandidate>, SpoolError> {
+        let queue = match crate::queue::read_queue(self) {
+            Ok(queue) => queue,
+            Err(_) => return Ok(Vec::new()),
+        };
+        let cursors = self.cursor_records()?;
+        let threshold = time::Duration::days(older_than_days as i64);
+        let mut out = Vec::new();
+        for ulid in self.session_ulids()? {
+            if self.is_pruned(&ulid) {
+                continue;
+            }
+            let bytes = self.session_data_bytes(&ulid);
+            if bytes == 0 {
+                continue;
+            }
+            let Ok(state) = self.read_upload(&ulid) else {
+                continue;
+            };
+            if !state.complete {
+                continue;
+            }
+            let Ok(present) = self.existing_segments(&ulid) else {
+                continue;
+            };
+            if !present
+                .iter()
+                .all(|n| state.uploaded_segments.contains_key(n))
+            {
+                continue;
+            }
+            let Ok(meta) = self.read_meta(&ulid) else {
+                continue;
+            };
+            let Ok(hash) = meta_body_hash(&meta) else {
+                continue;
+            };
+            if state.meta_hash.as_deref() != Some(hash.as_str()) {
+                continue;
+            }
+            if queue.iter().any(|e| e.ulid == ulid) {
+                continue;
+            }
+            let last_activity = meta.ended_at.clone().or_else(|| {
+                cursors
+                    .values()
+                    .filter(|rec| rec.ulid == ulid)
+                    .filter_map(|rec| rec.last_event_at.clone())
+                    .max()
+            });
+            let Some(last_activity) = last_activity else {
+                continue;
+            };
+            let Ok(last) = time::OffsetDateTime::parse(
+                &last_activity,
+                &time::format_description::well_known::Rfc3339,
+            ) else {
+                continue;
+            };
+            if now - last <= threshold {
+                continue;
+            }
+            out.push(PruneCandidate {
+                ulid,
+                bytes,
+                last_activity,
+            });
+        }
+        Ok(out)
     }
 }

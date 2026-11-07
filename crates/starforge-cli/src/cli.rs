@@ -85,6 +85,24 @@ pub enum Cmd {
     /// Git `pre-push` hook entry point (invoked by installed hooks).
     #[command(hide = true, name = "_hook-pre-push")]
     HookPrePush,
+    /// Manage the local session spool.
+    Spool {
+        #[command(subcommand)]
+        cmd: SpoolCmd,
+    },
+}
+
+/// `spool` subcommands.
+#[derive(Debug, Subcommand)]
+pub enum SpoolCmd {
+    /// Delete local segment/raw blobs for fully uploaded, completed
+    /// sessions whose last activity is older than the threshold.
+    /// Keeps `meta.json`, `upload.json`, and cursor records.
+    Prune {
+        /// Only prune sessions idle longer than this many days.
+        #[arg(long, default_value_t = 30)]
+        older_than: u64,
+    },
 }
 /// `hook` subcommands: agent hook entry points (invoked by Claude Code).
 #[derive(Debug, Subcommand)]
@@ -109,11 +127,35 @@ pub enum AuthCmd {
     },
     /// Show auth status.
     Status,
+    /// Manage SSH keys registered on the server.
+    SshKey {
+        #[command(subcommand)]
+        cmd: SshKeyCmd,
+    },
 }
 
-/// `sessions` subcommands: `list`/`show`/`link`/`unlink` are local (spool);
-/// `publish`/`unpublish`/`delete` are server-side administration (`--repo`
-/// overrides the discovered `owner/repo`).
+/// `auth ssh-key` subcommands.
+#[derive(Debug, Subcommand)]
+pub enum SshKeyCmd {
+    /// Register a public key via a one-time approval (enables `git push`
+    /// over SSH; the approval token is used once and discarded).
+    Add {
+        /// Public key file (`.pub`). Defaults to the first of
+        /// `~/.ssh/id_ed25519.pub`, `~/.ssh/id_ecdsa.pub`, `~/.ssh/id_rsa.pub`.
+        public_key_path: Option<PathBuf>,
+        /// Server host or URL (default: discovered from the current repo,
+        /// else the single logged-in host).
+        #[arg(long)]
+        server: Option<String>,
+        /// Title for the key on the server (default: the key comment).
+        #[arg(long)]
+        title: Option<String>,
+    },
+}
+
+/// `sessions` subcommands: `list`/`show`/`link`/`unlink`/`backfill-links` are
+/// local (spool); `publish`/`unpublish`/`delete` are server-side
+/// administration (`--repo` overrides the discovered `owner/repo`).
 #[derive(Debug, Subcommand)]
 pub enum SessionsCmd {
     /// List local sessions.
@@ -138,6 +180,16 @@ pub enum SessionsCmd {
         /// Commit SHA to unlink.
         #[arg(long)]
         commit: String,
+    },
+    /// Backfill commit links for historical sessions: link every commit
+    /// reachable from HEAD whose committer time falls inside a session's
+    /// activity window (`[started_at, last_activity + 30 minutes]`) and
+    /// that touches a file the session touched. Pairs already linked are
+    /// skipped. `--dry-run` prints the pairs without writing anything.
+    BackfillLinks {
+        /// Consider only commits on or after this day (UTC, `YYYY-MM-DD`).
+        #[arg(long)]
+        since: Option<String>,
     },
     /// Publish a server-side session (public repositories only).
     Publish {
@@ -415,6 +467,7 @@ fn sync_stub(cli: Cli, paths: CliPaths) -> std::process::ExitCode {
         Cmd::Enable => run_enable(paths, dry_run),
         Cmd::Disable => run_disable(paths, dry_run),
         Cmd::Sessions { cmd } => run_sessions(cmd, dry_run),
+        Cmd::Spool { cmd } => run_spool(cmd, dry_run),
         Cmd::HookPrepare { msg_file } => run_hook_prepare(paths, msg_file),
         Cmd::HookPostCommit => run_hook_post_commit(paths),
         Cmd::HookPrePush => unreachable!("pre-push dispatches via run_async"),
@@ -500,8 +553,8 @@ async fn run_hook_pre_push_async(paths: CliPaths) -> std::process::ExitCode {
     std::process::ExitCode::from(code)
 }
 
-/// `sessions` subcommands: list/show/link/unlink are local (spool);
-/// publish/unpublish/delete dispatch via `run_async`.
+/// `sessions` subcommands: list/show/link/unlink/backfill-links are local
+/// (spool); publish/unpublish/delete dispatch via `run_async`.
 fn run_sessions(cmd: SessionsCmd, dry_run: bool) -> std::process::ExitCode {
     let repo = match std::env::current_dir() {
         Ok(dir) => dir,
@@ -519,9 +572,32 @@ fn run_sessions(cmd: SessionsCmd, dry_run: bool) -> std::process::ExitCode {
         SessionsCmd::Unlink { ulid, commit } => {
             crate::commands::sessions::unlink(&repo, &ulid, &commit, dry_run)
         }
+        SessionsCmd::BackfillLinks { since } => {
+            crate::commands::sessions::backfill_links(&repo, since.as_deref(), dry_run)
+        }
         SessionsCmd::Publish { .. } => unreachable!("publish dispatches via run_async"),
         SessionsCmd::Unpublish { .. } => unreachable!("unpublish dispatches via run_async"),
         SessionsCmd::Delete { .. } => unreachable!("delete dispatches via run_async"),
+    };
+    if code == 0 {
+        println!("{out}");
+    } else {
+        eprintln!("{out}");
+    }
+    std::process::ExitCode::from(code)
+}
+
+/// `spool` subcommands (local spool maintenance, like `sessions list`).
+fn run_spool(cmd: SpoolCmd, dry_run: bool) -> std::process::ExitCode {
+    let repo = match std::env::current_dir() {
+        Ok(dir) => dir,
+        Err(err) => {
+            eprintln!("error: cannot determine current directory: {err}");
+            return std::process::ExitCode::from(1);
+        }
+    };
+    let (out, code) = match cmd {
+        SpoolCmd::Prune { older_than } => crate::commands::spool::prune(&repo, older_than, dry_run),
     };
     if code == 0 {
         println!("{out}");
@@ -548,6 +624,7 @@ pub async fn run_async(cli: Cli, paths: CliPaths) -> std::process::ExitCode {
             | SessionsCmd::Delete { .. } => run_session_admin(cmd, paths, dry_run).await,
             _ => run_sessions(cmd, dry_run),
         },
+        Cmd::Spool { cmd } => run_spool(cmd, dry_run),
         Cmd::Export { dir, repo, session } => run_export(dir, repo, session, paths, dry_run).await,
         Cmd::Import { dir, repo } => run_import(dir, repo, paths, dry_run).await,
         Cmd::Trail { cmd } => run_trail(cmd, paths, dry_run).await,
@@ -616,6 +693,43 @@ async fn run_auth(cmd: AuthCmd, paths: CliPaths, dry_run: bool) -> std::process:
             let (out, code) = crate::commands::auth::status(&paths);
             println!("{out}");
             std::process::ExitCode::from(code)
+        }
+        AuthCmd::SshKey { cmd } => {
+            let SshKeyCmd::Add {
+                public_key_path,
+                server,
+                title,
+            } = cmd;
+            let repo = match std::env::current_dir() {
+                Ok(dir) => dir,
+                Err(err) => {
+                    eprintln!("error: cannot determine current directory: {err}");
+                    return std::process::ExitCode::from(1);
+                }
+            };
+            let sleeper = crate::queue::TokioSleeper;
+            let now = time::OffsetDateTime::now_utc();
+            match crate::commands::sshkey::add_ssh_key(
+                &paths,
+                &repo,
+                public_key_path,
+                server.as_deref(),
+                title.as_deref(),
+                &sleeper,
+                now,
+                dry_run,
+            )
+            .await
+            {
+                Ok(msg) => {
+                    println!("{msg}");
+                    std::process::ExitCode::SUCCESS
+                }
+                Err(err) => {
+                    eprintln!("error: {err}");
+                    std::process::ExitCode::from(1)
+                }
+            }
         }
     }
 }

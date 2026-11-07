@@ -413,3 +413,64 @@ async fn device_flow_cli_scopes_grant_reader_trail_and_upload() {
         upload.status()
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revoke_sets_revoked_at_and_is_idempotent() {
+    let s = TestServer::start().await;
+    s.user("alice").await;
+    let client = reqwest::Client::new();
+
+    let code = device_code(&client, &s).await;
+    let device_code = code["device_code"].as_str().unwrap().to_owned();
+    let user_code = code["user_code"].as_str().unwrap().to_owned();
+    let (browser, _) = s.login("alice").await;
+    let approved = approve(&browser, &s, &user_code, "approve").await;
+    assert_eq!(approved.status(), 200);
+
+    let (status, body) = poll(&client, &s, &device_code).await;
+    assert_eq!(status, 200, "token poll failed: {body}");
+    let refresh = body["refresh_token"].as_str().unwrap().to_owned();
+    let refresh_hash = starforged_core::crypto::sha256_hex(&refresh);
+
+    // The refresh-token row starts live.
+    let before: Option<i64> =
+        sqlx::query_scalar("SELECT revoked_at FROM access_tokens WHERE token_hash = $1")
+            .bind(&refresh_hash)
+            .fetch_one(s.core.db().pool())
+            .await
+            .unwrap();
+    assert!(before.is_none(), "refresh token must start live");
+
+    // Revoking by value sets revoked_at.
+    let first = client
+        .post(s.url("/api/v1/oauth/revoke"))
+        .form(&[("token", refresh.as_str())])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), 200);
+    let after: Option<i64> =
+        sqlx::query_scalar("SELECT revoked_at FROM access_tokens WHERE token_hash = $1")
+            .bind(&refresh_hash)
+            .fetch_one(s.core.db().pool())
+            .await
+            .unwrap();
+    assert!(after.is_some(), "revoke must set revoked_at");
+
+    // Idempotent: revoking again, and revoking an unknown token, still
+    // answer 200.
+    let again = client
+        .post(s.url("/api/v1/oauth/revoke"))
+        .form(&[("token", refresh.as_str())])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(again.status(), 200);
+    let unknown = client
+        .post(s.url("/api/v1/oauth/revoke"))
+        .form(&[("token", "sfp_nonexistent")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unknown.status(), 200);
+}

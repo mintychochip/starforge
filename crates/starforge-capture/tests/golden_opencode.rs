@@ -80,6 +80,13 @@ fn opencode_golden_pinned_version() {
             "tool_result",
             "system",
             "compaction",
+            "system",
+            "system",
+            "system",
+            "tool_call",
+            "tool_result",
+            "tool_call",
+            "tool_result",
         ]
     );
     assert!(out.header.capture.adapter_version_verified);
@@ -89,10 +96,10 @@ fn opencode_golden_pinned_version() {
     let system = out
         .events
         .iter()
-        .find(|e| kind_name(&e.kind) == "system")
+        .find(|e| matches!(&e.kind, starforge_format::EventKind::System(s) if s.text.contains("future-part")))
         .expect("fixture must contain a system fallback event");
     let starforge_format::EventKind::System(body) = &system.kind else {
-        unreachable!("kind_name already matched system");
+        unreachable!("find already matched system with future-part");
     };
     assert!(
         body.text.contains("future-part"),
@@ -100,13 +107,45 @@ fn opencode_golden_pinned_version() {
         body.text
     );
 
+    // Real message types map readably, never as raw-JSON system events:
+    // `synthetic`/`system` carry their text (description-prefixed when
+    // present), `agent-switched` names both agents, and `idle` yields
+    // nothing (there is no idle event; total events stay 14).
+    let system_texts: Vec<&str> = out
+        .events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            starforge_format::EventKind::System(s) => Some(s.text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        system_texts,
+        vec![
+            "{\"type\":\"future-part\",\"weird\":true}",
+            "Retry: Synthetic retry hint.",
+            "Notice: Engine restarted.",
+            "Agent switched from build to plan",
+        ]
+    );
+    for text in &system_texts[1..] {
+        assert!(
+            !text.trim_start().starts_with('{'),
+            "mapped message type must not be raw JSON: {text}"
+        );
+    }
+    assert_eq!(out.events.len(), 14, "idle must produce no event");
+
     // Header matches meta.json exactly.
     let meta = std::fs::read_to_string(fixture_dir("2.0.29").join("meta.json")).unwrap();
     let want = SessionMeta::parse(meta.trim()).unwrap();
     assert_eq!(out.header, want);
     assert_eq!(out.header.usage.input, 1200);
     assert_eq!(out.header.usage.output, 60);
-    assert_eq!(out.header.files_touched, vec!["src/auth.rs"]);
+    assert_eq!(
+        out.header.files_touched,
+        vec!["src/auth.rs", "src/modern.rs", "src/legacy.rs"]
+    );
 }
 
 #[test]
@@ -137,7 +176,7 @@ fn opencode_read_is_read_only() {
     let before = std::fs::metadata(&db).unwrap();
     let (mtime, size) = (before.modified().unwrap(), before.len());
     let out = a.read(&found[0], &Cursor::start(), FALLBACK_TS).unwrap();
-    assert_eq!(out.events.len(), 7);
+    assert_eq!(out.events.len(), 14);
     let after = std::fs::metadata(&db).unwrap();
     assert_eq!(after.modified().unwrap(), mtime);
     assert_eq!(after.len(), size);
@@ -186,12 +225,12 @@ fn opencode_incremental_read_resumes() {
     let found = a.discover(&roots, &HashMap::new());
     assert_eq!(found.len(), 1);
     let first = a.read(&found[0], &Cursor::start(), FALLBACK_TS).unwrap();
-    assert_eq!(first.events.len(), 7);
+    assert_eq!(first.events.len(), 14);
     let next = first.next;
-    // 3 messages consumed; the last seq consumed is 2.
-    assert_eq!(next.lines, 3);
-    assert_eq!(next.offset, 2);
-    assert_eq!(next.events, 7);
+    // 8 messages consumed; the last seq consumed is 7.
+    assert_eq!(next.lines, 8);
+    assert_eq!(next.offset, 7);
+    assert_eq!(next.events, 14);
 
     // Empty growth: same cursor back.
     let again = a.read(&found[0], &next, FALLBACK_TS).unwrap();
@@ -199,7 +238,7 @@ fn opencode_incremental_read_resumes() {
     assert_eq!(again.next, next);
 
     // Partial resume across the multi-part assistant message (seq 1
-    // emits 6 events): a cursor after the first message holds 1 event,
+    // emits 5 events): a cursor after the first message holds 1 event,
     // so the tail continues at seq 1 with no reuse, skip, or reorder,
     // and head-plus-tail equals the fresh full read.
     let mid = Cursor {
@@ -208,25 +247,25 @@ fn opencode_incremental_read_resumes() {
         events: 1,
     };
     let tail = a.read(&found[0], &mid, FALLBACK_TS).unwrap();
-    assert_eq!(tail.events.len(), 6);
+    assert_eq!(tail.events.len(), 13);
     assert_eq!(tail.events[0].seq, 1);
-    assert_eq!(tail.next.lines, 3);
-    assert_eq!(tail.next.offset, 2);
+    assert_eq!(tail.next.lines, 8);
+    assert_eq!(tail.next.offset, 7);
     let mut concat: Vec<starforge_format::Event> = first.events.iter().take(1).cloned().collect();
     concat.extend(tail.events.iter().cloned());
     assert_eq!(concat, first.events);
     let mut seqs: Vec<u64> = concat.iter().map(|e| e.seq).collect();
     seqs.sort_unstable();
     seqs.dedup();
-    assert_eq!(seqs, vec![0, 1, 2, 3, 4, 5, 6]);
+    assert_eq!(seqs, vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
 
-    // Growth: a new message (seq 3) is a new candidate, and reading from
+    // Growth: a new message (seq 8) is a new candidate, and reading from
     // the old cursor yields only the new event with continuing seq.
     rusqlite::Connection::open(&db)
         .unwrap()
         .execute_batch(
             "INSERT INTO session_message(id, session_id, type, seq, time_created, time_updated, data)
-             VALUES('msg_user_2', '01ARZ3NDEKTSV4RRFFQ69G5FAY', 'user', 3, 1793793620000, 1793793620000,
+             VALUES('msg_user_2', '01ARZ3NDEKTSV4RRFFQ69G5FAY', 'user', 8, 1793793620000, 1793793620000,
              '{\"text\":\"Thanks.\",\"files\":[],\"agents\":[],\"skills\":[],\"time\":{\"created\":1793793620000}}');",
         )
         .unwrap();
@@ -236,12 +275,12 @@ fn opencode_incremental_read_resumes() {
     assert_eq!(grown.len(), 1);
     let delta = a.read(&grown[0], &next, FALLBACK_TS).unwrap();
     assert_eq!(delta.events.len(), 1);
-    assert_eq!(delta.events[0].seq, 7);
-    assert_eq!(delta.next.offset, 3);
-    assert_eq!(delta.next.lines, 4);
-    assert_eq!(delta.next.events, 8);
+    assert_eq!(delta.events[0].seq, 14);
+    assert_eq!(delta.next.offset, 8);
+    assert_eq!(delta.next.lines, 9);
+    assert_eq!(delta.next.events, 15);
     let fresh = a.read(&grown[0], &Cursor::start(), FALLBACK_TS).unwrap();
-    assert_eq!(fresh.events.len(), 8);
+    assert_eq!(fresh.events.len(), 15);
     let mut concat2 = first.events.clone();
     concat2.extend(delta.events.iter().cloned());
     assert_eq!(concat2, fresh.events);
@@ -320,4 +359,46 @@ fn opencode_session_with_unknown_workdir_is_skipped() {
         found.is_empty(),
         "unknown-cwd sessions must be skipped, got {found:?}"
     );
+}
+
+// `synthetic`/`system` with empty text and description must not push an
+// empty `System` event.
+#[test]
+fn opencode_blank_synthetic_and_system_emit_no_event() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let db = data.join("opencode.db");
+    let sql = "CREATE TABLE project(id TEXT PRIMARY KEY, worktree TEXT NOT NULL, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL);\
+        CREATE TABLE session_v2(id TEXT PRIMARY KEY, project_id TEXT NOT NULL, directory TEXT NOT NULL DEFAULT '', version TEXT NOT NULL DEFAULT '', parent_id TEXT, title TEXT, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, time_archived INTEGER);\
+        CREATE TABLE session_message(id TEXT PRIMARY KEY, session_id TEXT NOT NULL, type TEXT NOT NULL, seq INTEGER NOT NULL, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL);\
+        CREATE TABLE session_part(message_id TEXT NOT NULL, session_id TEXT NOT NULL, ordinal INTEGER NOT NULL, type TEXT NOT NULL, call_id TEXT, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL);\
+        INSERT INTO project(id, worktree, time_created, time_updated) VALUES('p1', '/repo', 1, 1);\
+        INSERT INTO session_v2(id, project_id, directory, version, time_created, time_updated) VALUES('sess_blank', 'p1', '/repo', '2.0.29', 1, 1);\
+        INSERT INTO session_message(id, session_id, type, seq, time_created, time_updated, data) VALUES('m1', 'sess_blank', 'user', 0, 1, 1, '{\"text\":\"hi\"}');\
+        INSERT INTO session_message(id, session_id, type, seq, time_created, time_updated, data) VALUES('m2', 'sess_blank', 'synthetic', 1, 2, 2, '{\"text\":\"\",\"description\":\"\"}');\
+        INSERT INTO session_message(id, session_id, type, seq, time_created, time_updated, data) VALUES('m3', 'sess_blank', 'system', 2, 3, 3, '{}');";
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute_batch(sql)
+        .unwrap();
+    let roots = Roots {
+        config_dir: tmp.path().join("cfg"),
+        data_dir: data,
+        worktree: PathBuf::from("/repo"),
+    };
+    let a = OpencodeAdapter;
+    let found = a.discover(&roots, &HashMap::new());
+    assert_eq!(found.len(), 1);
+    let out = a.read(&found[0], &Cursor::start(), FALLBACK_TS).unwrap();
+    assert_eq!(
+        out.events.len(),
+        1,
+        "only the user message survives: {:?}",
+        out.events
+    );
+    assert!(matches!(
+        out.events[0].kind,
+        starforge_format::EventKind::UserMessage(_)
+    ));
 }

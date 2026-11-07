@@ -6,7 +6,7 @@
 <h3>Changes</h3>
 {% if header.changes.is_empty() %}<p class="muted">No changes yet.</p>{% else %}
 <ul>
-{% for ch in header.changes %}<li><a href="/{{ head.owner }}/{{ head.name }}/trails/{{ header.number }}/changes/{{ ch.k }}">change {{ ch.k }}</a> <span class="badge">{{ ch.kind }}</span> <span class="badge">{{ ch.state }}</span>{% if let Some(h) = ch.head_branch %} <code>{{ h }}</code>{% endif %} onto <code>{{ ch.base_branch }}</code> · r{{ ch.current_revision }} · <span class="badge">{{ ch.mergeability }}</span></li>
+{% for ch in header.changes %}<li><a href="/{{ head.owner }}/{{ head.name }}/trails/{{ header.number }}/changes/{{ ch.k }}">change {{ ch.k }}</a> <span class="badge">{{ ch.kind }}</span> <span class="badge">{{ ch.state }}</span>{% if let Some(h) = ch.head_branch %} <code>{{ h }}</code>{% else if let Some(t) = ch.topic %} <code>for/{{ t }}</code>{% endif %} onto <code>{{ ch.base_branch }}</code> · r{{ ch.current_revision }} · <span class="badge">{{ ch.mergeability }}</span></li>
 {% endfor %}
 </ul>
 {% endif %}

@@ -896,6 +896,37 @@ pub async fn sessions_of_repo(db: &Db, repo_id: i64, limit: i64) -> DbResult<Vec
     .await?;
     rows.iter().map(session_from_row).collect()
 }
+/// Sessions of the repository, newest first, at most `limit` rows.
+pub async fn sessions_of_repo_newest(
+    db: &Db,
+    repo_id: i64,
+    limit: i64,
+) -> DbResult<Vec<SessionRow>> {
+    let rows = sqlx::query(select_session!(
+        "WHERE repo_id = $1 ORDER BY started_at DESC, id DESC LIMIT $2"
+    ))
+    .bind(repo_id)
+    .bind(limit)
+    .fetch_all(db.read_pool())
+    .await?;
+    rows.iter().map(session_from_row).collect()
+}
+
+/// Direct subagent sessions of one parent in the repository, oldest first.
+pub async fn sessions_by_parent(
+    db: &Db,
+    repo_id: i64,
+    parent_ulid: &str,
+) -> DbResult<Vec<SessionRow>> {
+    let rows = sqlx::query(select_session!(
+        "WHERE repo_id = $1 AND parent_ulid = $2 ORDER BY started_at ASC, id ASC"
+    ))
+    .bind(repo_id)
+    .bind(parent_ulid)
+    .fetch_all(db.read_pool())
+    .await?;
+    rows.iter().map(session_from_row).collect()
+}
 
 /// Overwrites the session visibility (`inherit` or `published`). Callers validate the value.
 pub async fn set_visibility(db: &Db, id: i64, visibility: &str) -> DbResult<()> {

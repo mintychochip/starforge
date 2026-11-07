@@ -5,3 +5,10 @@
 {"kind":"tool_result","result":{"is_error":false,"original_bytes":24,"output":"Edited /repo/src/auth.rs","truncated":false},"seq":4,"ts":"2026-11-04T12:00:05Z","v":1}
 {"kind":"system","seq":5,"text":"{\"type\":\"future-part\",\"weird\":true}","ts":"2026-11-04T12:00:05Z","v":1}
 {"kind":"compaction","seq":6,"summary":"Refactored the auth module.","ts":"2026-11-04T12:00:15Z","v":1}
+{"kind":"system","seq":7,"text":"Retry: Synthetic retry hint.","ts":"2026-11-04T12:00:20Z","v":1}
+{"kind":"system","seq":8,"text":"Notice: Engine restarted.","ts":"2026-11-04T12:00:25Z","v":1}
+{"kind":"system","seq":9,"text":"Agent switched from build to plan","ts":"2026-11-04T12:00:30Z","v":1}
+{"kind":"tool_call","seq":10,"tool":{"input":{"path":"/repo/src/modern.rs"},"name":"edit"},"ts":"2026-11-04T12:00:40Z","v":1}
+{"kind":"tool_result","result":{"is_error":false,"original_bytes":26,"output":"Edited /repo/src/modern.rs","truncated":false},"seq":11,"ts":"2026-11-04T12:00:40Z","v":1}
+{"kind":"tool_call","seq":12,"tool":{"input":{"filePath":"/repo/src/legacy.rs"},"name":"edit"},"ts":"2026-11-04T12:00:40Z","v":1}
+{"kind":"tool_result","result":{"is_error":false,"original_bytes":26,"output":"Edited /repo/src/legacy.rs","truncated":false},"seq":13,"ts":"2026-11-04T12:00:40Z","v":1}

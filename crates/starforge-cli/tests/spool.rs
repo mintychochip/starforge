@@ -35,6 +35,7 @@ fn fixture_events() -> (Vec<starforge_format::Event>, SessionMeta, String) {
         native_path: native.clone(),
         agent_version: String::new(),
         workdir: PathBuf::from("/work/repo"),
+        parent_session_key: None,
     };
     let adapter = PiAdapter;
     let out = adapter
@@ -430,6 +431,7 @@ fn cursors_round_trip_cursor_shape_and_unknown_key_is_absent() {
             cursor,
             "/tmp/x/sessions/pi-test.jsonl",
             None,
+            None,
         )
         .unwrap();
 
@@ -576,4 +578,414 @@ fn load_rules_merges_repo_file_and_missing_file_is_builtin() {
         "custom pattern must redact: {out}"
     );
     assert_eq!(counts.get("local"), Some(&1));
+}
+// ---------------------------------------------------------------------------
+// spool prune: only fully uploaded, completed, old sessions lose blobs.
+// ---------------------------------------------------------------------------
+
+fn prune_now() -> time::OffsetDateTime {
+    time::OffsetDateTime::parse(
+        "2026-11-06T00:00:00Z",
+        &time::format_description::well_known::Rfc3339,
+    )
+    .unwrap()
+}
+
+/// Seed one spooled session with segments + a raw slice; returns
+/// `(ulid, cursor_key)`. When `complete` is true, `upload.json` records the
+/// server's acknowledgement (segments + meta hash + `complete`).
+fn seed_spool_session(spool: &Spool, ended_at: Option<&str>, complete: bool) -> (String, String) {
+    let (events, header, raw) = fixture_events();
+    let (rules, compiled) = Spool::load_rules(Path::new("/nonexistent-repo")).unwrap();
+    let (jsonl, counts) = redacted_jsonl(&compiled, &events);
+    let mut meta = test_meta(header, &fingerprint(&rules), counts);
+    meta.ended_at = ended_at.map(str::to_string);
+    let ulid = meta.id.to_string();
+    spool.put_session(&meta).unwrap();
+    let nums = spool
+        .append_events(&ulid, &jsonl, DEFAULT_SEGMENT_CAP, &BTreeMap::new())
+        .unwrap();
+    assert!(!nums.is_empty());
+    spool.write_raw(&ulid, nums[0], raw.as_bytes()).unwrap();
+    for &n in &nums {
+        spool.mark_segment_uploaded(&ulid, n).unwrap();
+    }
+    spool
+        .mark_meta_uploaded(&ulid, starforge_cli::spool::meta_body_hash(&meta).unwrap())
+        .unwrap();
+    if complete {
+        let mut state = spool.read_upload(&ulid).unwrap();
+        state.complete = true;
+        std::fs::write(
+            spool.root.join("sessions").join(&ulid).join("upload.json"),
+            serde_json::to_vec_pretty(&state).unwrap(),
+        )
+        .unwrap();
+    }
+    let key = format!("pi/test-{ulid}");
+    spool
+        .write_cursor(&key, &ulid, Cursor::start(), "/native/path", None, None)
+        .unwrap();
+    (ulid, key)
+}
+
+#[test]
+fn prune_deletes_only_eligible_blobs_and_keeps_meta_upload_and_cursor() {
+    let (_tmp, spool) = open_spool();
+    let (old, old_key) = seed_spool_session(&spool, Some("2026-01-01T00:00:00Z"), true);
+    let (recent, _) = seed_spool_session(&spool, Some("2026-11-05T00:00:00Z"), true);
+    let (incomplete, _) = seed_spool_session(&spool, Some("2026-01-01T00:00:00Z"), false);
+
+    let candidates = spool.prune_candidates(prune_now(), 30).unwrap();
+    let ulids: Vec<&str> = candidates.iter().map(|c| c.ulid.as_str()).collect();
+    assert_eq!(
+        ulids,
+        vec![old.as_str()],
+        "only the old completed session: {candidates:?}"
+    );
+    assert!(candidates[0].bytes > 0);
+
+    let freed = spool
+        .prune_session(&old)
+        .unwrap()
+        .expect("eligible session prunes");
+    assert_eq!(freed, candidates[0].bytes);
+
+    let dir = spool.root.join("sessions").join(&old);
+    assert!(!dir.join("segments").exists(), "segments dir pruned");
+    assert!(!dir.join("raw").exists(), "raw dir pruned");
+    assert!(dir.join("meta.json").is_file(), "meta survives");
+    assert!(dir.join("upload.json").is_file(), "upload state survives");
+    let state = spool.read_upload(&old).unwrap();
+    assert!(state.complete);
+    assert!(
+        !state.uploaded_segments.is_empty(),
+        "uploaded record survives"
+    );
+    assert!(spool.read_meta(&old).is_ok(), "meta still readable");
+    assert!(spool.is_pruned(&old));
+
+    // The ineligible sessions keep their blobs.
+    for other in [&recent, &incomplete] {
+        let dir = spool.root.join("sessions").join(other);
+        assert!(dir.join("segments").is_dir(), "{other} segments kept");
+        assert!(dir.join("raw").is_dir(), "{other} raw kept");
+        assert!(!spool.is_pruned(other));
+    }
+
+    // Cursor record survives: re-ingest of the same native file reuses `old`.
+    let rec = spool
+        .read_cursor(&old_key)
+        .unwrap()
+        .expect("cursor survives");
+    assert_eq!(rec.ulid, old, "cursor still names the pruned session");
+}
+
+#[test]
+fn prune_candidates_dry_run_deletes_nothing() {
+    // The command's `--dry-run` path only scans: computing candidates must
+    // leave every blob on disk.
+    let (_tmp, spool) = open_spool();
+    let (old, _) = seed_spool_session(&spool, Some("2026-01-01T00:00:00Z"), true);
+    let dir = spool.root.join("sessions").join(&old);
+    let before = spool.session_data_bytes(&old);
+    let candidates = spool.prune_candidates(prune_now(), 30).unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert!(dir.join("segments").is_dir());
+    assert!(dir.join("raw").is_dir());
+    assert_eq!(spool.session_data_bytes(&old), before);
+    assert!(!spool.is_pruned(&old));
+}
+
+#[test]
+fn prune_never_touches_unuploaded_or_queued_sessions() {
+    let (_tmp, spool) = open_spool();
+    // Segment never marked uploaded (meta uploaded + complete): ineligible.
+    let (unuploaded, _) = seed_spool_session(&spool, Some("2026-01-01T00:00:00Z"), true);
+    let mut state = spool.read_upload(&unuploaded).unwrap();
+    state.uploaded_segments.clear();
+    std::fs::write(
+        spool
+            .root
+            .join("sessions")
+            .join(&unuploaded)
+            .join("upload.json"),
+        serde_json::to_vec_pretty(&state).unwrap(),
+    )
+    .unwrap();
+    // Eligible except a queue entry is still pending for it.
+    let (queued, _) = seed_spool_session(&spool, Some("2026-01-01T00:00:00Z"), true);
+    enqueue(
+        &spool,
+        queue_entry(QueueOp::Segment, &queued, Some(0), "2026-11-06T00:00:00Z"),
+    )
+    .unwrap();
+
+    let candidates = spool.prune_candidates(prune_now(), 30).unwrap();
+    assert!(
+        candidates.is_empty(),
+        "unuploaded/queued sessions are never pruned: {candidates:?}"
+    );
+    assert!(
+        spool
+            .root
+            .join("sessions")
+            .join(&unuploaded)
+            .join("segments")
+            .is_dir()
+    );
+    assert!(
+        spool
+            .root
+            .join("sessions")
+            .join(&queued)
+            .join("segments")
+            .is_dir()
+    );
+}
+
+#[test]
+fn prune_uses_cursor_last_event_at_without_ended_at() {
+    let (_tmp, spool) = open_spool();
+    // No ended_at: the cursor's last_event_at is the activity fallback.
+    let (ulid, key) = seed_spool_session(&spool, None, true);
+    spool
+        .write_cursor(
+            &key,
+            &ulid,
+            Cursor::start(),
+            "/native/path",
+            Some("2026-01-01T00:00:00Z".to_string()),
+            None,
+        )
+        .unwrap();
+    let candidates = spool.prune_candidates(prune_now(), 30).unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].last_activity, "2026-01-01T00:00:00Z");
+}
+
+#[test]
+fn reingest_after_prune_reuses_the_pruned_ulid() {
+    use starforge_capture::Roots;
+    use starforge_cli::config::CliPaths;
+    use starforge_cli::git::common_dir;
+    use starforge_cli::ingest::ingest;
+    use starforge_cli::queue::{read_queue, rewrite_queue};
+
+    fn git_ok(repo: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed");
+    }
+    fn parse_now(s: &str) -> time::OffsetDateTime {
+        time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339).unwrap()
+    }
+
+    // Real repo + fake home with the Pi fixture as a native session.
+    let repo_dir = TempDir::new().unwrap();
+    let repo = repo_dir.path().to_path_buf();
+    git_ok(&repo, &["init", "-q"]);
+    git_ok(&repo, &["config", "user.email", "t@t.t"]);
+    git_ok(&repo, &["config", "user.name", "t"]);
+    git_ok(&repo, &["commit", "--allow-empty", "-q", "-m", "init"]);
+    let home = TempDir::new().unwrap();
+    let _paths = CliPaths::from_home(home.path().to_path_buf());
+    let store = home.path().join(".pi/agent/sessions/--x--");
+    std::fs::create_dir_all(&store).unwrap();
+    let body = std::fs::read_to_string(fixture_path())
+        .unwrap()
+        .replace("/work/repo", &repo.to_string_lossy());
+    std::fs::write(store.join("pi-prune-1.jsonl"), body).unwrap();
+
+    let common = common_dir(&repo).unwrap();
+    let spool = Spool::open(&common);
+    spool.ensure_layout().unwrap();
+    let roots = BTreeMap::from([(
+        "pi".to_string(),
+        Roots {
+            config_dir: home.path().join(".config"),
+            data_dir: home.path().to_path_buf(),
+            worktree: repo.clone(),
+        },
+    )]);
+    // `now` long after the fixture's last event, so the session ends old.
+    ingest(&spool, &roots, &repo, parse_now("2026-11-06T00:00:00Z")).unwrap();
+    let ulids = spool.session_ulids().unwrap();
+    assert_eq!(ulids.len(), 1, "one spool session: {ulids:?}");
+    let ulid = ulids[0].clone();
+
+    // Pretend the server acknowledged everything: every segment uploaded,
+    // current meta hash uploaded, complete set, queue settled.
+    for n in spool.existing_segments(&ulid).unwrap() {
+        spool.mark_segment_uploaded(&ulid, n).unwrap();
+    }
+    let meta = spool.read_meta(&ulid).unwrap();
+    spool
+        .mark_meta_uploaded(&ulid, starforge_cli::spool::meta_body_hash(&meta).unwrap())
+        .unwrap();
+    let mut state = spool.read_upload(&ulid).unwrap();
+    state.complete = true;
+    std::fs::write(
+        spool.root.join("sessions").join(&ulid).join("upload.json"),
+        serde_json::to_vec_pretty(&state).unwrap(),
+    )
+    .unwrap();
+    rewrite_queue(&spool, &[]).unwrap();
+    assert!(read_queue(&spool).unwrap().is_empty());
+
+    // Eligible, and prune_session deletes only the blobs.
+    let candidates = spool
+        .prune_candidates(parse_now("2026-11-06T00:00:00Z"), 30)
+        .unwrap();
+    assert_eq!(
+        candidates.len(),
+        1,
+        "ingested session is eligible: {candidates:?}"
+    );
+    spool
+        .prune_session(&candidates[0].ulid)
+        .unwrap()
+        .expect("eligible session prunes");
+    assert!(spool.is_pruned(&ulid));
+
+    // Re-ingest of the unchanged native file must not mint a new session.
+    let stats = ingest(&spool, &roots, &repo, parse_now("2026-11-06T00:00:00Z")).unwrap();
+    assert_eq!(
+        stats.sessions, 0,
+        "unchanged file yields no new session: {stats:?}"
+    );
+    let after = spool.session_ulids().unwrap();
+    assert_eq!(
+        after,
+        vec![ulid.clone()],
+        "no new session dir after prune + re-ingest"
+    );
+    let records = spool.cursor_records().unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records.values().next().unwrap().ulid, ulid);
+}
+
+#[test]
+fn append_after_prune_recreates_dirs_and_writes_segment_zero() {
+    let (_tmp, spool) = open_spool();
+    let (ulid, _) = seed_spool_session(&spool, Some("2026-01-01T00:00:00Z"), true);
+    let candidates = spool.prune_candidates(prune_now(), 30).unwrap();
+    assert_eq!(candidates.len(), 1);
+    spool
+        .prune_session(&ulid)
+        .unwrap()
+        .expect("eligible session prunes");
+    assert!(spool.is_pruned(&ulid));
+
+    // Re-ingest after prune: append_events/write_raw must recreate the
+    // removed dirs instead of failing with ENOENT.
+    let (events, _header, raw) = fixture_events();
+    let (_rules, compiled) = Spool::load_rules(Path::new("/nonexistent-repo")).unwrap();
+    let (jsonl, counts) = redacted_jsonl(&compiled, &events);
+    let nums = spool
+        .append_events(&ulid, &jsonl, DEFAULT_SEGMENT_CAP, &counts)
+        .unwrap();
+    assert_eq!(nums, vec![0], "segment numbering restarts at 0 after prune");
+    assert_eq!(spool.existing_segments(&ulid).unwrap(), vec![0]);
+    spool.write_raw(&ulid, 0, raw.as_bytes()).unwrap();
+    assert!(
+        spool.raw_bytes(&ulid, 0).is_ok(),
+        "raw slice written post-prune"
+    );
+    let meta = spool.read_meta(&ulid).unwrap();
+    assert!(
+        meta.redaction.counts.contains_key("known-token"),
+        "meta updated post-prune: {:?}",
+        meta.redaction.counts
+    );
+}
+
+#[test]
+fn prune_session_skips_when_session_changed_since_scan() {
+    let (_tmp, spool) = open_spool();
+    let (ulid, _) = seed_spool_session(&spool, Some("2026-01-01T00:00:00Z"), true);
+    let candidates = spool.prune_candidates(prune_now(), 30).unwrap();
+    assert_eq!(candidates.len(), 1);
+
+    // A new (unuploaded) segment appears after the scan.
+    let (events, _header, _raw) = fixture_events();
+    let (_rules, compiled) = Spool::load_rules(Path::new("/nonexistent-repo")).unwrap();
+    let (jsonl, _counts) = redacted_jsonl(&compiled, &events);
+    let nums = spool
+        .append_events(&ulid, &jsonl, DEFAULT_SEGMENT_CAP, &BTreeMap::new())
+        .unwrap();
+    assert_eq!(nums, vec![1]);
+
+    let result = spool.prune_session(&ulid).unwrap();
+    assert_eq!(result, None, "changed session is skipped, not pruned");
+    let dir = spool.root.join("sessions").join(&ulid);
+    assert!(dir.join("segments").is_dir(), "nothing deleted");
+    assert_eq!(spool.existing_segments(&ulid).unwrap(), vec![0, 1]);
+}
+
+#[cfg(unix)]
+#[test]
+fn prune_refuses_symlinked_dirs_and_session_ulids_skips_them() {
+    let (_tmp, spool) = open_spool();
+    let (ulid, _) = seed_spool_session(&spool, Some("2026-01-01T00:00:00Z"), true);
+    let dir = spool.root.join("sessions").join(&ulid);
+
+    // A symlinked `segments` component must be refused, target untouched.
+    let target = _tmp.path().join("segments-target");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(target.join("keep.txt"), "keep me").unwrap();
+    std::fs::remove_dir_all(dir.join("segments")).unwrap();
+    std::os::unix::fs::symlink(&target, dir.join("segments")).unwrap();
+    assert!(
+        spool.prune_session(&ulid).is_err(),
+        "symlinked segments refused"
+    );
+    assert_eq!(
+        std::fs::read_to_string(target.join("keep.txt")).unwrap(),
+        "keep me",
+        "prune never deletes through the symlink"
+    );
+
+    // A symlinked session dir is not listed as a session at all.
+    std::fs::remove_dir_all(&target).unwrap();
+    std::fs::remove_file(dir.join("segments")).unwrap();
+    let real = _tmp.path().join("real-session");
+    std::fs::rename(&dir, &real).unwrap();
+    std::os::unix::fs::symlink(&real, &dir).unwrap();
+    let ulids = spool.session_ulids().unwrap();
+    assert!(
+        !ulids.contains(&ulid),
+        "symlinked session dir skipped: {ulids:?}"
+    );
+}
+
+#[test]
+fn prune_command_rejects_huge_older_than() {
+    use starforge_cli::commands::spool::prune;
+    let repo_dir = TempDir::new().unwrap();
+    let repo = repo_dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    for args in [
+        vec!["init", "-q"],
+        vec!["config", "user.email", "t@t.t"],
+        vec!["config", "user.name", "t"],
+        vec!["commit", "--allow-empty", "-q", "-m", "init"],
+    ] {
+        let status = std::process::Command::new("git")
+            .args(&args)
+            .current_dir(&repo)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed");
+    }
+    let (out, code) = prune(&repo, u64::MAX, false);
+    assert_eq!(code, 1, "huge --older-than exits 1: {out}");
+    assert!(out.contains("too large"), "error names the bound: {out}");
 }

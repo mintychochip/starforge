@@ -15,7 +15,9 @@ use crate::AppState;
 use crate::auth::{CsrfForm, MaybeUser, verify_csrf};
 use crate::error::WebError;
 use crate::session_render::{render_event, render_marker};
-use crate::views::{FileView, NavUser, RepoHead, STRICT_CSP, file_views, format_time, nav};
+use crate::views::{
+    FileView, NavUser, RepoHead, STRICT_CSP, display_title, file_views, format_time, nav,
+};
 
 #[derive(Deserialize)]
 pub struct SessionQuery {
@@ -40,6 +42,29 @@ pub struct EventView {
     anchor: String,
     html: String,
     focused: bool,
+}
+
+/// One linked session heading: the readable parent (when present) and each
+/// readable direct child. Titles fall back to `Untitled session`.
+pub struct RelatedSessionView {
+    ulid: String,
+    title: String,
+    agent_name: String,
+    lifecycle: String,
+}
+
+fn related_view(
+    ulid: String,
+    title: &str,
+    agent_name: String,
+    lifecycle: String,
+) -> RelatedSessionView {
+    RelatedSessionView {
+        ulid,
+        title: display_title(title),
+        agent_name,
+        lifecycle,
+    }
 }
 
 #[derive(Template, WebTemplate)]
@@ -86,6 +111,11 @@ pub struct SessionPageView {
     split_sha: Option<String>,
     files: Vec<FileView>,
     truncated: bool,
+    /// The readable parent, when this session names one the viewer may
+    /// read; unreadable or absent parents stay hidden.
+    parent: Option<RelatedSessionView>,
+    /// Readable direct subagent sessions, oldest first.
+    children: Vec<RelatedSessionView>,
 }
 
 /// `GET /{owner}/{repo}/sessions/{ulid}?page=N&focus=seq&q=needle&split=<sha>`:
@@ -200,6 +230,35 @@ pub async fn show(
     let models = serde_json::from_str::<Vec<String>>(&session_row.models)
         .map(|models| models.join(", "))
         .unwrap_or_else(|_| session_row.models.clone());
+    // Parent/children links (§6.4-checked in core): an unreadable parent is
+    // hidden rather than shown as a locked placeholder.
+    let parent_row = state
+        .core
+        .readable_parent_session(user, &access, &session_row)
+        .await?;
+    let parent = parent_row.map(|row| {
+        related_view(
+            row.ulid.clone(),
+            &row.title,
+            row.agent_name.clone(),
+            row.lifecycle.clone(),
+        )
+    });
+    let child_rows = state
+        .core
+        .readable_child_sessions(user, &access, &session_row.ulid)
+        .await?;
+    let children = child_rows
+        .iter()
+        .map(|row| {
+            related_view(
+                row.ulid.clone(),
+                &row.title,
+                row.agent_name.clone(),
+                row.lifecycle.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
     let page_view = SessionPageView {
         nav_user: nav(session.as_ref()),
         head: RepoHead::new(&access, "sessions", None),
@@ -256,6 +315,8 @@ pub async fn show(
         split_sha,
         files,
         truncated,
+        parent,
+        children,
     };
     // Sessions never reach search indexes (spec §11.1). The transcript is
     // attacker-influenced, so the viewer also carries the strict CSP (it

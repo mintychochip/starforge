@@ -38,6 +38,10 @@ pub struct ChangeJson {
     pub k: i64,
     pub kind: String,
     pub head_branch: Option<String>,
+    /// The `refs/for/<base>/<topic>` push topic for `agit` changes (the
+    /// pusher's handle when the push named no topic); `null` for branch and
+    /// imported changes, whose `head_branch` names the source instead.
+    pub topic: Option<String>,
     pub base_branch: String,
     pub current_revision: i64,
     pub state: String,
@@ -67,6 +71,7 @@ async fn change_json_full(
         k: view.k,
         kind: view.kind.clone(),
         head_branch: view.head_branch.clone(),
+        topic: view.topic.clone(),
         base_branch: view.base_branch.clone(),
         current_revision: view.current_revision,
         state: view.state.clone(),

@@ -8,10 +8,10 @@ search, webhooks, and mirrors, on SQLite or Postgres.
 ### Features by area
 
 - **Git hosting (M0):** smart HTTP, local accounts, personal access tokens,
-  user-owned repositories with collaborators, code and history browsing,
-  repository rename redirects, archive, and soft-delete with a 7-day restore
-  window, plus a REST API (`/api/v1`, OpenAPI 3.1 at
-  `/api/v1/openapi.json`).
+  user-owned repositories with collaborators, code and history browsing
+  (including per-file history at `/commits/{ref}/{path}`), repository rename
+  redirects, archive, and soft-delete with a 7-day restore window, plus a
+  REST API (`/api/v1`, OpenAPI 3.1 at `/api/v1/openapi.json`).
 - **Accounts and auth:** invite-only registration (`invite`, `open`,
   `domains`, and `sso` modes), email verification and password reset,
   TOTP two-factor authentication with recovery codes, OIDC single sign-on
@@ -23,8 +23,11 @@ search, webhooks, and mirrors, on SQLite or Postgres.
   adapters for Claude Code, Codex, Pi and omp, OpenCode (v2 SQLite store),
   and Gemini CLI, read from each agent's own store directory (see
   `docs/user/sessions.md`), session viewer with in-session search and split
-  view, quarantine on high-confidence redaction hits,
-  publish/unpublish/delete, export/import bundles. Only sessions whose
+  view, a per-repository sessions list with agent/state filters and the
+  subagent hierarchy (omp nested sessions link to their parent), fallback
+  titles and `files_touched` from real tool-call records, quarantine on
+  high-confidence redaction hits, publish/unpublish/delete, export/import
+  bundles. Only sessions whose
   working directory lies inside the repository are captured; sessions with
   no known working directory are never attributed. Antigravity CLI sessions
   are not captured (see README "Known gaps").
@@ -52,10 +55,13 @@ search, webhooks, and mirrors, on SQLite or Postgres.
   cargo-dist installers for `starforge`, and Playwright browser tests
   (`tests/browser/`).
 - **CLI:** `starforge` — `auth login` (device flow, scopes `repo:read
-  trail:write session:upload`), `enable`/`disable` (git hooks plus the
-  Claude Code `SessionEnd` hook, which runs `starforge hook session-end`),
-  `status`, `doctor`, `sync`, `sessions list/show/link/unlink/publish/
-  unpublish/delete`, `export`/`import`, and `trail
+  trail:write session:upload`), `auth ssh-key add` (one-time `repo:write`
+  device flow, token never stored), `enable`/`disable` (git hooks plus the
+  Claude Code `SessionEnd` hook, which runs `starforge hook session-end`;
+  `enable` configures only agents it detects), `status`, `doctor`, `sync`,
+  `spool prune` (drop uploaded session blobs, `--dry-run`), `sessions
+  list/show/link/unlink/backfill-links/publish/unpublish/delete`,
+  `export`/`import`, and `trail
   list/show/create/comment/push/checkout/review/merge`. Server discovery
   uses `GET /.well-known/starforge.json`; the advertised `api_url` must
   share the origin of the repository's remote (or of `git config
