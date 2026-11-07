@@ -4,7 +4,8 @@ A self-hostable git forge built around agent-assisted development. It hosts
 git over HTTP and SSH with local accounts, personal access tokens,
 user-owned repositories with collaborators, code and history browsing, a
 REST API, Trails (issue-like objects with changes, revisions, reviews, and
-gates), agent session traces with redaction, search, webhooks, and mirrors.
+gates), agent session traces with redaction, search, webhooks, mirrors, and
+opt-in CI runners with sandboxed jobs.
 See `docs/superpowers/specs/2026-11-03-starforge-design.md`.
 
 ## Requirements
@@ -67,7 +68,10 @@ podman run --rm -p 3000:3000 -p 2222:2222 -v starforge-data:/data starforge:0.1.
   backup and restore, upgrades and migrations, doctor, monitoring, abuse
   controls, site administration.
 - User guide: [docs/user/](docs/user/) — getting started, repositories and
-  SSH keys, Trails, sessions, search, orgs and teams, API and webhooks.
+  SSH keys, Trails, sessions, search, orgs and teams, API and webhooks,
+  and [CI](docs/user/ci.md).
+- CI administration: [docs/admin/ci.md](docs/admin/ci.md) — runner
+  registration, `starforge-sandboxd`, E2B, quotas, and audit.
 - Trace format: [docs/format/README.md](docs/format/README.md).
 
 ## Development
@@ -92,6 +96,13 @@ Explicit v0.1.0 non-goals (program rulings):
 - **Per-response CSP nonce (§11.1):** the CSP forbids inline scripts entirely
   and serves scripts only from the origin, which is stricter than a nonce
   allowance. Cost: none.
+- **CI runners are opt-in:** a repository with no `.starforge/ci.toml`
+  behaves exactly as before, and external CI keeps reporting through the
+  status API and webhooks. The server never executes job code: operators
+  run `starforge-runner` and `starforge-sandboxd`. The E2B adapter is
+  E2B-shaped, not a wire-compatibility promise; Firecracker and Kata are
+  reserved runtime names for a later release. Cost: those runtimes need
+  an adapter, not a config change.
 - **Antigravity CLI capture:** current Antigravity CLI releases keep sessions
   under `~/.gemini/antigravity-cli/brain/<id>/` in an undocumented, closed
   format, which the Gemini adapter does not read. Gemini CLI sessions are

@@ -137,3 +137,6 @@ proxy injects them as headers for allowlisted destinations only
 without a proxy). A secret's value is registered for dynamic redaction
 in the job's sessions, so it cannot appear in session text, logs, or
 search results.
+
+The normative spec — limits, run states, check descriptions, and the
+`ci`/`check` webhook payloads — is [CI Format v1](../format/ci-v1.md).

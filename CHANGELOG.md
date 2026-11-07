@@ -55,6 +55,15 @@ search, webhooks, and mirrors, on SQLite or Postgres.
   the OCI image (`Containerfile`, Alpine, non-root, `/data` volume),
   cargo-dist installers for `starforge`, and Playwright browser tests
   (`tests/browser/`).
+- **CI runners and sandboxes (M6):** opt-in `.starforge/ci.toml` jobs
+  triggered by pushes, Trail changes, or manually; self-hosted runners
+  with lease fences and per-job tokens; sandboxed execution through
+  `starforge-sandboxd` (`podman`/gVisor) or an E2B-shaped adapter;
+  artifacts with BLAKE3 CAS and 30-day retention; sealed repo secrets
+  injected only by the egress proxy; per-job agent sessions linked to the
+  run; and the `ci` webhook event (`queued`/`started`/`finished`/
+  `canceled`). External CI statuses and webhooks are unchanged, and the
+  server never runs job code.
 - **CLI:** `starforge` — `auth login` (device flow, scopes `repo:read
   trail:write session:upload`), `auth ssh-key add` (one-time `repo:write`
   device flow; both tokens are revoked and never stored), `enable`/`disable`
@@ -109,6 +118,10 @@ before upgrading (see `docs/admin/backup-and-restore.md`).
 | 0028 | Audit indexes |
 | 0029 | Atomic SSH fingerprint registry |
 | 0034 | Fingerprint registry rows cascade with their key rows |
+| 0035 | Rerun requests for deduplicated jobs |
+| 0036 | CI runners, jobs, logs, artifacts, job sessions and tokens |
+| 0037 | Sandboxes and sandbox-second usage windows |
+| 0038 | CI secrets and one-time artifact tokens |
 
 Note: migration numbers 0030–0033 do not exist; the series jumps from 0029
 to 0034.
