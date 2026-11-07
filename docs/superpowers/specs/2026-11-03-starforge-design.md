@@ -33,7 +33,10 @@ It ships as two programs:
 
 ### Non-goals (v0.1.0)
 
-- CI runners. External CI integrates through the commit status API and webhooks (§10.4).
+- CI runners are opt-in (M6, additive supersession of D13): repositories
+  without a runner keep the external-CI path (commit status API and
+  webhooks, §10.4); runners and sandboxed agent execution are described in
+  §14 M6.
 - Git LFS.
 - Forks, cross-repo changes, and multi-repo Trails. Contributors without write access use `refs/for` pushes (§8.2).
 - Rebase-and-merge. Git's server-side `replay` is still experimental.
@@ -593,6 +596,7 @@ Each milestone ends in a usable increment and gets its own implementation plan.
 | **M3** Orgs and SSH | Orgs, teams, base permissions; branch and tag protection; SSH via russh; deploy keys; OIDC single sign-on; TOTP |
 | **M4** Search and import | tantivy search over Trails and sessions; `git grep` code search; git import; pull and push mirrors; GitHub metadata import |
 | **M5** Hardening and v0.1.0 | Rate limits and quotas; audit log UI; backup and restore; `doctor`; packaging (binaries, OCI image, installers); admin, user, and format documentation |
+| **M6** CI runners and sandboxed agent execution (additive supersession of D13) | Opt-in per-repository CI (`.starforge/ci.toml`): runner registration and long-poll claim with lease fencing, sandbox API (local rootless podman/`starforge-sandboxd`, gVisor opt-in, E2B; Firecracker/Kata reserved, no GPU), egress proxy with per-sandbox CA, sealed secrets with proxy header injection, artifacts, `ci` webhook event, dynamic session redaction of secret values, admin/CI UI. Repositories without a runner keep external CI via statuses/webhooks |
 
 ## 15. Risks
 

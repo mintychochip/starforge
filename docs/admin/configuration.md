@@ -51,6 +51,19 @@
 | `sandbox.limits.sandbox_seconds_per_hour` | Sandbox-seconds per user per hour (default `0`; `0` disables) |
 | `sandbox.default_ttl_secs` | Default sandbox lifetime cap in seconds when a request does not carry `timeout_s` (default `3600`) |
 
+### CI (M6, opt-in)
+
+CI has no server-wide `[ci]` section in `starforged.toml`. The control
+plane (runners, jobs, artifacts, secrets) is configured per repository
+through `.starforge/ci.toml` and the APIs; see [User: CI](../user/ci.md)
+and [CI administration](ci.md). The per-repo `[ci]` keys set in the
+repository's `.starforge/ci.toml` are:
+
+| Key | Meaning |
+|---|---|
+| `ci.allow_secrets_on_refs_for` | Whether `refs/for` runs may resolve repo secrets (default `false`, server-wide default `false`; when off, `refs/for` runs get no secrets) |
+| `ci.env_secrets` | Explicit per-repo opt-in to inject secret values into the job environment for providers without an egress proxy (default `false`; by default secrets only enter the egress-proxy headers) |
+
 Any key can be overridden with an environment variable such as `STARFORGE__SERVER__HTTP_ADDR` or
 `STARFORGE__DATABASE__URL`. `STARFORGE_CONFIG` sets the config file path.
 

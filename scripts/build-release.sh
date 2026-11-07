@@ -31,12 +31,12 @@ rm -f "$OUT_DIR"/starforged-*.tar.gz "$OUT_DIR"/starforged-*-SHA256SUMS
 
 for target in "${TARGETS[@]}"; do
   echo "==> building $target"
-  cargo zigbuild --release --target "$target" -p starforged -p starforge-cli
+  cargo zigbuild --release --target "$target" -p starforged -p starforge-cli -p starforge-runner -p starforge-sandboxd
 
   stage="$OUT_DIR/$target"
   rm -rf "$stage"
   mkdir -p "$stage"
-  cp "$TARGET_DIR/$target/release/starforged" "$TARGET_DIR/$target/release/starforge" "$stage/"
+  cp "$TARGET_DIR/$target/release/starforged" "$TARGET_DIR/$target/release/starforge" "$TARGET_DIR/$target/release/starforge-runner" "$TARGET_DIR/$target/release/starforge-sandboxd" "$stage/"
   tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner -cf - -C "$OUT_DIR" "$target" | gzip -n > "$OUT_DIR/starforged-$VERSION-$target.tar.gz"
   rm -rf "$stage"
 done

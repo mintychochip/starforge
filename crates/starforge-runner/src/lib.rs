@@ -157,12 +157,21 @@ pub fn parse_timeout(text: &str) -> Option<Duration> {
     if text.is_empty() {
         return None;
     }
-    let (num, unit) = text.split_at(text.len() - text.chars().last().map_or(0, |c| c.len_utf8()));
-    let n: u64 = num.trim().parse().ok()?;
+    // Split leading digits from the unit suffix ("30m", "90s", "1h", "120").
+    let digit_len = text
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .map(|c| c.len_utf8())
+        .sum::<usize>();
+    if digit_len == 0 {
+        return None;
+    }
+    let (digits, unit) = text.split_at(digit_len);
+    let n: u64 = digits.parse().ok()?;
     match unit.trim() {
-        "s" | "" => Some(Duration::from_secs(n)),
-        "m" => Some(Duration::from_secs(n * 60)),
-        "h" => Some(Duration::from_secs(n * 3600)),
+        "" | "s" => Some(Duration::from_secs(n)),
+        "m" => Some(Duration::from_secs(n.saturating_mul(60))),
+        "h" => Some(Duration::from_secs(n.saturating_mul(3600))),
         _ => None,
     }
 }
@@ -1068,22 +1077,34 @@ impl<P: SandboxProvider> Executor<P> {
 
 /// Simple glob match supporting `*` and `**`.
 pub fn glob_match(pattern: &str, text: &str) -> bool {
+    // `**/` matches any number of path segments (including zero).
     if let Some(rest) = pattern.strip_prefix("**/") {
         if glob_match(rest, text) {
             return true;
         }
-        return text
-            .find('/')
-            .map(|i| glob_match(pattern, &text[i + 1..]))
-            .unwrap_or(false);
+        if text.len() > 1 {
+            return glob_match(pattern, &text[1..]);
+        }
+        return text.len() == 1 && glob_match(pattern, "");
     }
     if let Some(star) = pattern.find('*') {
-        let (pre, post) = (&pattern[..star], &pattern[star + 1..]);
+        let double = pattern[star..].starts_with("**");
+        let pre = &pattern[..star];
+        let post = if double {
+            &pattern[star + 2..]
+        } else {
+            &pattern[star + 1..]
+        };
         if !text.starts_with(pre) {
             return false;
         }
         let rest = &text[pre.len()..];
-        return (0..=rest.len()).any(|i| glob_match(post, &rest[i..]) && !rest[..i].contains('/'));
+        if double {
+            // `**` matches any characters, including `/`.
+            return (0..=rest.len()).any(|i| glob_match(post, &rest[i..]));
+        }
+        // Single `*` matches any characters except `/`.
+        return (0..=rest.len()).any(|i| !rest[..i].contains('/') && glob_match(post, &rest[i..]));
     }
     pattern == text
 }
@@ -1211,6 +1232,7 @@ mod tests {
     fn timeout_parses_units() {
         assert_eq!(parse_timeout("90s"), Some(Duration::from_secs(90)));
         assert_eq!(parse_timeout("30m"), Some(Duration::from_secs(1800)));
+        assert_eq!(parse_timeout("2m"), Some(Duration::from_secs(120)));
         assert_eq!(parse_timeout("1h"), Some(Duration::from_secs(3600)));
         assert_eq!(parse_timeout("120"), Some(Duration::from_secs(120)));
         assert_eq!(parse_timeout("bogus"), None);
@@ -1227,6 +1249,8 @@ mod tests {
     #[test]
     fn glob_matches() {
         assert!(glob_match("target/nextest/**", "target/nextest/a/b.txt"));
+        assert!(glob_match("**/a.txt", "x/y/a.txt"));
+        assert!(glob_match("target/nextest/**", "target/nextest/a.txt"));
         assert!(glob_match("*.txt", "a.txt"));
         assert!(!glob_match("*.txt", "a/b.txt"));
         assert!(glob_match("out.bin", "out.bin"));
