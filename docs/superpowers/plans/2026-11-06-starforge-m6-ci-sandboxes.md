@@ -3,7 +3,7 @@
 > **Status (2026-11-08):** complete and released in the `0.1.0-rc.1`
 > release candidate. The real end-to-end run (`scripts/ci-e2e.sh`, server +
 > runner + sandboxd + rootless podman) passes. Deferred by ruling and
-> documented: E2B is E2B-shaped, not wire-compatible; Firecracker and
+> documented: E2B uses the real v2 API; Firecracker and
 > Kata are reserved runtime names (422); no GPU; only Depot usage is
 > read. The egress proxy is HTTPS `CONNECT` only and local sandboxes
 > reach it through an in-sandbox forwarder over a Unix socket; the

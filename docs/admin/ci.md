@@ -103,7 +103,7 @@ Server-side configuration (`[sandbox]`, see
 | `sandbox.local.socket` | `/run/starforge/sandboxd.sock` |
 | `sandbox.local.token_file` | `/run/starforge/sandboxd.token` |
 | `sandbox.local.egress.allowlist` | `[]` |
-| `sandbox.e2b.api_url` | `https://api.e2b.dev` |
+| `sandbox.e2b.api_url` | `https://api.e2b.app` |
 | `sandbox.e2b.api_key` | (sealed; never logged or rendered) |
 | `sandbox.limits.max_concurrent_per_user` / `max_concurrent_per_repo` | `0` (disabled) |
 | `sandbox.limits.sandbox_seconds_per_hour` | `0` (disabled) |

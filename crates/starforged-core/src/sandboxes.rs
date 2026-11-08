@@ -151,7 +151,7 @@ impl Default for E2bSandboxConfig {
 }
 
 fn default_e2b_api_url() -> String {
-    "https://api.e2b.dev".to_owned()
+    "https://api.e2b.app".to_owned()
 }
 
 /// Admission limits for sandboxes. Every limit is `0`-disables.
@@ -1350,7 +1350,7 @@ mod tests {
             PathBuf::from("/run/starforge/sandboxd.token")
         );
         assert!(config.local.egress.allowlist.is_empty());
-        assert_eq!(config.e2b.api_url, "https://api.e2b.dev");
+        assert_eq!(config.e2b.api_url, "https://api.e2b.app");
         assert_eq!(config.default_ttl_secs, 3600);
         assert_eq!(config.limits.max_concurrent_per_user, 0);
     }
@@ -1396,7 +1396,7 @@ sandbox_seconds_per_hour = 1800
     #[test]
     fn api_key_never_renders_in_debug() {
         let config = E2bSandboxConfig {
-            api_url: "https://api.e2b.dev".to_owned(),
+            api_url: "https://api.e2b.app".to_owned(),
             api_key: "super-secret".to_owned(),
         };
         let rendered = format!("{config:?}");

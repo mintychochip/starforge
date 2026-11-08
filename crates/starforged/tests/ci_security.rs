@@ -184,28 +184,31 @@ async fn spawn_fake_e2b() -> String {
                 let path = target.split('?').next().unwrap_or_default().to_owned();
                 let info = |st: &str| {
                     serde_json::json!({
-                        "id": "sbx-1", "state": st, "runtime": "e2b",
-                        "expires_at": null, "provider": "e2b",
+                        "sandboxID": "sbx-1", "state": st,
+                        "envdAccessToken": "envd-tok", "domain": "fake",
                     })
                     .to_string()
                 };
-                let (status, resp_body): (u16, String) = if method == "POST" && path == "/sandboxes"
-                {
-                    (200, info("running"))
-                } else if method == "GET" && path == "/sandboxes/sbx-1" {
-                    (200, info(&state.lock().unwrap().clone()))
-                } else if method == "DELETE" && path == "/sandboxes/sbx-1" {
-                    *state.lock().unwrap() = "killed".to_owned();
-                    (204, String::new())
-                } else {
-                    (
-                        404,
-                        json!({"code": "not_found", "message": "no route", "retryable": false})
-                            .to_string(),
-                    )
-                };
+                let (status, resp_body): (u16, String) =
+                    if method == "POST" && path == "/v2/sandboxes" {
+                        (201, info("running"))
+                    } else if method == "GET" && path == "/sandboxes/sbx-1" {
+                        (200, info(&state.lock().unwrap().clone()))
+                    } else if method == "POST" && path == "/sandboxes/sbx-1/connect" {
+                        (200, info("running"))
+                    } else if method == "DELETE" && path == "/sandboxes/sbx-1" {
+                        *state.lock().unwrap() = "killed".to_owned();
+                        (204, String::new())
+                    } else {
+                        (
+                            404,
+                            json!({"code": "not_found", "message": "no route", "retryable": false})
+                                .to_string(),
+                        )
+                    };
                 let reason = match status {
                     200 => "OK",
+                    201 => "Created",
                     204 => "No Content",
                     _ => "Not Found",
                 };

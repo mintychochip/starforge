@@ -105,8 +105,8 @@ Explicit v0.1.0 non-goals and deferrals (program rulings):
   behaves exactly as before, and external CI keeps reporting through the
   status API and webhooks. The server never executes job code: operators
   run `starforge-runner` and `starforge-sandboxd`. The E2B adapter is
-  E2B-shaped, not a wire-compatibility promise; Firecracker and Kata are
-  reserved runtime names for a later release. Local sandbox egress uses
+  real E2B v2 API; Firecracker and Kata are reserved runtime names for a
+  later release. Local sandbox egress uses
   an in-sandbox forwarder over a Unix socket: the sandbox keeps
   `--network none`, the daemon copies its own static binary in, and the
   host connects into the forwarder's socket with a connection pool. The

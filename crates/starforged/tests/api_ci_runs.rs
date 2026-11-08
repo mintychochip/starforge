@@ -1033,11 +1033,11 @@ async fn spawn_recording_e2b() -> (String, Arc<Mutex<Vec<Value>>>) {
                     .split_once("\r\n\r\n")
                     .map(|(_, b)| b)
                     .unwrap_or_default();
-                if method == "POST" && target == "/sandboxes" {
+                if method == "POST" && target == "/v2/sandboxes" {
                     if let Ok(value) = serde_json::from_str::<Value>(body) {
                         recorded.lock().unwrap().push(value);
                     }
-                    let resp = r#"{"id":"sbx-e2b-1","state":"running","runtime":"e2b","expires_at":null,"provider":"e2b"}"#;
+                    let resp = r#"{"sandboxID":"sbx-e2b-1","envdAccessToken":"envd-tok","domain":"e2b.app"}"#;
                     let _ = stream
                         .write_all(
                             format!(
@@ -1165,11 +1165,10 @@ async fn job_sandbox_delivers_secrets_only_to_e2b_with_the_repo_opt_in() {
         "E2B must never receive secret bindings: {first}"
     );
     assert!(
-        !first["envs"]
-            .as_object()
-            .unwrap()
-            .values()
-            .any(|v| v.as_str() == Some(secret_value)),
+        first
+            .get("envVars")
+            .and_then(Value::as_object)
+            .is_none_or(|envs| !envs.values().any(|v| v.as_str() == Some(secret_value))),
         "no env delivery without the opt-in: {first}"
     );
 
@@ -1197,8 +1196,8 @@ async fn job_sandbox_delivers_secrets_only_to_e2b_with_the_repo_opt_in() {
     .await;
     assert_eq!(status, StatusCode::CREATED, "{value}");
     let second = recorded.lock().unwrap().last().cloned().unwrap();
-    assert_eq!(second["envs"]["CARGO_REGISTRY_TOKEN"], secret_value);
-    assert_eq!(second["envs"]["HOSTLESS_TOKEN"], "hostless-secret-value");
+    assert_eq!(second["envVars"]["CARGO_REGISTRY_TOKEN"], secret_value);
+    assert_eq!(second["envVars"]["HOSTLESS_TOKEN"], "hostless-secret-value");
     assert!(
         second.get("secret_bindings").is_none(),
         "E2B must never receive secret bindings: {second}"

@@ -108,7 +108,7 @@ The code rejects an unknown nested key as fatal.
 | `sandbox.local` | `socket` | path | `/run/starforge/sandboxd.sock` | Sandbox daemon Unix socket |
 | `sandbox.local` | `token_file` | path | `/run/starforge/sandboxd.token` | Sandbox daemon token file |
 | `sandbox.local.egress` | `allowlist` | list | empty | Hosts the sandbox can reach |
-| `sandbox.e2b` | `api_url` | string | `https://api.e2b.dev` | E2B API base URL |
+| `sandbox.e2b` | `api_url` | string | `https://api.e2b.app` | E2B API base URL |
 | `sandbox.e2b` | `api_key` | string | empty | E2B API key |
 | `sandbox.limits` | `max_concurrent_per_user` | number | 0, disabled | Concurrent sandboxes per user |
 | `sandbox.limits` | `max_concurrent_per_repo` | number | 0, disabled | Concurrent sandboxes per repository |

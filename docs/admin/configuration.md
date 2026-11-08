@@ -49,7 +49,7 @@
 | `sandbox.local.socket` | Unix socket the local sandbox daemon listens on (default `/run/starforge/sandboxd.sock`) |
 | `sandbox.local.token_file` | Daemon auth token file, mode `0600`; rotates on restart (default `/run/starforge/sandboxd.token`) |
 | `sandbox.local.egress.allowlist` | Hosts the egress proxy (and therefore the sandbox) may reach (default `[]`) |
-| `sandbox.e2b.api_url` | Base URL of the E2B-shaped gateway (default `https://api.e2b.dev`; the adapter is not compatible with real E2B) |
+| `sandbox.e2b.api_url` | E2B API base URL (default `https://api.e2b.app`) |
 | `sandbox.e2b.api_key` | E2B API key (never logged or rendered) |
 | `sandbox.limits.max_concurrent_per_user` | Concurrent sandboxes per user (default `0`; `0` disables) |
 | `sandbox.limits.max_concurrent_per_repo` | Concurrent sandboxes per repository (default `0`; `0` disables) |

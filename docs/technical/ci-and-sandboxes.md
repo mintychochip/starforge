@@ -130,7 +130,9 @@ One trait `SandboxProvider` covers every provider. The `local` provider talks to
 
 Runtime `podman` is the default. Runtime `gvisor` selects `runsc` on request. The table `sandbox_runtimes` reports `podman`, `gvisor`, and `e2b` as available. It reports `firecracker` and `kata` as reserved. A create that names `firecracker` or `kata` returns 422.
 
-The `e2b` provider talks to an E2B-shaped gateway over HTTP. The wire shapes match `starforge-sandbox-protocol`. The adapter is not wire-compatible with real E2B. The admin guide describes the gap in full. The API key never reaches logs.
+The `e2b` provider talks to the real E2B v2 API over HTTPS. The control plane is `POST /v2/sandboxes` and the lifecycle routes on `api.e2b.app` with `X-API-Key`. The data plane is envd on `sandbox.e2b.app` with the per-sandbox `E2b-Sandbox-Id`, `E2b-Sandbox-Port`, and `X-Access-Token` headers.
+
+Exec uses the Connect protocol. The method is `process.Process/Start`. Files use the envd file and filesystem routes. The API key never reaches logs.
 
 Each sandbox gets its own egress proxy task. The proxy terminates TLS under a per-sandbox CA. The CA name constraints cover only allowlisted destinations. The proxy resolves each DNS name once and pins the answer. The proxy injects a secret header only for a bound host and a matching `Host`. The proxy answers `403` when the `Host` does not match.
 

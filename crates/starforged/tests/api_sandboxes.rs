@@ -95,96 +95,102 @@ async fn spawn_fake_e2b() -> String {
                     .split_once("\r\n\r\n")
                     .map(|(_, b)| b.to_owned())
                     .unwrap_or_default();
-                let info = |st: &str| {
-                    serde_json::json!({
-                        "id": "sbx-1", "state": st, "runtime": "e2b",
-                        "expires_at": null, "provider": "e2b",
-                    })
-                    .to_string()
-                };
-                let (status, resp_body): (u16, String) = if method == "POST" && path == "/sandboxes"
-                {
-                    (200, info("running"))
-                } else if method == "GET" && path == "/sandboxes/sbx-1" {
-                    (200, info(&state.lock().unwrap().clone()))
-                } else if method == "DELETE" && path == "/sandboxes/sbx-1" {
-                    *state.lock().unwrap() = "killed".to_owned();
-                    (204, String::new())
-                } else if method == "POST" && path == "/sandboxes/sbx-1/pause" {
-                    *state.lock().unwrap() = "paused".to_owned();
-                    (200, info("paused"))
-                } else if method == "POST" && path == "/sandboxes/sbx-1/resume" {
-                    *state.lock().unwrap() = "running".to_owned();
-                    (200, info("running"))
-                } else if method == "POST" && path == "/sandboxes/sbx-1/timeout" {
-                    (200, info(&state.lock().unwrap().clone()))
-                } else if method == "POST" && path == "/sandboxes/sbx-1/exec" {
-                    (
-                        200,
-                        serde_json::to_string(&json!([
-                            {"stream": "stdout", "data": "hello from exec"},
-                            {"stream": "exit", "code": 0},
-                        ]))
-                        .unwrap(),
-                    )
-                } else if method == "GET" && path == "/sandboxes/sbx-1/files" {
-                    let query = target.split('?').nth(1).unwrap_or_default();
-                    let path_q: String = query
-                        .split('&')
-                        .find_map(|kv| kv.strip_prefix("path=").map(percent_decode))
-                        .unwrap_or_default();
-                    if query.contains("op=list") {
+                let (status, resp_body): (u16, Vec<u8>) =
+                    if method == "POST" && path == "/v2/sandboxes" {
+                        (
+                            201,
+                            br#"{"sandboxID":"sbx-1","envdAccessToken":"envd-tok","domain":"fake"}"#
+                                .to_vec(),
+                        )
+                    } else if method == "POST" && path == "/sandboxes/sbx-1/connect" {
                         (
                             200,
-                            json!({"path": path_q, "entries": ["a.txt"]}).to_string(),
+                            br#"{"sandboxID":"sbx-1","envdAccessToken":"envd-tok","domain":"fake"}"#
+                                .to_vec(),
                         )
-                    } else {
+                    } else if method == "GET" && path == "/sandboxes/sbx-1" {
+                        (
+                            200,
+                            json!({
+                                "state": state.lock().unwrap().clone(),
+                                "envdAccessToken": "envd-tok",
+                                "domain": "fake",
+                            })
+                            .to_string()
+                            .into_bytes(),
+                        )
+                    } else if method == "DELETE" && path == "/sandboxes/sbx-1" {
+                        *state.lock().unwrap() = "killed".to_owned();
+                        (204, Vec::new())
+                    } else if method == "POST" && path == "/sandboxes/sbx-1/pause" {
+                        *state.lock().unwrap() = "paused".to_owned();
+                        (200, b"{}".to_vec())
+                    } else if method == "POST" && path == "/sandboxes/sbx-1/resume" {
+                        *state.lock().unwrap() = "running".to_owned();
+                        (200, br#"{"envdAccessToken":"envd-tok"}"#.to_vec())
+                    } else if method == "POST" && path == "/sandboxes/sbx-1/timeout" {
+                        (200, b"{}".to_vec())
+                    } else if method == "POST" && path == "/process.Process/Start" {
+                        // Connect frames: one stdout event, one end event, a
+                        // terminal frame. "hello from exec" is base64 below.
+                        let stdout =
+                            json!({"event":{"data":{"stdout":"aGVsbG8gZnJvbSBleGVj"}}}).to_string();
+                        let end = json!({"event":{"end":{"exitCode":0,"exited":true}}}).to_string();
+                        let mut out = Vec::new();
+                        for payload in [stdout, end] {
+                            out.push(0);
+                            out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+                            out.extend_from_slice(payload.as_bytes());
+                        }
+                        out.push(2);
+                        out.extend_from_slice(&2u32.to_be_bytes());
+                        out.extend_from_slice(b"{}");
+                        (200, out)
+                    } else if method == "GET" && path == "/files" {
+                        let query = target.split('?').nth(1).unwrap_or_default();
+                        let path_q: String = query
+                            .split('&')
+                            .find_map(|kv| kv.strip_prefix("path=").map(percent_decode))
+                            .unwrap_or_default();
                         let content = files
                             .lock()
                             .unwrap()
                             .get(&path_q)
                             .cloned()
                             .unwrap_or_else(|| "hello".into());
-                        (200, json!({"path": path_q, "content": content}).to_string())
-                    }
-                } else if method == "PUT" && path == "/sandboxes/sbx-1/files" {
-                    let parsed: Value = serde_json::from_str(&body).unwrap_or(json!({}));
-                    let p = parsed["path"].as_str().unwrap_or_default().to_owned();
-                    let c = parsed["content"].as_str().unwrap_or_default().to_owned();
-                    files.lock().unwrap().insert(p.clone(), c);
-                    (200, json!({"path": p}).to_string())
-                } else if method == "DELETE" && path == "/sandboxes/sbx-1/files" {
-                    let query = target.split('?').nth(1).unwrap_or_default();
-                    let path_q: String = query
-                        .split('&')
-                        .find_map(|kv| kv.strip_prefix("path=").map(percent_decode))
-                        .unwrap_or_default();
-                    files.lock().unwrap().remove(&path_q);
-                    (204, String::new())
-                } else if method == "GET" && path == "/sandboxes/sbx-1/ports/8080/url" {
-                    (
-                        200,
-                        json!({"url": "https://sbx-1.fake:8080", "port": 8080, "expires_at": null})
-                            .to_string(),
-                    )
-                } else {
-                    (
-                        404,
-                        json!({"code": "not_found", "message": "no route", "retryable": false})
-                            .to_string(),
-                    )
-                };
+                        (200, content.into_bytes())
+                    } else if method == "PUT" && path == "/files" {
+                        let query = target.split('?').nth(1).unwrap_or_default();
+                        let path_q: String = query
+                            .split('&')
+                            .find_map(|kv| kv.strip_prefix("path=").map(percent_decode))
+                            .unwrap_or_default();
+                        files.lock().unwrap().insert(path_q, body.clone());
+                        (200, b"{}".to_vec())
+                    } else if method == "POST" && path == "/filesystem.Filesystem/ListDir" {
+                        (200, br#"{"entries":[{"name":"a.txt"}]}"#.to_vec())
+                    } else if method == "POST" && path == "/filesystem.Filesystem/Remove" {
+                        let parsed: Value = serde_json::from_str(&body).unwrap_or(json!({}));
+                        let p = parsed["path"].as_str().unwrap_or_default().to_owned();
+                        files.lock().unwrap().remove(&p);
+                        (200, b"{}".to_vec())
+                    } else {
+                        (404, br#"{"code":404,"message":"no route"}"#.to_vec())
+                    };
                 let reason = match status {
                     200 => "OK",
+                    201 => "Created",
                     204 => "No Content",
                     404 => "Not Found",
                     _ => "Error",
                 };
-                let resp = format!(
-                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp_body}",
+                let mut resp = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     resp_body.len(),
-                );
-                let _ = stream.write_all(resp.as_bytes()).await;
+                )
+                .into_bytes();
+                resp.extend_from_slice(&resp_body);
+                let _ = stream.write_all(&resp).await;
             });
         }
     });
