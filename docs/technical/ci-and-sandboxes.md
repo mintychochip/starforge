@@ -126,7 +126,7 @@ When the daemon provisions egress, it starts the container with `--network pasta
 
 The proxy listens on host loopback. The container reaches the proxy at `10.0.2.2:<port>`. The daemon sets `HTTP_PROXY` and `HTTPS_PROXY` to that address. The proxy forwards HTTPS `CONNECT` to allowlisted hosts on ports 80 and 443. The proxy refuses a plain `http://` request and any other port, so a local job needs an `https://` server and repository URL.
 
-Pasta maps host loopback to `10.0.2.2`, so a sandbox can also reach host loopback ports directly. The proxy is not the only reachable host service. Do not expose untrusted services on host loopback. Secret values never enter the sandbox. With egress disabled, the container stays with `--network none`.
+Pasta maps host loopback to `10.0.2.2`, so a sandbox can also reach host loopback ports directly. The proxy is not the only reachable host service. The proxy requires a per-sandbox Basic credential from the proxy URL, so a sibling sandbox cannot borrow it. Do not expose untrusted services on host loopback. Secret values never enter the sandbox. With egress disabled, the container stays with `--network none`.
 
 Sandbox limits answer 429 for a limit breach. `max_concurrent_per_user` caps concurrent sandboxes per user. `max_concurrent_per_repo` caps concurrent sandboxes per repository. `sandbox_seconds_per_hour` caps seconds per user per hour. `default_ttl_secs` records the default lifetime at 3600 seconds. A request can set its own `timeout_s`.
 

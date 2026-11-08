@@ -220,7 +220,7 @@ It covers secrets at rest, audit reads, and known limits.
 - The sandbox trusts the per sandbox CA. The CA keys rest in a directory with mode `0600`.
 - When the daemon provisions egress, it starts the container with pasta and maps host loopback to `10.0.2.2`. The container reaches the proxy at `10.0.2.2:<port>`. The daemon uses slirp4netns when pasta is unavailable. With egress disabled, the container stays with `--network none`.
 - The proxy forwards HTTPS `CONNECT` to allowlisted hosts on ports 80 and 443. The proxy refuses plain HTTP and other ports. Pasta also exposes host loopback ports directly, so the proxy is not the only reachable host service. Do not expose untrusted services on host loopback.
-- Each proxy listens on a random host loopback port and has no per sandbox credential in this release. A sibling sandbox that finds another sandbox's port can use its proxy. Run one daemon per trust domain, or add network isolation.
+- Each proxy listens on a random host loopback port and requires a per sandbox Basic credential in the proxy URL. A sibling sandbox that finds the port cannot use the proxy without the credential. Pasta still exposes other host loopback services directly. Run one daemon per trust domain, or add network isolation.
 - The proxy enforces the allowlist for proxied traffic. Secret values never enter the sandbox.
 
 ### CI and sandbox abuse controls

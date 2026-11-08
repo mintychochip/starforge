@@ -96,6 +96,9 @@ pub struct SandboxProxy {
     pub ca_cert_path: std::path::PathBuf,
     /// CA key path on the daemon host (`0600`, destroyed on kill/expire).
     pub ca_key_path: std::path::PathBuf,
+    /// Per-sandbox proxy credential (`sbx:<random>`); the proxy rejects
+    /// unauthenticated CONNECT so a sibling sandbox cannot borrow it.
+    pub credential: String,
 }
 
 /// Shared daemon state (cheap to clone).
@@ -338,15 +341,28 @@ pub async fn start_egress(
         proxy::destroy_ca_key(&ca_key_path);
         return Err(ProviderError::new("internal", "failed to write CA cert"));
     }
-    let proxy_inst = proxy::start_proxy(listen, Arc::new(ca), Arc::new(policy.clone()), None, None)
-        .await
-        .map_err(|e| ProviderError::new("internal", format!("egress proxy: {e}")))?;
+    let credential = format!(
+        "sbx:{}",
+        random_hex(16)
+            .map_err(|e| ProviderError::new("internal", format!("proxy credential: {e}")))?
+    );
+    let proxy_inst = proxy::start_proxy(
+        listen,
+        Arc::new(ca),
+        Arc::new(policy.clone()),
+        Some(credential.clone()),
+        None,
+        None,
+    )
+    .await
+    .map_err(|e| ProviderError::new("internal", format!("egress proxy: {e}")))?;
     state.proxies.lock().unwrap().insert(
         id.to_owned(),
         SandboxProxy {
             proxy: proxy_inst,
             ca_cert_path,
             ca_key_path,
+            credential,
         },
     );
     Ok(())
@@ -408,8 +424,14 @@ pub fn teardown_egress(state: &DaemonState, id: &str) {
 /// Env vars pointing a sandbox at its egress proxy (injected into the
 /// create request's env, or usable by future exec callers).
 pub fn proxy_env(state: &DaemonState, id: &str) -> Vec<(String, String)> {
-    match state.proxy_addr(id) {
-        Some(addr) => {
+    let credential = state
+        .proxies
+        .lock()
+        .unwrap()
+        .get(id)
+        .map(|entry| entry.credential.clone());
+    match (state.proxy_addr(id), credential) {
+        (Some(addr), Some(credential)) => {
             // Inside the container the host proxy is reachable over the
             // pasta/slirp loopback gateway, not the daemon's own listen IP.
             let host = if addr.ip().is_loopback() || addr.ip().is_unspecified() {
@@ -417,7 +439,7 @@ pub fn proxy_env(state: &DaemonState, id: &str) -> Vec<(String, String)> {
             } else {
                 addr.ip().to_string()
             };
-            let url = format!("http://{host}:{}", addr.port());
+            let url = format!("http://{credential}@{host}:{}", addr.port());
             vec![
                 ("HTTPS_PROXY".to_owned(), url.clone()),
                 ("https_proxy".to_owned(), url.clone()),
@@ -433,7 +455,7 @@ pub fn proxy_env(state: &DaemonState, id: &str) -> Vec<(String, String)> {
                 ),
             ]
         }
-        None => Vec::new(),
+        _ => Vec::new(),
     }
 }
 // -------------------------------------------------------------- middleware --
@@ -1370,8 +1392,10 @@ mod tests {
         let port = state.proxy_addr(&id).unwrap().port();
         let env = proxy_env(&state, &id);
         let get = |key: &str| env.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone());
-        assert_eq!(get("HTTP_PROXY"), Some(format!("http://10.0.2.2:{port}")));
-        assert_eq!(get("HTTPS_PROXY"), Some(format!("http://10.0.2.2:{port}")));
+        let http = get("HTTP_PROXY").expect("HTTP_PROXY");
+        assert!(http.starts_with("http://sbx:"), "{http}");
+        assert!(http.ends_with(&format!("@10.0.2.2:{port}")), "{http}");
+        assert_eq!(get("HTTPS_PROXY").as_deref(), Some(http.as_str()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

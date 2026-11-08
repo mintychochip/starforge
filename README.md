@@ -108,8 +108,9 @@ Explicit v0.1.0 non-goals and deferrals (program rulings):
   reserved runtime names for a later release. Local sandbox egress uses
   pasta host-loopback mapping; the proxy forwards HTTPS `CONNECT` only
   (plain HTTP and non-443 ports are not proxied), and host loopback ports
-  are reachable directly. Use an `https://` server and repo URL, and keep
-  untrusted services off host loopback. Of external
+  are reachable directly. The proxy requires a per-sandbox credential.
+  Use an `https://` server and repo URL, and keep untrusted services off
+  host loopback. Of external
   CI suppliers, only Depot is integrated, and only to read usage; GitHub
   Actions, Namespace, Blacksmith, and Buildkite usage is not read. Cost:
   those runtimes and suppliers need an adapter, not a config change.

@@ -32,6 +32,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use base64::Engine as _;
+
 use rcgen::{
     BasicConstraints, Certificate, CertificateParams, DistinguishedName, DnType, GeneralSubtree,
     IsCa, KeyPair, NameConstraints, PKCS_ECDSA_P256_SHA256,
@@ -433,6 +435,7 @@ pub async fn start_proxy(
     listen: SocketAddr,
     ca: Arc<CaMaterial>,
     policy: Arc<EgressPolicy>,
+    credential: Option<String>,
     dns_override: Option<BTreeMap<String, SocketAddr>>,
     upstream_roots: Option<RootCertStore>,
 ) -> Result<EgressProxy, ProxyError> {
@@ -451,8 +454,18 @@ pub async fn start_proxy(
             let client_config = Arc::clone(&client_config);
             let dns_override = dns_override.clone();
             let logs = Arc::clone(&logs_clone);
+            let credential = credential.clone();
             tokio::spawn(async move {
-                handle_connection(stream, ca, policy, client_config, dns_override, logs).await;
+                handle_connection(
+                    stream,
+                    ca,
+                    policy,
+                    client_config,
+                    credential,
+                    dns_override,
+                    logs,
+                )
+                .await;
             });
         }
     });
@@ -536,11 +549,37 @@ fn inject_binding(head: &[u8], policy: &EgressPolicy, host: &str) -> Vec<u8> {
     bytes
 }
 
+/// Whether the request head carries the expected `Proxy-Authorization`
+/// Basic credential. The comparison is constant time.
+fn proxy_authorized(head: &str, expected: &str) -> bool {
+    let Some(value) = head.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        if name.eq_ignore_ascii_case("proxy-authorization") {
+            Some(value.trim())
+        } else {
+            None
+        }
+    }) else {
+        return false;
+    };
+    let Some(encoded) = value
+        .strip_prefix("Basic ")
+        .or_else(|| value.strip_prefix("basic "))
+    else {
+        return false;
+    };
+    let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(encoded) else {
+        return false;
+    };
+    crate::ct_eq(&decoded, expected.as_bytes())
+}
+
 async fn handle_connection(
     mut client: tokio::net::TcpStream,
     ca: Arc<CaMaterial>,
     policy: Arc<EgressPolicy>,
     client_config: Arc<ClientConfig>,
+    credential: Option<String>,
     dns_override: Option<BTreeMap<String, SocketAddr>>,
     logs: Arc<ProxyLog>,
 ) {
@@ -554,6 +593,17 @@ async fn handle_connection(
         Err(_) => return,
     };
     let head_text = String::from_utf8_lossy(&head_bytes);
+    if let Some(expected) = credential.as_deref()
+        && !proxy_authorized(&head_text, expected)
+    {
+        logs.record("auth 407".to_owned());
+        let _ = client
+            .write_all(
+                b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"starforge\"\r\nContent-Length: 0\r\n\r\n",
+            )
+            .await;
+        return;
+    }
     let Some(request_line) = head_text.lines().next() else {
         return;
     };
@@ -857,11 +907,35 @@ mod tests {
             (Ipv4Addr::LOCALHOST, 0).into(),
             ca,
             Arc::new(policy),
+            None,
             Some(overrides),
             Some(upstream_roots),
         )
         .await
         .unwrap()
+    }
+
+    async fn connect_status(
+        proxy: SocketAddr,
+        host: &str,
+        port: u16,
+        auth: Option<&str>,
+    ) -> String {
+        let mut stream = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        let mut req = format!("CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n");
+        if let Some(auth) = auth {
+            req.push_str(&format!("Proxy-Authorization: {auth}\r\n"));
+        }
+        req.push_str("\r\n");
+        stream.write_all(req.as_bytes()).await.unwrap();
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+            stream.read_exact(&mut byte).await.unwrap();
+            head.extend_from_slice(&byte);
+            assert!(head.len() < MAX_HEAD_BYTES, "CONNECT response too large");
+        }
+        String::from_utf8_lossy(&head).into_owned()
     }
 
     async fn fetch_via_proxy(proxy: SocketAddr, ca: &CaMaterial, host: &str, port: u16) -> String {
@@ -1057,5 +1131,40 @@ mod tests {
         destroy_ca_key(&path);
         assert!(!path.exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn proxy_requires_its_credential() {
+        use base64::Engine as _;
+
+        let (origin, upstream_roots, _) = spawn_origin().await;
+        let ca = Arc::new(CaMaterial::generate(&["bound.test".to_owned()]).unwrap());
+        let overrides: BTreeMap<String, SocketAddr> =
+            [("bound.test".to_owned(), origin)].into_iter().collect();
+        let proxy = start_proxy(
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            Arc::clone(&ca),
+            Arc::new(test_policy("secret")),
+            Some("sbx:test-token".to_owned()),
+            Some(overrides),
+            Some(upstream_roots),
+        )
+        .await
+        .unwrap();
+        let addr = proxy.addr();
+        let missing = connect_status(addr, "bound.test", 443, None).await;
+        assert!(missing.contains("407"), "{missing}");
+        let good = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode("sbx:test-token")
+        );
+        let allowed = connect_status(addr, "bound.test", 443, Some(&good)).await;
+        assert!(allowed.contains("200"), "{allowed}");
+        let wrong = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode("sbx:wrong")
+        );
+        let refused = connect_status(addr, "bound.test", 443, Some(&wrong)).await;
+        assert!(refused.contains("407"), "{refused}");
     }
 }

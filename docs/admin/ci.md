@@ -146,11 +146,12 @@ forwarded, so a local job needs an `https://` server and repo URL.
 Pasta maps host loopback to `10.0.2.2`, so a sandbox can also reach
 host loopback ports directly; the proxy is not the only reachable
 host service. Do not expose untrusted services on host loopback. Each
-proxy listens on a random host loopback port and has no per-sandbox
-credential in this release: a sibling sandbox that finds another
-sandbox's port can use its proxy. Run one daemon per trust domain, or
-add network isolation. With egress disabled the container stays
-`--network none`. Secret values never enter the sandbox.
+proxy listens on a random host loopback port and requires a per-sandbox
+Basic credential in the proxy URL: a sibling sandbox that finds the
+port cannot use the proxy without the credential. Pasta still exposes
+other host loopback services directly; run one daemon per trust
+domain, or add network isolation. With egress disabled the container
+stays `--network none`. Secret values never enter the sandbox.
 
 For a job-token sandbox create, the server resolves the job's
 secrets itself, records them in `ci_job_secrets`, and passes the

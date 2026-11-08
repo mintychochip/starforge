@@ -77,8 +77,8 @@ search, webhooks, and mirrors, on SQLite or Postgres.
   `ci_env_secrets` (both off by default) gate `refs/for` trust and the
   E2B-only environment opt-in. The proxy forwards HTTPS `CONNECT` only;
   plain HTTP and non-443 ports are not proxied, and pasta exposes host
-  loopback directly. The hourly cleanup deletes expired artifacts and
-  collects zero-ref blobs.
+  loopback directly. The proxy requires a per-sandbox credential. The
+  hourly cleanup deletes expired artifacts and collects zero-ref blobs.
 - **CLI:** `starforge` — `auth login` (device flow, scopes `repo:read
   trail:write session:upload`), `auth ssh-key add` (one-time `repo:write`
   device flow; both tokens are revoked and never stored), `enable`/`disable`
