@@ -122,9 +122,11 @@ must be relative and stay inside the workspace.
 
 Repo secrets are created and rotated by repo admins (at least Admin).
 In the web UI, open the repository's **CI secrets** settings page
-(`/{owner}/{repo}/settings/ci-secrets`): it lists secret names and
-timestamps, adds or rotates a secret, and deletes one. Values stay
-write-only there, exactly as with the API below.
+(`/{owner}/{repo}/settings/ci-secrets`): it lists each secret's name,
+proxy host and header, redaction flag, and timestamps; it adds or rotates
+a secret and deletes one. A rotate with blank Host and Header keeps the
+existing proxy binding. Values stay write-only there, exactly as with the
+API below.
 ```shell
 curl -X POST "$SERVER/api/v1/repos/$OWNER/$REPO/ci/secrets" \
   -H "Authorization: Bearer $TOKEN" \
