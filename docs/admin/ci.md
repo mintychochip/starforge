@@ -229,7 +229,10 @@ CI usage and its limits belong to whoever runs the compute:
   queued — a refused run gets an `error` `ci/<job>` check naming the reset
   date unless the commit already has that check, and a manual trigger
   answers `422` — and `artifact_bytes` when an upload is authorized and
-  again when its bytes arrive (`422`). The minutes quota is best-effort:
+  again when its bytes arrive (`422`). `cache_bytes` bounds a
+  repository's live cache entries when a cache is saved; the least
+  recently used entries are evicted first, and a save that still does not
+  fit is refused (`422`). The minutes quota is best-effort:
   an attempt counts when it ends (a reaped attempt at its lease end), so
   runs already queued or running when it fills still finish and count.
 - **Depot.** A repository admin links the repository

@@ -439,6 +439,15 @@ pub fn router(core: Core, base_url: String) -> Router {
             put(ci::put_supplier_link).delete(ci::delete_supplier_link),
         )
         .route(
+            "/runners/jobs/{id}/cache",
+            get(ci::download_cache).put(ci::upload_cache).route_layer(
+                axum::extract::DefaultBodyLimit::max(
+                    usize::try_from(starforged_core::ci::MAX_CACHE_ENTRY_BYTES)
+                        .unwrap_or(usize::MAX),
+                ),
+            ),
+        )
+        .route(
             "/runners/jobs/{id}/artifacts/authorize",
             post(ci::authorize_artifact),
         )
@@ -473,6 +482,15 @@ pub fn router(core: Core, base_url: String) -> Router {
             get(sandboxes::get_sandbox_file)
                 .put(sandboxes::put_sandbox_file)
                 .delete(sandboxes::delete_sandbox_file),
+        )
+        .route(
+            "/sandboxes/{id}/files/raw",
+            get(sandboxes::get_sandbox_file_raw)
+                .put(sandboxes::put_sandbox_file_raw)
+                .route_layer(axum::extract::DefaultBodyLimit::max(
+                    usize::try_from(starforged_core::sandboxes::MAX_FILE_BYTES)
+                        .unwrap_or(usize::MAX),
+                )),
         )
         .route(
             "/sandboxes/{id}/ports/{port}/url",

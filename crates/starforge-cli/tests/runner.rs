@@ -367,5 +367,6 @@ fn spec() -> CiJobSpec {
         secrets: vec![],
         artifacts: vec!["out.bin".to_owned()],
         runs_on: vec![],
+        cache: None,
     }
 }

@@ -49,6 +49,10 @@ pub struct CiLimits {
     /// authorized.
     #[serde(default)]
     pub artifact_bytes: u64,
+    /// Bytes of live CI cache entries per repository. Checked when a
+    /// cache is saved; the least recently used entries are evicted first.
+    #[serde(default)]
+    pub cache_bytes: u64,
 }
 
 /// Settings for reading usage from Depot.
@@ -216,6 +220,7 @@ impl Core {
         let seconds = db_ci::usage_seconds_since(self.db(), repo_id, start).await?;
         let attempts = db_ci::usage_attempts_since(self.db(), repo_id, start).await?;
         let artifact_bytes = db_ci::live_artifact_bytes(self.db(), repo_id, now()).await?;
+        let cache_bytes = db_ci::live_cache_bytes(self.db(), repo_id, now()).await?;
         let limit = |value: u64| (value > 0).then_some(value as f64);
         Ok(SupplierUsage {
             supplier: "native",
@@ -241,6 +246,12 @@ impl Core {
                     unit: "bytes",
                     used: artifact_bytes as f64,
                     limit: limit(limits.artifact_bytes),
+                },
+                UsageMetric {
+                    name: "cache_bytes",
+                    unit: "bytes",
+                    used: cache_bytes as f64,
+                    limit: limit(limits.cache_bytes),
                 },
             ],
             error: None,
@@ -456,6 +467,22 @@ impl Core {
         if stored.saturating_add(size) > i64::try_from(limit).unwrap_or(i64::MAX) {
             return Err(CoreError::Invalid(format!(
                 "the CI artifact storage quota ({limit} bytes) would be exceeded: {stored} bytes are stored"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Refuses a cache save that would take the repository's live cache
+    /// entries past the cache quota. The caller evicts LRU entries first.
+    pub(crate) async fn check_cache_quota(&self, repo_id: i64, size: i64) -> CoreResult<()> {
+        let limit = self.config().ci.limits.cache_bytes;
+        if limit == 0 {
+            return Ok(());
+        }
+        let stored = db_ci::live_cache_bytes(self.db(), repo_id, now()).await?;
+        if stored.saturating_add(size) > i64::try_from(limit).unwrap_or(i64::MAX) {
+            return Err(CoreError::Invalid(format!(
+                "the CI cache quota ({limit} bytes) would be exceeded: {stored} bytes are stored"
             )));
         }
         Ok(())

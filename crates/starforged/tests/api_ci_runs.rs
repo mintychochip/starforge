@@ -1585,3 +1585,136 @@ commands = ["true"]
         .collect();
     assert_eq!(names, vec!["test-fast"], "{names:?}");
 }
+
+/// Raw-body request helper for the cache routes.
+async fn api_bytes(
+    client: &reqwest::Client,
+    method: &str,
+    url: &str,
+    token: &str,
+    body: Option<Vec<u8>>,
+) -> (StatusCode, Vec<u8>) {
+    let req = match method {
+        "GET" => client.get(url),
+        "PUT" => client.put(url),
+        _ => unreachable!(),
+    };
+    let req = req.bearer_auth(token);
+    let req = match body {
+        Some(bytes) => req.body(bytes),
+        None => req,
+    };
+    let resp = req.send().await.unwrap();
+    let status = resp.status();
+    (status, resp.bytes().await.unwrap().to_vec())
+}
+
+/// A runner saves a cache entry and another job restores it by prefix.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cache_round_trip_and_restore_keys() {
+    let s = TestServer::start().await;
+    let alice = s.user("alice").await;
+    let _repo = s.repo(&alice, "proj", Visibility::Private).await;
+    let pat = s.token(&alice, &[Scope::RepoWrite]).await;
+    let spec = r#"
+version = 1
+[triggers]
+push = ["main"]
+[[job]]
+name = "first"
+image = "example.test/image:1"
+commands = ["true"]
+[job.cache]
+key = "cargo-1.85"
+paths = ["target"]
+[[job]]
+name = "second"
+image = "example.test/image:1"
+commands = ["true"]
+[job.cache]
+key = "cargo-2.0"
+paths = ["target"]
+restore_keys = ["cargo-"]
+"#;
+    let tmp = tempfile::tempdir().unwrap();
+    let work = work_repo(
+        tmp.path(),
+        "work",
+        &[(".starforge/ci.toml", spec), ("README.md", "# proj\n")],
+    )
+    .await;
+    git_ok(
+        &work,
+        &[
+            "push",
+            "-q",
+            &s.git_url("alice", "proj", Some(&pat)),
+            "main",
+        ],
+    )
+    .await;
+    let runner = register_runner(&s, &pat).await;
+    let (first, _fence, first_token) = claim(&s, &runner).await;
+    let payload = b"\x1f\x8b\x08 cache-bytes";
+    let (status, _) = api_bytes(
+        &s.browser(),
+        "PUT",
+        &s.url(&format!(
+            "/api/v1/runners/jobs/{first}/cache?key=cargo-1.85"
+        )),
+        &first_token,
+        Some(payload.to_vec()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) = api_bytes(
+        &s.browser(),
+        "GET",
+        &s.url(&format!(
+            "/api/v1/runners/jobs/{first}/cache?key=cargo-1.85"
+        )),
+        &first_token,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, payload);
+
+    // A key outside the spec is refused.
+    let (status, _) = api_bytes(
+        &s.browser(),
+        "PUT",
+        &s.url(&format!("/api/v1/runners/jobs/{first}/cache?key=other")),
+        &first_token,
+        Some(vec![1, 2, 3]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // The second job's exact key misses; its restore prefix finds the entry.
+    let (second, _fence, second_token) = claim(&s, &runner).await;
+    let (status, _) = api_bytes(
+        &s.browser(),
+        "GET",
+        &s.url(&format!(
+            "/api/v1/runners/jobs/{second}/cache?key=cargo-2.0"
+        )),
+        &second_token,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, body) = api_bytes(
+        &s.browser(),
+        "GET",
+        &s.url(&format!(
+            "/api/v1/runners/jobs/{second}/cache?key=cargo-2.0&restore=cargo-"
+        )),
+        &second_token,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, payload);
+}

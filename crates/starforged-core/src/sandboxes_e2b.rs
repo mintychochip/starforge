@@ -715,6 +715,56 @@ impl SandboxProvider for E2bSandboxProvider {
         })
     }
 
+    fn read_file_bytes(
+        &self,
+        id: String,
+        path: String,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, ProviderError>> + Send + '_>> {
+        Box::pin(async move {
+            let (status, bytes) = self
+                .envd(
+                    &id,
+                    reqwest::Method::GET,
+                    &format!("/files?path={}", encode(&path)),
+                    None,
+                    "application/octet-stream",
+                    None,
+                )
+                .await?;
+            if status == 404 {
+                return Err(ProviderError::new("not_found", "e2b file not found"));
+            }
+            if status >= 400 {
+                return Err(parse_error(status, &bytes));
+            }
+            Ok(bytes)
+        })
+    }
+
+    fn write_file_bytes(
+        &self,
+        id: String,
+        path: String,
+        bytes: Vec<u8>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ProviderError>> + Send + '_>> {
+        Box::pin(async move {
+            let (status, body) = self
+                .envd(
+                    &id,
+                    reqwest::Method::PUT,
+                    &format!("/files?path={}", encode(&path)),
+                    Some(bytes),
+                    "application/octet-stream",
+                    None,
+                )
+                .await?;
+            if status >= 400 {
+                return Err(parse_error(status, &body));
+            }
+            Ok(())
+        })
+    }
+
     fn port_url(
         &self,
         id: String,

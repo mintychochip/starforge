@@ -29,6 +29,9 @@ pub const JOB_STATUS_HEADER: &str = "job-status";
 pub const TRACE_CHUNK: usize = 64 * 1024;
 /// Lease heartbeat interval; the server's claim lease is 60 seconds.
 pub const HEARTBEAT_SECS: u64 = 30;
+/// Cache archives move through the sandbox file API in 8 MiB chunks (the
+/// daemon's per-file cap).
+const CACHE_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Config
@@ -164,6 +167,24 @@ pub struct CiJobSpec {
     pub artifacts: Vec<String>,
     #[serde(default)]
     pub runs_on: Vec<String>,
+    #[serde(default)]
+    pub cache: Option<CiCacheSpec>,
+}
+
+/// One job's dependency cache (mirrors `starforged_core::ci_spec::CiCacheSpec`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CiCacheSpec {
+    pub key: String,
+    #[serde(default)]
+    pub paths: Vec<String>,
+    #[serde(default)]
+    pub restore_keys: Vec<String>,
+    #[serde(default = "default_true")]
+    pub save: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl CiJobSpec {
@@ -352,6 +373,13 @@ pub trait SandboxProvider: Send + Sync {
         id: &str,
         path: &str,
     ) -> impl Future<Output = Result<Option<Vec<u8>>, RunnerError>> + Send;
+    fn write_file(
+        &self,
+        job: &ClaimedJob,
+        id: &str,
+        path: &str,
+        bytes: Vec<u8>,
+    ) -> impl Future<Output = Result<(), RunnerError>> + Send;
     fn list_files(
         &self,
         job: &ClaimedJob,
@@ -449,7 +477,7 @@ impl SandboxProvider for HttpSandboxProvider {
         path: &str,
     ) -> Result<Option<Vec<u8>>, RunnerError> {
         let url = format!(
-            "{}/sandboxes/{id}/files?path={}",
+            "{}/sandboxes/{id}/files/raw?path={}",
             self.base,
             url::form_urlencoded::byte_serialize(path.as_bytes()).collect::<String>()
         );
@@ -469,13 +497,42 @@ impl SandboxProvider for HttpSandboxProvider {
                 resp.status()
             )));
         }
-        let v: serde_json::Value = resp
-            .json()
+        Ok(Some(
+            resp.bytes()
+                .await
+                .map_err(RunnerError::from_reqwest)?
+                .to_vec(),
+        ))
+    }
+
+    async fn write_file(
+        &self,
+        job: &ClaimedJob,
+        id: &str,
+        path: &str,
+        bytes: Vec<u8>,
+    ) -> Result<(), RunnerError> {
+        let url = format!(
+            "{}/sandboxes/{id}/files/raw?path={}",
+            self.base,
+            url::form_urlencoded::byte_serialize(path.as_bytes()).collect::<String>()
+        );
+        let resp = self
+            .client
+            .put(url)
+            .bearer_auth(&job.job_token)
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            .body(bytes)
+            .send()
             .await
-            .map_err(|e| RunnerError::Malformed(e.to_string()))?;
-        Ok(v.get("content")
-            .and_then(|c| c.as_str())
-            .map(|s| s.as_bytes().to_vec()))
+            .map_err(RunnerError::from_reqwest)?;
+        if !resp.status().is_success() {
+            return Err(RunnerError::Provider(format!(
+                "write file: {}",
+                resp.status()
+            )));
+        }
+        Ok(())
     }
 
     async fn list_files(
@@ -749,6 +806,87 @@ impl Client {
             ))
             .bearer_auth(token)
             .header("x-starforge-sha256", sha256)
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            .body(bytes.to_vec())
+            .send()
+            .await
+            .map_err(RunnerError::from_reqwest)?;
+        if resp.status() == StatusCode::CONFLICT {
+            return Err(RunnerError::StaleFence);
+        }
+        if !resp.status().is_success() {
+            let s = resp.status();
+            return Err(RunnerError::Http(s, resp.text().await.unwrap_or_default()));
+        }
+        Ok(())
+    }
+
+    /// Downloads one cache entry for the executing job. The exact key wins;
+    /// the restore prefixes are tried in order. `None` means no entry.
+    pub async fn download_cache(
+        &self,
+        job_id: i64,
+        job_token: &str,
+        key: &str,
+        restore: &[String],
+    ) -> Result<Option<(Vec<u8>, String)>, RunnerError> {
+        let mut url = format!(
+            "{}/runners/jobs/{job_id}/cache?key={}",
+            self.base,
+            url::form_urlencoded::byte_serialize(key.as_bytes()).collect::<String>()
+        );
+        if !restore.is_empty() {
+            url.push_str("&restore=");
+            url.push_str(
+                &url::form_urlencoded::byte_serialize(restore.join(",").as_bytes())
+                    .collect::<String>(),
+            );
+        }
+        let resp = self
+            .http
+            .get(url)
+            .bearer_auth(job_token)
+            .send()
+            .await
+            .map_err(RunnerError::from_reqwest)?;
+        if resp.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            let s = resp.status();
+            return Err(RunnerError::Http(s, resp.text().await.unwrap_or_default()));
+        }
+        let matched = resp
+            .headers()
+            .get("x-starforge-cache-key")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or(key)
+            .to_owned();
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(RunnerError::from_reqwest)?
+            .to_vec();
+        Ok(Some((bytes, matched)))
+    }
+
+    /// Saves one cache entry for the executing job (raw tar bytes).
+    pub async fn upload_cache(
+        &self,
+        job_id: i64,
+        job_token: &str,
+        key: &str,
+        bytes: &[u8],
+    ) -> Result<(), RunnerError> {
+        let url = format!(
+            "{}/runners/jobs/{job_id}/cache?key={}",
+            self.base,
+            url::form_urlencoded::byte_serialize(key.as_bytes()).collect::<String>()
+        );
+        let resp = self
+            .http
+            .put(url)
+            .bearer_auth(job_token)
             .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
             .body(bytes.to_vec())
             .send()
@@ -1086,6 +1224,11 @@ impl<P: SandboxProvider> Executor<P> {
             return o;
         }
 
+        // 3b. Restore the dependency cache (best effort).
+        if let Err(e) = self.restore_cache(job, &sandbox_id).await {
+            tracing::warn!("cache restore failed: {e}");
+        }
+
         // 4. Run commands.
         let mut exit_code: i64 = 0;
         for cmd in &job.spec.commands {
@@ -1104,6 +1247,13 @@ impl<P: SandboxProvider> Executor<P> {
                     return o;
                 }
             }
+        }
+
+        // 4b. Save the dependency cache after a successful job (best effort).
+        if exit_code == 0
+            && let Err(e) = self.save_cache(job, &sandbox_id).await
+        {
+            tracing::warn!("cache save failed: {e}");
         }
 
         // 5. starforge sync in the sandbox.
@@ -1296,6 +1446,138 @@ impl<P: SandboxProvider> Executor<P> {
         out
     }
 
+    /// Restores the job's cache into the workspace: download the archive,
+    /// write it in chunks, concatenate, and extract. Best effort; the caller
+    /// logs a failure and runs the job without the cache.
+    async fn restore_cache(&self, job: &ClaimedJob, sandbox_id: &str) -> Result<(), RunnerError> {
+        let Some(cache) = &job.spec.cache else {
+            return Ok(());
+        };
+        let Some((bytes, _matched)) = self
+            .client
+            .download_cache(job.job_id, &job.job_token, &cache.key, &cache.restore_keys)
+            .await?
+        else {
+            return Ok(());
+        };
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let mut parts = Vec::new();
+        for (index, chunk) in bytes.chunks(CACHE_CHUNK_BYTES).enumerate() {
+            let path = format!(".starforge-cache.part-{index:03}");
+            self.provider
+                .write_file(job, sandbox_id, &path, chunk.to_vec())
+                .await?;
+            parts.push(path);
+        }
+        let cmd = format!(
+            "cat {} > .starforge-cache.tgz && tar xzf .starforge-cache.tgz && rm -f .starforge-cache.tgz {}",
+            parts.join(" "),
+            parts.join(" ")
+        );
+        let out = self
+            .provider
+            .exec(
+                job,
+                sandbox_id,
+                ExecRequest {
+                    command: vec!["sh".to_owned(), "-c".to_owned(), cmd],
+                    cwd: None,
+                    envs: BTreeMap::new(),
+                    timeout_s: 120,
+                },
+            )
+            .await?;
+        if out.exit != 0 {
+            return Err(RunnerError::Provider(format!(
+                "cache restore: {}",
+                out.stderr.trim()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Saves the job's cache: tar the declared paths, split into chunks,
+    /// read them back, and upload the archive. Best effort.
+    async fn save_cache(&self, job: &ClaimedJob, sandbox_id: &str) -> Result<(), RunnerError> {
+        let Some(cache) = &job.spec.cache else {
+            return Ok(());
+        };
+        if !cache.save {
+            return Ok(());
+        }
+        let paths = cache
+            .paths
+            .iter()
+            .map(|path| shell_quote(path))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let cmd = format!(
+            "rm -f .starforge-cache.tgz .starforge-cache.part-* && tar czf .starforge-cache.tgz {paths} && split -b {CACHE_CHUNK_BYTES} .starforge-cache.tgz .starforge-cache.part-"
+        );
+        let out = self
+            .provider
+            .exec(
+                job,
+                sandbox_id,
+                ExecRequest {
+                    command: vec!["sh".to_owned(), "-c".to_owned(), cmd],
+                    cwd: None,
+                    envs: BTreeMap::new(),
+                    timeout_s: 300,
+                },
+            )
+            .await?;
+        if out.exit != 0 {
+            return Err(RunnerError::Provider(format!(
+                "cache save: {}",
+                out.stderr.trim()
+            )));
+        }
+        let names = self.provider.list_files(job, sandbox_id, ".").await?;
+        let mut parts: Vec<String> = names
+            .into_iter()
+            .filter(|name| name.starts_with(".starforge-cache.part-"))
+            .collect();
+        parts.sort();
+        if parts.is_empty() {
+            return Err(RunnerError::Provider(
+                "cache save produced no chunks".into(),
+            ));
+        }
+        let mut bytes = Vec::new();
+        for name in &parts {
+            let Some(chunk) = self.provider.read_file(job, sandbox_id, name).await? else {
+                return Err(RunnerError::Provider(format!(
+                    "cache save: chunk {name} disappeared"
+                )));
+            };
+            bytes.extend_from_slice(&chunk);
+        }
+        self.client
+            .upload_cache(job.job_id, &job.job_token, &cache.key, &bytes)
+            .await?;
+        let _ = self
+            .provider
+            .exec(
+                job,
+                sandbox_id,
+                ExecRequest {
+                    command: vec![
+                        "sh".to_owned(),
+                        "-c".to_owned(),
+                        "rm -f .starforge-cache.tgz .starforge-cache.part-*".to_owned(),
+                    ],
+                    cwd: None,
+                    envs: BTreeMap::new(),
+                    timeout_s: 30,
+                },
+            )
+            .await;
+        Ok(())
+    }
+
     /// Claim loop: poll claims and execute them until `poll_timeout`
     /// elapses without a job, or `stop` is set.
     pub async fn run_until_idle(
@@ -1364,6 +1646,8 @@ pub struct FakeSandboxProvider {
     pub script: Vec<(String, String, i64)>,
     /// Files served by `read_file` / `list_files`.
     pub files: BTreeMap<String, Vec<u8>>,
+    /// Files written through `write_file` (read back first).
+    pub written: std::sync::Mutex<BTreeMap<String, Vec<u8>>>,
     /// Artificial exec delay (timeout tests).
     pub delay: Duration,
     /// Set when a sandbox is killed.
@@ -1445,7 +1729,28 @@ impl SandboxProvider for FakeSandboxProvider {
         _id: &str,
         path: &str,
     ) -> Result<Option<Vec<u8>>, RunnerError> {
+        if let Some(bytes) = self
+            .written
+            .lock()
+            .ok()
+            .and_then(|files| files.get(path).cloned())
+        {
+            return Ok(Some(bytes));
+        }
         Ok(self.files.get(path).cloned())
+    }
+
+    async fn write_file(
+        &self,
+        _job: &ClaimedJob,
+        _id: &str,
+        path: &str,
+        bytes: Vec<u8>,
+    ) -> Result<(), RunnerError> {
+        if let Ok(mut files) = self.written.lock() {
+            files.insert(path.to_owned(), bytes);
+        }
+        Ok(())
     }
 
     async fn list_files(

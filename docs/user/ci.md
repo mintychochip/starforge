@@ -134,6 +134,24 @@ appears on the commit / Trail / run page. The egress proxy forwards
 HTTPS `CONNECT` only, so use an `https://` server and repo URL; a plain
 `http://` origin or a non-443 port is not proxied.
 
+## Cache
+
+A job can keep a dependency cache between runs:
+
+```toml
+[job.cache]
+key = "cargo-1.85"
+paths = ["target", ".cargo/registry"]
+restore_keys = ["cargo-"]
+```
+
+The runner restores the entry before the commands and saves it after a
+successful job. The exact key wins; `restore_keys` are prefixes tried in
+order. Paths are relative to the checkout root. An entry is at most
+256 MiB, is retained 7 days, and the repository keeps at most 50 live
+entries (the least recently used entry is evicted first). A cache failure
+does not fail the job.
+
 ## Artifacts
 
 Files matching a job's `artifacts` globs are uploaded after a

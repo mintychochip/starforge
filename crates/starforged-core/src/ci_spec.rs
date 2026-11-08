@@ -38,6 +38,10 @@ const MAX_EXPANDED_JOBS: usize = 256;
 const MAX_LABEL_LEN: usize = 64;
 const MAX_TRIGGERS: usize = 100;
 const MAX_PATTERN_LEN: usize = 256;
+const MAX_CACHE_KEY_LEN: usize = 128;
+const MAX_CACHE_PATH_LEN: usize = 256;
+const MAX_CACHE_PATHS: usize = 8;
+const MAX_CACHE_RESTORE_KEYS: usize = 4;
 
 /// What enqueues a run: branch pushes and/or Trail change actions. Both
 /// empty means the spec is manual-only.
@@ -89,6 +93,32 @@ pub struct CiJobSpec {
     /// `<name>-<index>-<key>-<value>...` (sanitized, unique).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub matrix: BTreeMap<String, Vec<String>>,
+    /// Dependency cache restored before the commands and saved after a
+    /// successful job.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache: Option<CiCacheSpec>,
+}
+
+/// One job's dependency cache. The key is exact; `restore_keys` are
+/// prefixes tried in order when the exact key misses.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CiCacheSpec {
+    /// Exact cache key: 1–128 chars of `[A-Za-z0-9._-]`.
+    pub key: String,
+    /// Paths archived and restored, relative to the checkout root.
+    #[serde(default)]
+    pub paths: Vec<String>,
+    /// Prefix keys tried in order when the exact key misses.
+    #[serde(default)]
+    pub restore_keys: Vec<String>,
+    /// Save the cache after a successful job. Defaults to true.
+    #[serde(default = "default_true")]
+    pub save: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl CiJobSpec {
@@ -218,6 +248,7 @@ impl CiSpec {
             }
             validate_job(job)?;
             validate_matrix(job)?;
+            validate_cache(job)?;
         }
         let expanded = self.expanded_jobs();
         if expanded.len() > MAX_EXPANDED_JOBS {
@@ -413,6 +444,77 @@ fn validate_matrix(job: &CiJobSpec) -> CoreResult<()> {
         if !names.insert(expanded.name.clone()) {
             return Err(bad("matrix expansion produced a duplicate name".to_owned()));
         }
+    }
+    Ok(())
+}
+
+fn validate_cache_key(key: &str) -> CoreResult<()> {
+    if key.is_empty() || key.len() > MAX_CACHE_KEY_LEN {
+        return Err(invalid(format!(
+            "ci.toml: cache key `{key}` must be 1-{MAX_CACHE_KEY_LEN} characters"
+        )));
+    }
+    if !key
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+    {
+        return Err(invalid(format!(
+            "ci.toml: cache key `{key}` may only contain [A-Za-z0-9._-]"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_cache_path(path: &str) -> CoreResult<()> {
+    if path.is_empty() || path.len() > MAX_CACHE_PATH_LEN {
+        return Err(invalid(format!(
+            "ci.toml: cache path `{path}` must be 1-{MAX_CACHE_PATH_LEN} characters"
+        )));
+    }
+    if path.starts_with('/') {
+        return Err(invalid(format!(
+            "ci.toml: cache path `{path}` must be relative to the checkout root"
+        )));
+    }
+    for component in path.split('/') {
+        if component.is_empty() || component == "." || component == ".." {
+            return Err(invalid(format!(
+                "ci.toml: cache path `{path}` must not contain empty, `.`, or `..` components"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_cache(job: &CiJobSpec) -> CoreResult<()> {
+    let Some(cache) = &job.cache else {
+        return Ok(());
+    };
+    let bad = |message: String| invalid(format!("ci.toml: job `{}`: {message}", job.name));
+    validate_cache_key(&cache.key).map_err(|e| match e {
+        CoreError::Invalid(message) => bad(message),
+        other => other,
+    })?;
+    if cache.paths.is_empty() || cache.paths.len() > MAX_CACHE_PATHS {
+        return Err(bad(format!("cache must list 1-{MAX_CACHE_PATHS} paths")));
+    }
+    for path in &cache.paths {
+        validate_cache_path(path).map_err(|e| match e {
+            CoreError::Invalid(message) => bad(message),
+            other => other,
+        })?;
+    }
+    if cache.restore_keys.len() > MAX_CACHE_RESTORE_KEYS {
+        return Err(bad(format!(
+            "{} cache restore keys, over the {MAX_CACHE_RESTORE_KEYS}-key limit",
+            cache.restore_keys.len()
+        )));
+    }
+    for key in &cache.restore_keys {
+        validate_cache_key(key).map_err(|e| match e {
+            CoreError::Invalid(message) => bad(message),
+            other => other,
+        })?;
     }
     Ok(())
 }
@@ -916,6 +1018,7 @@ commands = ["cargo clippy"]
             },
             jobs: vec![CiJobSpec {
                 name: "test".to_owned(),
+                cache: None,
                 image: Some("rust:1.85".to_owned()),
                 template: None,
                 commands: Vec::new(),
@@ -969,6 +1072,38 @@ rust = ["1.85", "1.90"]
     }
 
     #[test]
+    fn cache_spec_parses_and_validates() {
+        let text = r#"
+version = 1
+[triggers]
+push = ["main"]
+[[job]]
+name = "test"
+image = "rust:1.85"
+commands = ["cargo test"]
+[job.cache]
+key = "cargo-1.85"
+paths = ["target", ".cargo/registry"]
+restore_keys = ["cargo-"]
+"#;
+        let spec = CiSpec::parse(text).unwrap();
+        let cache = spec.jobs[0].cache.as_ref().unwrap();
+        assert_eq!(cache.key, "cargo-1.85");
+        assert_eq!(cache.paths, vec!["target", ".cargo/registry"]);
+        assert_eq!(cache.restore_keys, vec!["cargo-"]);
+        assert!(cache.save);
+
+        let bad_key = text.replace("key = \"cargo-1.85\"", "key = \"bad key\"");
+        assert!(err(&bad_key).contains("may only contain"));
+        let absolute = text.replace("paths = [\"target\"", "paths = [\"/target\"");
+        assert!(err(&absolute).contains("relative"));
+        let dotdot = text.replace("paths = [\"target\"", "paths = [\"../target\"");
+        assert!(err(&dotdot).contains("must not contain"));
+        let no_paths = text.replace("paths = [\"target\", \".cargo/registry\"]", "paths = []");
+        assert!(err(&no_paths).contains("list 1-"));
+    }
+
+    #[test]
     fn expanded_names_are_unique_across_jobs() {
         let text = r#"
 version = 1
@@ -996,6 +1131,7 @@ commands = ["true"]
     fn total_expanded_jobs_are_capped() {
         let job = |name: &str| CiJobSpec {
             name: name.to_owned(),
+            cache: None,
             image: Some("rust:1.85".to_owned()),
             template: None,
             commands: vec!["true".to_owned()],

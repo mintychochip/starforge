@@ -115,6 +115,7 @@ The code rejects an unknown nested key as fatal.
 | `sandbox.limits` | `sandbox_seconds_per_hour` | number | 0, disabled | Sandbox seconds per user per hour |
 | `ci.limits` | `minutes_per_month` | number | 0, disabled | Native runner minutes per month |
 | `ci.limits` | `artifact_bytes` | number | 0, disabled | Unexpired artifact bytes per repository |
+| `ci.limits` | `cache_bytes` | number | 0, disabled | Live cache bytes per repository |
 | `ci.depot` | `api_url` | string | `https://api.depot.dev` | Depot API base URL |
 | `ci.depot` | `api_token` | string | empty, disabled | Depot organization token |
 

@@ -220,6 +220,19 @@ pub trait SandboxProvider: Send + Sync {
         id: String,
         op: FileOp,
     ) -> Pin<Box<dyn Future<Output = Result<String, ProviderError>> + Send + '_>>;
+    /// Read one file's bytes (binary-safe). Capped at [`MAX_FILE_BYTES`].
+    fn read_file_bytes(
+        &self,
+        id: String,
+        path: String,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, ProviderError>> + Send + '_>>;
+    /// Write one file's bytes (binary-safe). Capped at [`MAX_FILE_BYTES`].
+    fn write_file_bytes(
+        &self,
+        id: String,
+        path: String,
+        bytes: Vec<u8>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ProviderError>> + Send + '_>>;
     /// A signed, short-lived URL for one sandbox port.
     fn port_url(
         &self,
@@ -691,6 +704,48 @@ impl SandboxProvider for LocalSandboxProvider {
                     Ok(String::new())
                 }
             }
+        })
+    }
+
+    fn read_file_bytes(
+        &self,
+        id: String,
+        path: String,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, ProviderError>> + Send + '_>> {
+        Box::pin(async move {
+            let body: serde_json::Value = self
+                .json(
+                    "GET",
+                    &format!("/sandboxes/{}/files?path={}", encode(&id), encode(&path)),
+                    None,
+                )
+                .await?;
+            let content = body["content"]
+                .as_str()
+                .ok_or_else(|| ProviderError::new("internal", "file read has no content"))?;
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, content)
+                .map_err(|e| ProviderError::new("internal", format!("decoding file content: {e}")))
+        })
+    }
+
+    fn write_file_bytes(
+        &self,
+        id: String,
+        path: String,
+        bytes: Vec<u8>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ProviderError>> + Send + '_>> {
+        Box::pin(async move {
+            let content =
+                base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes);
+            let body = serde_json::json!({ "path": path, "content": content });
+            let _: serde_json::Value = self
+                .json(
+                    "PUT",
+                    &format!("/sandboxes/{}/files", encode(&id)),
+                    Some(&body),
+                )
+                .await?;
+            Ok(())
         })
     }
 
@@ -1202,6 +1257,51 @@ impl Core {
             )));
         }
         Ok(content)
+    }
+
+    /// Read one sandbox file's bytes (binary-safe). The path is validated
+    /// like [`Core::sandbox_file`] and the caller must own the sandbox.
+    pub async fn sandbox_read_file(
+        &self,
+        caller: SandboxCaller,
+        id: &str,
+        path: &str,
+    ) -> CoreResult<Vec<u8>> {
+        validate_sandbox_path(path, false)?;
+        let row = self.sandbox_row(id, caller).await?;
+        let bytes = self
+            .sandbox_provider(&row.runtime)
+            .read_file_bytes(id.to_owned(), path.to_owned())
+            .await
+            .map_err(provider_err)?;
+        if bytes.len() as u64 > MAX_FILE_BYTES {
+            return Err(CoreError::Invalid(format!(
+                "file content exceeds {MAX_FILE_BYTES} bytes"
+            )));
+        }
+        Ok(bytes)
+    }
+
+    /// Write one sandbox file's bytes (binary-safe). Capped at
+    /// [`MAX_FILE_BYTES`].
+    pub async fn sandbox_write_file(
+        &self,
+        caller: SandboxCaller,
+        id: &str,
+        path: &str,
+        bytes: Vec<u8>,
+    ) -> CoreResult<()> {
+        validate_sandbox_path(path, false)?;
+        if bytes.len() as u64 > MAX_FILE_BYTES {
+            return Err(CoreError::Invalid(format!(
+                "file content exceeds {MAX_FILE_BYTES} bytes"
+            )));
+        }
+        let row = self.sandbox_row(id, caller).await?;
+        self.sandbox_provider(&row.runtime)
+            .write_file_bytes(id.to_owned(), path.to_owned(), bytes)
+            .await
+            .map_err(provider_err)
     }
 
     /// A signed, short-lived URL for one sandbox port.

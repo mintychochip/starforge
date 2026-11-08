@@ -1321,6 +1321,14 @@ pub const ARTIFACT_TOKEN_TTL_SECS: i64 = 600;
 pub const MAX_ARTIFACT_BYTES: i64 = 1024 * 1024 * 1024;
 /// Artifact retention window: 30 days.
 pub const ARTIFACT_TTL_SECS: i64 = 30 * 24 * 3600;
+
+/// Max bytes of one CI cache entry (a tar of the declared paths).
+pub const MAX_CACHE_ENTRY_BYTES: i64 = 256 * 1024 * 1024;
+/// Cache retention: entries expire 7 days after they were saved.
+pub const CACHE_TTL_SECS: i64 = 7 * 24 * 3600;
+/// Max live cache entries per repository; the least recently used entry is
+/// evicted first when a save would exceed it.
+pub const MAX_CACHE_ENTRIES_PER_REPO: i64 = 50;
 /// Default job deadline when the spec sets no timeout: 1 hour.
 pub const DEFAULT_JOB_TIMEOUT_SECS: i64 = 3600;
 
@@ -2496,6 +2504,7 @@ impl Core {
             if db_ci::delete_artifact(self.db(), row.id).await?
                 && db_ci::artifact_refcount(self.db(), &row.blake3).await? == 0
                 && db_ci::ci_log_refcount(self.db(), &row.blake3).await? == 0
+                && db_ci::cache_refcount(self.db(), &row.blake3).await? == 0
                 && !db_sessions::blob_by_hash(self.db(), &row.blake3)
                     .await?
                     .is_some_and(|blob| blob.refcount > 0)
@@ -2514,6 +2523,191 @@ impl Core {
         }
         Ok(ids)
     }
+
+    /// Saves one cache entry for the executing job. The key must equal the
+    /// job spec's `cache.key`, saving must be enabled, and the bytes must
+    /// fit the entry cap and the repository quota. The least recently used
+    /// entries are evicted first. The blob goes to the CAS store and the row
+    /// expires after [`CACHE_TTL_SECS`].
+    pub async fn put_ci_cache(
+        &self,
+        principal: &JobPrincipal,
+        key: &str,
+        bytes: &[u8],
+    ) -> CoreResult<CacheView> {
+        let job = db_ci::ci_job_by_id(self.db(), principal.job_id)
+            .await?
+            .ok_or(CoreError::NotFound)?;
+        if job.repo_id != principal.repo_id {
+            return Err(CoreError::Forbidden);
+        }
+        let spec: CiJobSpec = serde_json::from_str(&job.spec)
+            .map_err(|_| CoreError::Invalid("job spec is not parseable".into()))?;
+        let cache = spec.cache.as_ref().ok_or(CoreError::Forbidden)?;
+        if !cache.save || cache.key != key {
+            return Err(CoreError::Forbidden);
+        }
+        if bytes.len() as i64 > MAX_CACHE_ENTRY_BYTES {
+            return Err(CoreError::Invalid(format!(
+                "cache entry exceeds the {MAX_CACHE_ENTRY_BYTES}-byte cap"
+            )));
+        }
+        self.evict_cache_entries(job.repo_id, bytes.len() as i64)
+            .await?;
+        self.check_cache_quota(job.repo_id, bytes.len() as i64)
+            .await?;
+        let blob = self
+            .config()
+            .blob_store
+            .put(bytes)
+            .await
+            .map_err(|e| CoreError::Internal(format!("cache blob store: {e}")))?;
+        let row = db_ci::upsert_cache_entry(
+            self.db(),
+            &db_ci::NewCacheEntry {
+                repo_id: job.repo_id,
+                key,
+                size: bytes.len() as i64,
+                blake3: &blob.hash,
+                now: now(),
+                expires_at: now() + CACHE_TTL_SECS,
+            },
+        )
+        .await?;
+        Ok(CacheView {
+            key: row.key,
+            size: row.size,
+            blake3: row.blake3,
+        })
+    }
+
+    /// Restores one cache entry for the executing job. The exact key wins;
+    /// otherwise the first `restore_keys` prefix with a live entry wins.
+    /// The key must be the spec's exact key or start with one of its
+    /// restore keys. Returns the bytes and the matched key.
+    pub async fn get_ci_cache(
+        &self,
+        principal: &JobPrincipal,
+        key: &str,
+        restore_keys: &[String],
+    ) -> CoreResult<(Vec<u8>, String)> {
+        let job = db_ci::ci_job_by_id(self.db(), principal.job_id)
+            .await?
+            .ok_or(CoreError::NotFound)?;
+        if job.repo_id != principal.repo_id {
+            return Err(CoreError::Forbidden);
+        }
+        let spec: CiJobSpec = serde_json::from_str(&job.spec)
+            .map_err(|_| CoreError::Invalid("job spec is not parseable".into()))?;
+        let cache = spec.cache.as_ref().ok_or(CoreError::Forbidden)?;
+        let exact_allowed = key == cache.key;
+        let prefix_allowed = cache
+            .restore_keys
+            .iter()
+            .any(|prefix| key.starts_with(prefix.as_str()));
+        if !exact_allowed && !prefix_allowed {
+            return Err(CoreError::Forbidden);
+        }
+        let mut row = if exact_allowed {
+            db_ci::cache_entry(self.db(), job.repo_id, key).await?
+        } else {
+            None
+        };
+        if row.is_none() {
+            for prefix in restore_keys {
+                if !cache
+                    .restore_keys
+                    .iter()
+                    .any(|allowed| prefix.starts_with(allowed.as_str()))
+                {
+                    continue;
+                }
+                if let Some(found) =
+                    db_ci::restore_cache_entry(self.db(), job.repo_id, prefix, now()).await?
+                {
+                    row = Some(found);
+                    break;
+                }
+            }
+        }
+        let row = row.ok_or(CoreError::NotFound)?;
+        let bytes = self
+            .config()
+            .blob_store
+            .get_by_hash(&row.blake3)
+            .await
+            .map_err(|e| CoreError::Internal(format!("reading cache blob: {e}")))?;
+        db_ci::touch_cache_entry(self.db(), row.id, now()).await?;
+        Ok((bytes, row.key))
+    }
+
+    /// Evicts the least recently used live entries until a new entry of
+    /// `incoming` bytes fits both the entry count and the repository quota.
+    async fn evict_cache_entries(&self, repo_id: i64, incoming: i64) -> CoreResult<()> {
+        let limit = self.config().ci.limits.cache_bytes;
+        loop {
+            let entries = db_ci::live_cache_entries(self.db(), repo_id, now()).await?;
+            let bytes = db_ci::live_cache_bytes(self.db(), repo_id, now()).await?;
+            let over_count = entries + 1 > MAX_CACHE_ENTRIES_PER_REPO;
+            let over_bytes = limit > 0
+                && bytes.saturating_add(incoming) > i64::try_from(limit).unwrap_or(i64::MAX);
+            if !over_count && !over_bytes {
+                return Ok(());
+            }
+            let Some(victim) = db_ci::lru_cache_entries(self.db(), repo_id, now(), 1)
+                .await?
+                .into_iter()
+                .next()
+            else {
+                return Ok(());
+            };
+            self.delete_cache_entry_row(&victim).await?;
+        }
+    }
+
+    /// Deletes one cache row and its blob when no other live reference
+    /// remains.
+    async fn delete_cache_entry_row(&self, row: &db_ci::CiCacheRow) -> CoreResult<()> {
+        if db_ci::delete_cache_entry(self.db(), row.id).await?
+            && db_ci::artifact_refcount(self.db(), &row.blake3).await? == 0
+            && db_ci::ci_log_refcount(self.db(), &row.blake3).await? == 0
+            && db_ci::cache_refcount(self.db(), &row.blake3).await? == 0
+            && !db_sessions::blob_by_hash(self.db(), &row.blake3)
+                .await?
+                .is_some_and(|blob| blob.refcount > 0)
+        {
+            let _ = self
+                .config()
+                .blob_store
+                .delete(&starforged_blob::BlobRef {
+                    hash: row.blake3.clone(),
+                    size: row.size as u64,
+                    key: row.blake3.clone(),
+                })
+                .await;
+        }
+        Ok(())
+    }
+
+    /// Deletes expired cache entries and their blobs when unreferenced.
+    /// Returns the deleted entry ids.
+    pub async fn gc_expired_caches(&self) -> CoreResult<Vec<i64>> {
+        let expired = db_ci::expired_cache_entries(self.db(), now(), 1000).await?;
+        let mut ids = Vec::new();
+        for row in expired {
+            self.delete_cache_entry_row(&row).await?;
+            ids.push(row.id);
+        }
+        Ok(ids)
+    }
+}
+
+/// One cache entry as the runner sees it after a save.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheView {
+    pub key: String,
+    pub size: i64,
+    pub blake3: String,
 }
 
 /// How a caller authenticates an artifact download.

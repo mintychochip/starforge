@@ -430,10 +430,11 @@ impl Core {
         // Expired sandboxes are killed and marked (M6b B5).
         self.gc_expired_sandboxes().await?;
         // Stalled `receiving` sessions become `complete` so search can see
-        // them; expired CI artifacts lose their rows and, when the last
-        // live reference goes, their blobs.
+        // them; expired CI artifacts and caches lose their rows and, when
+        // the last live reference goes, their blobs.
         self.finalize_stalled_sessions().await?;
         self.gc_expired_artifacts().await?;
+        self.gc_expired_caches().await?;
         // Delivery attempts older than 30 days fall out of the log (D5).
         starforged_db::checks::prune_deliveries_before(self.db(), ts - 30 * DAY).await?;
         self.prune_notifications(ts).await?;

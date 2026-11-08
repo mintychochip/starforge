@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use axum::Json;
 use axum::body::Bytes;
-use axum::extract::{ConnectInfo, Path, State};
+use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
@@ -1021,6 +1021,118 @@ pub async fn download_artifact(
     );
     *response.status_mut() = StatusCode::OK;
     Ok(response)
+}
+
+/// Query for the runner cache routes: the exact key plus optional
+/// comma-separated restore-key prefixes.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CacheQuery {
+    pub key: String,
+    #[serde(default)]
+    pub restore: Option<String>,
+}
+
+/// `GET /runners/jobs/{id}/cache?key=&restore=` (200; job token).
+#[utoipa::path(
+    get,
+    path = "/api/v1/runners/jobs/{id}/cache",
+    params(
+        ("id" = i64, Path, description = "CI job id"),
+        ("key" = String, Query, description = "Exact cache key"),
+        ("restore" = Option<String>, Query, description = "Comma-separated restore-key prefixes"),
+    ),
+    responses(
+        (status = 200, description = "Cache archive bytes"),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "No matching cache entry", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+pub async fn download_cache(
+    State(state): State<ApiState>,
+    Path(id): Path<i64>,
+    Query(query): Query<CacheQuery>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let token = bearer_of(&headers).ok_or(ApiError::Unauthenticated)?;
+    let principal = state.core.authenticate_job(&token).await?;
+    if principal.job_id != id {
+        return Err(ApiError::Forbidden(
+            "cache token does not match the job".into(),
+        ));
+    }
+    let restore: Vec<String> = query
+        .restore
+        .as_deref()
+        .unwrap_or_default()
+        .split(',')
+        .filter(|key| !key.is_empty())
+        .map(str::to_owned)
+        .collect();
+    let (bytes, matched) = state
+        .core
+        .get_ci_cache(&principal, &query.key, &restore)
+        .await?;
+    let mut response = Response::new(axum::body::Body::from(bytes));
+    no_store(response.headers_mut());
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static("application/octet-stream"),
+    );
+    response.headers_mut().insert(
+        "x-starforge-cache-key",
+        header::HeaderValue::from_str(&matched)
+            .unwrap_or_else(|_| header::HeaderValue::from_static("")),
+    );
+    *response.status_mut() = StatusCode::OK;
+    Ok(response)
+}
+
+/// `PUT /runners/jobs/{id}/cache?key=` (201; job token, raw archive).
+#[utoipa::path(
+    put,
+    path = "/api/v1/runners/jobs/{id}/cache",
+    params(
+        ("id" = i64, Path, description = "CI job id"),
+        ("key" = String, Query, description = "Exact cache key"),
+    ),
+    request_body = Vec<u8>,
+    responses(
+        (status = 201, description = "Saved cache entry"),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 413, description = "Too large", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+pub async fn upload_cache(
+    State(state): State<ApiState>,
+    Path(id): Path<i64>,
+    Query(query): Query<CacheQuery>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    let token = bearer_of(&headers).ok_or(ApiError::Unauthenticated)?;
+    let principal = state.core.authenticate_job(&token).await?;
+    if principal.job_id != id {
+        return Err(ApiError::Forbidden(
+            "cache token does not match the job".into(),
+        ));
+    }
+    let view = state
+        .core
+        .put_ci_cache(&principal, &query.key, &body)
+        .await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "key": view.key,
+            "size": view.size,
+            "blake3": view.blake3,
+        })),
+    ))
 }
 
 /// `POST /repos/{owner}/{repo}/ci/secrets` (201; create or rotate).

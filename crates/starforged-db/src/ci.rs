@@ -1393,6 +1393,190 @@ pub async fn delete_artifact(db: &Db, id: i64) -> DbResult<bool> {
     Ok(done.rows_affected() > 0)
 }
 
+/// One CI dependency cache entry: one exact key per repository.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CiCacheRow {
+    pub id: i64,
+    pub repo_id: i64,
+    pub key: String,
+    pub size: i64,
+    pub blake3: String,
+    pub created_at: i64,
+    pub last_used_at: i64,
+    pub expires_at: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewCacheEntry<'a> {
+    pub repo_id: i64,
+    pub key: &'a str,
+    pub size: i64,
+    pub blake3: &'a str,
+    pub now: i64,
+    pub expires_at: i64,
+}
+
+fn cache_from_row(row: &sqlx::any::AnyRow) -> DbResult<CiCacheRow> {
+    use sqlx::Row as _;
+    Ok(CiCacheRow {
+        id: row.try_get("id")?,
+        repo_id: row.try_get("repo_id")?,
+        key: row.try_get("key")?,
+        size: row.try_get("size")?,
+        blake3: row.try_get("blake3")?,
+        created_at: row.try_get("created_at")?,
+        last_used_at: row.try_get("last_used_at")?,
+        expires_at: row.try_get("expires_at")?,
+    })
+}
+
+/// One unexpired cache entry by exact key.
+pub async fn cache_entry(db: &Db, repo_id: i64, key: &str) -> DbResult<Option<CiCacheRow>> {
+    let row = sqlx::query(
+        "SELECT id, repo_id, key, size, blake3, created_at, last_used_at, expires_at FROM ci_cache_entries \
+         WHERE repo_id = $1 AND key = $2 AND expires_at > $3",
+    )
+    .bind(repo_id)
+    .bind(key)
+    .bind(now())
+    .fetch_optional(db.read_pool())
+    .await?;
+    row.as_ref().map(cache_from_row).transpose()
+}
+
+/// The newest unexpired entry whose key starts with `prefix` (restore-key
+/// fallback). `substr` avoids LIKE wildcard escaping: keys may contain `_`.
+pub async fn restore_cache_entry(
+    db: &Db,
+    repo_id: i64,
+    prefix: &str,
+    now_ts: i64,
+) -> DbResult<Option<CiCacheRow>> {
+    let row = sqlx::query(
+        "SELECT id, repo_id, key, size, blake3, created_at, last_used_at, expires_at FROM ci_cache_entries \
+         WHERE repo_id = $1 AND substr(key, 1, length($2)) = $2 AND expires_at > $3 \
+         ORDER BY created_at DESC, id DESC LIMIT 1",
+    )
+    .bind(repo_id)
+    .bind(prefix)
+    .bind(now_ts)
+    .fetch_optional(db.read_pool())
+    .await?;
+    row.as_ref().map(cache_from_row).transpose()
+}
+
+/// Inserts or replaces one (repository, key) entry.
+pub async fn upsert_cache_entry(db: &Db, n: &NewCacheEntry<'_>) -> DbResult<CiCacheRow> {
+    let row = sqlx::query(
+        "INSERT INTO ci_cache_entries \
+         (repo_id, key, size, blake3, created_at, last_used_at, expires_at) \
+         VALUES ($1, $2, $3, $4, $5, $5, $6) \
+         ON CONFLICT (repo_id, key) DO UPDATE SET \
+           size = excluded.size, blake3 = excluded.blake3, \
+           created_at = excluded.created_at, last_used_at = excluded.last_used_at, \
+           expires_at = excluded.expires_at \
+         RETURNING id, repo_id, key, size, blake3, created_at, last_used_at, expires_at",
+    )
+    .bind(n.repo_id)
+    .bind(n.key)
+    .bind(n.size)
+    .bind(n.blake3)
+    .bind(n.now)
+    .bind(n.expires_at)
+    .fetch_one(db.pool())
+    .await?;
+    cache_from_row(&row)
+}
+
+/// Marks one entry as used now (LRU).
+pub async fn touch_cache_entry(db: &Db, id: i64, now_ts: i64) -> DbResult<()> {
+    sqlx::query("UPDATE ci_cache_entries SET last_used_at = $2 WHERE id = $1")
+        .bind(id)
+        .bind(now_ts)
+        .execute(db.pool())
+        .await?;
+    Ok(())
+}
+
+/// Bytes of unexpired cache entries for one repository.
+pub async fn live_cache_bytes(db: &Db, repo_id: i64, now_ts: i64) -> DbResult<i64> {
+    let total: i64 = sqlx::query_scalar(
+        "SELECT CAST(COALESCE(SUM(size), 0) AS BIGINT) FROM ci_cache_entries \
+         WHERE repo_id = $1 AND expires_at > $2",
+    )
+    .bind(repo_id)
+    .bind(now_ts)
+    .fetch_one(db.read_pool())
+    .await?;
+    Ok(total)
+}
+
+/// Count of unexpired cache entries for one repository.
+pub async fn live_cache_entries(db: &Db, repo_id: i64, now_ts: i64) -> DbResult<i64> {
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM ci_cache_entries WHERE repo_id = $1 AND expires_at > $2",
+    )
+    .bind(repo_id)
+    .bind(now_ts)
+    .fetch_one(db.read_pool())
+    .await?;
+    Ok(count)
+}
+
+/// Entries whose retention window ended, oldest first (expiry GC).
+pub async fn expired_cache_entries(db: &Db, now_ts: i64, limit: i64) -> DbResult<Vec<CiCacheRow>> {
+    let rows = sqlx::query(
+        "SELECT id, repo_id, key, size, blake3, created_at, last_used_at, expires_at FROM ci_cache_entries \
+         WHERE expires_at <= $1 ORDER BY id ASC LIMIT $2",
+    )
+    .bind(now_ts)
+    .bind(limit)
+    .fetch_all(db.read_pool())
+    .await?;
+    rows.iter().map(cache_from_row).collect()
+}
+
+/// Deletes one cache entry; false when it was already gone.
+pub async fn delete_cache_entry(db: &Db, id: i64) -> DbResult<bool> {
+    let done = sqlx::query("DELETE FROM ci_cache_entries WHERE id = $1")
+        .bind(id)
+        .execute(db.pool())
+        .await?;
+    Ok(done.rows_affected() > 0)
+}
+
+/// Least-recently-used unexpired entries for one repository (eviction).
+pub async fn lru_cache_entries(
+    db: &Db,
+    repo_id: i64,
+    now_ts: i64,
+    limit: i64,
+) -> DbResult<Vec<CiCacheRow>> {
+    let rows = sqlx::query(
+        "SELECT id, repo_id, key, size, blake3, created_at, last_used_at, expires_at FROM ci_cache_entries \
+         WHERE repo_id = $1 AND expires_at > $2 \
+         ORDER BY last_used_at ASC, id ASC LIMIT $3",
+    )
+    .bind(repo_id)
+    .bind(now_ts)
+    .bind(limit)
+    .fetch_all(db.read_pool())
+    .await?;
+    rows.iter().map(cache_from_row).collect()
+}
+
+/// How many unexpired entries reference one blob (CAS refcount).
+pub async fn cache_refcount(db: &Db, blake3: &str) -> DbResult<i64> {
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM ci_cache_entries WHERE blake3 = $1 AND expires_at > $2",
+    )
+    .bind(blake3)
+    .bind(now())
+    .fetch_one(db.read_pool())
+    .await?;
+    Ok(count)
+}
+
 /// One outstanding artifact token by its SHA-256 hash (plaintext never
 /// stored). The row carries the `(job, name, size, sha256)` binding the
 /// upload must satisfy, the expiry, and whether the token was used.

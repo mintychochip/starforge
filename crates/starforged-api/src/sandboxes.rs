@@ -10,9 +10,11 @@
 use std::collections::BTreeMap;
 
 use axum::Json;
+use axum::body::Bytes;
 use axum::extract::{FromRequestParts, Path, Query, State};
 use axum::http::StatusCode;
 use axum::http::request::Parts;
+use axum::response::Response;
 use serde::{Deserialize, Serialize};
 use starforged_core::ci::{JOB_TOKEN_PREFIX, JobPrincipal};
 use starforged_core::limits::RateDecision;
@@ -552,6 +554,73 @@ pub async fn put_sandbox_file(
         content: None,
         entries: None,
     }))
+}
+
+/// `GET /api/v1/sandboxes/{id}/files/raw?path=` (binary read).
+#[utoipa::path(
+    get,
+    path = "/api/v1/sandboxes/{id}/files/raw",
+    params(
+        ("id" = String, Path, description = "Sandbox provider handle"),
+        ("path" = String, Query, description = "Workspace-relative path"),
+    ),
+    responses(
+        (status = 200, description = "Raw file bytes"),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 422, description = "Invalid", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+pub async fn get_sandbox_file_raw(
+    State(state): State<ApiState>,
+    auth: SandboxAuth,
+    Path(id): Path<String>,
+    Query(query): Query<FileQuery>,
+) -> Result<Response, ApiError> {
+    let bytes = state
+        .core
+        .sandbox_read_file(auth.caller(), &id, &query.path)
+        .await?;
+    let mut response = Response::new(axum::body::Body::from(bytes));
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/octet-stream"),
+    );
+    Ok(response)
+}
+
+/// `PUT /api/v1/sandboxes/{id}/files/raw?path=` (binary write).
+#[utoipa::path(
+    put,
+    path = "/api/v1/sandboxes/{id}/files/raw",
+    params(
+        ("id" = String, Path, description = "Sandbox provider handle"),
+        ("path" = String, Query, description = "Workspace-relative path"),
+    ),
+    request_body = Vec<u8>,
+    responses(
+        (status = 204, description = "Written"),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 422, description = "Invalid", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+pub async fn put_sandbox_file_raw(
+    State(state): State<ApiState>,
+    auth: SandboxAuth,
+    Path(id): Path<String>,
+    Query(query): Query<FileQuery>,
+    body: Bytes,
+) -> Result<StatusCode, ApiError> {
+    state
+        .core
+        .sandbox_write_file(auth.caller(), &id, &query.path, body.to_vec())
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// `DELETE /api/v1/sandboxes/{id}/files?path=` (delete).

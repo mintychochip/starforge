@@ -29,6 +29,11 @@ env = { RUST_BACKTRACE = "1" }
 secrets = ["CARGO_REGISTRY_TOKEN"]
 artifacts = ["target/nextest/**"]
 runs_on = ["linux"]
+
+[job.cache]
+key = "cargo-1.85"
+paths = ["target", ".cargo/registry"]
+restore_keys = ["cargo-"]
 ```
 
 | Key | Type | Rules |
@@ -46,6 +51,7 @@ runs_on = ["linux"]
 | `jobs[].artifacts` | array of globs | At most 32; relative, non-empty, no `..`, 256 chars; each artifact at most 1 GiB, retained 30 days. |
 | `jobs[].runs_on` | array of labels | At most 16 labels, 64 chars each; empty means any runner for the repo. |
 | `jobs[].matrix` | table of arrays | At most 8 keys, 16 values per key, 64 expanded jobs; keys match `[A-Za-z_][A-Za-z0-9_]*`, values 1–4096 chars. Matrix values are added to the job `env` (a matrix value overrides a same-named `env` entry). The expanded name is `<name>-<index>-<key>-<value>...`, sanitized to `[A-Za-z0-9_-]` and at most 64 chars. The whole file expands to at most 256 jobs. |
+| `jobs[].cache` | table | Optional. `key` is 1–128 chars of `[A-Za-z0-9._-]`; `paths` lists 1–8 relative paths (no `.` or `..` components); `restore_keys` lists at most 4 prefixes; `save` defaults to true. The runner restores the entry before the commands and saves it after a successful job. An entry is at most 256 MiB, retained 7 days; a repository keeps at most 50 live entries, evicting the least recently used first. |
 
 A malformed or invalid spec fails the run with a `ci/spec` check in state
 `error` and a description naming the first validation failure.
