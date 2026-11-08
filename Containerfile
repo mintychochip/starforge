@@ -11,9 +11,9 @@
 # then:
 #
 #   podman build --build-arg STARFORGE_TARGET=x86_64-unknown-linux-musl \
-#     -t starforge:0.1.0-pre.1 .
+#     -t starforge:0.1.0-rc.1 .
 #   podman run --rm -p 3000:3000 -p 2222:2222 -v starforge-data:/data \
-#     starforge:0.1.0-pre.1
+#     starforge:0.1.0-rc.1
 #
 # For aarch64, pass --build-arg STARFORGE_TARGET=aarch64-unknown-linux-musl
 # (and a matching build host / --platform).

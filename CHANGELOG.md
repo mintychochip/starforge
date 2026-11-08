@@ -1,8 +1,8 @@
 # Changelog
 
-## 0.1.0-pre.1
+## 0.1.0-rc.1
 
-First prerelease of the 0.1.0 line: git over HTTP and SSH with Trails,
+First release candidate of the 0.1.0 line: git over HTTP and SSH with Trails,
 agent session traces, search, webhooks, mirrors, notifications, releases,
 and opt-in CI runners with sandboxed jobs, on SQLite or Postgres.
 

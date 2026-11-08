@@ -26,7 +26,7 @@ scripts/build-release.sh            # builds the starforge tarballs
 mkdir -p target/agent-bin
 install -m 0755 /path/to/pi target/agent-bin/pi
 podman build --build-arg STARFORGE_TARGET=x86_64-unknown-linux-musl \
-  -t starforge-sandbox:0.1.0-pre.1 -f packaging/sandbox/Containerfile .
+  -t starforge-sandbox:0.1.0-rc.1 -f packaging/sandbox/Containerfile .
 ```
 
 ## Runtime contract
