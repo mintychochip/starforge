@@ -17,7 +17,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use starforged_core::ci::{FinishOutcome, RunnerView, TraceOutcome};
+use starforged_core::ci::{CiSecretInput, FinishOutcome, RunnerView, TraceOutcome};
 use starforged_core::tokens::Scope;
 
 use crate::ApiState;
@@ -253,6 +253,8 @@ pub struct ClaimedJobJson {
     pub job_token: String,
     pub deadline: String,
     pub lease_until: String,
+    /// The clone URL of the job's repository (`{base}/{owner}/{repo}.git`).
+    pub clone_url: String,
 }
 
 /// The finish report (`PUT /runners/jobs/{id}`).
@@ -336,6 +338,7 @@ pub async fn request_job(
                 job_token: claimed.job_token,
                 deadline: rfc3339(claimed.deadline),
                 lease_until: rfc3339(claimed.lease_until),
+                clone_url: claimed.clone_url,
             };
             let mut response = (StatusCode::CREATED, Json(body)).into_response();
             no_store(response.headers_mut());
@@ -690,6 +693,13 @@ pub struct SecretBody {
     /// The plaintext value. It is sealed before storage and never logged
     /// or returned; responses carry metadata only.
     pub value: String,
+    /// The host (with optional `:port`) the value is injected for; empty
+    /// means unbound.
+    #[serde(default)]
+    pub bind_host: String,
+    /// The HTTP header the value is injected as; empty means unbound.
+    #[serde(default)]
+    pub bind_header: String,
     pub redact_in_sessions: Option<bool>,
 }
 
@@ -699,23 +709,12 @@ pub struct SecretJson {
     pub id: i64,
     pub name: String,
     pub redact_in_sessions: bool,
+    /// The host the value is injected for; empty when unbound.
+    pub bind_host: String,
+    /// The HTTP header the value is injected as; empty when unbound.
+    pub bind_header: String,
     pub created_at: String,
     pub updated_at: String,
-}
-
-/// One resolved secret value (in memory only; the response carries
-/// `Cache-Control: no-store` and the value never reaches logs or disk).
-#[derive(Serialize, utoipa::ToSchema)]
-pub struct ResolvedSecretJson {
-    pub name: String,
-    pub value: String,
-}
-
-/// Response of the secret-resolution route.
-#[derive(Serialize, utoipa::ToSchema)]
-pub struct ResolvedSecretsJson {
-    /// Empty under the trust rule (unprotected branch, unapproved Trail).
-    pub secrets: Vec<ResolvedSecretJson>,
 }
 
 /// `POST /repos/{owner}/{repo}/ci/runs` (201; manual trigger).
@@ -1045,8 +1044,12 @@ pub async fn create_secret(
             &auth.user,
             &owner,
             &repo,
-            &body.name,
-            &body.value,
+            &CiSecretInput {
+                name: body.name.clone(),
+                value: body.value.clone(),
+                bind_host: body.bind_host.clone(),
+                bind_header: body.bind_header.clone(),
+            },
             body.redact_in_sessions.unwrap_or(true),
         )
         .await?;
@@ -1056,6 +1059,8 @@ pub async fn create_secret(
             id: view.id,
             name: view.name,
             redact_in_sessions: view.redact_in_sessions,
+            bind_host: view.bind_host,
+            bind_header: view.bind_header,
             created_at: rfc3339(view.created_at),
             updated_at: rfc3339(view.updated_at),
         }),
@@ -1094,6 +1099,8 @@ pub async fn list_secrets(
             id: secret.id,
             name: secret.name,
             redact_in_sessions: secret.redact_in_sessions,
+            bind_host: secret.bind_host,
+            bind_header: secret.bind_header,
             created_at: rfc3339(secret.created_at),
             updated_at: rfc3339(secret.updated_at),
         }).collect::<Vec<_>>(),
@@ -1129,51 +1136,6 @@ pub async fn delete_secret(
         .delete_ci_secret(&auth.user, &owner, &repo, &name)
         .await?;
     Ok(StatusCode::NO_CONTENT)
-}
-
-/// `POST /runners/jobs/{id}/secrets` (200; resolve for egress injection).
-#[utoipa::path(
-    post,
-    path = "/api/v1/runners/jobs/{id}/secrets",
-    params(
-        ("id" = i64, Path, description = "CI job id"),
-        ("X-Starforge-Fence" = String, Header, description = "Per-claim lease fence"),
-    ),
-    responses(
-        (status = 200, description = "Resolved secrets", body = ResolvedSecretsJson),
-        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
-        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
-        (status = 409, description = "Stale fence", body = crate::openapi::ApiErrorBody),
-        (status = 400, description = "Bad request", body = crate::openapi::ApiErrorBody),
-    ),
-    security(("bearer_auth" = [])),
-)]
-pub async fn resolve_job_secrets(
-    State(state): State<ApiState>,
-    RunnerAuth(runner): RunnerAuth,
-    Path(id): Path<i64>,
-    headers: HeaderMap,
-) -> Result<Response, ApiError> {
-    let fence = fence_header(&headers)?;
-    let resolved = state
-        .core
-        .resolve_runner_job_secrets(&runner, id, &fence)
-        .await?;
-    let mut response = (
-        StatusCode::OK,
-        Json(ResolvedSecretsJson {
-            secrets: resolved
-                .into_iter()
-                .map(|secret| ResolvedSecretJson {
-                    name: secret.name,
-                    value: secret.value,
-                })
-                .collect(),
-        }),
-    )
-        .into_response();
-    no_store(response.headers_mut());
-    Ok(response)
 }
 
 /// The `Authorization: Bearer …` credential of a request, if present.

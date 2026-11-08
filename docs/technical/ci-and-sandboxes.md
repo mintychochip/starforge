@@ -98,13 +98,17 @@ A job runs agent commands in the sandbox. The runner runs `starforge sync` in th
 
 `create_ci_secret` seals each secret value. `CiSecretBox` uses XChaCha20-Poly1305. The server derives the key with HKDF under the domain `ci-secrets-v1`. The sealed form carries the prefix `c1:`. The database, the audit log, and the logs never receive the plain value.
 
-`resolve_runner_job_secrets` resolves the secret names of one claimed job. The runner owns the claim and presents the fence. The returned values exist in memory only.
+`CiSecretInput` carries `name`, `value`, `bind_host`, and `bind_header`. `bind_host` holds a hostname or an IP with an optional `:port`. `bind_header` holds one HTTP header token. Two empty fields mean an unbound secret. One field without the other returns `Invalid`. Secret views expose `bind_host` and `bind_header` and never expose values.
 
-`secrets_trusted_for_job` applies the trust rule. A job trusts secrets only on a protected branch or an approved Trail. `ALLOW_SECRETS_ON_REFS_FOR` is false. A `refs/for` run so resolves no secrets. `ENV_SECRETS` is false. A secret value never enters the job environment.
+`create_sandbox_for_job` resolves the secret names of one job. `secrets_trusted_for_job` gates the resolution. A name present with a false trust result returns `Invalid` with `repository secrets are not available to this run`. A missing name returns `Invalid` with `secret NAME does not exist for this repository`. An unbound secret returns `Invalid` with `secret NAME has no host binding`.
+
+Each bound secret adds `bind_host` to `allow_out`. Each bound secret sets `secret_headers[bind_host]`. Each bound secret pushes one `SecretValue` with `host`, `header`, and `value`. The function records `ci_job_secrets` rows for dynamic redaction. The function audits `ci.job.secrets.resolve` with names only.
+
+`create_sandbox_inner` refuses a request with non-empty `network.secret_values` from a caller. Only the server adds values after that check. `ALLOW_SECRETS_ON_REFS_FOR` is false. A `refs/for` run resolves no secrets. `ENV_SECRETS` is false. A secret value never enters the job environment.
 
 The egress proxy injects the value as a header for an allowlisted host. Each secret row also holds a redaction flag. Dynamic redaction uses the values of redaction-enabled resolved secrets.
 
-The runner does not call the resolution route at this time. The runner creates each sandbox with the default network policy, so a job receives no secret header.
+The removed function `resolve_runner_job_secrets` and the removed route `POST /api/v1/runners/jobs/{id}/secrets` once returned values to runners. The runner never sees values now. The server sends values to `starforge-sandboxd` over its local token-authenticated socket.
 
 ### Sandboxes
 
@@ -114,13 +118,25 @@ Runtime `podman` is the default. Runtime `gvisor` selects `runsc` on request. Th
 
 The `e2b` provider talks to an E2B-shaped gateway over HTTP. The wire shapes match `starforge-sandbox-protocol`. The adapter is not wire-compatible with real E2B. The admin guide describes the gap in full. The API key never reaches logs.
 
-Each sandbox gets its own egress proxy task. The proxy terminates TLS under a per-sandbox CA. The CA name constraints cover only allowlisted destinations. The proxy resolves each DNS name once and pins the answer. The proxy injects a secret header only for a bound host.
+Each sandbox gets its own egress proxy task. The proxy terminates TLS under a per-sandbox CA. The CA name constraints cover only allowlisted destinations. The proxy resolves each DNS name once and pins the answer.
+
+The proxy injects a secret header only for a bound host. The proxy forwards absolute-form plain HTTP to origin-form with the same allowlist checks. A `host:port` entry permits exactly that port. A `host` entry permits every port.
 
 The proxy refuses a non-allowlisted host. The CA keys carry mode `0600`. The daemon destroys the CA with the sandbox. The daemon refuses host mounts and privileged containers. The server rejects a secret header host outside the allowlist.
 
-The `local` provider starts each container with `--network none`. The proxy listens on a host address, and the container cannot reach that address. A local sandbox so has no network access at this time. The allowlist and the secret headers have no effect until the container network routes traffic to the proxy.
+The `local` provider starts each container with `--network none`. The daemon creates `<egress-dir>/<id>/` with mode `0777`. The daemon mounts that directory at `/run/starforge/egress` with `:Z`. The sandbox environment points `HTTP_PROXY`, `HTTPS_PROXY`, `http_proxy`, and `https_proxy` at `http://127.0.0.1:3128`. The daemon copies its own executable into `/workspace/.starforge-proxy/` with `podman cp`. The daemon starts the forwarder detached with `podman exec -d` before the sandbox reports ready.
 
-Sandbox limits answer 429 for a limit breach. `max_concurrent_per_user` caps concurrent sandboxes per user. `max_concurrent_per_repo` caps concurrent sandboxes per repository. `sandbox_seconds_per_hour` caps seconds per user per hour. `default_ttl_secs` records the default lifetime at 3600 seconds. A request can set its own `timeout_s`.
+The `forward` subcommand listens on TCP and on the Unix socket it creates. The socket path reads `/run/starforge/egress/shim.sock`. The daemon connects into that socket. The daemon keeps a pool of 4 idle connections. Each TCP client pairs with one pooled connection. A used connection gets replaced at once.
+
+SELinux denies a container process connecting to a host socket. SELinux allows a host process connecting to a container socket. The reversed direction follows that rule. The pool gives up after 10 seconds. Sandbox creation fails at that point.
+
+The daemon flag `--egress-dir` replaces `--egress-listen`. Egress stays disabled without the flag. The daemon creates one directory per sandbox. The directory path reads `<dir>/<id>/`. The daemon removes the directory at kill or removal.
+
+The network policy merges `network.secret_values` with `--secret-binding` flags. A value applies only to a host named in `secret_headers` and allowed.
+
+`create_sandbox_for_job` adds the forge `host:port` from `server.base_url` to `allow_out`. The port defaults by scheme. The runner checks out the job commit in place. The runner falls back to `--repo-url` when `clone_url` stays empty. The runner builds the credential URL with username `x-access-token` for http and https. The runner excludes `.starforge-proxy/` from the checkout.
+
+Sandbox limits answer 429 for a limit breach. `max_concurrent_per_user` caps concurrent sandboxes per user. `max_concurrent_per_repo` caps concurrent sandboxes per repository. `sandbox_seconds_per_hour` caps seconds per user per hour. `default_ttl_secs` records the default lifetime at 3600 seconds. A request sets its own `timeout_s`.
 
 The daemon enforces each sandbox TTL.
 
@@ -156,7 +172,7 @@ Depot metrics are `depot_ci_vcpu_minutes`, `depot_ci_minutes`, `depot_ci_attempt
 
 `CiSpec::parse` and `read_ci_spec_at_commit` handle the spec. `ci_trigger_push`, `ci_trigger_trail`, and `ci_trigger_manual` start runs. `claim_ci_job`, `trace_ci_job`, `heartbeat_ci_job`, and `finish_ci_job` drive the runner protocol. `cancel_ci_job` requests a cancel. `sweep_ci_jobs` reaps expired leases and missed deadlines.
 
-`run_ci_sweep_if_due` gates the sweep by time. `authorize_artifact_upload` and `upload_ci_artifact` move artifacts. `git_credential_for_runner` mints the git credential. `resolve_runner_job_secrets` returns in-memory secret values. `create_ci_secret` seals a secret value.
+`run_ci_sweep_if_due` gates the sweep by time. `authorize_artifact_upload` and `upload_ci_artifact` move artifacts. `git_credential_for_runner` mints the git credential. `create_sandbox_for_job` resolves job secrets and builds the network policy. `create_ci_secret` seals a secret value.
 
 `redact_ci_secrets` and `redact_ci_secrets_with_history` redact session text. `create_sandbox` and `sandbox_runtimes` drive sandboxes. The HTTP routes live in `starforged-api/src/sandboxes.rs` and `starforged-api/src/ci.rs`. The CI runs page lives in `starforged-web/src/pages/ci.rs`. Route and scope detail lives in [HTTP API conventions](http-api.md).
 
@@ -164,9 +180,9 @@ Depot metrics are `depot_ci_vcpu_minutes`, `depot_ci_minutes`, `depot_ci_attempt
 
 A malformed spec writes a `ci/spec` error check and fails the trigger. A job with no matching runner stays queued. A label mismatch returns the job to `queued`. A stale fence answers 409 on trace, finish, and heartbeat. A cancel wins over a late trace and over a late finish. A reaped job drops its credentials at once.
 
-The sweep never sends a check for a job that returns to `queued`. Resolve skips a missing secret name. An untrusted `refs/for` run resolves no secret value. An artifact replay answers `Conflict`. An artifact with a wrong hash answers `Invalid`. An artifact past the storage cap answers `Invalid`.
+A secret resolution failure fails the job before the sandbox starts. The messages name the cause. The sweep never sends a check for a job that returns to `queued`. An artifact replay answers `Conflict`. An artifact with a wrong hash answers `Invalid`. An artifact past the storage cap answers `Invalid`.
 
-A sandbox create that names `firecracker` or `kata` answers 422. A sandbox create past a limit answers 429 with `Retry-After`.
+A sandbox create that names `firecracker` or `kata` answers 422. A sandbox create past a limit answers 429 with `Retry-After`. A sandbox create with caller-supplied secret values answers `Invalid`.
 
 ## Verification
 

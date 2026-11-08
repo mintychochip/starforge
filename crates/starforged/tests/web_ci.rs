@@ -725,13 +725,16 @@ async fn ci_secrets_settings_page_crud_and_auth() {
             .contains("MY_TOKEN"),
     );
 
-    // Create: 303 back to the list; the value never appears in any response.
+    // Create with a host/header binding: 303 back to the list; the value
+    // never appears in any response, but the binding is shown.
     let resp = alice_browser
         .post(&page_url)
         .form(&[
             ("_csrf", alice_csrf.as_str()),
             ("name", "MY_TOKEN"),
             ("value", "v1-secret-value"),
+            ("bind_host", "registry.example.com:443"),
+            ("bind_header", "Authorization"),
         ])
         .send()
         .await
@@ -742,8 +745,41 @@ async fn ci_secrets_settings_page_crud_and_auth() {
     let page = get_text(&alice_browser, &page_url).await;
     assert!(page.contains("MY_TOKEN"), "{page}");
     assert!(
+        page.contains("registry.example.com:443"),
+        "bind host is shown: {page}"
+    );
+    assert!(
+        page.contains("Authorization"),
+        "bind header is shown: {page}"
+    );
+    assert!(
         !page.contains("v1-secret-value"),
         "value is never rendered: {page}"
+    );
+
+    // A one-sided binding (host without header) is refused with 422.
+    let resp = alice_browser
+        .post(&page_url)
+        .form(&[
+            ("_csrf", alice_csrf.as_str()),
+            ("name", "ONE_SIDED"),
+            ("value", "v1-secret-value"),
+            ("bind_host", "registry.example.com"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "one-sided binding is 422: {}",
+        resp.status()
+    );
+    assert!(
+        !get_text(&alice_browser, &page_url)
+            .await
+            .contains("ONE_SIDED"),
+        "refused secret creates nothing"
     );
 
     // Rotate: same name, new value; still 303, neither value leaks.

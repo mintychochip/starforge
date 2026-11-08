@@ -94,6 +94,8 @@ impl From<NetworkPolicyJson> for NetworkPolicy {
             allow_out: value.allow_out,
             deny_out: value.deny_out,
             secret_headers: value.secret_headers,
+            // Server-resolved only; callers must never supply values.
+            secret_values: Vec::new(),
         }
     }
 }

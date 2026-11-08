@@ -314,7 +314,6 @@ const ROUTES: &[(&str, &str)] = &[
     ("post", "/api/v1/runners/jobs/{id}/artifacts/authorize"),
     ("put", "/api/v1/runners/jobs/{id}/artifacts/{*name}"),
     ("get", "/api/v1/runners/jobs/{id}/artifacts/{*name}"),
-    ("post", "/api/v1/runners/jobs/{id}/secrets"),
     ("get", "/api/v1/repos/{owner}/{repo}/ci/secrets"),
     ("post", "/api/v1/repos/{owner}/{repo}/ci/secrets"),
     ("delete", "/api/v1/repos/{owner}/{repo}/ci/secrets/{name}"),

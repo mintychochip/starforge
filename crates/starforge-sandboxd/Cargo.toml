@@ -27,6 +27,7 @@ rustls-native-certs = "0.8"
 serde.workspace = true
 serde_json.workspace = true
 starforge-sandbox-protocol = { path = "../starforge-sandbox-protocol", version = "0.1.0" }
+tar.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-rustls = "0.26"

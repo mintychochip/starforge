@@ -327,12 +327,6 @@ fn new_routes(
             None,
         ),
         (
-            "POST",
-            format!("/api/v1/runners/jobs/{jid}/secrets"),
-            Some(json!({})),
-            None,
-        ),
-        (
             "GET",
             "/api/v1/repos/alice/proj/ci/secrets".into(),
             None,
@@ -826,6 +820,65 @@ async fn sealed_secret_never_discloses() {
     .await;
     assert_eq!(status, StatusCode::CREATED, "{value}");
     assert!(!value.to_string().contains(SECRET), "create leaks: {value}");
+    assert_eq!(value["bind_host"], "");
+    assert_eq!(value["bind_header"], "");
+
+    // A bound secret: the binding is accepted and shown; the value never is.
+    let (status, value) = api(
+        &s.browser(),
+        "POST",
+        &s.url("/api/v1/repos/alice/proj/ci/secrets"),
+        &pat,
+        &[],
+        Some(json!({"name": "BOUND", "value": SECRET, "bind_host": "registry.example.com:443", "bind_header": "Authorization"})),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{value}");
+    assert_eq!(value["bind_host"], "registry.example.com:443");
+    assert_eq!(value["bind_header"], "Authorization");
+    assert!(!value.to_string().contains(SECRET), "create leaks: {value}");
+
+    // A one-sided binding is a 422 and creates nothing.
+    let (status, value) = api(
+        &s.browser(),
+        "POST",
+        &s.url("/api/v1/repos/alice/proj/ci/secrets"),
+        &pat,
+        &[],
+        Some(json!({"name": "ONE_SIDED", "value": SECRET, "bind_host": "registry.example.com"})),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{value}");
+
+    let (status, value) = api(
+        &s.browser(),
+        "GET",
+        &s.url("/api/v1/repos/alice/proj/ci/secrets"),
+        &pat,
+        &[],
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let bound = value["secrets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["name"] == "BOUND")
+        .expect("bound secret listed");
+    assert_eq!(bound["bind_host"], "registry.example.com:443");
+    assert_eq!(bound["bind_header"], "Authorization");
+    assert!(
+        value["secrets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|s| s["name"] != "ONE_SIDED"),
+        "one-sided secret not created: {value}"
+    );
 
     let sealed: String =
         sqlx::query_scalar("SELECT sealed_value FROM ci_secrets WHERE repo_id = $1")
@@ -873,7 +926,7 @@ async fn sealed_secret_never_discloses() {
         .spec;
     assert!(!spec.contains(SECRET), "spec leaks");
 
-    // Resolve with correct fence returns value exactly once, no-store.
+    // The runner secret-resolution route is gone: values never reach runners.
     let resp = s
         .browser()
         .post(s.url(&format!("/api/v1/runners/jobs/{job_id}/secrets")))
@@ -882,32 +935,16 @@ async fn sealed_secret_never_discloses() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    assert!(
-        resp.headers()["cache-control"]
-            .to_str()
-            .unwrap()
-            .starts_with("no-store"),
-        "cache-control must be no-store"
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "POST /runners/jobs/{{id}}/secrets must not exist"
     );
-    let body: Value = resp.json().await.unwrap();
+    let body = resp.text().await.unwrap();
     assert!(
-        body["secrets"][0]["value"].is_null(),
-        "sealed secret value must never be returned: {body}"
+        !body.contains(SECRET),
+        "removed route leaks the secret: {body}"
     );
-
-    // Stale fence cannot resolve.
-    let (status, _) = api(
-        &s.browser(),
-        "POST",
-        &s.url(&format!("/api/v1/runners/jobs/{job_id}/secrets")),
-        &runner,
-        &[("x-starforge-fence", "stale-fence")],
-        Some(json!({})),
-        None,
-    )
-    .await;
-    assert_eq!(status, StatusCode::CONFLICT);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -188,7 +188,10 @@ A CI run enters `starforged-api`.
 The runner registers with a runner token.
 The runner long-polls for a job with `POST /runners/jobs/request`.
 The server claims the job under a fence token.
+
+The claim carries `clone_url` for one repository clone.
 The runner mints a short-lived git credential.
+The server resolves job secrets and builds the network policy.
 The runner creates a sandbox through the sandbox API.
 
 The runner runs job commands in the sandbox.
@@ -209,13 +212,20 @@ Each sandbox gets one egress proxy task.
 The proxy denies all egress by default.
 The proxy allows only `sandbox.local.egress.allowlist` hosts.
 The proxy terminates TLS with a per-sandbox CA.
+
 The proxy injects secret headers for allowlisted hosts.
+The proxy forwards plain HTTP with the same checks.
 Secret values never enter the sandbox.
 
 The local provider starts each container with `--network none`.
-The proxy listens on a host address that such a container cannot reach.
-A local sandbox so has no network access at this time.
-The allowlist and the secret headers have no effect until the container network routes traffic to the proxy.
+The daemon mounts `<egress-dir>/<id>/` at `/run/starforge/egress`.
+The daemon copies its own executable into the container.
+The daemon starts the forwarder detached before ready.
+
+The forwarder listens on `127.0.0.1:3128` and on its own Unix socket.
+The daemon connects into that socket.
+The daemon keeps a pool of 4 idle connections.
+The flag `--egress-dir` sets the socket directory.
 
 ## Failure behavior
 

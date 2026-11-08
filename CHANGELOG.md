@@ -93,12 +93,24 @@ search, webhooks, and mirrors, on SQLite or Postgres.
   secrets on a settings page as well as through the API; the hourly cleanup
   deletes expired artifacts; the OCI image ships `starforge-runner` and
   `starforge-sandboxd`. The never-read server keys
-  `sandbox.local.egress.proxy_listen` and `ca_dir` are removed (the daemon's
-  `--egress-listen` and `--egress-ca-dir` flags set them); an environment
-  override for either now fails startup as an unknown key. Known
-  limitation: local sandboxes still run with `--network none`, so they
-  cannot reach the egress proxy, and the runner's in-sandbox `git clone`
-  and session sync fail there.
+  `sandbox.local.egress.proxy_listen` and `ca_dir` are removed; an
+  environment override for either now fails startup as an unknown key.
+  Local sandboxes keep `--network none` and reach the network only through
+  their egress proxy: `starforge-sandboxd --egress-dir` mounts a directory
+  into each sandbox, where a forwarder listens on `127.0.0.1:3128` and on a
+  Unix socket that the daemon connects into (SELinux forbids the reverse
+  direction); the proxy also forwards plain HTTP, and allowlist entries may
+  name a port. Job sandboxes may reach the forge itself; the runner checks
+  out the `clone_url` from its claim in place with a working credential
+  for `http` and `https`. Real podman sandboxes now run commands and move
+  files at all: the daemon used to pass `--` after the container name to
+  `podman exec` and raw bytes to `podman cp`, and both always failed.
+  A secret carries a host and header binding (set by a repository
+  admin); the server resolves a trusted job's secrets and hands the values
+  to the sandbox daemon, never to the runner, and a job naming a missing,
+  unbound, or untrusted secret fails with that reason in its log.
+  Breaking: `--egress-listen` is replaced by `--egress-dir`, and
+  `POST /runners/jobs/{id}/secrets` is removed.
 - **CLI:** `starforge` — `auth login` (device flow, scopes `repo:read
   trail:write session:upload`), `auth ssh-key add` (one-time `repo:write`
   device flow; both tokens are revoked and never stored), `enable`/`disable`
@@ -166,6 +178,7 @@ before upgrading (see `docs/admin/backup-and-restore.md`).
 | 0040 | Drop queued rows of two removed no-op job kinds |
 | 0041 | Notifications, repository watches, Trail subscriptions, per-user email setting |
 | 0042 | Releases and release assets |
+| 0043 | Host and header bindings for CI secrets |
 
 Note: migration numbers 0030–0033 do not exist; the series jumps from 0029
 to 0034.

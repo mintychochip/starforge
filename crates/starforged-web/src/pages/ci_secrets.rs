@@ -38,6 +38,10 @@ pub struct SecretForm {
     name: String,
     #[serde(default)]
     value: String,
+    #[serde(default)]
+    bind_host: String,
+    #[serde(default)]
+    bind_header: String,
 }
 
 fn settings_url(owner: &str, repo: &str) -> String {
@@ -66,7 +70,18 @@ pub async fn create_or_rotate(
     verify_csrf(&session.csrf_token, &form.csrf)?;
     match state
         .core
-        .create_ci_secret(&session.user, &owner, &repo, &form.name, &form.value, true)
+        .create_ci_secret(
+            &session.user,
+            &owner,
+            &repo,
+            &starforged_core::ci::CiSecretInput {
+                name: form.name.clone(),
+                value: form.value.clone(),
+                bind_host: form.bind_host.clone(),
+                bind_header: form.bind_header.clone(),
+            },
+            true,
+        )
         .await
     {
         Ok(_) => Ok(Redirect::to(&settings_url(&owner, &repo)).into_response()),

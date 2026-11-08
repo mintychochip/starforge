@@ -10,10 +10,13 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 /// Egress policy for a sandbox. Outbound destinations are denied by default;
-/// `allow_out` lists the only hosts a sandbox may reach, `deny_out` lists
-/// hosts that stay denied even when an allowlist entry would otherwise match,
-/// and `secret_headers` names the header the egress proxy injects (by host)
-/// for a bound secret. Secret *values* never appear on the wire.
+/// `allow_out` lists the only hosts a sandbox may reach: each entry is a
+/// `host` (the host on any port) or a `host:port` (exactly that port).
+/// `deny_out` lists hosts that stay denied even when an allowlist entry
+/// would otherwise match, and `secret_headers` names the header the egress
+/// proxy injects (by host) for a bound secret. Secret *values* reach the
+/// proxy only as the daemon's local `secret_values` bindings, never through
+/// environment variables or URLs.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetworkPolicy {
     #[serde(default)]
@@ -22,6 +25,29 @@ pub struct NetworkPolicy {
     pub deny_out: Vec<String>,
     #[serde(default)]
     pub secret_headers: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secret_values: Vec<SecretValue>,
+}
+
+/// One secret value the egress proxy injects as an HTTP header. The `host`
+/// must be in [`NetworkPolicy::allow_out`] and match a key of
+/// [`NetworkPolicy::secret_headers`]; `value` is held in memory only and
+/// never rendered by `Debug`.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecretValue {
+    pub host: String,
+    pub header: String,
+    pub value: String,
+}
+
+impl std::fmt::Debug for SecretValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SecretValue")
+            .field("host", &self.host)
+            .field("header", &self.header)
+            .field("value", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Create a sandbox (E2B-shaped, plan M6b B1).
@@ -189,12 +215,17 @@ mod tests {
             disk_gb: 10,
             envs: BTreeMap::from([("RUST_BACKTRACE".to_owned(), "1".to_owned())]),
             network: NetworkPolicy {
-                allow_out: vec!["crates.io".to_owned()],
+                allow_out: vec!["crates.io".to_owned(), "api.example.com:8443".to_owned()],
                 deny_out: vec!["evil.example".to_owned()],
                 secret_headers: BTreeMap::from([(
                     "api.github.com".to_owned(),
                     "Authorization".to_owned(),
                 )]),
+                secret_values: vec![SecretValue {
+                    host: "api.github.com".to_owned(),
+                    header: "Authorization".to_owned(),
+                    value: "super-secret".to_owned(),
+                }],
             },
             metadata: BTreeMap::from([("job_id".to_owned(), "42".to_owned())]),
             idempotency_key: Some("key-1".to_owned()),
@@ -299,5 +330,22 @@ mod tests {
         let plain = ProviderError::new("not_found", "no such sandbox");
         round_trips(&plain);
         assert!(!plain.retryable);
+    }
+
+    #[test]
+    fn secret_value_debug_redacts_value() {
+        let value = SecretValue {
+            host: "api.example.com".to_owned(),
+            header: "Authorization".to_owned(),
+            value: "super-secret".to_owned(),
+        };
+        let debug = format!("{value:?}");
+        assert!(!debug.contains("super-secret"), "{debug}");
+        assert!(debug.contains("api.example.com"), "{debug}");
+        assert!(debug.contains("Authorization"), "{debug}");
+        round_trips(&value);
+        // Absent secret_values defaults to empty on the wire.
+        let policy: NetworkPolicy = serde_json::from_str("{}").unwrap();
+        assert!(policy.secret_values.is_empty());
     }
 }

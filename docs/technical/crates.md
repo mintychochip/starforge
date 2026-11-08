@@ -120,8 +120,8 @@ Relevant build files live in each crate directory.
 | `starforged-index` | Tantivy search index | `SearchIndex`, `TrailDoc`, `EventDoc` | `tantivy`, `thiserror` | `src/` unit tests |
 | `starforged` | Server binary and setup | `admin`, `backup`, `config`, `doctor`, `hook`, `index_cmd`, `init`, `restore`, `serve` | `starforged-api`, `starforged-web`, `starforged-ssh`, `starforged-core`, `clap`, `axum` | `tests/` integration |
 | `starforge-runner` | CI runner binary and job executor | `Executor`, `Client`, `HttpSandboxProvider`, `FakeSandboxProvider` | `clap`, `reqwest`, `starforge-sandbox-protocol`, `tokio` | `src/` unit tests |
-| `starforge-sandbox-protocol` | Shared sandbox wire types | `CreateSandboxRequest`, `ExecRequest`, `FileOp`, `NetworkPolicy`, `ProviderError` | `serde`, `serde_json`, `thiserror` | `src/` unit tests |
-| `starforge-sandboxd` | Local sandbox daemon | `DaemonState`, `podman`, `proxy` | `axum`, `starforge-sandbox-protocol`, `tokio`, `nix` | `src/` unit tests |
+| `starforge-sandbox-protocol` | Shared sandbox wire types | `CreateSandboxRequest`, `ExecRequest`, `FileOp`, `NetworkPolicy`, `SecretValue`, `ProviderError` | `serde`, `serde_json`, `thiserror` | `src/` unit tests |
+| `starforge-sandboxd` | Local sandbox daemon | `DaemonState`, `podman`, `proxy`, `forward` | `axum`, `starforge-sandbox-protocol`, `tokio`, `nix` | `src/` unit tests |
 
 `starforge-format` defines `Event` and `SessionMeta`.
 `starforge-format` also defines segment split and assemble.
@@ -149,13 +149,21 @@ The crate depends on no `starforged-*` crate.
 `starforge-sandboxd` ships the local sandbox daemon binary.
 The daemon serves an HTTP control plane over a Unix socket.
 The daemon runs rootless podman containers through `podman`.
-The daemon also runs a per-sandbox egress proxy through `proxy`.
-The containers run with `--network none` and cannot reach the proxy at this time.
-The opt-in `gvisor` runtime runs through the same daemon.
+The daemon runs a per-sandbox egress proxy through `proxy`.
+The daemon runs the in-sandbox forwarder through `forward`.
+The containers keep `--network none`.
+
+The daemon mounts the per-sandbox egress directory into each container.
+The forwarder listens on `127.0.0.1:3128` inside the container.
+The forwarder also listens on the Unix socket it creates.
+The daemon connects into that socket and keeps 4 idle connections.
+The flag `--egress-dir` sets the socket directory.
 
 `starforge-runner` ships the `starforge-runner` binary.
 The same executor also runs inside the `starforge` command.
 `Executor` claims jobs, runs job commands in a sandbox, and finishes jobs.
+`Executor` checks out the commit in place from the claim `clone_url`.
+`Executor` falls back to `--repo-url` when the claim omits the URL.
 `FakeSandboxProvider` supports tests and dry runs.
 
 `starforged-core` holds the CI control plane in `ci` and `ci_spec`.

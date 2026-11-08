@@ -30,7 +30,7 @@ use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rcgen::{
     BasicConstraints, Certificate, CertificateParams, DistinguishedName, DnType, GeneralSubtree,
@@ -113,29 +113,82 @@ pub struct EgressPolicy {
 }
 
 impl EgressPolicy {
-    /// Does `entry` (exact host, or `*.example.com` suffix wildcard) match?
-    fn entry_matches(entry: &str, host: &str) -> bool {
-        let entry = entry.split(':').next().unwrap_or(entry);
-        if let Some(suffix) = entry.strip_prefix("*.") {
+    /// Split an allow/deny entry into `(host, Option<port>)`. Bracketed IPv6
+    /// (`[::1]:8080`) is handled; a bare IPv6 literal without brackets has no
+    /// port suffix.
+    fn parse_entry(entry: &str) -> (&str, Option<u16>) {
+        if let Some(rest) = entry.strip_prefix('[') {
+            if let Some((host, port_str)) = rest.split_once("]:")
+                && let Ok(port) = port_str.parse::<u16>()
+            {
+                return (host, Some(port));
+            }
+            return (entry, None);
+        }
+        match entry.rsplit_once(':') {
+            Some((host, port_str)) if host.matches(':').count() == 0 => {
+                match port_str.parse::<u16>() {
+                    Ok(port) => (host, Some(port)),
+                    Err(_) => (entry, None),
+                }
+            }
+            _ => (entry, None),
+        }
+    }
+
+    /// Allow/deny entry match. A `host:port` entry matches exactly that
+    /// port. A bare `host` entry matches ports 80/443 for *allow* entries
+    /// (the pre-existing rule); a bare *deny* entry matches every port.
+    fn entry_matches_port(entry: &str, host: &str, port: u16, is_deny: bool) -> bool {
+        let (entry_host, entry_port) = Self::parse_entry(entry);
+        match entry_port {
+            Some(want_port) => {
+                if want_port != port {
+                    return false;
+                }
+            }
+            None => {
+                if !is_deny && !matches!(port, 80 | 443) {
+                    return false;
+                }
+            }
+        }
+        if let Some(suffix) = entry_host.strip_prefix("*.") {
             host.len() > suffix.len() + 1
                 && host.ends_with(suffix)
                 && host.as_bytes()[host.len() - suffix.len() - 1] == b'.'
         } else {
-            entry == host
+            entry_host == host
         }
     }
 
-    /// Whether the policy may tunnel to `host` (deny wins over allow).
-    pub fn host_allowed(&self, host: &str) -> bool {
-        if self.deny_out.iter().any(|e| Self::entry_matches(e, host)) {
+    /// Whether `host:port` is allowlisted. A bare `host` entry permits only
+    /// ports 80/443; a `host:port` entry permits exactly that port. Deny
+    /// wins over allow.
+    pub fn host_port_allowed(&self, host: &str, port: u16) -> bool {
+        if self
+            .deny_out
+            .iter()
+            .any(|e| Self::entry_matches_port(e, host, port, true))
+        {
             return false;
         }
-        self.allow_out.iter().any(|e| Self::entry_matches(e, host))
+        self.allow_out
+            .iter()
+            .any(|e| Self::entry_matches_port(e, host, port, false))
     }
 
-    /// Secret header to inject for `host`, if a binding matches exactly.
+    /// Whether the policy may tunnel to `host` on a default HTTP(S) port.
+    pub fn host_allowed(&self, host: &str) -> bool {
+        self.host_port_allowed(host, 443) || self.host_port_allowed(host, 80)
+    }
+
+    /// Secret header to inject for `host`, if a binding matches. A binding
+    /// host may carry a `:port` suffix; it matches the bare host.
     pub fn binding_for(&self, host: &str) -> Option<&SecretBinding> {
-        self.bindings.iter().find(|b| b.host == host)
+        self.bindings
+            .iter()
+            .find(|b| b.host == host || Self::parse_entry(&b.host).0 == host)
     }
 
     /// Whether `ip` is CIDR-allowlisted (non-HTTP egress escape hatch).
@@ -371,14 +424,21 @@ impl ProxyLog {
 
 /// A running per-sandbox egress proxy.
 pub struct EgressProxy {
-    addr: SocketAddr,
+    addr: Option<SocketAddr>,
+    unix_path: Option<PathBuf>,
     logs: Arc<ProxyLog>,
     handle: tokio::task::AbortHandle,
 }
 
 impl EgressProxy {
+    /// TCP listen address (only when started via [`start_proxy`]).
     pub fn addr(&self) -> SocketAddr {
-        self.addr
+        self.addr.expect("proxy started on a TCP address")
+    }
+
+    /// Unix socket path (only when started via [`start_proxy_unix`]).
+    pub fn unix_path(&self) -> Option<&Path> {
+        self.unix_path.as_deref()
     }
 
     pub fn logs(&self) -> Arc<ProxyLog> {
@@ -389,6 +449,9 @@ impl EgressProxy {
 impl Drop for EgressProxy {
     fn drop(&mut self) {
         self.handle.abort();
+        if let Some(path) = &self.unix_path {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
 
@@ -457,9 +520,183 @@ pub async fn start_proxy(
         }
     });
     Ok(EgressProxy {
-        addr,
+        addr: Some(addr),
+        unix_path: None,
         logs,
         handle: handle.abort_handle(),
+    })
+}
+
+/// Start a proxy on the Unix socket at `path` (mode `0666`, so the in-sandbox
+/// forwarder — a different mount namespace — can connect). The socket file is
+/// removed when the returned [`EgressProxy`] is dropped. Same policy, DNS
+/// pinning, and secret injection as the TCP variant.
+pub async fn start_proxy_unix(
+    path: &Path,
+    ca: Arc<CaMaterial>,
+    policy: Arc<EgressPolicy>,
+    dns_override: Option<BTreeMap<String, SocketAddr>>,
+    upstream_roots: Option<RootCertStore>,
+) -> Result<EgressProxy, ProxyError> {
+    let client_config = upstream_client_config(upstream_roots)?;
+    let _ = std::fs::remove_file(path);
+    let listener = tokio::net::UnixListener::bind(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666))?;
+    }
+    let logs = Arc::new(ProxyLog::new());
+    let logs_clone = Arc::clone(&logs);
+    let handle = tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            let ca = Arc::clone(&ca);
+            let policy = Arc::clone(&policy);
+            let client_config = Arc::clone(&client_config);
+            let dns_override = dns_override.clone();
+            let logs = Arc::clone(&logs_clone);
+            tokio::spawn(async move {
+                handle_connection(stream, ca, policy, client_config, dns_override, logs).await;
+            });
+        }
+    });
+    Ok(EgressProxy {
+        addr: None,
+        unix_path: Some(path.to_path_buf()),
+        logs,
+        handle: handle.abort_handle(),
+    })
+}
+
+// --------------------------------------------------------- connection pool --
+//
+// Reverse-direction transport: the in-sandbox forwarder *creates* the Unix
+// socket (`<egress-dir>/<id>/shim.sock`, mode `0666`) and the daemon (host)
+// connects to it — the container never connects to a host-owned socket
+// (denied under SELinux). Each pooled connection is served by the same
+// [`handle_connection`] policy path as a directly accepted connection.
+
+/// Idle host connections kept open per sandbox.
+pub const POOL_SIZE: usize = 4;
+/// How long [`start_connection_pool`] retries connecting to the forwarder's
+/// socket while it starts up.
+pub const POOL_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A running per-sandbox connection pool: `POOL_SIZE` idle connections to
+/// the in-sandbox forwarder's Unix socket, each served by
+/// [`handle_connection`]. Dropping the pool aborts every slot task.
+pub struct EgressPool {
+    logs: Arc<ProxyLog>,
+    socket_path: PathBuf,
+    handles: Vec<tokio::task::AbortHandle>,
+}
+
+impl EgressPool {
+    pub fn logs(&self) -> Arc<ProxyLog> {
+        Arc::clone(&self.logs)
+    }
+
+    /// Forwarder socket this pool connects to (`<egress-dir>/<id>/shim.sock`).
+    pub fn socket_path(&self) -> &Path {
+        &self.socket_path
+    }
+}
+
+impl Drop for EgressPool {
+    fn drop(&mut self) {
+        for handle in &self.handles {
+            handle.abort();
+        }
+    }
+}
+
+struct PoolCtx {
+    socket_path: PathBuf,
+    ca: Arc<CaMaterial>,
+    policy: Arc<EgressPolicy>,
+    client_config: Arc<ClientConfig>,
+    dns_override: Option<BTreeMap<String, SocketAddr>>,
+    logs: Arc<ProxyLog>,
+}
+
+/// Connect one idle pooled connection, retrying until `ctx` is aborted
+/// (the slot task is cancelled on pool drop).
+async fn connect_idle(socket_path: &Path) -> tokio::net::UnixStream {
+    loop {
+        match tokio::net::UnixStream::connect(socket_path).await {
+            Ok(stream) => return stream,
+            Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    }
+}
+
+/// One pool slot: wait for the first byte on the idle connection, hand it
+/// to [`handle_connection`], and immediately open a replacement so
+/// `POOL_SIZE` connections stay idle.
+async fn pool_slot(ctx: Arc<PoolCtx>, mut stream: tokio::net::UnixStream) {
+    loop {
+        // `readable` fires on the first forwarded byte (or on close).
+        let _ = stream.readable().await;
+        tokio::spawn(handle_connection(
+            stream,
+            Arc::clone(&ctx.ca),
+            Arc::clone(&ctx.policy),
+            Arc::clone(&ctx.client_config),
+            ctx.dns_override.clone(),
+            Arc::clone(&ctx.logs),
+        ));
+        stream = connect_idle(&ctx.socket_path).await;
+    }
+}
+
+/// Open the connection pool to the in-sandbox forwarder's socket at
+/// `socket_path`, keeping [`POOL_SIZE`] idle connections. Retries for up
+/// to [`POOL_CONNECT_TIMEOUT`] while the forwarder starts; fails if it
+/// never connects.
+pub async fn start_connection_pool(
+    socket_path: &Path,
+    ca: Arc<CaMaterial>,
+    policy: Arc<EgressPolicy>,
+    dns_override: Option<BTreeMap<String, SocketAddr>>,
+    upstream_roots: Option<RootCertStore>,
+) -> Result<EgressPool, ProxyError> {
+    let client_config = upstream_client_config(upstream_roots)?;
+    let logs = Arc::new(ProxyLog::new());
+    let deadline = Instant::now() + POOL_CONNECT_TIMEOUT;
+    let mut idle = Vec::new();
+    while idle.len() < POOL_SIZE {
+        match tokio::net::UnixStream::connect(socket_path).await {
+            Ok(stream) => idle.push(stream),
+            Err(e) => {
+                if Instant::now() >= deadline {
+                    return Err(ProxyError::Io(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!("egress forwarder did not accept connections: {e}"),
+                    )));
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
+    let ctx = Arc::new(PoolCtx {
+        socket_path: socket_path.to_path_buf(),
+        ca,
+        policy,
+        client_config,
+        dns_override,
+        logs: Arc::clone(&logs),
+    });
+    let mut handles = Vec::new();
+    for stream in idle {
+        handles.push(tokio::spawn(pool_slot(Arc::clone(&ctx), stream)).abort_handle());
+    }
+    Ok(EgressPool {
+        logs,
+        socket_path: socket_path.to_path_buf(),
+        handles,
     })
 }
 
@@ -536,54 +773,87 @@ fn inject_binding(head: &[u8], policy: &EgressPolicy, host: &str) -> Vec<u8> {
     bytes
 }
 
-async fn handle_connection(
-    mut client: tokio::net::TcpStream,
+async fn handle_connection<S>(
+    mut client: S,
     ca: Arc<CaMaterial>,
     policy: Arc<EgressPolicy>,
     client_config: Arc<ClientConfig>,
     dns_override: Option<BTreeMap<String, SocketAddr>>,
     logs: Arc<ProxyLog>,
-) {
-    // 1. CONNECT line.
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    // 1. Request line: CONNECT authority-form, or absolute-form plain HTTP.
     let head = match read_until_header_end(&mut client, Duration::from_secs(10)).await {
         Ok(head) => head,
         Err(_) => return,
     };
-    let (head_bytes, _) = match split_head(&head) {
+    let (head_bytes, body_start) = match split_head(&head) {
         Ok(pair) => pair,
         Err(_) => return,
     };
-    let head_text = String::from_utf8_lossy(&head_bytes);
-    let Some(request_line) = head_text.lines().next() else {
+    let head_text = String::from_utf8_lossy(&head_bytes).into_owned();
+    let Some(request_line) = head_text.lines().next().map(str::to_owned) else {
         return;
     };
     let mut parts = request_line.split_whitespace();
-    if parts.next() != Some("CONNECT") {
+    let method = parts.next().unwrap_or("").to_owned();
+    let target = parts.next().unwrap_or("").to_owned();
+    let is_connect = method == "CONNECT";
+    // `(host, port, origin-form request line for plain HTTP)`.
+    let (host, port, plain_request_line): (String, u16, Option<String>) = if is_connect {
+        let Some((host, port_str)) = target.rsplit_once(':') else {
+            return;
+        };
+        let Ok(port) = port_str.parse::<u16>() else {
+            return;
+        };
+        (host.trim_matches(['[', ']']).to_owned(), port, None)
+    } else {
+        // Absolute-form: METHOD http://host[:port]/path HTTP/1.1
+        let Some(rest) = target.strip_prefix("http://") else {
+            let _ = client
+                .write_all(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n")
+                .await;
+            return;
+        };
+        let (authority, path) = match rest.split_once('/') {
+            Some((authority, path)) => (authority, format!("/{path}")),
+            None => (rest, "/".to_owned()),
+        };
+        let (host, port): (String, u16) = match authority.rsplit_once(':') {
+            Some((host, port_str)) => match port_str.parse::<u16>() {
+                Ok(port) => (host.trim_matches(['[', ']']).to_owned(), port),
+                Err(_) => {
+                    return;
+                }
+            },
+            None => (authority.trim_matches(['[', ']']).to_owned(), 80),
+        };
+        let version = request_line.split_whitespace().nth(2).unwrap_or("HTTP/1.1");
+        (host, port, Some(format!("{method} {path} {version}")))
+    };
+
+    // 2. Policy gate — before any DNS resolution (resolving an
+    // attacker-chosen name leaks data through DNS). A host no allowlist
+    // entry names is refused with 403 without resolving it, unless CIDR
+    // rules exist that can only be checked against the resolved address.
+    let name_allowed = policy.host_port_allowed(&host, port);
+    let override_addr = dns_override.as_ref().and_then(|m| m.get(&host)).copied();
+    if !name_allowed && override_addr.is_none() && policy.cidr_allow.is_empty() {
+        logs.record(format!("{method} {host}:{port} -> 403 denied"));
         let _ = client
-            .write_all(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n")
+            .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
             .await;
         return;
     }
-    let Some(authority) = parts.next() else {
-        return;
-    };
-    let Some((host, port)) = authority.rsplit_once(':') else {
-        return;
-    };
-    let Ok(port) = port.parse::<u16>() else {
-        return;
-    };
-    let host = host.trim_matches(['[', ']']).to_owned();
-
-    // 2. Policy gate — before any upstream contact.
-    let is_http_port = matches!(port, 80 | 443);
     // Resolve + pin (override map in tests, system DNS otherwise).
-    let pinned: Vec<SocketAddr> = match dns_override.as_ref().and_then(|m| m.get(&host)) {
-        Some(addr) => vec![*addr],
+    let pinned: Vec<SocketAddr> = match override_addr {
+        Some(addr) => vec![addr],
         None => match system_resolve(&host, port).await {
             Ok(addrs) if !addrs.is_empty() => addrs,
             _ => {
-                logs.record(format!("CONNECT {host}:{port} -> 502 dns"));
+                logs.record(format!("{method} {host}:{port} -> 502 dns"));
                 let _ = client
                     .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
                     .await;
@@ -591,20 +861,69 @@ async fn handle_connection(
             }
         },
     };
-    let allowed = if is_http_port {
-        policy.host_allowed(&host)
-    } else {
-        // Non-HTTP(S): denied unless CIDR-allowlisted.
-        pinned.iter().any(|addr| policy.ip_allowed(&addr.ip()))
-    };
+    let allowed = name_allowed || pinned.iter().any(|addr| policy.ip_allowed(&addr.ip()));
     if !allowed {
-        logs.record(format!("CONNECT {host}:{port} -> 403 denied"));
+        logs.record(format!("{method} {host}:{port} -> 403 denied"));
         let _ = client
             .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
             .await;
         return;
     }
-    // Mint the MITM leaf only for allowed HTTPS destinations.
+
+    // 3. Connect upstream to the pinned address (never re-resolved).
+    let upstream_addr = pinned[0];
+    let upstream = match tokio::net::TcpStream::connect(upstream_addr).await {
+        Ok(stream) => stream,
+        Err(_) => {
+            logs.record(format!("{method} {host}:{port} -> 502 upstream"));
+            let _ = client
+                .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+                .await;
+            return;
+        }
+    };
+
+    if !is_connect {
+        // Plain HTTP: rewrite absolute-form to origin-form, inject the bound
+        // secret header, forward, and relay the response.
+        logs.record(format!("{method} {host}:{port} -> 200 plain"));
+        let mut rewritten = {
+            let text = head_text.clone();
+            let mut lines: Vec<String> = text.split("\r\n").map(str::to_owned).collect();
+            if let Some(new_line) = &plain_request_line {
+                lines[0] = new_line.clone();
+            }
+            let mut bytes = lines.join("\r\n").into_bytes();
+            if !bytes.ends_with(b"\r\n") {
+                bytes.extend_from_slice(b"\r\n");
+            }
+            bytes
+        };
+        rewritten = inject_binding(&rewritten, &policy, &host);
+        if policy.binding_for(&host).is_some() {
+            logs.record(format!("{method} {host} -> inject header"));
+        }
+        let (mut client_read, mut client_write) = tokio::io::split(client);
+        let (mut upstream_read, mut upstream_write) = tokio::io::split(upstream);
+        if upstream_write.write_all(&rewritten).await.is_err() {
+            return;
+        }
+        if !body_start.is_empty() && upstream_write.write_all(&body_start).await.is_err() {
+            return;
+        }
+        let client_to_upstream = async {
+            let _ = tokio::io::copy(&mut client_read, &mut upstream_write).await;
+            let _ = upstream_write.shutdown().await;
+        };
+        let upstream_to_client = async {
+            let _ = tokio::io::copy(&mut upstream_read, &mut client_write).await;
+            let _ = client_write.shutdown().await;
+        };
+        tokio::join!(client_to_upstream, upstream_to_client);
+        return;
+    }
+
+    // CONNECT: mint the MITM leaf only for allowed HTTPS destinations.
     let leaf = if port == 443 {
         match ca.mint_leaf(&policy, &host) {
             Ok(leaf) => Some(leaf),
@@ -613,24 +932,8 @@ async fn handle_connection(
     } else {
         None
     };
-
-    // 3. Connect upstream to the pinned address (never re-resolved).
-    let upstream_addr = pinned[0];
-    let upstream = match tokio::net::TcpStream::connect(upstream_addr).await {
-        Ok(stream) => stream,
-        Err(_) => {
-            logs.record(format!("CONNECT {host}:{port} -> 502 upstream"));
-            let _ = client
-                .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
-                .await;
-            return;
-        }
-    };
-
     match (port, leaf) {
         (443, Some(leaf)) => {
-            // MITM: terminate TLS from the client, TLS to the origin. The
-            // 200 must precede the TLS handshakes (CONNECT semantics).
             let server_config = match server_config_for_leaf(&leaf) {
                 Ok(config) => config,
                 Err(_) => return,
@@ -660,8 +963,6 @@ async fn handle_connection(
             relay_http(client_tls, upstream_tls, &policy, &host, logs).await;
         }
         (_, _) => {
-            // Plain HTTP (80) or CIDR-allowlisted raw TCP: inject into the
-            // HTTP head for port 80, otherwise tunnel bytes untouched.
             logs.record(format!("CONNECT {host}:{port} -> 200 tcp"));
             if client
                 .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
@@ -673,8 +974,7 @@ async fn handle_connection(
             if port == 80 {
                 relay_http(client, upstream, &policy, &host, logs).await;
             } else {
-                let (client_read, client_write) = client.into_split();
-                relay_raw(client_read, client_write, upstream).await;
+                relay_raw(client, upstream).await;
             }
         }
     }
@@ -733,22 +1033,26 @@ async fn relay_http<C, U>(
     if !body_start.is_empty() {
         let _ = upstream_write.write_all(&body_start).await;
     }
-    // Relay to EOF in both directions.
+    // Relay to EOF in both directions, shutting down the destination
+    // write half when a direction ends so the peer sees EOF (instead of
+    // waiting forever for the other direction to end too).
     let client_to_upstream = async {
         let _ = tokio::io::copy(&mut client_read, &mut upstream_write).await;
+        let _ = upstream_write.shutdown().await;
     };
     let upstream_to_client = async {
         let _ = tokio::io::copy(&mut upstream_read, &mut client_write).await;
+        let _ = client_write.shutdown().await;
     };
     tokio::join!(client_to_upstream, upstream_to_client);
 }
 
-async fn relay_raw(
-    mut client_read: tokio::net::tcp::OwnedReadHalf,
-    mut client_write: tokio::net::tcp::OwnedWriteHalf,
-    upstream: tokio::net::TcpStream,
-) {
-    let (mut upstream_read, mut upstream_write) = upstream.into_split();
+async fn relay_raw<C>(client: C, upstream: tokio::net::TcpStream)
+where
+    C: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let (mut client_read, mut client_write) = tokio::io::split(client);
+    let (mut upstream_read, mut upstream_write) = tokio::io::split(upstream);
     let client_to_upstream = async {
         let _ = tokio::io::copy(&mut client_read, &mut upstream_write).await;
         let _ = upstream_write.shutdown().await;
@@ -1056,6 +1360,316 @@ mod tests {
         }
         destroy_ca_key(&path);
         assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Spin up a local plain-HTTP origin that echoes received request heads.
+    async fn spawn_plain_origin() -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let (mut read, mut write) = tokio::io::split(stream);
+                    let head = read_until_header_end(&mut read, Duration::from_secs(10))
+                        .await
+                        .unwrap_or_default();
+                    let (head_bytes, _) = split_head(&head).unwrap_or_default();
+                    let dump = String::from_utf8_lossy(&head_bytes).into_owned();
+                    let body = format!("HEADERS>>> {dump}");
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = write.write_all(response.as_bytes()).await;
+                    let _ = write.shutdown().await;
+                });
+            }
+        });
+        addr
+    }
+
+    async fn fetch_plain_via_unix(sock: &Path, target: &str) -> String {
+        let mut stream = tokio::net::UnixStream::connect(sock).await.unwrap();
+        stream
+            .write_all(
+                format!(
+                    "GET {target} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+                    target.strip_prefix("http://").unwrap_or(target)
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut body = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut body)).await;
+        String::from_utf8_lossy(&body).into_owned()
+    }
+
+    #[tokio::test]
+    async fn plain_http_forwarded_via_unix_proxy_with_secret() {
+        let secret = "plain-secret-xyz";
+        let origin = spawn_plain_origin().await;
+        let host = "127.0.0.1";
+        let entry = format!("{host}:{}", origin.port());
+        let policy = EgressPolicy {
+            allow_out: vec![entry.clone()],
+            deny_out: Vec::new(),
+            bindings: vec![SecretBinding {
+                host: host.to_owned(),
+                header: "Authorization".to_owned(),
+                value: secret.to_owned(),
+            }],
+            cidr_allow: Vec::new(),
+        };
+        let ca = Arc::new(CaMaterial::generate(&[entry]).unwrap());
+        let dir =
+            std::env::temp_dir().join(format!("starforge-plain-proxy-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("proxy.sock");
+        let proxy = start_proxy_unix(&sock, ca, Arc::new(policy), None, None)
+            .await
+            .unwrap();
+        assert!(sock.exists());
+        let target = format!("http://{host}:{}/x?y=1", origin.port());
+        let response = fetch_plain_via_unix(&sock, &target).await;
+        assert!(
+            response.contains("200 OK"),
+            "plain forward failed: {response}"
+        );
+        // Origin received origin-form (not absolute-form) …
+        assert!(
+            response.contains("GET /x?y=1 HTTP/1.1"),
+            "origin-form rewrite missing: {response}"
+        );
+        assert!(
+            !response.contains(&format!("GET {target}")),
+            "absolute-form leaked to origin: {response}"
+        );
+        // … and the bound secret header was injected.
+        assert!(
+            response
+                .to_lowercase()
+                .contains(&format!("authorization: {secret}").to_lowercase()),
+            "secret header not injected: {response}"
+        );
+        for line in proxy.logs().lines() {
+            assert!(!line.contains(secret), "secret in proxy log: {line}");
+        }
+        drop(proxy);
+        assert!(!sock.exists(), "socket removed on drop");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn plain_http_denied_host_gets_403() {
+        let origin = spawn_plain_origin().await;
+        let entry = format!("127.0.0.1:{}", origin.port());
+        let policy = EgressPolicy {
+            allow_out: vec![entry.clone()],
+            deny_out: Vec::new(),
+            bindings: Vec::new(),
+            cidr_allow: Vec::new(),
+        };
+        let ca = Arc::new(CaMaterial::generate(&[entry]).unwrap());
+        let dir =
+            std::env::temp_dir().join(format!("starforge-plain-deny-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("proxy.sock");
+        let _proxy = start_proxy_unix(&sock, ca, Arc::new(policy), None, None)
+            .await
+            .unwrap();
+        let response = fetch_plain_via_unix(&sock, "http://evil.test/x").await;
+        assert!(
+            response.contains("403"),
+            "expected 403 for denied host: {response}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn plain_http_close_framed_response_reaches_eof() {
+        // Origin answers without Content-Length and closes; the client
+        // reading through the plain-HTTP path must see EOF (the relay
+        // must shut down the client write half when the origin ends),
+        // not hang waiting for the other relay direction.
+        let origin_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let origin = origin_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((stream, _)) = origin_listener.accept().await else {
+                return;
+            };
+            let (mut read, mut write) = tokio::io::split(stream);
+            let _head = read_until_header_end(&mut read, Duration::from_secs(10))
+                .await
+                .unwrap_or_default();
+            let _ = write
+                .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nhello-close")
+                .await;
+            let _ = write.shutdown().await;
+        });
+        let entry = format!("127.0.0.1:{}", origin.port());
+        let policy = EgressPolicy {
+            allow_out: vec![entry.clone()],
+            deny_out: Vec::new(),
+            bindings: Vec::new(),
+            cidr_allow: Vec::new(),
+        };
+        let ca = Arc::new(CaMaterial::generate(&[entry]).unwrap());
+        let dir =
+            std::env::temp_dir().join(format!("starforge-plain-eof-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("proxy.sock");
+        let _proxy = start_proxy_unix(&sock, ca, Arc::new(policy), None, None)
+            .await
+            .unwrap();
+        let mut stream = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        stream
+            .write_all(
+                format!(
+                    "GET http://127.0.0.1:{}/x HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
+                    origin.port(),
+                    origin.port()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut body = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut body))
+            .await
+            .expect("read to EOF must complete once the origin closes")
+            .unwrap();
+        let text = String::from_utf8_lossy(&body).into_owned();
+        assert!(text.contains("200 OK"), "response missing: {text}");
+        assert!(text.contains("hello-close"), "body missing: {text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn port_not_named_by_host_port_entry_is_refused() {
+        let origin = spawn_plain_origin().await;
+        // Allowlist names only the origin's port; another port must be refused
+        // for both plain HTTP and CONNECT.
+        let entry = format!("127.0.0.1:{}", origin.port());
+        let policy = EgressPolicy {
+            allow_out: vec![entry.clone()],
+            deny_out: Vec::new(),
+            bindings: Vec::new(),
+            cidr_allow: Vec::new(),
+        };
+        let ca = Arc::new(CaMaterial::generate(&[entry]).unwrap());
+        let dir =
+            std::env::temp_dir().join(format!("starforge-port-deny-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("proxy.sock");
+        let _proxy = start_proxy_unix(&sock, ca, Arc::new(policy), None, None)
+            .await
+            .unwrap();
+        let other = origin.port().saturating_add(1).max(2);
+        let response = fetch_plain_via_unix(&sock, &format!("http://127.0.0.1:{other}/x")).await;
+        assert!(
+            response.contains("403"),
+            "plain request to unnamed port must be 403: {response}"
+        );
+        // CONNECT to the unnamed port is refused too.
+        let mut stream = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        stream
+            .write_all(
+                format!("CONNECT 127.0.0.1:{other} HTTP/1.1\r\nHost: 127.0.0.1:{other}\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let head = read_until_header_end(&mut stream, Duration::from_secs(10))
+            .await
+            .unwrap();
+        let (head_bytes, _) = split_head(&head).unwrap();
+        assert!(
+            String::from_utf8_lossy(&head_bytes).contains("403"),
+            "CONNECT to unnamed port must be 403: {}",
+            String::from_utf8_lossy(&head_bytes)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn pool_keeps_four_idle_and_replaces_used_connection() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // Local Unix listener standing in for the in-sandbox forwarder.
+        let dir = std::env::temp_dir().join(format!("starforge-pool-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("shim.sock");
+        let _ = std::fs::remove_file(&sock);
+        let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let streams: Arc<Mutex<Vec<tokio::net::UnixStream>>> = Arc::new(Mutex::new(Vec::new()));
+        {
+            let accepted = Arc::clone(&accepted);
+            let streams = Arc::clone(&streams);
+            tokio::spawn(async move {
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else {
+                        break;
+                    };
+                    accepted.fetch_add(1, Ordering::SeqCst);
+                    streams.lock().unwrap().push(stream);
+                }
+            });
+        }
+        let entry = "bound.test".to_owned();
+        let ca = Arc::new(CaMaterial::generate(std::slice::from_ref(&entry)).unwrap());
+        let policy = Arc::new(EgressPolicy {
+            allow_out: vec![entry],
+            deny_out: Vec::new(),
+            bindings: Vec::new(),
+            cidr_allow: Vec::new(),
+        });
+        let pool = start_connection_pool(&sock, ca, policy, None, None)
+            .await
+            .unwrap();
+        // 4 idle connections are open.
+        for _ in 0..100 {
+            if accepted.load(Ordering::SeqCst) >= 4 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(accepted.load(Ordering::SeqCst), 4);
+        // Use one pooled connection from the forwarder side: send a denied
+        // plain request; the proxy handler on that connection answers 403.
+        let mut used = {
+            let mut guard = streams.lock().unwrap();
+            guard.remove(0)
+        };
+        used.write_all(b"GET http://evil.test/x HTTP/1.1\r\nHost: evil.test\r\n\r\n")
+            .await
+            .unwrap();
+        let head = read_until_header_end(&mut used, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&head).contains("403"),
+            "pooled connection must go through the proxy policy: {}",
+            String::from_utf8_lossy(&head)
+        );
+        // A replacement idle connection is opened (5th accepted).
+        for _ in 0..100 {
+            if accepted.load(Ordering::SeqCst) >= 5 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(accepted.load(Ordering::SeqCst), 5);
+        drop(pool);
+        let _ = std::fs::remove_file(&sock);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

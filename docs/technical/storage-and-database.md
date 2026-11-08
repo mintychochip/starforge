@@ -53,7 +53,7 @@ Reads inside open transactions use the writer pool. The engine enforces foreign 
 
 ### Migrations
 
-Embedded migrators live in `crates/starforged-db/migrations`. The SQLite and Postgres sets share filenames. Versions run from `0001` to `0042`, so `0030` to `0033` are absent. `Db::migrate` runs versions in order. Bookkeeping lives in `_sqlx_migrations`. Rerun of `migrate` is safe and idempotent.
+Embedded migrators live in `crates/starforged-db/migrations`. The SQLite and Postgres sets share filenames. Versions run from `0001` to `0043`, so `0030` to `0033` are absent. `Db::migrate` runs versions in order. Bookkeeping lives in `_sqlx_migrations`. Rerun of `migrate` is safe and idempotent.
 
 Migrations are forward only. A released migration must not change, because sqlx validates its checksum. `0034` rebuilds the SSH fingerprint table and drops orphan rows during the rebuild. `0035` adds the `jobs.rerun_at` column for rerun requests on deduplicated jobs. A request that arrives while a deduplicated job runs records its time in `rerun_at`, so the worker runs the job again after it finishes.
 
@@ -74,6 +74,8 @@ Migrations are forward only. A released migration must not change, because sqlx 
 `0042` adds `releases` and `release_assets`. `releases` stores tag, title, notes, draft flag, prerelease flag, author, and publish times per repository. The pair of repository and tag is unique. `release_assets` stores name, size, blob hash, and content type per release. The pair of release and name is unique. An index covers `release_assets` by release.
 
 Removal of a release cascades to its assets. Removal of a repository cascades to its releases.
+
+`0043` adds `ci_secrets.bind_host` and `ci_secrets.bind_header`. Both columns use text with an empty default. The columns hold one secret binding per secret. An empty pair means an unbound secret.
 
 `auto_migrate` runs migrations at start. `starforged migrate` runs them manually. `doctor` compares latest and known versions. A difference reports a migrate action.
 

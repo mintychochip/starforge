@@ -51,10 +51,11 @@ runs_on = ["linux"]
   claims the job, so time spent waiting for a runner does not count; a
   job still running past it fails with `the job exceeded its timeout`.
 - `env` injects plain environment variables into the job.
-- `secrets` lists secret **names** (never values) for the job. Delivery
-  of secrets to jobs is not wired yet (see [Secrets](#secrets)): a job
-  receives none of them today, and a missing or forbidden name is not an
-  error.
+- `secrets` lists secret **names** (never values) for the job. The server
+  resolves each name for this run and delivers the value to the sandbox
+  daemon over its local token-authenticated socket; the runner never sees
+  values. A missing, untrusted, or unbound name fails the job before the
+  sandbox starts, with the message listed under [Secrets](#secrets).
 - `artifacts` lists globs for files the runner harvests on completion:
   relative paths only, no `..`; each artifact upload is capped at 1 GiB.
 - `runs_on` lists runner labels that may claim the job (empty means any
@@ -116,19 +117,23 @@ successful run (authorize-then-PUT, download authenticated). Artifacts
 expire after 30 days: an expired artifact can no longer be downloaded,
 and the hourly cleanup deletes it.
 Artifact names must be relative and stay inside the workspace.
-
 ## Secrets
 
 Repo secrets are created and rotated by repo admins (at least Admin).
 In the web UI, open the repository's **CI secrets** settings page
 (`/{owner}/{repo}/settings/ci-secrets`): it lists secret names and
 timestamps, adds or rotates a secret, and deletes one. Values stay
-write-only there, exactly as with the API below.
+write-only there, exactly as with the API below. Each secret also carries
+an optional host/header binding: `bind_host` is a hostname or IP with an
+optional `:port`, and `bind_header` is the HTTP header that carries the
+value. Set both fields when you create or rotate a secret, on the web
+page or through the API. A secret with one field set and the other empty
+is rejected; a secret with both empty is unbound and never reaches a job.
 ```shell
 curl -X POST "$SERVER/api/v1/repos/$OWNER/$REPO/ci/secrets" \
   -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
-  -d '{"name": "CARGO_REGISTRY_TOKEN", "value": "…"}'
+  -d '{"name": "CARGO_REGISTRY_TOKEN", "value": "…", "bind_host": "crates.io", "bind_header": "Authorization"}'
 curl "$SERVER/api/v1/repos/$OWNER/$REPO/ci/secrets" \
   -H "Authorization: Bearer $TOKEN"
 curl -X DELETE "$SERVER/api/v1/repos/$OWNER/$REPO/ci/secrets/CARGO_REGISTRY_TOKEN" \
@@ -139,14 +144,46 @@ Values are sealed (XChaCha20-Poly1305) and never stored or logged in
 plaintext; the spec carries names only. Secrets resolve only for runs
 on protected branches or approved Trails; `refs/for` runs get none.
 Values never enter the sandbox environment or filesystem — the egress
-proxy injects them as headers for allowlisted destinations only. A
-secret's value is registered for dynamic redaction in the job's
-sessions, so it cannot appear in session text, logs, or search results.
+proxy injects them as headers for the bound host only, and only when
+that host is on the sandbox allowlist. A secret's value is registered
+for dynamic redaction in the job's sessions, so it cannot appear in
+session text, logs, or search results.
 
-**Not wired yet:** the runner does not resolve a job's secrets and creates
-its sandbox with an empty network policy, and local sandboxes have no
-network at all, so no secret reaches a job today. Creating, listing,
-rotating, and deleting secrets works.
+Delivery path: the server resolves the job's secret names, adds the
+bound host to the sandbox allowlist, and sends each host, header, and
+value to the sandbox daemon over the daemon's local token-authenticated
+socket as part of the sandbox create. The runner never sees secret
+values, and `create_sandbox_inner` refuses any caller-supplied network
+policy that already carries secret values — only the server adds them.
+The proxy merges the per-job values with the daemon's `--secret-binding`
+flags under the same rule: a value applies only to a host named in
+`secret_headers` and allowed.
+
+Bound hosts are reachable from the job sandbox. The allowlist entry for a
+binding is `host` or `host:port`; a port-qualified entry permits exactly
+that port for CONNECT and plain HTTP. The job sandbox also allows the
+forge host and port from the server's `base_url`, so the in-sandbox
+checkout of the job commit reaches the forge over HTTPS or plain HTTP
+with the job's short-lived git credential. The claim response carries
+`clone_url` (`{base_url}/{owner}/{repo}.git`), and the runner checks out
+the commit in place from it (falling back to `--repo-url` when the claim
+omits it), because the workspace also holds the egress forwarder under
+`.starforge-proxy/`, which the checkout excludes.
+
+A job fails before its sandbox starts when a listed secret name cannot
+be resolved. The check description names the cause:
+
+- `repository secrets are not available to this run` — the name exists
+  but `secrets_trusted_for_job` is false for this run, e.g. an
+  unapproved `refs/for` run.
+- `secret <NAME> does not exist for this repository` — the name is not
+  defined for the repository.
+- `secret <NAME> has no host binding` — the secret has no `bind_host`
+  and `bind_header` pair.
+
+The server audits each resolution as `ci.job.secrets.resolve` with names
+only, never values, and records `ci_job_secrets` rows so dynamic
+redaction covers the resolved values.
 
 ## Usage and quotas
 

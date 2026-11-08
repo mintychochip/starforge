@@ -198,13 +198,13 @@ It covers secrets at rest, audit reads, and known limits.
 ### CI secret handling
 
 - The server seals CI secrets with XChaCha20 Poly1305 through `CiSecretBox`. The seal uses the `ci-secrets-v1` key.
-- Secret views never carry sealed values or plaintexts. List routes show names only.
-- Resolution returns values in memory for header injection at the egress proxy. The response sends `Cache-Control: no-store`.
+- Secret views never carry sealed values or plaintexts. List routes show names only. Views expose `bind_host` and `bind_header`.
+- The server resolves job secrets at sandbox create time. The server sends values to `starforge-sandboxd` over its local token-authenticated socket. The runner never sees values. The route `POST /runners/jobs/{id}/secrets` no longer exists.
 - Secret values never enter the job environment. The runner keeps them out of sandbox environment variables.
 - A `refs/for` run resolves no secrets. The constant `ALLOW_SECRETS_ON_REFS_FOR` is false, and no setting changes it.
-- The egress proxy injects secret headers for allowlisted hosts only. Unbound hosts receive no secret header.
+- The egress proxy injects secret headers for allowlisted hosts only. Unbound hosts receive no secret header. A `host:port` allowlist entry permits exactly one port.
 - The proxy and its bindings redact values in `Debug` output. Values never reach logs, rendered pages, or URLs.
-- The runner does not call the resolution route at this time. A job so receives no repository secret.
+- `create_sandbox_inner` refuses caller-supplied secret values. Only the server adds values after that check.
 
 ### Sandbox isolation
 
@@ -216,8 +216,8 @@ It covers secrets at rest, audit reads, and known limits.
 - A per sandbox egress proxy meters socket traffic. The proxy trusts one CA per sandbox.
 - The proxy enforces a host allowlist. Non HTTP ports need CIDR allowlisted addresses.
 - The sandbox trusts the per sandbox CA. The CA keys rest in a directory with mode `0600`.
-- The local provider starts each container with `--network none`. The container cannot reach the proxy on the host, so a local sandbox has no network access.
-- The allowlist and the secret headers have no effect until the container network routes traffic to the proxy.
+- The local provider starts each container with `--network none`. The daemon mounts `<egress-dir>/<id>/` at `/run/starforge/egress` with `:Z`. A forwarder inside the sandbox listens on `127.0.0.1:3128` and on its own Unix socket. The daemon connects into that socket and keeps 4 idle pooled connections. Each TCP client pairs with one pooled connection. SELinux allows this direction and denies the reverse.
+- The allowlist and the secret headers apply to HTTPS CONNECT and plain HTTP alike. DNS pinning and secret injection cover both paths.
 
 ### CI and sandbox abuse controls
 

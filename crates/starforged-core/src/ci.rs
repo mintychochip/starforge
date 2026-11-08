@@ -131,6 +131,10 @@ pub struct ClaimedCiJob {
     pub job_token: String,
     pub deadline: i64,
     pub lease_until: i64,
+    /// `{base_url}/{owner}/{repo}.git` for the job's repository: the runner
+    /// clones from here and resets the remote to this credential-free URL
+    /// after fetching.
+    pub clone_url: String,
 }
 
 /// The outcome of one [`Core::trace_ci_job`] append.
@@ -979,6 +983,16 @@ impl Core {
             )
             .await?;
             self.emit_ci_event(&job, "started", "claimed", None).await;
+            let repo = db_repos::by_id(self.db(), job.repo_id).await?;
+            let clone_url = match repo {
+                Some(repo) => format!(
+                    "{}/{}/{}.git",
+                    self.config().base_url.trim_end_matches('/'),
+                    repo.owner_handle,
+                    repo.name
+                ),
+                None => String::new(),
+            };
             return Ok(Some(ClaimedCiJob {
                 job_id: job.id,
                 job_name: job.job_name.clone(),
@@ -988,6 +1002,7 @@ impl Core {
                 fence,
                 job_token,
                 deadline,
+                clone_url,
             }));
         }
         Ok(None)
@@ -1333,7 +1348,8 @@ pub const ALLOW_SECRETS_ON_REFS_FOR: bool = false;
 /// `ci.env_secrets` (plan decision 7): env injection of secrets is an
 /// explicit per-repo opt-in for providers without an egress proxy. The
 /// server-wide default is false; resolution below returns values to the
-/// runner for proxy header injection, never to the sandbox environment.
+/// sandbox daemon for proxy header injection, never to the sandbox
+/// environment or the runner.
 pub const ENV_SECRETS: bool = false;
 
 /// A CI run as listed to repository users.
@@ -1399,6 +1415,19 @@ impl From<starforged_db::ci::CiArtifactRow> for ArtifactView {
     }
 }
 
+/// Input for [`Core::create_ci_secret`] (create or rotate): the plaintext
+/// `value` is sealed before storage and never logged or returned. The
+/// `bind_host`/`bind_header` pair names the one egress destination the
+/// value may be injected for; both empty means unbound, and exactly one
+/// set is rejected.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CiSecretInput {
+    pub name: String,
+    pub value: String,
+    pub bind_host: String,
+    pub bind_header: String,
+}
+
 /// A repository secret as listed to administrators: metadata only, never
 /// the sealed value and never the plaintext.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1407,6 +1436,8 @@ pub struct SecretView {
     pub repo_id: i64,
     pub name: String,
     pub redact_in_sessions: bool,
+    pub bind_host: String,
+    pub bind_header: String,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -1418,6 +1449,8 @@ impl From<starforged_db::ci::CiSecretRow> for SecretView {
             repo_id: row.repo_id,
             name: row.name,
             redact_in_sessions: row.redact_in_sessions,
+            bind_host: row.bind_host,
+            bind_header: row.bind_header,
             created_at: row.created_at,
             updated_at: row.updated_at,
         }
@@ -1428,14 +1461,20 @@ impl From<starforged_db::ci::CiSecretRow> for SecretView {
 /// egress-proxy header injection. `Debug` redacts the value so a stray log
 /// line can never carry it.
 pub struct ResolvedSecret {
+    pub secret_id: i64,
     pub name: String,
+    pub host: String,
+    pub header: String,
     pub value: String,
 }
 
 impl std::fmt::Debug for ResolvedSecret {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ResolvedSecret")
+            .field("secret_id", &self.secret_id)
             .field("name", &self.name)
+            .field("host", &self.host)
+            .field("header", &self.header)
             .field("value", &"<redacted>")
             .finish()
     }
@@ -1479,6 +1518,116 @@ pub fn validate_secret_name(name: &str) -> CoreResult<()> {
     if !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
         return Err(CoreError::Invalid(
             "secret name may only contain [A-Za-z0-9_]".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Validates one secret binding host: a hostname or IP literal with an
+/// optional `:port` (an IPv6 literal takes the `[::1]` bracket form).
+/// Empty means the secret is unbound.
+pub fn validate_bind_host(host: &str) -> CoreResult<()> {
+    if host.is_empty() {
+        return Ok(());
+    }
+    if host.len() > 253 || host.chars().any(char::is_whitespace) {
+        return Err(CoreError::Invalid(
+            "bind_host must be a hostname or IP with an optional port".into(),
+        ));
+    }
+    // Split an optional trailing :port (bracketed IPv6 keeps its colons).
+    let (name, port): (String, Option<String>) = if let Some(rest) = host.strip_prefix('[') {
+        let Some((inner, tail)) = rest.split_once(']') else {
+            return Err(CoreError::Invalid(
+                "bind_host must be a hostname or IP with an optional port".into(),
+            ));
+        };
+        if inner.parse::<std::net::Ipv6Addr>().is_err() {
+            return Err(CoreError::Invalid(format!(
+                "bind_host `{host}` must be a hostname or IP with an optional port"
+            )));
+        }
+        let port = if tail.is_empty() {
+            None
+        } else {
+            Some(
+                tail.strip_prefix(':')
+                    .ok_or_else(|| {
+                        CoreError::Invalid(format!(
+                            "bind_host `{host}` must be a hostname or IP with an optional port"
+                        ))
+                    })?
+                    .to_owned(),
+            )
+        };
+        (inner.to_owned(), port)
+    } else {
+        match host.rsplit_once(':') {
+            Some((head, tail)) if !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()) => {
+                (head.to_owned(), Some(tail.to_owned()))
+            }
+            _ => (host.to_owned(), None),
+        }
+    };
+    if let Some(port) = port {
+        let port: u32 = port
+            .parse()
+            .map_err(|_| CoreError::Invalid(format!("bind_host `{host}` port must be 1-65535")))?;
+        if !(1..=65535).contains(&port) {
+            return Err(CoreError::Invalid(format!(
+                "bind_host `{host}` port must be 1-65535"
+            )));
+        }
+    }
+    if name.parse::<std::net::IpAddr>().is_ok() {
+        return Ok(());
+    }
+    let name = name.trim_end_matches('.');
+    if name.is_empty()
+        || name.split('.').any(|label| {
+            label.is_empty()
+                || label.len() > 63
+                || !label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                || label.starts_with('-')
+                || label.ends_with('-')
+        })
+    {
+        return Err(CoreError::Invalid(format!(
+            "bind_host `{host}` must be a hostname or IP with an optional port"
+        )));
+    }
+    Ok(())
+}
+
+/// Validates one secret binding header: an HTTP header field-name token
+/// (RFC 9110 `tchar`). Empty means the secret is unbound.
+pub fn validate_bind_header(header: &str) -> CoreResult<()> {
+    if header.is_empty() {
+        return Ok(());
+    }
+    if !header.bytes().all(|b| {
+        matches!(
+            b,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        ) || b.is_ascii_alphanumeric()
+    }) {
+        return Err(CoreError::Invalid(
+            "bind_header must be an HTTP header token".into(),
         ));
     }
     Ok(())
@@ -1999,33 +2148,43 @@ impl Core {
         user: &crate::accounts::User,
         owner: &str,
         repo: &str,
-        name: &str,
-        value: &str,
+        input: &CiSecretInput,
         redact_in_sessions: bool,
     ) -> CoreResult<SecretView> {
         let access = self
             .require_repo(Some(user), owner, repo, Permission::Admin)
             .await?;
-        validate_secret_name(name)?;
-        if value.is_empty() {
+        validate_secret_name(&input.name)?;
+        if input.value.is_empty() {
             return Err(CoreError::Invalid("secret value must not be empty".into()));
         }
-        let sealed = self.seal_ci_secret(value);
+        validate_bind_host(&input.bind_host)?;
+        validate_bind_header(&input.bind_header)?;
+        if input.bind_host.is_empty() != input.bind_header.is_empty() {
+            return Err(CoreError::Invalid(
+                "bind_host and bind_header must be set together".into(),
+            ));
+        }
+        let sealed = self.seal_ci_secret(&input.value);
         let row = db_ci::upsert_secret(
             self.db(),
-            access.repo.id,
-            name,
-            &sealed,
-            redact_in_sessions,
-            Some(user.id),
-            now(),
+            &db_ci::NewCiSecret {
+                repo_id: access.repo.id,
+                name: &input.name,
+                sealed_value: &sealed,
+                bind_host: &input.bind_host,
+                bind_header: &input.bind_header,
+                redact_in_sessions,
+                created_by: Some(user.id),
+                now: now(),
+            },
         )
         .await?;
         self.audit(
             Some(user.id),
             "ci.secret.create",
             &format!("ci_secret:{}", row.id),
-            &format!("repo={} name={name}", access.repo.full_name()),
+            &format!("repo={} name={}", access.repo.full_name(), input.name),
         )
         .await?;
         Ok(SecretView::from(row))
@@ -2074,48 +2233,53 @@ impl Core {
         Ok(())
     }
 
-    /// Resolves the secrets a claimed job named in its spec, for
-    /// egress-proxy header injection (decision 7). The runner must own the
-    /// claim and present the current fence. Each resolved secret is
-    /// recorded in `ci_job_secrets` (so the server can decrypt it in memory
-    /// for dynamic session redaction). Under the trust rule
-    /// ([`Core::secrets_trusted_for_job`]) no values are returned at all,
-    /// and spec-named secrets that do not exist for the job's repository
-    /// are skipped. Values are never stored in the spec, the database, or
-    /// logs — they exist only in this return value.
-    pub async fn resolve_runner_job_secrets(
+    /// Resolves the bound secrets a job named in its spec, for the server's
+    /// own sandbox create (Phase 4): the values travel only as
+    /// `SecretValue` bindings to the sandbox daemon over its local
+    /// token-authenticated socket — never to the runner, whose claim
+    /// response carries names only. Each resolved secret is recorded in
+    /// `ci_job_secrets` (so the server can decrypt it in memory for dynamic
+    /// session redaction) and the resolution is audited with names only.
+    /// A spec-named secret that does not exist, or has no host binding, is
+    /// `Invalid`; a job the trust rule
+    /// ([`Core::secrets_trusted_for_job`]) denies cannot resolve any.
+    pub async fn resolve_job_secret_bindings(
         &self,
-        runner: &RunnerPrincipal,
-        job_id: i64,
-        fence: &str,
+        job: &starforged_db::ci::CiJobRow,
     ) -> CoreResult<Vec<ResolvedSecret>> {
-        let job = match self.checked_claim(runner, job_id, fence).await? {
-            Ok(job) => job,
-            Err(ClaimGate::NotFound) => return Err(CoreError::NotFound),
-            Err(ClaimGate::FenceMismatch) => {
-                return Err(CoreError::Conflict("stale runner fence".into()));
-            }
-            Err(ClaimGate::Canceled) => {
-                return Err(CoreError::Invalid("job is canceled".into()));
-            }
-        };
-        if !self.secrets_trusted_for_job(&job).await? {
-            return Ok(Vec::new());
-        }
         let spec: CiJobSpec = serde_json::from_str(&job.spec)
             .map_err(|_| CoreError::Invalid("job spec is not parseable".into()))?;
+        if spec.secrets.is_empty() {
+            return Ok(Vec::new());
+        }
+        if !self.secrets_trusted_for_job(job).await? {
+            return Err(CoreError::Invalid(
+                "repository secrets are not available to this run".into(),
+            ));
+        }
         let mut resolved = Vec::new();
         let mut names = Vec::new();
         for name in &spec.secrets {
-            if let Some(row) = db_ci::secret_by_name(self.db(), job.repo_id, name).await? {
-                let value = self.open_ci_secret(&row.sealed_value)?;
-                db_ci::insert_job_secret(self.db(), job.id, row.id, now()).await?;
-                names.push(name.clone());
-                resolved.push(ResolvedSecret {
-                    name: name.clone(),
-                    value,
-                });
+            let Some(row) = db_ci::secret_by_name(self.db(), job.repo_id, name).await? else {
+                return Err(CoreError::Invalid(format!(
+                    "secret {name} does not exist for this repository"
+                )));
+            };
+            if row.bind_host.is_empty() || row.bind_header.is_empty() {
+                return Err(CoreError::Invalid(format!(
+                    "secret {name} has no host binding"
+                )));
             }
+            let value = self.open_ci_secret(&row.sealed_value)?;
+            db_ci::insert_job_secret(self.db(), job.id, row.id, now()).await?;
+            names.push(name.clone());
+            resolved.push(ResolvedSecret {
+                secret_id: row.id,
+                name: name.clone(),
+                host: row.bind_host,
+                header: row.bind_header,
+                value,
+            });
         }
         self.audit(
             job.created_by,
@@ -3147,5 +3311,40 @@ mod tests {
         assert!(validate_secret_name("has-dash").is_err());
         assert!(validate_secret_name("").is_err());
         assert!(validate_secret_name(&"A".repeat(129)).is_err());
+    }
+
+    #[test]
+    fn bind_host_and_header_rules() {
+        for ok in [
+            "",
+            "api.example.com",
+            "api.example.com:8443",
+            "127.0.0.1",
+            "127.0.0.1:3128",
+            "localhost",
+            "[::1]",
+            "[::1]:8443",
+            "api.example.com.",
+        ] {
+            assert!(validate_bind_host(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "has space.com",
+            "api.example.com:0",
+            "api.example.com:65536",
+            "api.example.com:notaport",
+            "-bad-.com",
+            "bad..com",
+            "https://api.example.com",
+            "[::1",
+        ] {
+            assert!(validate_bind_host(bad).is_err(), "{bad}");
+        }
+        for ok in ["", "Authorization", "X-Auth-Token", "x_api.key~1"] {
+            assert!(validate_bind_header(ok).is_ok(), "{ok}");
+        }
+        for bad in ["has space", "colon: here", "(paren)", "under_score,comma"] {
+            assert!(validate_bind_header(bad).is_err(), "{bad}");
+        }
     }
 }

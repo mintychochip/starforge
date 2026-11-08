@@ -189,6 +189,63 @@ pub struct ClaimedJob {
     pub job_token: String,
     pub deadline: String,
     pub lease_until: String,
+    /// Repository clone URL for this job (server-resolved).
+    #[serde(default)]
+    pub clone_url: String,
+}
+
+/// The clone URL to use for a job: the server-provided `clone_url` when
+/// present, otherwise the `--repo-url` fallback.
+pub fn effective_clone_url<'a>(job: &'a ClaimedJob, fallback: &'a str) -> &'a str {
+    if !job.clone_url.is_empty() {
+        &job.clone_url
+    } else {
+        fallback
+    }
+}
+
+/// Build the authenticated clone URL: parse `raw`, set username
+/// `x-access-token` and password to `token`, keeping any port. Returns
+/// `raw` unchanged when it does not parse (or when `token` is empty).
+pub fn authenticated_clone_url(raw: &str, token: &str) -> String {
+    if token.is_empty() {
+        return raw.to_owned();
+    }
+    let mut url = match url::Url::parse(raw) {
+        Ok(u) => u,
+        Err(_) => return raw.to_owned(),
+    };
+    if !matches!(url.scheme(), "http" | "https") {
+        return raw.to_owned();
+    }
+    let _ = url.set_username("x-access-token");
+    let _ = url.set_password(Some(token));
+    url.to_string()
+}
+
+/// Strip any userinfo (`user:pass@`) from a clone URL.
+pub fn clean_clone_url(raw: &str) -> String {
+    if let Some(scheme_end) = raw.find("://") {
+        let rest = &raw[scheme_end + 3..];
+        let authority_end = rest.find('/').unwrap_or(rest.len());
+        if let Some(at) = rest[..authority_end].rfind('@') {
+            return format!("{}{}", &raw[..scheme_end + 3], &rest[at + 1..]);
+        }
+    }
+    raw.to_owned()
+}
+
+/// In-place checkout run from the workspace root: the workspace is not
+/// empty (the daemon places its forwarder/CA under `.starforge-proxy/`),
+/// so `git clone <url> /workspace` would fail. Adds the authenticated
+/// URL as origin, fetches/checks out the commit, then resets origin to
+/// the credential-free URL.
+pub fn build_clone_command(raw_url: &str, token: &str, sha: &str) -> String {
+    let auth = authenticated_clone_url(raw_url, token);
+    let clean = clean_clone_url(raw_url);
+    format!(
+        "git init -q && git remote add origin {auth} && git fetch -q --depth 1 origin {sha} && git checkout -q FETCH_HEAD && git remote set-url origin {clean} && echo .starforge-proxy/ >> .git/info/exclude"
+    )
 }
 
 #[derive(Debug, Serialize)]
@@ -745,7 +802,8 @@ impl<P: SandboxProvider> Executor<P> {
         }
     }
 
-    /// Scrub known secrets (and their URL-encoded form) from a log chunk.
+    /// Scrub known secrets (and their URL-encoded, percent-encoded, base64
+    /// and Basic-auth forms) from a log chunk.
     pub fn scrub(text: &str, secrets: &[String]) -> String {
         let mut out = text.to_owned();
         for s in secrets {
@@ -753,13 +811,46 @@ impl<P: SandboxProvider> Executor<P> {
                 continue;
             }
             out = out.replace(s.as_str(), "***");
-            // URL-encoded variant of the secret.
-            let url = url::form_urlencoded::byte_serialize(s.as_bytes()).collect::<String>();
-            if url != *s {
-                out = out.replace(&url, "***");
+            let forms = url::form_urlencoded::byte_serialize(s.as_bytes()).collect::<String>();
+            if forms != *s {
+                out = out.replace(&forms, "***");
             }
+            // Percent-encoded password form, exactly as it appears in an
+            // authenticated URL built with `Url::set_password`.
+            if let Ok(mut probe) = url::Url::parse("http://x-access-token@host/") {
+                let _ = probe.set_password(Some(s.as_str()));
+                if let Some(pct) = probe.password()
+                    && pct != s.as_str()
+                {
+                    out = out.replace(pct, "***");
+                    out = out.replace(&pct.to_ascii_lowercase(), "***");
+                }
+            }
+            use base64::Engine as _;
+            out = out.replace(
+                &base64::engine::general_purpose::STANDARD.encode(s.as_bytes()),
+                "***",
+            );
+            out = out.replace(
+                &base64::engine::general_purpose::STANDARD
+                    .encode(format!("x-access-token:{s}").as_bytes()),
+                "***",
+            );
         }
         out
+    }
+
+    /// Best-effort: scrub `msg` into the job log.
+    async fn trace_error(&self, job: &ClaimedJob, offset: &mut u64, msg: &str, secrets: &[String]) {
+        let _ = self.trace_all(job, offset, msg, secrets).await;
+    }
+
+    /// Best-effort: finish the job as failed.
+    async fn finish_failed_best_effort(&self, job: &ClaimedJob) {
+        let _ = self
+            .client
+            .finish(job.job_id, &job.fence, "failed", None, None, Vec::new())
+            .await;
     }
 
     async fn trace_all(
@@ -853,24 +944,18 @@ impl<P: SandboxProvider> Executor<P> {
         let sandbox_id = match self.provider.create(job, self.sandbox_request(job)).await {
             Ok(id) => id,
             Err(e) => {
-                let _ = self
-                    .client
-                    .finish(job.job_id, &job.fence, "failed", None, None, Vec::new())
+                let msg = e.to_string();
+                self.trace_error(job, &mut offset, &format!("{msg}\n"), &secrets)
                     .await;
-                return JobOutcome::ProviderFailed(e.to_string());
+                self.finish_failed_best_effort(job).await;
+                return JobOutcome::ProviderFailed(msg);
             }
         };
 
         // 3. Clone / checkout.
-        if !self.config.repo_url.is_empty() {
-            let url = self.config.repo_url.replace(
-                "https://",
-                &format!("https://{}@x-access-token:", git_token),
-            );
-            let cmd = format!(
-                "git clone --depth 1 {url} /workspace && cd /workspace && git fetch --depth 1 origin {} && git checkout {}",
-                job.commit_sha, job.commit_sha
-            );
+        let clone_url = effective_clone_url(job, &self.config.repo_url).to_owned();
+        if !clone_url.is_empty() {
+            let cmd = build_clone_command(&clone_url, &git_token, &job.commit_sha);
             match self
                 .run_cmd(job, &sandbox_id, &cmd, &mut offset, &secrets)
                 .await
@@ -882,6 +967,9 @@ impl<P: SandboxProvider> Executor<P> {
                 Ok(_) => {}
                 Err(o) => {
                     self.kill_sandbox(job, &sandbox_id).await;
+                    if matches!(o, JobOutcome::ProviderFailed(_)) {
+                        self.finish_failed_best_effort(job).await;
+                    }
                     return o;
                 }
             }
@@ -902,6 +990,9 @@ impl<P: SandboxProvider> Executor<P> {
                 }
                 Err(o) => {
                     self.kill_sandbox(job, &sandbox_id).await;
+                    if matches!(o, JobOutcome::ProviderFailed(_)) {
+                        self.finish_failed_best_effort(job).await;
+                    }
                     return o;
                 }
             }
@@ -927,6 +1018,9 @@ impl<P: SandboxProvider> Executor<P> {
                 }
                 Err(o) => {
                     self.kill_sandbox(job, &sandbox_id).await;
+                    if matches!(o, JobOutcome::ProviderFailed(_)) {
+                        self.finish_failed_best_effort(job).await;
+                    }
                     return o;
                 }
             }
@@ -1010,7 +1104,9 @@ impl<P: SandboxProvider> Executor<P> {
     ) -> Result<i64, JobOutcome> {
         let req = ExecRequest {
             command: vec!["sh".to_owned(), "-c".to_owned(), cmd.to_owned()],
-            cwd: Some("/workspace".to_owned()),
+            // The sandbox exec API takes a workspace-relative cwd; the
+            // container workdir is already /workspace, so send none.
+            cwd: None,
             envs: BTreeMap::new(),
             timeout_s: job
                 .spec
@@ -1020,7 +1116,12 @@ impl<P: SandboxProvider> Executor<P> {
         };
         let res = match self.provider.exec(job, sandbox_id, req).await {
             Ok(r) => r,
-            Err(e) => return Err(JobOutcome::ProviderFailed(e.to_string())),
+            Err(e) => {
+                let msg = e.to_string();
+                self.trace_error(job, offset, &format!("{msg}\n"), secrets)
+                    .await;
+                return Err(JobOutcome::ProviderFailed(msg));
+            }
         };
         if res.stdout.contains("starforge sync") || cmd.contains("starforge sync") {
             // Collect candidate session ULIDs from sync output.
@@ -1168,6 +1269,10 @@ pub struct FakeSandboxProvider {
     pub killed: std::sync::Mutex<Vec<String>>,
     /// Created sandbox ids.
     pub created: std::sync::Mutex<Vec<String>>,
+    /// When set, `create` fails with this message (provider-failure tests).
+    pub create_failure: Option<String>,
+    /// Cwds sent on each exec request (tests assert none is absolute).
+    pub exec_cwds: std::sync::Mutex<Vec<Option<String>>>,
 }
 
 impl FakeSandboxProvider {
@@ -1196,6 +1301,9 @@ impl SandboxProvider for FakeSandboxProvider {
         _job: &ClaimedJob,
         _req: CreateSandboxRequest,
     ) -> Result<String, RunnerError> {
+        if let Some(msg) = &self.create_failure {
+            return Err(RunnerError::Provider(msg.clone()));
+        }
         let id = format!(
             "sbx-fake-{}",
             self.created.lock().map(|c| c.len()).unwrap_or(0)
@@ -1214,6 +1322,9 @@ impl SandboxProvider for FakeSandboxProvider {
     ) -> Result<ExecResult, RunnerError> {
         if !self.delay.is_zero() {
             tokio::time::sleep(self.delay).await;
+        }
+        if let Ok(mut c) = self.exec_cwds.lock() {
+            c.push(req.cwd.clone());
         }
         let joined = req.command.join(" ");
         for (needle, stdout, exit) in &self.script {
@@ -1306,5 +1417,234 @@ mod tests {
         let plan = cfg.plan_text();
         assert!(plan.contains("podman"));
         assert!(!plan.contains("sfr_secret"));
+    }
+
+    fn test_job(clone_url: &str) -> ClaimedJob {
+        ClaimedJob {
+            job_id: 42,
+            job_name: "test".to_owned(),
+            commit_sha: "abc123".to_owned(),
+            spec: CiJobSpec::default(),
+            fence: "fence-1".to_owned(),
+            job_token: "jobtok-123456".to_owned(),
+            deadline: String::new(),
+            lease_until: String::new(),
+            clone_url: clone_url.to_owned(),
+        }
+    }
+
+    #[test]
+    fn authenticated_clone_url_keeps_port_and_path() {
+        assert_eq!(
+            authenticated_clone_url("http://127.0.0.1:3000/alice/proj.git", "TOKEN"),
+            "http://x-access-token:TOKEN@127.0.0.1:3000/alice/proj.git"
+        );
+        assert_eq!(
+            authenticated_clone_url("https://forge.example.com/alice/proj.git", "TOKEN"),
+            "https://x-access-token:TOKEN@forge.example.com/alice/proj.git"
+        );
+    }
+
+    #[test]
+    fn clean_clone_url_strips_credentials() {
+        assert_eq!(
+            clean_clone_url("http://x-access-token:TOKEN@127.0.0.1:3000/alice/proj.git"),
+            "http://127.0.0.1:3000/alice/proj.git"
+        );
+        assert_eq!(
+            clean_clone_url("https://forge.example.com/alice/proj.git"),
+            "https://forge.example.com/alice/proj.git"
+        );
+    }
+
+    #[test]
+    fn clone_command_prefers_clone_url_and_resets_origin() {
+        let job = test_job("https://forge.example.com/alice/proj.git");
+        let url = effective_clone_url(&job, "https://fallback.example/x.git");
+        let cmd = build_clone_command(url, "TOKEN", "abc123");
+        assert!(cmd.starts_with("git init -q && git remote add origin https://x-access-token:TOKEN@forge.example.com/alice/proj.git"), "{cmd}");
+        assert!(
+            cmd.contains("git fetch -q --depth 1 origin abc123"),
+            "{cmd}"
+        );
+        assert!(cmd.contains("git checkout -q FETCH_HEAD"), "{cmd}");
+        assert!(
+            cmd.contains("git remote set-url origin https://forge.example.com/alice/proj.git"),
+            "{cmd}"
+        );
+        assert!(
+            cmd.ends_with("echo .starforge-proxy/ >> .git/info/exclude"),
+            "{cmd}"
+        );
+        assert!(!cmd.contains("git clone"), "{cmd}");
+    }
+
+    #[test]
+    fn clone_command_falls_back_to_repo_url() {
+        let job = test_job("");
+        let url = effective_clone_url(&job, "http://127.0.0.1:3000/alice/proj.git");
+        let cmd = build_clone_command(url, "TOKEN", "abc123");
+        assert!(
+            cmd.contains(
+                "git remote add origin http://x-access-token:TOKEN@127.0.0.1:3000/alice/proj.git"
+            ),
+            "{cmd}"
+        );
+        assert!(
+            cmd.ends_with("echo .starforge-proxy/ >> .git/info/exclude"),
+            "{cmd}"
+        );
+        assert!(!cmd.contains("git clone"), "{cmd}");
+    }
+
+    #[tokio::test]
+    async fn exec_sends_no_cwd() {
+        let traced = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let finishes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let server_url = mock_server(traced, finishes).await;
+        let cfg = RunnerConfig::new(&server_url, "sfr_run_123456");
+        let executor = Executor::new(cfg, FakeSandboxProvider::new());
+        let job = test_job("");
+        let mut offset = 0u64;
+        let secrets = vec!["sfr_run_123456".to_owned()];
+        executor
+            .run_cmd(&job, "sbx-1", "echo hi", &mut offset, &secrets)
+            .await
+            .expect("run_cmd");
+        let cwds = executor.provider.exec_cwds.lock().unwrap().clone();
+        assert_eq!(cwds, vec![None]);
+    }
+
+    #[test]
+    fn scrub_removes_percent_and_base64_forms() {
+        use base64::Engine as _;
+        let secret = "tok/en?x=y";
+        let secrets = vec![secret.to_owned()];
+        let mut probe = url::Url::parse("http://x-access-token@host/").unwrap();
+        let _ = probe.set_password(Some(secret));
+        let pct = probe.password().unwrap().to_owned();
+        assert_ne!(pct, secret);
+        let out = Executor::<FakeSandboxProvider>::scrub(&format!("a {pct} b"), &secrets);
+        assert!(!out.contains(&pct));
+        let b64 = base64::engine::general_purpose::STANDARD.encode(secret.as_bytes());
+        let out = Executor::<FakeSandboxProvider>::scrub(&format!("a {b64} b"), &secrets);
+        assert!(!out.contains(&b64));
+        let basic = base64::engine::general_purpose::STANDARD
+            .encode(format!("x-access-token:{secret}").as_bytes());
+        let out = Executor::<FakeSandboxProvider>::scrub(&format!("a {basic} b"), &secrets);
+        assert!(!out.contains(&basic));
+    }
+
+    /// Minimal mock server: git-credential, trace (captured), finish
+    /// (captured) and heartbeat.
+    async fn mock_server(
+        traced: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        finishes: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = match listener.accept().await {
+                    Ok(v) => v,
+                    Err(_) => break,
+                };
+                let traced = traced.clone();
+                let finishes = finishes.clone();
+                tokio::spawn(async move {
+                    // Read headers.
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    let header_end = loop {
+                        match sock.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => {
+                                buf.extend_from_slice(&chunk[..n]);
+                                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                    break pos + 4;
+                                }
+                            }
+                        }
+                    };
+                    let head = String::from_utf8_lossy(&buf[..header_end]).to_ascii_lowercase();
+                    let content_length: usize = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .and_then(|v| v.trim().parse().ok())
+                        .unwrap_or(0);
+                    while buf.len() < header_end + content_length {
+                        match sock.read(&mut chunk).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                    let body = buf[header_end..].to_vec();
+                    let request_line = head.lines().next().unwrap_or("").to_owned();
+                    let (status, resp_body): (&str, String) =
+                        if request_line.contains("git-credential") {
+                            (
+                                "200 OK",
+                                r#"{"token":"gittok123456","token_id":7}"#.to_owned(),
+                            )
+                        } else if request_line.contains("/trace") {
+                            if let Ok(mut t) = traced.lock() {
+                                t.extend_from_slice(&body);
+                            }
+                            ("200 OK", String::new())
+                        } else if request_line.contains("/heartbeat") {
+                            ("200 OK", String::new())
+                        } else if request_line.starts_with("put") {
+                            if let Ok(mut f) = finishes.lock() {
+                                f.push(String::from_utf8_lossy(&body).into_owned());
+                            }
+                            ("200 OK", String::new())
+                        } else {
+                            ("404 Not Found", String::new())
+                        };
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\ncontent-length: {}\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{resp_body}",
+                        resp_body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn create_failure_is_traced_and_finishes_failed() {
+        let traced = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let finishes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let server_url = mock_server(traced.clone(), finishes.clone()).await;
+        let mut cfg = RunnerConfig::new(&server_url, "sfr_run_123456");
+        cfg.repo_url = "https://forge.example.com/alice/proj.git".to_owned();
+        let provider = FakeSandboxProvider {
+            create_failure: Some("secret X does not exist for this repository".to_owned()),
+            ..Default::default()
+        };
+        let executor = Executor::new(cfg, provider);
+        let outcome = executor.execute_job(test_job("")).await;
+        match &outcome {
+            JobOutcome::ProviderFailed(msg) => {
+                assert!(
+                    msg.contains("secret X does not exist for this repository"),
+                    "{msg}"
+                );
+            }
+            other => panic!("expected ProviderFailed, got {other:?}"),
+        }
+        let log = String::from_utf8_lossy(&traced.lock().unwrap().clone()).into_owned();
+        assert!(
+            log.contains("secret X does not exist for this repository"),
+            "log: {log}"
+        );
+        let finishes = finishes.lock().unwrap().clone();
+        assert!(
+            finishes.iter().any(|b| b.contains("\"failed\"")),
+            "finishes: {finishes:?}"
+        );
     }
 }

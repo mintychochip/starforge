@@ -48,6 +48,7 @@ starforge-runner = { path = "crates/starforge-runner", version = "0.1.0" }
 subtle = "2.6.1"
 tantivy = "0.27.0"
 syntect = { version = "5.3.0", default-features = false, features = ["default-fancy"] }
+tar = { version = "0.4.44", default-features = false }
 tempfile = "3.27.0"
 thiserror = "2.0.21"
 time = { version = "0.3.55", features = ["formatting", "macros", "parsing"] }

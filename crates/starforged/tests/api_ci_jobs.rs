@@ -172,6 +172,11 @@ async fn claim_trace_finish_round_trip() {
     assert_eq!(value["job_id"], job_id);
     assert_eq!(value["job_name"], "test");
     assert!(value["job_token"].as_str().unwrap().starts_with("sfj_"));
+    assert_eq!(
+        value["clone_url"],
+        format!("{}/alice/proj.git", s.base),
+        "claim carries the repo clone URL"
+    );
     let fence = value["fence"].as_str().unwrap().to_owned();
     let job_token = value["job_token"].as_str().unwrap().to_owned();
 

@@ -18,6 +18,7 @@ workspace = true
 
 [dependencies]
 clap.workspace = true
+base64.workspace = true
 hex.workspace = true
 reqwest.workspace = true
 serde.workspace = true

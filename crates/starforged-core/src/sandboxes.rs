@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 
 use percent_encoding::percent_encode;
+use starforged_db::ci as db_ci;
 use starforged_db::now;
 use starforged_db::sandboxes as db_sandboxes;
 
@@ -23,7 +24,7 @@ use serde::{Deserialize, Serialize};
 pub use starforge_sandbox_protocol as protocol;
 pub use starforge_sandbox_protocol::{
     CreateSandboxRequest, ExecChunk, ExecRequest, FileOp, NetworkPolicy, PortUrl, ProviderError,
-    SandboxInfo, SandboxState,
+    SandboxInfo, SandboxState, SecretValue,
 };
 
 /// Which sandbox provider the server talks to.
@@ -782,21 +783,63 @@ impl Core {
     ) -> CoreResult<SandboxView> {
         let caller = SandboxCaller::user(user);
         let access = self.repo_for(Some(user), owner, repo).await?;
-        self.create_sandbox_inner(caller, access.repo.id, job_id, req)
+        self.create_sandbox_inner(caller, access.repo.id, job_id, req, false)
             .await
     }
 
     /// Creates a sandbox for the job's own repo (the `JobAuth` path).
     /// The job was authorized at creation; the user it acts for is the
-    /// job's creator, so quotas and ownership land on them.
+    /// job's creator, so quotas and ownership land on them. The server
+    /// adds the forge `host:port` to the egress allowlist and resolves the
+    /// job spec's bound secrets into `SecretValue` bindings for the daemon;
+    /// secret values reach the sandbox only through the egress proxy, never
+    /// through the runner or the sandbox environment. A caller-supplied
+    /// `secret_values` is refused.
     pub async fn create_sandbox_for_job(
         &self,
         principal: &JobPrincipal,
-        req: CreateSandboxRequest,
+        mut req: CreateSandboxRequest,
     ) -> CoreResult<SandboxView> {
+        if !req.network.secret_values.is_empty() {
+            return Err(CoreError::Invalid(
+                "secret values are resolved by the server and must not be supplied".into(),
+            ));
+        }
         let caller = SandboxCaller::job(principal);
-        self.create_sandbox_inner(caller, principal.repo_id, Some(principal.job_id), req)
+        let job = db_ci::ci_job_by_id(self.db(), principal.job_id)
+            .await?
+            .ok_or(CoreError::NotFound)?;
+        let bindings = self.resolve_job_secret_bindings(&job).await?;
+        if let Some(forge) = self.forge_host_port()
+            && !req.network.allow_out.contains(&forge)
+        {
+            req.network.allow_out.push(forge);
+        }
+        for binding in &bindings {
+            if !req.network.allow_out.contains(&binding.host) {
+                req.network.allow_out.push(binding.host.clone());
+            }
+            req.network
+                .secret_headers
+                .insert(binding.host.clone(), binding.header.clone());
+            req.network.secret_values.push(SecretValue {
+                host: binding.host.clone(),
+                header: binding.header.clone(),
+                value: binding.value.clone(),
+            });
+        }
+        self.create_sandbox_inner(caller, principal.repo_id, Some(principal.job_id), req, true)
             .await
+    }
+
+    /// The forge's `host:port` from the server `base_url` (the port is the
+    /// URL's own port, defaulted by scheme), for the job sandbox's egress
+    /// allowlist so the runner can reach `clone_url` through the proxy.
+    fn forge_host_port(&self) -> Option<String> {
+        let url = url::Url::parse(&self.config().base_url).ok()?;
+        let host = url.host_str()?;
+        let port = url.port_or_known_default()?;
+        Some(format!("{host}:{port}"))
     }
 
     async fn create_sandbox_inner(
@@ -805,7 +848,15 @@ impl Core {
         repo_id: i64,
         job_id: Option<i64>,
         req: CreateSandboxRequest,
+        allow_secret_values: bool,
     ) -> CoreResult<SandboxView> {
+        // Only the server adds secret values (after this check, on the job
+        // path); a caller's request must never carry them.
+        if !req.network.secret_values.is_empty() && !allow_secret_values {
+            return Err(CoreError::Invalid(
+                "secret values are resolved by the server and must not be supplied".into(),
+            ));
+        }
         let runtime = req.runtime.trim().to_ascii_lowercase();
         let runtime = if runtime.is_empty() {
             "podman"

@@ -204,7 +204,6 @@ A second test matches optional security with `reader` handlers.
 | Runner job protocol | `POST /runners/jobs/request`, `PATCH /runners/jobs/{id}/trace`, `POST /runners/jobs/{id}/heartbeat`, `PUT /runners/jobs/{id}` | Runner token `sfr_` |
 | Job git credential | `POST /ci/jobs/{id}/git-credential` | Runner token `sfr_` with the fence header |
 | Job artifacts | `POST /runners/jobs/{id}/artifacts/authorize`, `PUT /runners/jobs/{id}/artifacts/{*name}`, `GET /runners/jobs/{id}/artifacts/{*name}` | Runner token for authorize, artifact token or job token for upload and download |
-| Job secrets | `POST /runners/jobs/{id}/secrets` | Runner token `sfr_` with the fence header |
 | CI runs | `GET /repos/{owner}/{repo}/ci/runs`, `POST /repos/{owner}/{repo}/ci/runs`, `GET /repos/{owner}/{repo}/ci/runs/{id}`, `POST /repos/{owner}/{repo}/ci/runs/{id}/cancel` | `repo:read` for reads, `repo:write` for trigger and cancel |
 | CI usage | `GET /repos/{owner}/{repo}/ci/usage` | `repo:read` at the API layer, at least Maintain in Core |
 | Supplier links | `PUT /repos/{owner}/{repo}/ci/suppliers/{supplier}`, `DELETE /repos/{owner}/{repo}/ci/suppliers/{supplier}` | `repo:write` at the API layer, at least Admin in Core |
@@ -237,17 +236,18 @@ Each extractor accepts one token kind and answers `401` for any other kind.
 Runner and job traffic skips the personal access token rate limit count.
 
 `POST /runners/jobs/request` long polls for at most 50 seconds for a claim.
-It answers `201` with a claimed job or `204` with no job. The claim carries the job token and the fence.
-The trace, heartbeat, finish, git credential, and job secrets routes require the fence header `X-Starforge-Fence`.
+It answers `201` with a claimed job or `204` with no job. The claim carries the job token and the fence. The claim also carries `clone_url` with the forge repository URL.
+
+The trace, heartbeat, finish, and git credential routes require the fence header `X-Starforge-Fence`.
 A stale fence answers `409`. A missing fence answers `422` with code `invalid`.
 
 The lease deadline runs from claim time. Expired leases let another runner claim the job.
 The trace route takes a `Content-Range` header and answers `416` on a range mismatch.
 A canceled job makes the trace and finish routes answer the canceled state through the `Job-Status` header.
 
-CI secrets resolve through `POST /runners/jobs/{id}/secrets` for egress header injection.
-The response carries `Cache-Control: no-store`. The response never reaches logs or disk.
-Secret values never enter the job environment. A `refs/for` run resolves no secrets unless the repository opts in.
+The route `POST /runners/jobs/{id}/secrets` no longer exists. The runner never receives secret values. The server resolves job secrets and sends values to `starforge-sandboxd`. The server sends one `SecretValue` per bound secret with `host`, `header`, and `value`. Secret values never enter the job environment. A `refs/for` run resolves no secrets.
+
+CI secrets carry `bind_host` and `bind_header`. The create body accepts both fields. One field without the other answers `422` with code `invalid`. A list response exposes names, timestamps, and both binding fields. Values never appear in any response.
 
 CI usage reads one report per supplier for the current calendar month. Starforge meters native usage and limits it.
 Starforge reads Depot usage from the Depot API and never enforces Depot limits.

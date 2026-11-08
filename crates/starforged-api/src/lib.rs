@@ -446,7 +446,6 @@ pub fn router(core: Core, base_url: String) -> Router {
             "/runners/jobs/{id}/artifacts/{*name}",
             put(ci::upload_artifact).get(ci::download_artifact),
         )
-        .route("/runners/jobs/{id}/secrets", post(ci::resolve_job_secrets))
         .route(
             "/repos/{owner}/{repo}/ci/secrets",
             get(ci::list_secrets).post(ci::create_secret),

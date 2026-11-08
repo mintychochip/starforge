@@ -60,10 +60,20 @@ binary is built from the same crate). It long-polls
 `POST /runners/jobs/request` (up to 50 s), and per job: mints the
 short-lived git credential (`POST /ci/jobs/{id}/git-credential`, or
 uses an operator-configured deploy key), creates a sandbox through the
-server sandbox API with the per-job token, checks out the commit,
-runs the job commands, streams logs (`PATCH /runners/jobs/{id}/trace`
-with `Content-Range`), runs `starforge sync` in the sandbox, uploads
-artifacts, and finishes (`PUT /runners/jobs/{id}`).
+server sandbox API with the per-job token, checks out the job commit in
+place from the claim's `clone_url` (`{base_url}/{owner}/{repo}.git`,
+falling back to `--repo-url` when the claim omits it) with the git token
+as the `x-access-token` password for http and https (`git init`, fetch
+the commit, checkout, reset origin to the credential-free URL, exclude
+`.starforge-proxy/` — the workspace holds the forwarder), runs the job
+commands, streams logs (`PATCH /runners/jobs/{id}/trace` with
+`Content-Range`), runs `starforge sync` in the sandbox, uploads
+artifacts, and finishes (`PUT /runners/jobs/{id}`). `clone_url` carries
+no credentials. The runner never receives repository secret values: the
+server resolves them and sends them to the sandbox daemon directly. On
+sandbox-create or provider failure the runner writes the scrubbed error
+into the job log before finishing the job failed. `POST
+/runners/jobs/{id}/secrets` no longer exists; values never reach runners.
 
 Every trace/result/artifact call carries the per-claim `lease_token`
 fence; a stale fence answers `409` and the job is fenced out.
@@ -106,13 +116,14 @@ Server-side configuration (`[sandbox]`, see
 | `sandbox.limits.max_concurrent_per_user` / `max_concurrent_per_repo` | `0` (disabled) |
 | `sandbox.limits.sandbox_seconds_per_hour` | `0` (disabled) |
 | `sandbox.default_ttl_secs` | `3600` |
-
-The egress proxy listen address and the CA directory are
-`starforge-sandboxd` flags, not server config: `--egress-listen`
-(default `127.0.0.1:0`) sets the proxy listen address, and
-`--egress-ca-dir` (default `/run/starforge/egress-ca`) sets the
-per-sandbox CA directory. The daemon reads only its own flags; the
-server only reads `sandbox.local.egress.allowlist`.
+The egress socket directory and the CA directory are
+`starforge-sandboxd` flags, not server config: `--egress-dir` (required
+for egress) sets the directory holding one subdirectory per sandbox,
+`<dir>/<sandbox id>/` (mode `0777`, removed with the sandbox), mounted
+into the container at `/run/starforge/egress` with `:Z`; `--egress-ca-dir`
+(default `/run/starforge/egress-ca`) sets the per-sandbox CA directory.
+`--egress-listen` no longer exists. The daemon reads only its own flags;
+the server only reads `sandbox.local.egress.allowlist`.
 
 ## E2B adapter
 
@@ -128,26 +139,59 @@ Starforge's own REST shape. It is not a wire-compatibility promise.
 
 ## Egress proxy and per-sandbox CA
 
-Each sandbox's outbound HTTPS goes through a Rust MITM proxy in
-sandboxd. The proxy terminates TLS with a per-sandbox CA whose X.509
-name constraints cover only the allowlisted destinations, and installs
-that CA in the sandbox trust store (`SSL_CERT_FILE` /
-`NODE_EXTRA_CA_CERTS` plus the system bundle). Secret header injection
-happens only when the `CONNECT` host matches the secret's binding
-host; non-allowlisted hosts are refused, DNS is pinned before connect,
-CA keys are `0600` and destroyed with the sandbox, and secret values
-never enter the sandbox environment or filesystem.
+Each sandbox's outbound traffic goes through a Rust MITM proxy in
+sandboxd. Podman create keeps `--network none` and mounts the per-sandbox
+directory `<dir>/<id>/` (mode `0777`) into the container at
+`/run/starforge/egress` (`--volume <dir>/<id>:/run/starforge/egress:Z`).
+The sandbox environment sets `HTTP_PROXY`, `HTTPS_PROXY`, `http_proxy`,
+and `https_proxy` to `http://127.0.0.1:3128` with no `NO_PROXY`, plus
+the existing CA variables. The daemon copies its own executable
+(`std::env::current_exe()`) into the container at
+`/workspace/.starforge-proxy/` with `podman cp` (the binary exceeds
+`MAX_FILE_BYTES`, so `file_write` cannot carry it), makes it executable,
+and starts the forwarder detached with `podman exec -d` before the
+sandbox reports ready:
 
-**Current limitation:** the local provider still starts every container
-with `--network none`, so a local sandbox cannot reach the proxy (it
-listens on a host address) and has no network access at all. The
-allowlist and secret header injection therefore have no effect yet, and
-every step that needs the network fails: the runner's `git clone` of the
-commit (when `--repo-url` is set), `starforge sync` of job sessions, and
-any download a job makes. This fails closed; nothing leaves the sandbox.
-The runner also creates every sandbox with an empty network policy and
-never resolves the job's repository secrets, so repository secrets reach
-no job yet.
+```shell
+starforge-sandboxd forward --listen 127.0.0.1:3128 --unix /run/starforge/egress/shim.sock
+```
+
+The forwarder listens on both ports: TCP `127.0.0.1:3128` for sandbox
+clients and the Unix socket it creates at
+`/run/starforge/egress/shim.sock`. The direction is reversed from a
+host-owned socket: SELinux on Fedora/RHEL denies a container process
+connecting to a host process's socket, while the host process may
+connect to a socket the container creates. The daemon therefore connects
+INTO the container's socket and keeps a pool of 4 idle pooled
+connections. Each TCP client in the sandbox is paired with one pooled
+connection, and the daemon serves that connection under the egress
+proxy policy; a used connection is replaced at once. If the pool cannot
+connect within 10 seconds, sandbox creation fails. Egress is enabled
+only when `--egress-dir` is set. Sandbox file reads and writes use tar
+streams through `podman cp`.
+
+The proxy terminates TLS with a per-sandbox CA whose X.509 name
+constraints cover only the allowlisted destinations, and installs that
+CA in the sandbox trust store (`SSL_CERT_FILE` / `NODE_EXTRA_CA_CERTS`
+plus the system bundle). Secret header injection happens only when the
+request host matches the secret's binding host; non-allowlisted hosts
+are refused, DNS is pinned before connect, CA keys are `0600` and
+destroyed with the sandbox, and secret values never enter the sandbox
+environment or filesystem. The proxy forwards absolute-form plain HTTP
+(`GET http://host[:port]/path HTTP/1.1`, any method) to origin-form
+with the same allowlist, denylist, DNS pinning, and secret-header
+injection as CONNECT, so plain-HTTP forges work too. Allowlist entries
+are `host` (any port) or `host:port` (exactly that port).
+
+Job sandboxes additionally allow the forge `host:port` from the server's
+`base_url` (port defaults by scheme), so the runner's in-sandbox
+checkout, `starforge sync`, and job downloads reach the forge. The
+network policy carries `secret_values` (`host`, `header`, `value` per
+entry; `Debug` redacts `value`) from the server, merged with the
+daemon's `--secret-binding` flags: a value applies only to a host named in
+`secret_headers` and allowed. Only the server may add values — the
+daemon refuses any create request that carries `secret_values` from a
+caller.
 
 ## Quotas
 

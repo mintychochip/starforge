@@ -3,6 +3,7 @@
 //! artifact and secret paths in between.
 mod common;
 
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use common::*;
@@ -10,7 +11,12 @@ use reqwest::{Client, StatusCode};
 use serde_json::{Value, json};
 use sha2::Digest as _;
 use starforged_core::permission::Visibility;
+use starforged_core::sandboxes::{CreateSandboxRequest, SandboxConfig, SandboxProviderKind};
 use starforged_core::tokens::Scope;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+const BIND_HOST: &str = "registry.example.com";
+const BIND_HEADER: &str = "Authorization";
 
 const CI_TOML: &str = r#"version = 1
 
@@ -118,6 +124,135 @@ async fn claim(s: &TestServer, runner: &str) -> (i64, String, String) {
     )
 }
 
+/// A recording fake E2B provider (create/get/kill only).
+async fn spawn_fake_e2b(recorded: Arc<Mutex<Vec<CreateSandboxRequest>>>) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            let recorded = recorded.clone();
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    let n = stream.read(&mut chunk).await.unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&buf[..end]).into_owned();
+                        let len: usize = head
+                            .lines()
+                            .find_map(|l| {
+                                l.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .and_then(|v| v.trim().parse().ok())
+                            })
+                            .unwrap_or(0);
+                        if buf.len() >= end + 4 + len {
+                            break;
+                        }
+                    }
+                }
+                let text = String::from_utf8_lossy(&buf).into_owned();
+                let line = text.lines().next().unwrap_or_default().to_owned();
+                let mut parts = line.split_whitespace();
+                let method = parts.next().unwrap_or_default().to_owned();
+                let target = parts.next().unwrap_or_default().to_owned();
+                let path = target.split('?').next().unwrap_or_default().to_owned();
+                let body_text = text
+                    .split_once("\r\n\r\n")
+                    .map(|(_, b)| b.to_owned())
+                    .unwrap_or_default();
+                let info = |st: &str| {
+                    serde_json::json!({
+                        "id": "sbx-1", "state": st, "runtime": "e2b",
+                        "expires_at": null, "provider": "e2b",
+                    })
+                    .to_string()
+                };
+                let (status, resp_body): (u16, String) = if method == "POST" && path == "/sandboxes"
+                {
+                    if let Ok(req) = serde_json::from_str::<CreateSandboxRequest>(&body_text) {
+                        recorded.lock().unwrap().push(req);
+                    }
+                    (200, info("running"))
+                } else if method == "GET" && path == "/sandboxes/sbx-1" {
+                    (200, info("running"))
+                } else if method == "DELETE" && path == "/sandboxes/sbx-1" {
+                    (204, String::new())
+                } else {
+                    (
+                        404,
+                        json!({"code": "not_found", "message": "no route", "retryable": false})
+                            .to_string(),
+                    )
+                };
+                let reason = match status {
+                    200 => "OK",
+                    204 => "No Content",
+                    _ => "Not Found",
+                };
+                let resp = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp_body}",
+                    resp_body.len(),
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+            });
+        }
+    });
+    url
+}
+
+async fn sandbox_server(recorded: Arc<Mutex<Vec<CreateSandboxRequest>>>) -> TestServer {
+    let fake_url = spawn_fake_e2b(recorded).await;
+    TestServer::start_with(move |config| {
+        config.sandbox = SandboxConfig {
+            provider: SandboxProviderKind::E2b,
+            e2b: starforged_core::sandboxes::E2bSandboxConfig {
+                api_url: fake_url.clone(),
+                api_key: "test-key".to_owned(),
+            },
+            ..Default::default()
+        };
+    })
+    .await
+}
+
+fn sandbox_body() -> Value {
+    json!({
+        "runtime": "e2b",
+        "template": "starforge/rust",
+        "timeout_s": 300,
+    })
+}
+
+/// The removed runner-secrets route must answer 404.
+async fn assert_runner_secrets_route_gone(
+    client: &Client,
+    s: &TestServer,
+    job_id: i64,
+    runner: &str,
+    fence: &str,
+) {
+    let resp = client
+        .post(s.url(&format!("/api/v1/runners/jobs/{job_id}/secrets")))
+        .bearer_auth(runner)
+        .header("x-starforge-fence", fence)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "removed route must be gone"
+    );
+}
+
 async fn trace(
     s: &TestServer,
     runner: &str,
@@ -176,7 +311,8 @@ async fn wait_for_change(s: &TestServer, repo_id: i64, user_id: i64) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn push_runner_status_gate_artifact_and_secret_paths() {
-    let s = TestServer::start().await;
+    let recorded: Arc<Mutex<Vec<CreateSandboxRequest>>> = Arc::new(Mutex::new(Vec::new()));
+    let s = sandbox_server(recorded.clone()).await;
     let alice = s.user("alice").await;
     let repo = s.repo(&alice, "proj", Visibility::Private).await;
     let pat = s
@@ -184,18 +320,29 @@ async fn push_runner_status_gate_artifact_and_secret_paths() {
         .await;
     let client = s.browser();
 
-    // Seed the secret (sealed) and gate rule (protects `main`, requiring
-    // `ci/test`) through the API.
+    // Seed the bound secret (sealed) and gate rule (protects `main`,
+    // requiring `ci/test`) through the API.
     let secret_value = "cargo-registry-super-secret-value";
     let (status, value) = api(
         &client,
         "POST",
         &s.url("/api/v1/repos/alice/proj/ci/secrets"),
         &pat,
-        Some(json!({ "name": "CARGO_REGISTRY_TOKEN", "value": secret_value })),
+        Some(json!({
+            "name": "CARGO_REGISTRY_TOKEN",
+            "value": secret_value,
+            "bind_host": BIND_HOST,
+            "bind_header": BIND_HEADER,
+        })),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "{value}");
+    assert_eq!(value["bind_host"], BIND_HOST);
+    assert_eq!(value["bind_header"], BIND_HEADER);
+    assert!(
+        !value.to_string().contains(secret_value),
+        "create leaks: {value}"
+    );
     let sealed = starforged_db::ci::secret_by_name(s.db(), repo.id, "CARGO_REGISTRY_TOKEN")
         .await
         .unwrap()
@@ -268,26 +415,45 @@ async fn push_runner_status_gate_artifact_and_secret_paths() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    // The scripted runner: claim, secrets, logs, artifact, finish.
+    // The scripted runner: claim, sandbox, logs, artifact, finish.
     let runner = register_runner(&s, &pat).await;
     let (claimed, fence, job_token) = claim(&s, &runner).await;
     assert_eq!(claimed, job_id);
 
-    // Secret path: the protected-branch job resolves the sealed secret
-    // (in memory), records the resolution, and the value never reaches
-    // the spec, the sealed row, or the logs.
-    let resp = client
-        .post(s.url(&format!("/api/v1/runners/jobs/{job_id}/secrets")))
-        .bearer_auth(&runner)
-        .header("x-starforge-fence", &fence)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(resp.headers()["cache-control"], "no-store");
-    let resolved: Value = resp.json().await.unwrap();
-    assert_eq!(resolved["secrets"].as_array().unwrap().len(), 1);
-    assert_eq!(resolved["secrets"][0]["value"], secret_value);
+    // Secret path: the protected-branch job creates its sandbox, the
+    // server resolves the sealed secret to the provider only, records
+    // the resolution, and the value never reaches the spec, the sealed
+    // row, the runner, or the logs.
+    assert_runner_secrets_route_gone(&client, &s, job_id, &runner, &fence).await;
+    let (status, value) = api(
+        &client,
+        "POST",
+        &s.url("/api/v1/sandboxes"),
+        &job_token,
+        Some(sandbox_body()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{value}");
+    assert_eq!(value["id"], "sbx-1");
+    assert!(
+        !value.to_string().contains(secret_value),
+        "create leaks: {value}"
+    );
+    {
+        let requests = recorded.lock().unwrap();
+        assert_eq!(requests.len(), 1, "provider saw exactly one create");
+        let request = &requests[0];
+        assert_eq!(request.network.secret_values.len(), 1);
+        assert_eq!(request.network.secret_values[0].host, BIND_HOST);
+        assert_eq!(request.network.secret_values[0].header, BIND_HEADER);
+        assert_eq!(request.network.secret_values[0].value, secret_value);
+        let forge = s.base.trim_start_matches("http://").to_owned();
+        assert!(
+            request.network.allow_out.contains(&forge),
+            "forge host:port {forge} in {:?}",
+            request.network.allow_out
+        );
+    }
     assert_eq!(
         starforged_db::ci::job_secrets_for_job(s.db(), job_id)
             .await
@@ -379,20 +545,28 @@ async fn push_runner_status_gate_artifact_and_secret_paths() {
     git_ok(&work, &["push", "-q", &url, "HEAD:refs/for/main/e2e"]).await;
     wait_for_change(&s, repo.id, alice.id).await;
     let job2 = wait_for_job(&s, repo.id, Some(job_id)).await;
-    let (claimed2, fence2, _) = claim(&s, &runner).await;
+    let (claimed2, fence2, job_token2) = claim(&s, &runner).await;
     assert_eq!(claimed2, job2);
-    let resp = client
-        .post(s.url(&format!("/api/v1/runners/jobs/{job2}/secrets")))
-        .bearer_auth(&runner)
-        .header("x-starforge-fence", &fence2)
-        .send()
-        .await
-        .unwrap();
-    let resolved2: Value = resp.json().await.unwrap();
+    assert_runner_secrets_route_gone(&client, &s, job2, &runner, &fence2).await;
+    // The unapproved refs/for job is untrusted: its sandbox create fails
+    // with the trust-rule message and never reaches the provider.
+    let (status, body) = api(
+        &client,
+        "POST",
+        &s.url("/api/v1/sandboxes"),
+        &job_token2,
+        Some(sandbox_body()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
     assert_eq!(
-        resolved2["secrets"].as_array().unwrap().len(),
-        0,
-        "unapproved refs/for job resolves no secrets"
+        body["error"]["message"], "repository secrets are not available to this run",
+        "{body}"
+    );
+    assert_eq!(
+        recorded.lock().unwrap().len(),
+        1,
+        "only the trusted create reached the provider"
     );
     assert_eq!(
         trace(&s, &runner, job2, &fence2, 0, b"revision ok\n").await,

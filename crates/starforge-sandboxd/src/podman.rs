@@ -30,6 +30,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::io::Read as _;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Mutex;
@@ -167,6 +168,83 @@ pub fn decode_content(text: &str) -> Result<Vec<u8>, ProviderError> {
     Ok(bytes)
 }
 
+/// Build an in-memory tar archive holding one regular file named
+/// `basename`. This is the wire format `podman cp - <dir>` expects on
+/// stdin: a tar stream extracted into a directory. The entry is mode
+/// `0644` and its size is `bytes.len()`.
+pub(crate) fn build_file_tar(basename: &str, bytes: &[u8]) -> Result<Vec<u8>, ProviderError> {
+    let mut builder = tar::Builder::new(Vec::new());
+    let mut header = tar::Header::new_gnu();
+    header.set_entry_type(tar::EntryType::Regular);
+    header.set_mode(0o644);
+    header.set_size(bytes.len() as u64);
+    builder
+        .append_data(&mut header, basename, bytes)
+        .map_err(|e| err_runtime(format!("failed to build file tar: {e}")))?;
+    builder
+        .into_inner()
+        .map_err(|e| err_runtime(format!("failed to build file tar: {e}")))
+}
+
+/// Parse the tar stream `podman cp <path> -` writes to stdout. Require
+/// exactly one regular-file entry and return its bytes. A directory (or
+/// missing path, which yields no entries) is a `not_found` error; more
+/// than one entry is a runtime error. An oversized entry is refused
+/// from its header size, before reading its body.
+pub(crate) fn parse_file_tar(data: &[u8]) -> Result<Vec<u8>, ProviderError> {
+    let mut archive = tar::Archive::new(std::io::Cursor::new(data));
+    let mut file_bytes: Option<Vec<u8>> = None;
+    let mut saw_directory = false;
+    let mut entry_count = 0usize;
+    for entry in archive
+        .entries()
+        .map_err(|e| err_runtime(format!("invalid tar from podman cp: {e}")))?
+    {
+        let mut entry =
+            entry.map_err(|e| err_runtime(format!("invalid tar from podman cp: {e}")))?;
+        entry_count += 1;
+        if entry_count > 1 {
+            return Err(err_runtime(
+                "unexpected tar from podman cp: more than one entry",
+            ));
+        }
+        if entry.header().entry_type().is_dir() {
+            saw_directory = true;
+            continue;
+        }
+        if !entry.header().entry_type().is_file() {
+            return Err(err_runtime(format!(
+                "unexpected tar entry type {:?} from podman cp",
+                entry.header().entry_type()
+            )));
+        }
+        if entry.size() > MAX_FILE_BYTES as u64 {
+            return Err(ProviderError::new(
+                "too_large",
+                format!("file exceeds {MAX_FILE_BYTES} bytes"),
+            ));
+        }
+        let mut bytes = Vec::new();
+        entry
+            .read_to_end(&mut bytes)
+            .map_err(|e| err_runtime(format!("failed to read file from podman cp: {e}")))?;
+        if bytes.len() > MAX_FILE_BYTES {
+            return Err(ProviderError::new(
+                "too_large",
+                format!("file exceeds {MAX_FILE_BYTES} bytes"),
+            ));
+        }
+        file_bytes = Some(bytes);
+    }
+    if saw_directory {
+        return Err(ProviderError::new("not_found", "path is a directory"));
+    }
+    match file_bytes {
+        Some(bytes) => Ok(bytes),
+        None => Err(ProviderError::new("not_found", "file not found")),
+    }
+}
+
 type Fute<'a, T> = Pin<Box<dyn Future<Output = Result<T, ProviderError>> + Send + 'a>>;
 
 /// Isolation backend behind the daemon's HTTP layer.
@@ -175,7 +253,12 @@ type Fute<'a, T> = Pin<Box<dyn Future<Output = Result<T, ProviderError>> + Send 
 /// relative paths (see [`validate_relative_path`]) and stay within the byte
 /// caps. `create` receives the container id the daemon generated.
 pub trait Runtime: Send + Sync {
-    fn create<'a>(&'a self, id: &'a str, req: &'a CreateSandboxRequest) -> Fute<'a, ()>;
+    fn create<'a>(
+        &'a self,
+        id: &'a str,
+        req: &'a CreateSandboxRequest,
+        egress_volume: Option<&'a str>,
+    ) -> Fute<'a, ()>;
     fn inspect<'a>(&'a self, id: &'a str) -> Fute<'a, SandboxState>;
     fn remove<'a>(&'a self, id: &'a str) -> Fute<'a, ()>;
     fn pause<'a>(&'a self, id: &'a str) -> Fute<'a, ()>;
@@ -186,6 +269,17 @@ pub trait Runtime: Send + Sync {
     fn file_list<'a>(&'a self, id: &'a str, rel_path: &'a str) -> Fute<'a, Vec<String>>;
     fn file_delete<'a>(&'a self, id: &'a str, rel_path: &'a str) -> Fute<'a, ()>;
     fn port_url<'a>(&'a self, id: &'a str, port: u16) -> Fute<'a, PortUrl>;
+    /// Copy a host file into the container at an absolute container path
+    /// (`podman cp`). Used for the egress forwarder binary, which exceeds
+    /// [`MAX_FILE_BYTES`] and therefore cannot go through [`Self::file_write`].
+    fn copy_host_file<'a>(
+        &'a self,
+        id: &'a str,
+        host_path: &'a std::path::Path,
+        container_path: &'a str,
+    ) -> Fute<'a, ()>;
+    /// Start a detached process in the container (`podman exec -d`).
+    fn exec_detached<'a>(&'a self, id: &'a str, args: &'a [String]) -> Fute<'a, ()>;
 }
 
 // ---------------------------------------------------------------- podman --
@@ -277,8 +371,46 @@ impl PodmanRuntime {
     }
 }
 
+/// Build `podman exec` argv: options first, then the container id, then the
+/// command. There is deliberately **no `--` after the id**: podman parses
+/// `exec` flags non-interspersed, so everything after the container name is
+/// the command and a `--` there would become the executable
+/// (`crun: executable file '--' not found`).
+pub fn exec_argv(
+    id: &str,
+    cwd: Option<&str>,
+    envs: &std::collections::BTreeMap<String, String>,
+    command: &[String],
+) -> Vec<String> {
+    let mut args: Vec<String> = vec!["exec".into()];
+    if let Some(cwd) = cwd {
+        args.push("--workdir".into());
+        args.push(workspace_path(cwd));
+    }
+    for (key, value) in envs {
+        args.push("--env".into());
+        args.push(format!("{key}={value}"));
+    }
+    args.push(id.into());
+    args.extend(command.iter().cloned());
+    args
+}
+
+/// Build `podman exec -d` argv (see [`exec_argv`] for why there is no `--`
+/// after the container id).
+pub fn exec_detached_argv(id: &str, command: &[String]) -> Vec<String> {
+    let mut args: Vec<String> = vec!["exec".into(), "-d".into(), id.into()];
+    args.extend(command.iter().cloned());
+    args
+}
+
 impl Runtime for PodmanRuntime {
-    fn create<'a>(&'a self, id: &'a str, req: &'a CreateSandboxRequest) -> Fute<'a, ()> {
+    fn create<'a>(
+        &'a self,
+        id: &'a str,
+        req: &'a CreateSandboxRequest,
+        egress_volume: Option<&'a str>,
+    ) -> Fute<'a, ()> {
         Box::pin(async move {
             if req.template.is_empty() {
                 return Err(err_invalid("image/template must not be empty"));
@@ -317,6 +449,13 @@ impl Runtime for PodmanRuntime {
                 "--cpus".into(),
                 format!("{cpu}"),
             ];
+            if let Some(volume) = egress_volume {
+                // Per-sandbox egress directory, mounted read-write so the
+                // in-sandbox forwarder can create/listen on its shim socket
+                // there. `--network none` is kept.
+                args.push("--volume".into());
+                args.push(volume.to_owned());
+            }
             for (key, value) in &req.envs {
                 args.push("--env".into());
                 args.push(format!("{key}={value}"));
@@ -394,24 +533,16 @@ impl Runtime for PodmanRuntime {
                 return Err(err_invalid("command must not be empty"));
             }
             validate_env(&req.envs)?;
-            let mut args: Vec<String> = vec!["exec".into()];
-            if let Some(cwd) = &req.cwd {
-                let cwd = validate_relative_path(cwd)?;
-                args.push("--workdir".into());
-                args.push(workspace_path(&cwd));
-            }
-            for (key, value) in &req.envs {
-                args.push("--env".into());
-                args.push(format!("{key}={value}"));
-            }
-            args.push(id.into());
-            args.push("--".into());
+            let cwd = match &req.cwd {
+                Some(cwd) => Some(validate_relative_path(cwd)?),
+                None => None,
+            };
             for part in &req.command {
                 if part.contains('\0') {
                     return Err(err_invalid("command argument contains NUL"));
                 }
-                args.push(part.clone());
             }
+            let args = exec_argv(id, cwd.as_deref(), &req.envs, &req.command);
             let refs: Vec<&str> = args.iter().map(String::as_str).collect();
             let (code, stdout, stderr) = self.run(&refs, None).await?;
             if stdout.len() > MAX_EXEC_BYTES || stderr.len() > MAX_EXEC_BYTES {
@@ -437,16 +568,25 @@ impl Runtime for PodmanRuntime {
     fn file_read<'a>(&'a self, id: &'a str, rel_path: &'a str) -> Fute<'a, Vec<u8>> {
         Box::pin(async move {
             let resolved = self.resolve_in_container(id, rel_path).await?;
-            let out = self
-                .run_ok(&["cp", &format!("{id}:{resolved}"), "-"], None)
-                .await?;
-            if out.len() > MAX_FILE_BYTES {
-                return Err(ProviderError::new(
-                    "too_large",
-                    format!("file exceeds {MAX_FILE_BYTES} bytes"),
-                ));
+            let source = format!("{id}:{resolved}");
+            let (code, out, err) = self.run(&["cp", &source, "-"], None).await?;
+            if code != 0 {
+                let stderr = String::from_utf8_lossy(&err).to_lowercase();
+                if stderr.contains("no such")
+                    || stderr.contains("does not exist")
+                    || stderr.contains("not found")
+                {
+                    return Err(ProviderError::new(
+                        "not_found",
+                        format!("file `{rel_path}` not found in sandbox `{id}`"),
+                    ));
+                }
+                return Err(err_runtime(format!(
+                    "podman cp failed ({code}): {}",
+                    String::from_utf8_lossy(&err).trim()
+                )));
             }
-            Ok(out)
+            parse_file_tar(&out)
         })
     }
 
@@ -459,14 +599,21 @@ impl Runtime for PodmanRuntime {
                 ));
             }
             let resolved = self.resolve_in_container(id, rel_path).await?;
-            let parent = resolved
-                .rsplit_once('/')
-                .map(|(dir, _)| dir)
-                .unwrap_or(WORKSPACE_ROOT);
+            let (parent, basename) = match resolved.rsplit_once('/') {
+                Some(("", name)) => ("/", name),
+                Some((dir, name)) => (dir, name),
+                None => (WORKSPACE_ROOT, resolved.as_str()),
+            };
+            let parent = if parent.is_empty() {
+                WORKSPACE_ROOT
+            } else {
+                parent
+            };
             self.run_ok(&["exec", id, "mkdir", "-p", "--", parent], None)
                 .await?;
-            self.run_ok(&["cp", "-", &format!("{id}:{resolved}")], Some(bytes))
-                .await?;
+            let archive = build_file_tar(basename, bytes)?;
+            let dest = format!("{id}:{parent}");
+            self.run_ok(&["cp", "-", &dest], Some(&archive)).await?;
             Ok(())
         })
     }
@@ -515,6 +662,46 @@ impl Runtime for PodmanRuntime {
             })
         })
     }
+
+    fn copy_host_file<'a>(
+        &'a self,
+        id: &'a str,
+        host_path: &'a std::path::Path,
+        container_path: &'a str,
+    ) -> Fute<'a, ()> {
+        Box::pin(async move {
+            if !container_path.starts_with('/') || container_path.contains('\0') {
+                return Err(err_invalid("container path must be absolute"));
+            }
+            let parent = container_path
+                .rsplit_once('/')
+                .map(|(dir, _)| dir)
+                .unwrap_or("/");
+            self.run_ok(&["exec", id, "mkdir", "-p", "--", parent], None)
+                .await?;
+            let host = host_path.to_string_lossy().into_owned();
+            let dest = format!("{id}:{container_path}");
+            self.run_ok(&["cp", "--", &host, &dest], None).await?;
+            Ok(())
+        })
+    }
+
+    fn exec_detached<'a>(&'a self, id: &'a str, args: &'a [String]) -> Fute<'a, ()> {
+        Box::pin(async move {
+            if args.is_empty() {
+                return Err(err_invalid("command must not be empty"));
+            }
+            for part in args {
+                if part.contains('\0') {
+                    return Err(err_invalid("command argument contains NUL"));
+                }
+            }
+            let argv = exec_detached_argv(id, args);
+            let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+            self.run_ok(&refs, None).await?;
+            Ok(())
+        })
+    }
 }
 
 // ------------------------------------------------------------------- fake --
@@ -530,6 +717,12 @@ struct FakeInner {
     sandboxes: HashMap<String, FakeSandbox>,
     created: Vec<(String, CreateSandboxRequest)>,
     kills: Vec<String>,
+    /// Full `podman run` argv of every create (with the egress volume, if any).
+    create_args: Vec<Vec<String>>,
+    /// `(id, host path, container path)` of every [`Runtime::copy_host_file`].
+    copies: Vec<(String, String, String)>,
+    /// `(id, args)` of every [`Runtime::exec_detached`].
+    detached: Vec<(String, Vec<String>)>,
 }
 
 #[derive(Debug, Default)]
@@ -559,6 +752,21 @@ impl FakeRuntime {
     /// Ids of every remove, in order.
     pub fn kills(&self) -> Vec<String> {
         self.inner.lock().unwrap().kills.clone()
+    }
+
+    /// Full create argv (including `--volume`) of every create, in order.
+    pub fn create_args(&self) -> Vec<Vec<String>> {
+        self.inner.lock().unwrap().create_args.clone()
+    }
+
+    /// `(id, host path, container path)` of every host-file copy, in order.
+    pub fn copies(&self) -> Vec<(String, String, String)> {
+        self.inner.lock().unwrap().copies.clone()
+    }
+
+    /// `(id, args)` of every detached exec, in order.
+    pub fn detached_execs(&self) -> Vec<(String, Vec<String>)> {
+        self.inner.lock().unwrap().detached.clone()
     }
 
     /// Install the chunks `exec` returns for `id`.
@@ -613,7 +821,12 @@ impl FakeRuntime {
 }
 
 impl Runtime for FakeRuntime {
-    fn create<'a>(&'a self, id: &'a str, req: &'a CreateSandboxRequest) -> Fute<'a, ()> {
+    fn create<'a>(
+        &'a self,
+        id: &'a str,
+        req: &'a CreateSandboxRequest,
+        egress_volume: Option<&'a str>,
+    ) -> Fute<'a, ()> {
         Box::pin(async move {
             if req.template.is_empty() {
                 return Err(err_invalid("image/template must not be empty"));
@@ -634,6 +847,27 @@ impl Runtime for FakeRuntime {
                 ];
             }
             inner.created.push((id.to_owned(), req.clone()));
+            // Mirror PodmanRuntime's argv shape so tests can assert on the
+            // `--network none` + egress `--volume` + env placement.
+            let mut argv: Vec<String> = vec![
+                "run".into(),
+                "-d".into(),
+                "--name".into(),
+                id.to_owned(),
+                "--network".into(),
+                "none".into(),
+            ];
+            if let Some(volume) = egress_volume {
+                argv.push("--volume".into());
+                argv.push(volume.to_owned());
+            }
+            for (key, value) in &req.envs {
+                argv.push("--env".into());
+                argv.push(format!("{key}={value}"));
+            }
+            argv.push("--".into());
+            argv.push(req.template.clone());
+            inner.create_args.push(argv);
             Ok(())
         })
     }
@@ -779,6 +1013,43 @@ impl Runtime for FakeRuntime {
             })
         })
     }
+
+    fn copy_host_file<'a>(
+        &'a self,
+        id: &'a str,
+        host_path: &'a std::path::Path,
+        container_path: &'a str,
+    ) -> Fute<'a, ()> {
+        Box::pin(async move {
+            if !container_path.starts_with('/') || container_path.contains('\0') {
+                return Err(err_invalid("container path must be absolute"));
+            }
+            let mut inner = self.inner.lock().unwrap();
+            if !inner.sandboxes.contains_key(id) {
+                return Err(err_not_found(id));
+            }
+            inner.copies.push((
+                id.to_owned(),
+                host_path.to_string_lossy().into_owned(),
+                container_path.to_owned(),
+            ));
+            Ok(())
+        })
+    }
+
+    fn exec_detached<'a>(&'a self, id: &'a str, args: &'a [String]) -> Fute<'a, ()> {
+        Box::pin(async move {
+            if args.is_empty() {
+                return Err(err_invalid("command must not be empty"));
+            }
+            let mut inner = self.inner.lock().unwrap();
+            if !inner.sandboxes.contains_key(id) {
+                return Err(err_not_found(id));
+            }
+            inner.detached.push((id.to_owned(), args.to_vec()));
+            Ok(())
+        })
+    }
 }
 
 #[cfg(test)]
@@ -825,6 +1096,83 @@ mod tests {
         assert!(validate_relative_path("a\0b").is_err());
     }
 
+    #[test]
+    fn file_tar_write_contains_one_named_file() {
+        let archive = build_file_tar("hello.txt", b"data").unwrap();
+        let mut archive = tar::Archive::new(std::io::Cursor::new(archive));
+        let mut entries = archive.entries().unwrap();
+        let mut entry = entries.next().unwrap().unwrap();
+        assert_eq!(entry.path().unwrap().to_str().unwrap(), "hello.txt");
+        assert!(entry.header().entry_type().is_file());
+        assert_eq!(entry.header().mode().unwrap(), 0o644);
+        assert_eq!(entry.size(), 4);
+        let mut body = Vec::new();
+        entry.read_to_end(&mut body).unwrap();
+        assert_eq!(body, b"data");
+        drop(entry);
+        assert!(entries.next().is_none());
+    }
+
+    #[test]
+    fn file_tar_parse_returns_single_file_bytes() {
+        let archive = build_file_tar("a.bin", &[0u8, 1, 2, 255]).unwrap();
+        assert_eq!(parse_file_tar(&archive).unwrap(), vec![0u8, 1, 2, 255]);
+    }
+
+    #[test]
+    fn file_tar_parse_refuses_directory_and_multiple_entries() {
+        // Directory tar.
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Directory);
+        header.set_size(0);
+        builder
+            .append_data(&mut header, "somedir/", &[] as &[u8])
+            .unwrap();
+        let dir_tar = builder.into_inner().unwrap();
+        let err = parse_file_tar(&dir_tar).unwrap_err();
+        assert_eq!(err.code, "not_found");
+        // Two-entry tar.
+        let mut builder = tar::Builder::new(Vec::new());
+        for name in ["a.txt", "b.txt"] {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Regular);
+            header.set_size(1);
+            builder.append_data(&mut header, name, &b"x"[..]).unwrap();
+        }
+        let two_tar = builder.into_inner().unwrap();
+        assert!(parse_file_tar(&two_tar).is_err());
+        // Empty tar.
+        assert_eq!(parse_file_tar(&[]).unwrap_err().code, "not_found");
+    }
+
+    #[test]
+    fn file_tar_parse_refuses_oversized_entry() {
+        let big = vec![0u8; MAX_FILE_BYTES + 1];
+        let archive = build_file_tar("big.bin", &big).unwrap();
+        let err = parse_file_tar(&archive).unwrap_err();
+        assert_eq!(err.code, "too_large");
+    }
+
+    #[test]
+    fn exec_argv_has_no_separator_after_container_id() {
+        // Regression: podman parses exec flags non-interspersed, so a `--`
+        // after the container id becomes the executable and every real exec
+        // fails. The command's first element must directly follow the id.
+        let envs = std::collections::BTreeMap::from([("K".to_owned(), "v".to_owned())]);
+        let command = vec!["/bin/true".to_owned()];
+        let argv = exec_argv("sbx-1", Some("src"), &envs, &command);
+        let id_pos = argv.iter().position(|a| a == "sbx-1").unwrap();
+        assert_eq!(argv[id_pos + 1], "/bin/true");
+        assert!(!argv.iter().any(|a| a == "--"), "argv: {argv:?}");
+        assert_eq!(argv[0], "exec");
+        let detached = exec_detached_argv("sbx-1", &command);
+        let id_pos = detached.iter().position(|a| a == "sbx-1").unwrap();
+        assert_eq!(detached[id_pos + 1], "/bin/true");
+        assert!(!detached.iter().any(|a| a == "--"), "argv: {detached:?}");
+        assert_eq!(detached[1], "-d");
+    }
+
     #[tokio::test]
     async fn fake_symlink_escape_is_rejected() {
         let rt = FakeRuntime::new();
@@ -834,6 +1182,7 @@ mod tests {
                 template: "x".into(),
                 ..Default::default()
             },
+            None,
         )
         .await
         .unwrap();
@@ -860,6 +1209,7 @@ mod tests {
                 template: "x".into(),
                 ..Default::default()
             },
+            None,
         )
         .await
         .unwrap();
@@ -883,6 +1233,7 @@ mod tests {
                 template: "x".into(),
                 ..Default::default()
             },
+            None,
         )
         .await
         .unwrap();
@@ -891,7 +1242,7 @@ mod tests {
         rt.remove("sbx-1").await.unwrap();
         assert_eq!(rt.kills(), vec!["sbx-1".to_owned()]);
         assert!(
-            rt.create("sbx-1", &CreateSandboxRequest::default())
+            rt.create("sbx-1", &CreateSandboxRequest::default(), None)
                 .await
                 .is_err()
         );
@@ -903,18 +1254,144 @@ mod tests {
         if std::env::var("STARFORGE_TEST_SANDBOX").as_deref() != Ok("1") {
             return;
         }
+        use crate::proxy::{CaMaterial, EgressPolicy, start_connection_pool};
+        use std::net::Ipv4Addr;
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
         let rt = PodmanRuntime::new(PathBuf::from("podman"));
         let id = "sbx-smoke";
         rt.remove(id).await.ok();
+
+        // Host-side HTTP listener the sandbox must reach *through* the
+        // in-sandbox forwarder + the host connection pool (reverse
+        // direction: the forwarder creates the shim socket, the host
+        // connects to it).
+        let origin_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let origin_addr = origin_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = origin_listener.accept().await else {
+                return;
+            };
+            let mut buf = vec![0u8; 4096];
+            let _ = stream.read(&mut buf).await;
+            let _ = stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+                )
+                .await;
+        });
+
+        let dir =
+            std::env::temp_dir().join(format!("starforge-smoke-egress-{}", std::process::id()));
+        let egress_dir = dir.join(id);
+        std::fs::create_dir_all(&egress_dir).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&egress_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o711)).unwrap();
+        }
+        let sock = egress_dir.join("shim.sock");
+        let entry = format!("127.0.0.1:{}", origin_addr.port());
+        let ca = Arc::new(CaMaterial::generate(std::slice::from_ref(&entry)).unwrap());
+        let policy = Arc::new(EgressPolicy {
+            allow_out: vec![entry],
+            deny_out: Vec::new(),
+            bindings: Vec::new(),
+            cidr_allow: Vec::new(),
+        });
+        let volume = format!("{}:/run/starforge/egress:Z", egress_dir.display());
+
         rt.create(
             id,
             &CreateSandboxRequest {
-                template: "docker.io/library/rust:1.85".into(),
+                template: std::env::var("STARFORGE_TEST_SANDBOX_IMAGE")
+                    .unwrap_or_else(|_| "docker.io/library/rust:1.85".to_owned()),
                 ..Default::default()
             },
+            Some(&volume),
         )
         .await
         .expect("podman create");
+        // Copy the real `starforge-sandboxd` binary into the container and
+        // start its `forward` subcommand detached, exactly as the daemon
+        // does. The test binary itself cannot be used (no `forward`
+        // subcommand), so locate the sibling build artifact (override with
+        // STARFORGE_SANDBOXD_BIN).
+        let exe = std::env::var("STARFORGE_SANDBOXD_BIN")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                std::env::current_exe()
+                    .ok()
+                    .and_then(|p| {
+                        p.parent()
+                            .and_then(|d| d.parent())
+                            .map(|d| d.join("starforge-sandboxd"))
+                    })
+                    .unwrap_or_else(|| PathBuf::from("starforge-sandboxd"))
+            });
+        assert!(
+            exe.exists(),
+            "starforge-sandboxd binary not found at {} (build it first or set STARFORGE_SANDBOXD_BIN)",
+            exe.display()
+        );
+        rt.copy_host_file(id, &exe, "/workspace/.starforge-proxy/sandboxd")
+            .await
+            .expect("copy forwarder");
+        rt.exec_detached(
+            id,
+            &[
+                "/workspace/.starforge-proxy/sandboxd".to_owned(),
+                "forward".to_owned(),
+                "--listen".to_owned(),
+                "127.0.0.1:3128".to_owned(),
+                "--unix".to_owned(),
+                "/run/starforge/egress/shim.sock".to_owned(),
+            ],
+        )
+        .await
+        .expect("start forwarder");
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        // Host-side connection pool to the forwarder-created shim socket,
+        // with a policy allowing the host origin.
+        let _pool = start_connection_pool(&sock, ca, policy, None, None)
+            .await
+            .expect("connection pool");
+
+        // Fetch the host listener through the forwarder using bash /dev/tcp
+        // (no curl/python guarantee in the base image).
+        let request = format!(
+            "GET http://127.0.0.1:{}/x HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
+            origin_addr.port(),
+            origin_addr.port()
+        );
+        let script =
+            "exec 3<>/dev/tcp/127.0.0.1/3128 && printf '%s' \"$1\" >&3 && cat <&3".to_owned();
+        let chunks = rt
+            .exec(
+                id,
+                &ExecRequest {
+                    command: vec!["/bin/bash".into(), "-c".into(), script, "_".into(), request],
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("fetch through forwarder");
+        let stdout: String = chunks
+            .iter()
+            .filter_map(|c| match c {
+                ExecChunk::Stdout { data } => Some(data.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            stdout.contains("hello"),
+            "sandbox must fetch the host listener through the forwarder: {stdout}"
+        );
+
         assert_eq!(rt.inspect(id).await.unwrap(), SandboxState::Running);
         let chunks = rt
             .exec(
@@ -933,5 +1410,7 @@ mod tests {
         rt.file_write(id, "hello.txt", b"data").await.unwrap();
         assert_eq!(rt.file_read(id, "hello.txt").await.unwrap(), b"data");
         rt.remove(id).await.unwrap();
+        drop(_pool);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

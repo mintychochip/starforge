@@ -219,7 +219,6 @@ impl Modify for SecurityAddon {
         crate::ci::create_secret,
         crate::ci::list_secrets,
         crate::ci::delete_secret,
-        crate::ci::resolve_job_secrets,
         crate::openapi::openapi_json,
     ),
     components(schemas(
@@ -321,8 +320,6 @@ impl Modify for SecurityAddon {
         crate::ci::AuthorizedArtifactJson,
         crate::ci::SecretBody,
         crate::ci::SecretJson,
-        crate::ci::ResolvedSecretJson,
-        crate::ci::ResolvedSecretsJson,
         crate::sandboxes::NetworkPolicyJson,
         crate::sandboxes::CreateSandboxBody,
         crate::sandboxes::SandboxJson,
