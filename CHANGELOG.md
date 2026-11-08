@@ -31,7 +31,9 @@ search, webhooks, and mirrors, on SQLite or Postgres.
   bundles. Only sessions whose
   working directory lies inside the repository are captured; sessions with
   no known working directory are never attributed. Antigravity CLI sessions
-  are not captured (see README "Known gaps").
+  are not captured (see README "Known gaps"). The server completes a session
+  that stays `receiving` for 24 hours without activity, so an upload whose
+  client never sends `complete` still becomes searchable.
 - **Trails (M2):** per-repository numbered Trails with comments, labels,
   assignees, and review requests; changes via `refs/for/*` (agit) with
   revisions, reviews, threaded comments, and pending (draft) reviews;
@@ -86,7 +88,13 @@ search, webhooks, and mirrors, on SQLite or Postgres.
   storage metered and limited by Starforge (`[ci.limits]`), and a linked
   Depot repository's usage read from Depot's API with its limits left to
   Depot (`GET /repos/{owner}/{repo}/ci/usage`). External CI statuses and
-  webhooks are unchanged, and the server never runs job code.
+  webhooks are unchanged, and the server never runs job code. The
+  repository nav has CI and Compare tabs; repository admins manage CI
+  secrets on a settings page as well as through the API; the OCI image
+  ships `starforge-runner` and `starforge-sandboxd`. The never-read server
+  keys `sandbox.local.egress.proxy_listen` and `ca_dir` are removed (the
+  daemon's `--egress-listen` and `--egress-ca-dir` flags set them); an
+  environment override for either now fails startup as an unknown key.
 - **CI secret delivery and sandbox egress:** local sandboxes reach the
   egress proxy at `10.0.2.2` through pasta (slirp4netns fallback) when
   egress is provisioned, and stay `--network none` when it is disabled.
@@ -173,6 +181,7 @@ before upgrading (see `docs/admin/backup-and-restore.md`).
 | 0040 | Per-repository CI secret policy and secret host/header bindings |
 | 0041 | Notifications, repository watches, Trail subscriptions, per-user email setting |
 | 0042 | Releases and release assets |
+| 0043 | Drop queued rows of two removed no-op job kinds |
 
 Note: migration numbers 0030–0033 do not exist; the series jumps from 0029
 to 0034.

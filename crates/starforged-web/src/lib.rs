@@ -285,6 +285,14 @@ fn page_routes() -> Router<AppState> {
             get(pages::webhooks::show).post(pages::webhooks::create),
         )
         .route(
+            "/{owner}/{repo}/settings/ci-secrets",
+            get(pages::ci_secrets::show).post(pages::ci_secrets::create_or_rotate),
+        )
+        .route(
+            "/{owner}/{repo}/settings/ci-secrets/{name}/delete",
+            post(pages::ci_secrets::delete),
+        )
+        .route(
             "/{owner}/{repo}/settings/hooks/{id}/delete",
             post(pages::webhooks::delete),
         )

@@ -585,17 +585,26 @@ impl Core {
         self.authorize_session_write(&session, auth).await?;
         if session.lifecycle != "complete" {
             db_sessions::set_lifecycle(self.db(), session.id, "complete").await?;
-            let sender = self.sender_of(session.uploader_id).await;
-            self.dispatch_session_event(repo_id, sender, "uploaded", ulid)
-                .await;
-            self.enqueue_index(&crate::jobs::Job::IndexSessionEvents {
-                session_id: session.id,
-            })
-            .await;
+            self.announce_session_completed(&session).await;
         }
         db_sessions::session_by_ulid(self.db(), repo_id, ulid)
             .await?
             .ok_or_else(|| CoreError::Internal("session vanished after complete".into()))
+    }
+
+    /// The shared step after a session reaches `complete`, whether the
+    /// client called [`Core::complete_session`] or the hourly cleanup
+    /// finalised a stalled session: the `session`/`uploaded` webhook
+    /// fan-out with the uploader as sender, plus the search-index
+    /// enqueue. Never fails the caller.
+    pub(crate) async fn announce_session_completed(&self, session: &SessionRow) {
+        let sender = self.sender_of(session.uploader_id).await;
+        self.dispatch_session_event(session.repo_id, sender, "uploaded", &session.ulid)
+            .await;
+        self.enqueue_index(&crate::jobs::Job::IndexSessionEvents {
+            session_id: session.id,
+        })
+        .await;
     }
 
     /// Records the CLI's commit claims through D1's `upsert_claim_links`.
@@ -803,23 +812,12 @@ impl Core {
     /// failures propagate (the segment write already committed; the jobs rerun
     /// idempotently on the next store or a manual enqueue).
     async fn enqueue_ingest_jobs(&self, session: &SessionRow) -> CoreResult<()> {
-        let ulid = session.ulid.clone();
         self.enqueue(&Job::IndexSessionEvents {
             session_id: session.id,
         })
         .await?;
-        self.enqueue(&Job::ResolveCommitLinks {
-            repo_id: session.repo_id,
-            session_ulid: ulid,
-        })
-        .await?;
         self.enqueue(&Job::UpdateSessionStats {
             session_id: session.id,
-        })
-        .await?;
-        self.enqueue(&Job::SessionWebhookOutbox {
-            session_id: session.id,
-            event: "segment.stored".to_owned(),
         })
         .await
     }

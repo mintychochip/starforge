@@ -9,6 +9,7 @@ crates/starforge-cli/src/commands/sync.rs
 crates/starforge-cli/src/upload.rs
 crates/starforged-core/src/ingest.rs
 crates/starforged-api/src/sessions.rs
+crates/starforged-core/src/jobs.rs
 -->
 
 ## Purpose
@@ -58,6 +59,12 @@ The caller builds `Roots` with `config_dir`, `data_dir`, and worktree. Adapters 
 `ingest` runs every detected adapter and reads new records. Each adapter returns new events plus an advanced cursor. The cursor counts emitted events, and `seq` continues from that count. Resume never reuses a seq and never trusts mtime.
 
 The 24 hour idle rule ends a session with an old last event. The idle sweep ends stopped sessions with stale cursors.
+
+The server finalizer completes idle `receiving` sessions after 24 hours without activity. The hourly cleanup completes each `receiving` session with 24 hours of no activity. The finalizer sets `ended_at` only when the field stays empty. It sets `ended_at` to the last activity time in that case.
+
+The last activity time equals the newer of the session row update time and the newest segment upload time. The finalizer sends the `uploaded` session webhook event. It queues the same index job that a client `complete` call queues.
+
+Only `receiving` sessions change state. The CLI keeps its own 24-hour idle sweep for local capture.
 
 ### Spool and queue
 

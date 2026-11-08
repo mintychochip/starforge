@@ -10,6 +10,8 @@ Four calls make an upload: `PUT` metadata (Trace Format v1 JSON, path ULID match
 `POST .../complete` with an empty `{}` body, and `POST .../links` with commit SHAs to claim.
 Re-sending identical bytes is a safe no-op (`200`); a changed segment at a taken number answers
 `409` with exactly `{"hash": "<stored hex>"}`, and new content on a completed session is `422`.
+The server also completes a `receiving` session after 24 hours without
+activity, with the same `uploaded` event and index job as `complete`.
 Segments cap at 16 MiB (decompression is bounded at 256 MiB against bombs); quotas are
 500 MiB per user per hour, 5 GiB stored per user, and 20 GiB stored per repository.
 The CLI re-sends a session's metadata (title, models, files, end time)

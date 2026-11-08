@@ -6,4 +6,5 @@
 {% if head.can_maintain %}<a href="/{{ head.owner }}/{{ head.name }}/settings/protection"{% if settings_page == "protection" %} aria-current="page"{% endif %}>Protection</a>{% endif %}
 {% if head.can_maintain %}<a href="/{{ head.owner }}/{{ head.name }}/settings/mirrors"{% if settings_page == "mirrors" %} aria-current="page"{% endif %}>Mirrors</a>{% endif %}
 {% if head.can_admin %}<a href="/{{ head.owner }}/{{ head.name }}/settings/github-import"{% if settings_page == "github-import" %} aria-current="page"{% endif %}>GitHub import</a>{% endif %}
+{% if head.can_admin %}<a href="/{{ head.owner }}/{{ head.name }}/settings/ci-secrets"{% if settings_page == "ci-secrets" %} aria-current="page"{% endif %}>CI secrets</a>{% endif %}
 </nav>

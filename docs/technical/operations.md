@@ -79,9 +79,7 @@ CI jobs use a separate queue from the internal `jobs` table. The internal `Job` 
 | `index_repo` | `index_repo:<repo_id>` | on enqueue |
 | `drop_session_docs` | `drop_session_docs:<session_id>` | on enqueue |
 | `rebuild_index` | `rebuild_index` | on enqueue |
-| `resolve_commit_links` | none | on enqueue |
 | `update_session_stats` | none | on enqueue |
-| `session_webhook_outbox` | none | on enqueue |
 | `change_mergeability` | `change_mergeability:<change_id>` | on enqueue |
 | `record_revision_commits` | `record_revision_commits:<revision_id>` | on enqueue |
 | `import_repo` | `import_repo:<repo_id>` | on enqueue |

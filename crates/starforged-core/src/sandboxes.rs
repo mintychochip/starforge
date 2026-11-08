@@ -109,37 +109,15 @@ fn default_local_token_file() -> PathBuf {
 /// Egress-proxy settings for the local provider. The sandbox has no direct
 /// egress; its outbound HTTPS goes through this proxy, which terminates TLS
 /// with a per-sandbox CA and injects secret headers only for allowlisted
-/// destinations.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// destinations. The proxy listen address and the CA directory are
+/// `starforge-sandboxd` flags (`--egress-listen`, `--egress-ca-dir`), not
+/// server config: the daemon is a separate process and reads only its own
+/// flags.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EgressConfig {
-    /// Address the egress proxy listens on (inside the provider host).
-    #[serde(default = "default_egress_proxy_listen")]
-    pub proxy_listen: String,
-    /// Directory holding per-sandbox CA keys (mode `0600`, destroyed with
-    /// the sandbox).
-    #[serde(default = "default_egress_ca_dir")]
-    pub ca_dir: PathBuf,
     /// Hosts the proxy (and therefore the sandbox) may reach.
     #[serde(default)]
     pub allowlist: Vec<String>,
-}
-
-impl Default for EgressConfig {
-    fn default() -> Self {
-        Self {
-            proxy_listen: default_egress_proxy_listen(),
-            ca_dir: default_egress_ca_dir(),
-            allowlist: Vec::new(),
-        }
-    }
-}
-
-fn default_egress_proxy_listen() -> String {
-    "127.0.0.1:8888".to_owned()
-}
-
-fn default_egress_ca_dir() -> PathBuf {
-    PathBuf::from("/run/starforge/sandbox-ca")
 }
 
 /// Settings for the `e2b` provider (a `reqwest` client; the API key is
@@ -1342,7 +1320,6 @@ mod tests {
             config.local.token_file,
             PathBuf::from("/run/starforge/sandboxd.token")
         );
-        assert_eq!(config.local.egress.proxy_listen, "127.0.0.1:8888");
         assert!(config.local.egress.allowlist.is_empty());
         assert_eq!(config.e2b.api_url, "https://api.e2b.dev");
         assert_eq!(config.default_ttl_secs, 3600);
@@ -1366,8 +1343,6 @@ socket = "/tmp/sbx.sock"
 token_file = "/tmp/sbx.token"
 
 [local.egress]
-proxy_listen = "127.0.0.1:9000"
-ca_dir = "/tmp/ca"
 allowlist = ["crates.io"]
 
 [e2b]

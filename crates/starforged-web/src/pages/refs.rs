@@ -8,10 +8,14 @@ use crate::AppState;
 use crate::auth::MaybeUser;
 use crate::error::WebError;
 use crate::views::{NavUser, RepoHead, content_href, encode_path, format_age, format_time, nav};
+use starforged_core::permission::Permission;
 
 pub struct BranchRow {
     name: String,
     tree_href: String,
+    commits_href: String,
+    /// Empty for the default branch or for viewers who cannot create trails.
+    new_trail_href: String,
     is_default: bool,
     summary: String,
     author: String,
@@ -71,11 +75,28 @@ pub async fn branches(
         list.insert(0, first);
     }
     let has_default = list.first().is_some_and(|b| b.name == default);
+    let can_new_trail = session.is_some() && access.permission >= Permission::Triage;
     let now = unix_now();
     let branches = list
         .into_iter()
         .map(|b| BranchRow {
             tree_href: content_href(&repo.owner, &repo.name, "tree", &b.name, ""),
+            commits_href: format!(
+                "/{}/{}/commits/{}",
+                repo.owner,
+                repo.name,
+                encode_path(&b.name)
+            ),
+            new_trail_href: if can_new_trail && b.name != default {
+                format!(
+                    "/{}/{}/trails/new?head={}",
+                    repo.owner,
+                    repo.name,
+                    encode_path(&b.name)
+                )
+            } else {
+                String::new()
+            },
             is_default: b.name == default,
             compare_href: if has_default && b.name != default {
                 format!(

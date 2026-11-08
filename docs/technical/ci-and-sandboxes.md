@@ -82,6 +82,10 @@ A runner harvests files that match the job artifact globs. A file name stays rel
 
 The runner initializes the checkout in place with `git init` and `fetch` because `/workspace` already holds the per-sandbox CA directory.
 
+The hourly cleanup runs `gc_expired_artifacts`. It deletes expired artifact rows. It deletes a blob when no unexpired artifact references it.
+
+The blob store keeps the bytes under a BLAKE3 address. Downloads need an artifact token or the job token.
+
 The runner fetches one short-lived git credential per job. `git_credential_for_runner` mints one `sfp_` token. The token scope holds `repo:read` and `repo:write`. The token expires at the earlier of the deadline and now plus 1 hour. The server revokes the token at finish or cancel.
 
 ### Session capture inside jobs

@@ -9,7 +9,7 @@
 {% for b in branches %}
 <tr><td><a href="{{ b.tree_href }}">{{ b.name }}</a>{% if b.is_default %} <span class="badge">default</span>{% endif %}</td>
 <td>{{ b.summary }} <span class="muted">{{ b.author }} · <span title="{{ b.when }}">{{ b.age }}</span></span></td>
-<td>{% if !b.compare_href.is_empty() %}<a href="{{ b.compare_href }}">Compare</a>{% endif %}</td></tr>
+<td><a href="{{ b.commits_href }}">Commits</a>{% if !b.compare_href.is_empty() %} <a href="{{ b.compare_href }}">Compare</a>{% endif %}{% if !b.new_trail_href.is_empty() %} <a href="{{ b.new_trail_href }}">New Trail</a>{% endif %}</td></tr>
 {% endfor %}
 </tbody></table>
 {% endif %}
