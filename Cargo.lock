@@ -5683,6 +5683,7 @@ dependencies = [
  "starforge-format",
  "starforge-redact",
  "starforge-runner",
+ "starforge-sandbox-protocol",
  "tempfile",
  "thiserror",
  "time",
@@ -5728,6 +5729,7 @@ dependencies = [
 name = "starforge-runner"
 version = "0.1.0-rc.1"
 dependencies = [
+ "base64 0.23.1",
  "clap",
  "hex",
  "reqwest",
@@ -5735,6 +5737,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.1",
  "starforge-sandbox-protocol",
+ "tempfile",
  "thiserror",
  "tokio",
  "tracing",

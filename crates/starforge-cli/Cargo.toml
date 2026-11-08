@@ -38,6 +38,7 @@ starforge-capture.workspace = true
 starforge-format.workspace = true
 starforge-redact.workspace = true
 starforge-runner.workspace = true
+starforge-sandbox-protocol = { path = "../starforge-sandbox-protocol", version = "0.1.0-rc.1" }
 thiserror.workspace = true
 time.workspace = true
 tokio.workspace = true

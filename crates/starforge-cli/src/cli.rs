@@ -90,6 +90,11 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: SpoolCmd,
     },
+    /// Run a command in a local sandbox (developer loop against sandboxd).
+    Sandbox {
+        #[command(subcommand)]
+        cmd: SandboxCmd,
+    },
     /// Run the CI runner: claim jobs and execute them in sandboxes.
     Runner {
         #[command(flatten)]
@@ -109,6 +114,72 @@ pub enum SpoolCmd {
         older_than: u64,
     },
 }
+/// `sandbox` subcommands: local developer loop against `starforge-sandboxd`.
+#[derive(Debug, Subcommand)]
+pub enum SandboxCmd {
+    /// Create a sandbox, run one command, and remove it (unless `--keep`).
+    Run {
+        /// sandboxd Unix socket.
+        #[arg(long, default_value = "/run/starforge/sandboxd.sock")]
+        socket: PathBuf,
+        /// sandboxd bearer-token file (rotated on daemon restart).
+        #[arg(long, default_value = "/run/starforge/sandboxd.token")]
+        token_file: PathBuf,
+        /// Image the sandbox runs.
+        #[arg(long)]
+        image: String,
+        /// Egress allowlist entry (`host` or `host:port`; repeatable).
+        #[arg(long = "allow-host")]
+        allow_host: Vec<String>,
+        /// Sandbox environment variable (`KEY=VALUE`; repeatable).
+        #[arg(long = "env")]
+        envs: Vec<String>,
+        /// Sandbox lifetime in seconds (0 = daemon default).
+        #[arg(long, default_value_t = 0)]
+        timeout: u64,
+        /// Keep the sandbox after the command exits.
+        #[arg(long)]
+        keep: bool,
+        /// Command and arguments (after `--`).
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
+    /// Run one command in an existing sandbox.
+    Exec {
+        #[arg(long, default_value = "/run/starforge/sandboxd.sock")]
+        socket: PathBuf,
+        #[arg(long, default_value = "/run/starforge/sandboxd.token")]
+        token_file: PathBuf,
+        /// Sandbox id.
+        id: String,
+        /// Command and arguments (after `--`).
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
+    /// Copy a file out of a sandbox workspace.
+    Cp {
+        #[arg(long, default_value = "/run/starforge/sandboxd.sock")]
+        socket: PathBuf,
+        #[arg(long, default_value = "/run/starforge/sandboxd.token")]
+        token_file: PathBuf,
+        /// Sandbox id.
+        id: String,
+        /// Path inside the sandbox workspace.
+        path: String,
+        /// Local destination file.
+        dest: PathBuf,
+    },
+    /// Kill a sandbox.
+    Kill {
+        #[arg(long, default_value = "/run/starforge/sandboxd.sock")]
+        socket: PathBuf,
+        #[arg(long, default_value = "/run/starforge/sandboxd.token")]
+        token_file: PathBuf,
+        /// Sandbox id.
+        id: String,
+    },
+}
+
 /// `hook` subcommands: agent hook entry points (invoked by Claude Code).
 #[derive(Debug, Subcommand)]
 pub enum HookCmd {
@@ -445,6 +516,7 @@ pub fn run(cli: Cli, paths: CliPaths) -> std::process::ExitCode {
     }
     | Cmd::Export { .. }
     | Cmd::Import { .. }
+    | Cmd::Sandbox { .. }
     | Cmd::Runner { .. } = &cli.cmd
     {
         // fall through to async dispatch below
@@ -482,6 +554,7 @@ fn sync_stub(cli: Cli, paths: CliPaths) -> std::process::ExitCode {
         Cmd::Export { .. } => unreachable!("export dispatches via run_async"),
         Cmd::Import { .. } => unreachable!("import dispatches via run_async"),
         Cmd::Trail { .. } => unreachable!("trail dispatches via run_async"),
+        Cmd::Sandbox { .. } => unreachable!("sandbox dispatches via run_async"),
         Cmd::Runner { .. } => unreachable!("runner dispatches via run_async"),
     }
 }
@@ -639,6 +712,10 @@ pub async fn run_async(cli: Cli, paths: CliPaths) -> std::process::ExitCode {
         Cmd::HookPostCommit => run_hook_post_commit(paths),
         Cmd::HookPrePush => run_hook_pre_push_async(paths).await,
         Cmd::Hook { cmd } => run_hook(cmd, paths).await,
+        Cmd::Sandbox { cmd } => {
+            let code = crate::commands::sandbox::run(cmd, dry_run).await;
+            std::process::ExitCode::from(code)
+        }
         Cmd::Runner { args } => {
             let code = crate::commands::runner::run(args, dry_run).await;
             std::process::ExitCode::from(code)

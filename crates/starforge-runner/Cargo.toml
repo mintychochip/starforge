@@ -17,6 +17,7 @@ dist = false
 workspace = true
 
 [dependencies]
+base64.workspace = true
 clap.workspace = true
 hex.workspace = true
 reqwest.workspace = true
@@ -31,3 +32,4 @@ tracing-subscriber.workspace = true
 url.workspace = true
 
 [dev-dependencies]
+tempfile.workspace = true

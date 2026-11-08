@@ -12,6 +12,8 @@ crates/starforge-cli/src/untrusted.rs
 crates/starforge-runner/src/lib.rs
 crates/starforge-runner/src/main.rs
 crates/starforge-cli/src/commands/runner.rs
+crates/starforge-cli/src/commands/sandbox.rs
+crates/starforge-runner/src/local.rs
 -->
 
 ## Purpose
@@ -71,6 +73,7 @@ The command tree comes from `Cmd` in `cli.rs`:
 | `hook` | Agent hook entry points |
 | `spool` | Prune old spool data |
 | `runner` | Run the CI runner executor, claim CI jobs, and execute them in sandboxes |
+| `sandbox` | Run a command in a local sandbox through `starforge-sandboxd` |
 
 Three hidden commands serve the installed git hooks. `_hook-prepare-commit-msg <msg_file>` serves the `prepare-commit-msg` dispatcher. `_hook-post-commit` serves the `post-commit` dispatcher. `_hook-pre-push` serves the `pre-push` dispatcher.
 
@@ -250,6 +253,18 @@ The `runner` command runs the CI runner executor. It claims CI jobs from the ser
 The executor prints the run plan first. `--dry-run` prints the plan and writes nothing. It performs no network access. The command exits 2 when the token is empty. It exits 0 when the runner goes idle, and 1 on a runner error.
 
 Read the [CI and sandboxes page](ci-and-sandboxes.md) for runner claims, sandboxes, and quotas.
+
+## Sandbox
+
+The `sandbox` command runs a command in a local sandbox through `starforge-sandboxd`. It needs no server and no CI job. It reads the daemon socket and the token file. The defaults are `/run/starforge/sandboxd.sock` and `/run/starforge/sandboxd.token`.
+
+`sandbox run` creates a sandbox, runs one command, streams stdout and stderr, and returns the command's exit code. It kills the sandbox at the end unless you set `--keep`. `--image` sets the image. `--allow-host` adds an egress allowlist entry. `--env KEY=VALUE` adds an environment variable. `--timeout` sets the lifetime.
+
+`sandbox exec <id> -- <command>` runs another command in a kept sandbox. `sandbox cp <id> <path> <dest>` copies one file out of the sandbox workspace. `sandbox kill <id>` kills a sandbox.
+
+The daemon must run with `--egress-dir`. The image must meet the sandbox image contract. The sandbox workspace starts empty. The command must populate it, for example with a clone through the egress proxy.
+
+`--dry-run` prints the planned action and does not contact the daemon.
 
 ## Agent output framing
 

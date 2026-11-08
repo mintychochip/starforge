@@ -21,6 +21,8 @@ use sha2::{Digest, Sha256};
 
 use starforge_sandbox_protocol::{CreateSandboxRequest, ExecChunk, ExecRequest, NetworkPolicy};
 
+pub mod local;
+
 pub const FENCE_HEADER: &str = "x-starforge-fence";
 pub const JOB_STATUS_HEADER: &str = "job-status";
 /// Max log chunk sent per trace request.
