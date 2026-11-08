@@ -76,6 +76,17 @@ The table defines words that appear in code, in the database schema, and in the 
 | scope | A permission string on a token | `Scope` in `tokens.rs` | [http api](http-api.md) |
 | deploy key | One repository SSH key for bots and mirrors | `sshkeys.rs`, `deploy_keys` | [git hosting](git-hosting.md) |
 | SSRF | A forced request from the server to an inside address | `host_allowed` in `webhooks.rs` | [security](security.md) |
+| runner | One registered host that claims and runs CI jobs | `runners`, `RunnerAuth` | [CI and sandboxes](ci-and-sandboxes.md) |
+| CI job | One unit of CI work for one repository commit | `ci_jobs`, `ci.rs` | [CI and sandboxes](ci-and-sandboxes.md) |
+| attempt | One claim of a CI job by one runner | `ci_jobs` attempt fields | [CI and sandboxes](ci-and-sandboxes.md) |
+| lease | The time window that one claim holds a job | `deadline`, claim time | [CI and sandboxes](ci-and-sandboxes.md) |
+| fence | The per claim value that guards job routes | `X-Starforge-Fence` | [CI and sandboxes](ci-and-sandboxes.md) |
+| git credential | The short lived token that a job uses for git access | `ci_jobs.git_token_id` | [CI and sandboxes](ci-and-sandboxes.md) |
+| artifact | One uploaded file set with a BLAKE3 hash | `ci_artifacts`, `sfa_` | [CI and sandboxes](ci-and-sandboxes.md) |
+| supplier | One source of CI compute with its own quotas | `ci_usage.rs`, `depot` | [CI and sandboxes](ci-and-sandboxes.md) |
+| quota | One enforced cap on use per time window | `CiLimits`, `SandboxLimits` | [CI and sandboxes](ci-and-sandboxes.md) |
+| sandbox | One isolated run environment with a network policy | `sandboxes`, `sandboxes.rs` | [CI and sandboxes](ci-and-sandboxes.md) |
+| egress proxy | The per sandbox gateway for outbound traffic | `proxy.rs`, allowlist | [CI and sandboxes](ci-and-sandboxes.md) |
 
 ### Rules for correct use
 

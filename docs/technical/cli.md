@@ -9,6 +9,9 @@ crates/starforge-cli/src/hooks.rs
 crates/starforge-cli/src/spool.rs
 crates/starforge-cli/src/upload.rs
 crates/starforge-cli/src/untrusted.rs
+crates/starforge-runner/src/lib.rs
+crates/starforge-runner/src/main.rs
+crates/starforge-cli/src/commands/runner.rs
 -->
 
 ## Purpose
@@ -19,6 +22,9 @@ The `starforge` binary gives developers a local client for a Starforge server. I
 
 This page covers the `starforge-cli` crate and the `starforge` binary. It covers auth, discovery, hooks, spool, upload order, exit codes, and output framing for agents. It does not cover the server side, the web interface, or the user guide procedures.
 
+That page covers the `runner` command for the CI runner.
+
+The runner also ships as a separate `starforge-runner` binary. The runner crate lives in `crates/starforge-runner`, and the standalone entry point is `main.rs` in `crates/starforge-runner/src`. The `runner` subcommand runs the same executor inside the `starforge` binary.
 ## Install and configuration paths
 
 Install the binary from a release artifact or from the workspace build. The binary name is `starforge`. The crate lives in `crates/starforge-cli`. The entry point is `main.rs` in `crates/starforge-cli/src`.
@@ -64,6 +70,7 @@ The command tree comes from `Cmd` in `cli.rs`:
 | `trail` | List, show, create, comment, push, check out, review, merge Trails |
 | `hook` | Agent hook entry points |
 | `spool` | Prune old spool data |
+| `runner` | Run the CI runner executor, claim CI jobs, and execute them in sandboxes |
 
 Three hidden commands serve the installed git hooks. `_hook-prepare-commit-msg <msg_file>` serves the `prepare-commit-msg` dispatcher. `_hook-post-commit` serves the `post-commit` dispatcher. `_hook-pre-push` serves the `pre-push` dispatcher.
 
@@ -225,6 +232,24 @@ Trail commands talk to the API through `ApiClient` in `api.rs`. The base is `{ap
 `trail create` and `trail comment` accept `--body` or `--body-file`. A body file path of `-` reads stdin. `trail push` accepts `--trail`, `--title`, `--base`, `--topic`, and `--remote`. `trail checkout` accepts `--change`, `--rev`, and `--remote`. It refuses a dirty work tree.
 
 `trail review <n>` requires exactly one verdict flag. The flags are `--approve`, `--request-changes`, and `--comment`. It accepts `--body`, `--body-file`, `--comments`, `--session`, `--change`, and `--rev`. The `--comments` value takes a JSON array, an `@<path>` file, or `@-` for stdin.
+
+## Runner
+
+The `runner` command runs the CI runner executor. It claims CI jobs from the server and executes them in sandboxes. The command accepts the same flags as the `starforge-runner` binary.
+
+| Flag | Effect |
+|---|---|
+| `--server` | Server URL. Environment variable `STARFORGE_SERVER` sets it. |
+| `--token` | Runner token. Environment variable `STARFORGE_RUNNER_TOKEN` sets it. |
+| `--label` | Runner label. Repeat the flag for several labels. |
+| `--runtime` | Sandbox runtime. The default is `podman`. |
+| `--concurrency` | Maximum concurrent jobs. The range is 1 to 64, and the default is 1. |
+| `--poll-timeout` | Poll timeout in seconds. The default is 50. |
+| `--repo-url` | Git clone URL for the repository under test. Optional. |
+
+The executor prints the run plan first. `--dry-run` prints the plan and writes nothing. It performs no network access. The command exits 2 when the token is empty. It exits 0 when the runner goes idle, and 1 on a runner error.
+
+Read the [CI and sandboxes page](ci-and-sandboxes.md) for runner claims, sandboxes, and quotas.
 
 ## Agent output framing
 

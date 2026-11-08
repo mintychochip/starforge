@@ -573,22 +573,59 @@ def check_markdown(path: Path, text: str, root: Path,
     return diagnostics
 
 
+STRUCT_RE = re.compile(r"pub struct (\w+) \{(.*?)\n\}", re.DOTALL)
+FIELD_RE = re.compile(r"^\s*pub (\w+): (.+?),?\s*$", re.MULTILINE)
+
+
 def config_pairs(root: Path) -> set[tuple[str, str]] | None:
-    """Return every (section, key) pair declared in the server Config structs."""
+    """Return every (section, key) pair declared in the server Config structs.
+
+    A field whose type is a struct is a nested table: its keys get the
+    dotted section `section.field`.  A qualified type such as
+    `starforged_core::ci_usage::CiConfig` resolves to the module file in
+    that crate.
+    """
     source = root / "crates" / "starforged" / "src" / "config.rs"
     if not source.is_file():
         return None
-    text = source.read_text(encoding="utf-8")
-    top = re.search(r"pub struct Config \{(.*?)\n\}", text, re.DOTALL)
-    if not top:
-        return None
-    fields: dict[str, list[str]] = {}
-    for struct, body in re.findall(r"pub struct (\w+Config) \{(.*?)\n\}", text, re.DOTALL):
-        fields[struct] = re.findall(r"pub (\w+):", body)
+    files: dict[Path, dict[str, list[tuple[str, str]]]] = {}
+
+    def structs_in(path: Path) -> dict[str, list[tuple[str, str]]]:
+        if path not in files:
+            text = path.read_text(encoding="utf-8") if path.is_file() else ""
+            files[path] = {
+                name: FIELD_RE.findall(body) for name, body in STRUCT_RE.findall(text)
+            }
+        return files[path]
+
+    def resolve(type_name: str, here: Path) -> tuple[Path, str] | None:
+        *modules, name = type_name.strip().split("::")
+        path = here
+        if modules:
+            crate, *rest = modules
+            src = root / "crates" / crate.replace("_", "-") / "src"
+            path = src.joinpath(*rest).with_suffix(".rs") if rest else src / "lib.rs"
+            if rest and not path.is_file():
+                path = src.joinpath(*rest) / "mod.rs"
+        return (path, name) if name in structs_in(path) else None
+
     pairs: set[tuple[str, str]] = set()
-    for section, struct in re.findall(r"pub (\w+): (\w+Config)", top.group(1)):
-        for key in fields.get(struct, []):
-            pairs.add((section, key))
+
+    def walk(section: str, path: Path, struct: str) -> None:
+        for key, type_name in structs_in(path)[struct]:
+            nested = resolve(type_name, path)
+            if nested:
+                walk(f"{section}.{key}", *nested)
+            else:
+                pairs.add((section, key))
+
+    top = structs_in(source).get("Config")
+    if top is None:
+        return None
+    for section, type_name in top:
+        nested = resolve(type_name, source)
+        if nested:
+            walk(section, *nested)
     return pairs
 
 
@@ -599,7 +636,7 @@ def check_config_coverage(root: Path, diagnostics: list[Diagnostic]) -> None:
         return
     documented: set[tuple[str, str]] = set()
     for line in page.read_text(encoding="utf-8").splitlines():
-        match = re.match(r"^\| `([a-z_]+)` \| `([a-z_]+)` \|", line)
+        match = re.match(r"^\| `([a-z0-9_.]+)` \| `([a-z0-9_]+)` \|", line)
         if match:
             documented.add((match.group(1), match.group(2)))
     for section, key in sorted(pairs - documented):

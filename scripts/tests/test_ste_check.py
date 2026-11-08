@@ -210,6 +210,47 @@ pub struct ServerConfig {
             self.assertTrue(any("server.base_url" in item for item in messages))
             self.assertTrue(any("server.old_key" in item for item in messages))
 
+    def test_qualified_and_nested_sections(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "crates" / "starforged" / "src").mkdir(parents=True)
+            (root / "crates" / "starforged-core" / "src").mkdir(parents=True)
+            (root / "docs" / "technical").mkdir(parents=True)
+            (root / "crates" / "starforged" / "src" / "config.rs").write_text(
+                """
+pub struct Config {
+    pub ci: starforged_core::ci_usage::CiConfig,
+}
+""",
+                encoding="utf-8",
+            )
+            (root / "crates" / "starforged-core" / "src" / "ci_usage.rs").write_text(
+                """
+pub struct CiConfig {
+    pub limits: CiLimits,
+    pub depot: DepotConfig,
+}
+pub struct CiLimits {
+    pub minutes_per_month: u64,
+}
+pub struct DepotConfig {
+    pub api_url: String,
+}
+""",
+                encoding="utf-8",
+            )
+            page = root / "docs" / "technical" / "configuration.md"
+            page.write_text(
+                "# Configuration\n\n| `ci.limits` | `minutes_per_month` |\n",
+                encoding="utf-8",
+            )
+            diagnostics = []
+            ste.check_config_coverage(root, diagnostics)
+            messages = [item.message for item in diagnostics]
+            self.assertEqual(
+                messages, ["document the configuration key ci.depot.api_url"]
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

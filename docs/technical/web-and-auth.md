@@ -167,7 +167,7 @@ The router disables body limits for git routes. See [git hosting](git-hosting.md
 | Dashboard and search | `/` and `/search` | `dashboard`, `search` |
 | Accounts | `/login`, `/login/two-factor`, `/login/oidc`, `/join`, `/logout`, `/forgot`, `/reset/{token}`, `/verify/{token}` | `login`, `device`, `join`, `verify`, `password` |
 | Personal settings | `/settings/profile`, `/settings/tokens`, `/settings/keys`, `/settings/identities` | `settings`, `settings_2fa`, `tokens`, `sshkeys`, `identities` |
-| Site administration | `/admin/users`, `/admin/audit`, `/admin/quarantine`, `/admin/jobs` | `admin` |
+| Site administration | `/admin/users`, `/admin/audit`, `/admin/quarantine`, `/admin/jobs`, `/admin/sandboxes`, `/admin/sandboxes/{id}/kill` | `admin` |
 | Organizations and teams | `/orgs/new`, `/orgs/{org}/members`, `/orgs/{org}/teams/{team}` | `orgs` |
 | Repository creation | `/new`, `/{owner}/{repo}/import/start` | `repo_new` |
 | Repository settings | `/{owner}/{repo}/settings`, `/{owner}/{repo}/settings/hooks`, `/{owner}/{repo}/settings/collaborators` | `repo_settings`, `webhooks`, `collaborators`, `protection`, `remotes`, `github_import` |
@@ -175,11 +175,35 @@ The router disables body limits for git routes. See [git hosting](git-hosting.md
 | History and refs | `/{owner}/{repo}/commits`, `/{owner}/{repo}/commit/{id}`, `/{owner}/{repo}/branches`, `/{owner}/{repo}/compare/{*spec}` | `history`, `refs`, `compare` |
 | Sessions | `/{owner}/{repo}/sessions`, `/{owner}/{repo}/sessions/{ulid}` | `sessions`, `session` |
 | Trails and changes | `/{owner}/{repo}/trails`, `/{owner}/{repo}/trails/{number}`, `/{owner}/{repo}/trails/{number}/changes/{k}` | `trails`, `changes` |
+| CI runs and usage | `/{owner}/{repo}/ci`, `/{owner}/{repo}/ci/usage`, `/{owner}/{repo}/ci/{id}`, `/{owner}/{repo}/ci/{id}/logs`, `POST /{owner}/{repo}/ci/{id}/cancel` | `ci` |
 | Owner profiles | `/{owner}` | `owner` |
 | Static and discovery | `/static/starforge.css`, `/.well-known/starforge.json` | `well_known` |
 
 The list groups about 150 routes. Representative paths hide the full route count.
 A `message` module owns generic message pages.
+### CI and sandbox pages
+
+`/{owner}/{repo}/ci` lists CI runs, newest first. The runs page uses `MaybeUser`.
+Anonymous readers see public repositories only. Core enforces Read and answers `404` for private repositories.
+`/{owner}/{repo}/ci/{id}` shows one run with state, commit, logs, artifacts, and linked sessions.
+
+The run page uses `MaybeUser` and Core enforces Read. The page escapes all runner supplied text.
+`/{owner}/{repo}/ci/{id}/logs` shows full log text as plain text. The logs page uses `MaybeUser`.
+
+It sends `Cache-Control: no-store, private`. Core enforces Read for logs.
+`POST /{owner}/{repo}/ci/{id}/cancel` needs `RequireUser` and checks CSRF. Core enforces Write.
+
+Success redirects with `303` to the run detail. A job of another repository answers `404`.
+The cancel form shows for Write and for runs outside terminal states.
+
+The usage page sends `Cache-Control: no-store`. Starforge meters native usage and limits it. Starforge reads Depot usage from Depot and never enforces Depot limits.
+
+`/{owner}/{repo}/ci/usage` shows this month usage per supplier. It needs `RequireUser`. Core enforces at least Maintain.
+The runs page links to usage for at least Maintain.
+
+`/admin/sandboxes` lists every live and recently killed sandbox, newest first. The page needs `RequireAdmin`.
+Anonymous and non admin callers receive `404`. `POST /admin/sandboxes/{id}/kill` kills one sandbox.
+The kill action needs `RequireAdmin` and checks CSRF. Success redirects to `/admin/sandboxes`.
 
 ## Failure behavior
 
@@ -221,6 +245,7 @@ Integration tests in `crates/starforged/tests/web_*.rs` drive these routes in pr
 - [Accounts and permissions](accounts-and-permissions.md) for identities and grants
 - [Security](security.md) for trust boundaries and abuse controls
 - [User guide](../user/) for account procedures
+- [CI and sandboxes](ci-and-sandboxes.md) for runner and sandbox design
 
 <!-- ste-sources
 crates/starforged-web/src/lib.rs
@@ -231,4 +256,6 @@ crates/starforged-web/src/markdown.rs
 crates/starforged-web/src/highlight.rs
 crates/starforged-web/src/views.rs
 crates/starforged-web/src/pages/mod.rs
+crates/starforged-web/src/pages/ci.rs
+crates/starforged-web/src/pages/admin.rs
 -->

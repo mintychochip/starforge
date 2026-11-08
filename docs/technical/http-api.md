@@ -36,7 +36,7 @@ Scope checks run before repository permission checks. Repository permission chec
 | `RepoWrite` | `repo:write` | Writes repository resources |
 | `TrailWrite` | `trail:write` | Mutates Trails and changes |
 | `SessionUpload` | `session:upload` | Uploads session segments |
-| `Admin` | `admin` | Implies all other scopes |
+| `SandboxRun` | `sandbox:run` | Runs sandboxes for a repository |
 
 `admin` scope implies all other scopes. `repo:write` implies `repo:read`.
 Read handlers mask non-readers as `404`. Admin audit also needs `user.is_admin`.
@@ -194,13 +194,56 @@ A second test matches optional security with `reader` handlers.
 | Admin audit | `GET /admin/audit` | `admin` plus site admin user |
 | OAuth | `POST /oauth/device/code`, `POST /oauth/token`, `POST /oauth/revoke` | None |
 | OpenAPI | `GET /openapi.json` | None |
+| Runners | `POST /repos/{owner}/{repo}/runners/registration-token`, `POST /runners/register`, `GET /repos/{owner}/{repo}/runners`, `DELETE /runners/{id}` | `repo:write` for token, list, and revoke |
+| Runner job protocol | `POST /runners/jobs/request`, `PATCH /runners/jobs/{id}/trace`, `POST /runners/jobs/{id}/heartbeat`, `PUT /runners/jobs/{id}` | Runner token `sfr_` |
+| Job git credential | `POST /ci/jobs/{id}/git-credential` | Runner token `sfr_` with the fence header |
+| Job artifacts | `POST /runners/jobs/{id}/artifacts/authorize`, `PUT /runners/jobs/{id}/artifacts/{*name}`, `GET /runners/jobs/{id}/artifacts/{*name}` | Runner token for authorize, artifact token or job token for upload and download |
+| Job secrets | `POST /runners/jobs/{id}/secrets` | Runner token `sfr_` with the fence header |
+| CI runs | `GET /repos/{owner}/{repo}/ci/runs`, `POST /repos/{owner}/{repo}/ci/runs`, `GET /repos/{owner}/{repo}/ci/runs/{id}`, `POST /repos/{owner}/{repo}/ci/runs/{id}/cancel` | `repo:read` for reads, `repo:write` for trigger and cancel |
+| CI usage | `GET /repos/{owner}/{repo}/ci/usage` | `repo:read` at the API layer, at least Maintain in Core |
+| Supplier links | `PUT /repos/{owner}/{repo}/ci/suppliers/{supplier}`, `DELETE /repos/{owner}/{repo}/ci/suppliers/{supplier}` | `repo:write` at the API layer, at least Admin in Core |
+| CI secrets | `GET /repos/{owner}/{repo}/ci/secrets`, `POST /repos/{owner}/{repo}/ci/secrets`, `DELETE /repos/{owner}/{repo}/ci/secrets/{name}` | `repo:write` |
+| Sandboxes | `POST /sandboxes`, `GET /sandboxes/runtimes`, `GET /sandboxes/{id}`, `DELETE /sandboxes/{id}` | `sandbox:run` token or job token |
+| Sandbox operations | `POST /sandboxes/{id}/pause`, `POST /sandboxes/{id}/resume`, `POST /sandboxes/{id}/timeout`, `POST /sandboxes/{id}/exec` | `sandbox:run` token or job token |
+| Sandbox files and ports | `GET /sandboxes/{id}/files`, `PUT /sandboxes/{id}/files`, `DELETE /sandboxes/{id}/files`, `GET /sandboxes/{id}/ports/{port}/url` | `sandbox:run` token or job token |
 
 Organization member lists need a non-anonymous reader and answer `404` otherwise.
 User SSH key reads need `repo:read`. Deploy key reads need `repo:write`. Success statuses include `200`, `201`, and `202`.
 Deletes answer `204` without a body.
 
-### JSON conventions
+### CI and sandbox routes
 
+CI tokens use three prefixes. `sfp_` names a personal access token.
+`sfr_` names a runner token. `sfj_` names a job token. A fourth prefix, `sfa_`, names a one time artifact token.
+Each extractor accepts one token kind and answers `401` for any other kind.
+
+`RunnerAuth` accepts runner tokens on runner routes. `JobAuth` accepts job tokens on job routes.
+`SessionAuth` accepts a personal access token or a job token on session routes.
+`SandboxAuth` accepts a personal access token with `sandbox:run` or a job token on sandbox routes.
+Runner and job traffic skips the personal access token rate limit count.
+
+`POST /runners/jobs/request` long polls for at most 50 seconds for a claim.
+It answers `201` with a claimed job or `204` with no job. The claim carries the job token and the fence.
+The trace, heartbeat, finish, git credential, and job secrets routes require the fence header `X-Starforge-Fence`.
+A stale fence answers `409`. A missing fence answers `422` with code `invalid`.
+
+The lease deadline runs from claim time. Expired leases let another runner claim the job.
+The trace route takes a `Content-Range` header and answers `416` on a range mismatch.
+A canceled job makes the trace and finish routes answer the canceled state through the `Job-Status` header.
+
+CI secrets resolve through `POST /runners/jobs/{id}/secrets` for egress header injection.
+The response carries `Cache-Control: no-store`. The response never reaches logs or disk.
+Secret values never enter the job environment. A `refs/for` run resolves no secrets unless the repository opts in.
+
+CI usage reads one report per supplier for the current calendar month. Starforge meters native usage and limits it.
+Starforge reads Depot usage from the Depot API and never enforces Depot limits.
+Quota refusals answer `422` with code `invalid`. Sandbox quota refusals answer `429`.
+
+Artifact upload takes raw bytes with a `X-Starforge-Sha256` header. Upload answers `201` and stores content in the blob store.
+Artifact download answers `200` with raw bytes and a `X-Starforge-Blake3` header. Both routes send `Cache-Control: no-store`.
+
+
+### JSON conventions
 Success responses use JSON objects with stable keys. Creates answer `201` with the new resource.
 Session meta creates answer `201` and updates answer `200`. Segment upload answers `200` for new and identical bytes. Session deletes answer `204` without a body.
 
@@ -237,6 +280,7 @@ Core unit tests cover scope parsing and grants. Core unit tests cover fixed wind
 - [Webhooks](webhooks.md) for webhook delivery and retries
 - [Search](search.md) for search query behavior
 - [Configuration](configuration.md) for rate limit keys
+- [CI and sandboxes](ci-and-sandboxes.md) for runner and sandbox design
 
 <!-- ste-sources
 crates/starforged-api/src/lib.rs
@@ -247,4 +291,8 @@ crates/starforged-api/src/sessions.rs
 crates/starforged-api/src/trails.rs
 crates/starforged-api/src/changes.rs
 crates/starforged-api/src/search.rs
+crates/starforged-api/src/ci.rs
+crates/starforged-api/src/ci_auth.rs
+crates/starforged-api/src/sandboxes.rs
+crates/starforged-core/src/tokens.rs
 -->

@@ -54,6 +54,14 @@ It covers limits, the doctor command, backup, restore, and upgrade rules.
 - The hourly pass garbage collects zero reference blobs under the blob garbage collection lock.
 - The hourly pass enqueues at most 100 unrecorded revision commits.
 
+Each job worker also runs the CI sweep. `run_ci_sweep_if_due` calls `sweep_ci_jobs` at most once every 30 seconds across all workers. A compare-exchange on the due time lets one worker sweep per interval. Sweep errors only log warnings. A sweep failure never stops job work.
+
+The sweep requeues claimed or running CI jobs with expired leases. A lease lasts 60 seconds. A reaped job returns to `queued`, or ends `failed` after 3 attempts. A cancel request ends the job as `canceled`. A requeued job writes no terminal check and emits no event.
+
+The sweep also fails overdue CI jobs. A job fails when its deadline passed more than 60 seconds ago. The job ends `failed` with reason `the job exceeded its timeout`. Every job that ends in the sweep writes its terminal `ci/<job>` check and emits a `ci` event.
+
+CI jobs use a separate queue from the internal `jobs` table. The internal `Job` enum gains no new kind for M6. The hourly cleanup now also kills expired sandboxes through `gc_expired_sandboxes`. It kills at most 100 expired sandboxes per pass. A failed provider kill only logs a warning, and the row still moves to `killed`.
+
 | Kind | Dedupe key | Schedule |
 |---|---|---|
 | `hourly_cleanup` | kind | 1 hour |
@@ -129,6 +137,11 @@ It covers limits, the doctor command, backup, restore, and upgrade rules.
 | Key | Default | Storage |
 |---|---|---|
 | `limits.login_per_ip_per_minute` | 10 | in memory window of 60 seconds |
+| `ci.limits.minutes_per_month` | 0, disabled | native runner minutes per repository per month |
+| `ci.limits.artifact_bytes` | 0, disabled | live CI artifact bytes per repository |
+| `sandbox.limits.max_concurrent_per_user` | 0, disabled | running sandboxes per user |
+| `sandbox.limits.max_concurrent_per_repo` | 0, disabled | running sandboxes per repository |
+| `sandbox.limits.sandbox_seconds_per_hour` | 0, disabled | sandbox seconds per hour |
 | `limits.login_per_account_per_hour` | 20 | database count over 3600 seconds |
 | `limits.api_per_token_per_hour` | 5000 | in memory window of 3600 seconds |
 | `limits.refs_for_new_changes_per_hour` | 30 | database count over 3600 seconds |
@@ -136,7 +149,10 @@ It covers limits, the doctor command, backup, restore, and upgrade rules.
 | `sessions.max_repo_bytes` | 20 GiB | per repository |
 | `sessions.max_user_bytes` | 5 GiB | per user |
 | `sessions.max_hourly_bytes` | 500 MiB | per user per hour |
+
 | `sessions.max_decompressed_bytes` | 256 MiB | per decompressed segment |
+
+CI minutes come from `ci_usage` rows for native runner attempts. A full minutes quota refuses new runs at queue time. The refusal writes an `error` check, so a gate shows why the run did not start. The server reads Depot usage from the Depot API only. Starforge never enforces Depot limits.
 
 - A value of 0 disables one of the four `limits.*` controls. A zero session quota rejects every upload.
 - API limit breaches answer 429 with an error envelope and `Retry-After`.
@@ -244,4 +260,7 @@ crates/starforged/src/index_cmd.rs
 crates/starforged-core/src/jobs.rs
 crates/starforged-core/src/metrics.rs
 crates/starforged-core/src/audit.rs
+crates/starforged-core/src/ci.rs
+crates/starforged-core/src/sandboxes.rs
+crates/starforged-core/src/ci_usage.rs
 -->

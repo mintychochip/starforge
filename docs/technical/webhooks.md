@@ -8,13 +8,13 @@ Fan-out never blocks a caller. `dispatch_event` enqueues jobs and swallows fault
 
 ## Scope
 
-This page covers subscriptions, secrets, signatures, and delivery in `crates/starforged-core/src/webhooks.rs`. It covers the retry ladder in `crates/starforged-core/src/jobs.rs`. It covers HTTP routes in `crates/starforged-api/src/webhooks.rs`.
+This page covers subscriptions, secrets, signatures, and delivery in `crates/starforged-core/src/webhooks.rs`. It covers the `ci` event subject in `crates/starforged-core/src/ci.rs`. It covers the retry ladder in `crates/starforged-core/src/jobs.rs`. It covers HTTP routes in `crates/starforged-api/src/webhooks.rs`.
 
 Read [http-api.md](http-api.md) for error envelopes and pagination. Read [security.md](security.md) for permission and abuse rules.
 
 ## Design
 
-`EVENT_TYPES` lists six event names. This page defines the subject shape for the five events that the code emits. The HTTP create route accepts the `ci` name. No code path emits it yet, so this page does not define its subject. Each hook subscribes to a subset. An empty subscription means all events.
+`EVENT_TYPES` lists six event names. The code emits all six events. Each hook subscribes to a subset. An empty subscription means all events.
 
 | Event | Actions | Subject keys |
 |---|---|---|
@@ -23,6 +23,7 @@ Read [http-api.md](http-api.md) for error envelopes and pagination. Read [securi
 | `review` | `submitted`, `dismissed` | `id`, `trail`, `change`, `revision`, `verdict`, `state`, `author`, `body` |
 | `check` | None, None | `sha`, `context`, `state`, `target_url`, `description`, `creator` |
 | `session` | `uploaded`, `quarantined`, `published` | `ulid`, `uploader`, `agent`, `lifecycle_state`, `quarantine_state`, `visibility` |
+| `ci` | `queued`, `started`, `finished`, `canceled` | `ci_job_id`, `job_name`, `commit_sha`, `state`, `runner_id`, `exit_code`, `created_by` |
 
 `push` fires per branch or tag update. Only `refs/heads/*` and `refs/tags/*` qualify. `refs/for/*` proposals never emit `push`.
 
@@ -30,6 +31,10 @@ Read [http-api.md](http-api.md) for error envelopes and pagination. Read [securi
 
 `review` with `dismissed` fires on explicit dismissal. It also fires when a new revision lands. The automatic dismissal carries `sender: null`.
 
+
+`ci` carries run identity for one CI job. `emit_ci_event` in `crates/starforged-core/src/ci.rs` builds the subject. Action `queued` fires at queue time. Action `started` fires at claim time.
+
+Action `finished` fires at a terminal result. Action `canceled` fires at cancel time. Checks that a CI job submits carry `ci_job_id` in the subject.
 `session` subjects carry identifiers and state only. Titles, reasons, prompts, and transcripts never enter a payload. `session_subject` enforces this rule in code.
 
 Every envelope carries seven fixed fields. The subject sits under the key that names the event.
@@ -145,6 +150,7 @@ Read [http-api.md](http-api.md) for route conventions and error shape. Read [sec
 Read [docs/user/api-and-webhooks.md](../user/api-and-webhooks.md) for receiver setup and signature checks.
 
 <!-- ste-sources
+crates/starforged-core/src/ci.rs
 crates/starforged-core/src/webhooks.rs
 crates/starforged-core/src/jobs.rs
 crates/starforged-api/src/webhooks.rs

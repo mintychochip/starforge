@@ -112,7 +112,10 @@ pub struct StorageConfig {
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SecurityConfig {
-    /// 64 hex characters (32 bytes). Losing it logs everyone out (spec §12).
+    /// 64 hex characters (32 bytes). Seals webhook secrets, mirror and
+    /// GitHub-import credentials, CI secrets, and TOTP secrets: losing it
+    /// makes them unreadable. Web sessions and recovery codes do not depend
+    /// on it.
     pub secret_key: String,
 }
 

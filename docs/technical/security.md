@@ -29,6 +29,9 @@ It covers secrets at rest, audit reads, and known limits.
 | Agent output and session traces | Untrusted text until redaction and quarantine run |
 | Mirror upstream | Untrusted until URL and SSRF checks pass |
 | Webhook receiver | Untrusted until the SSRF gate allows delivery |
+| CI runner | Untrusted until the runner token and the lease fence pass |
+| CI job execution | Untrusted until the job token stays live and the fence matches |
+| Sandbox workload | Untrusted until isolation and the egress allowlist constrain it |
 
 - The server treats browser input as untrusted until templates escape output.
 - The server treats agent output as untrusted until redaction and quarantine run.
@@ -80,6 +83,7 @@ It covers secrets at rest, audit reads, and known limits.
 | `repo:write` | Write repository content |
 | `trail:write` | Change Trail content |
 | `session:upload` | Upload session segments |
+| `sandbox:run` | Run sandboxes for a repository |
 | `admin` | Full site administration |
 
 - `repo:write` implies `repo:read`.
@@ -164,8 +168,9 @@ It covers secrets at rest, audit reads, and known limits.
 ### Secrets handling
 
 - The configuration value `security.secret_key` holds 64 hex characters.
-- Loss of the value makes sealed webhook secrets and sealed mirror credentials unreadable.
+- Loss of the value makes sealed webhook secrets, sealed mirror credentials, sealed CI secrets, and sealed authenticator secrets unreadable.
 - Loss of the value does not by itself end a web session. Web sessions store only a hash of a random token.
+- Recovery codes stay usable after key loss. Recovery codes rest as hash values, not as sealed values.
 - Unreadable sealed values produce a clear error rather than a panic.
 - The credential box seals git remote credentials through XChaCha20 Poly1305.
 - The credential box derives its key from `security.secret_key`.
@@ -177,6 +182,51 @@ It covers secrets at rest, audit reads, and known limits.
 - Backup and restore directories have mode 0700. The initial data directory follows the process umask.
 - The server deletes temporary SSH files after a failure.
 - Git error text redacts user info before logging.
+### CI runner and job authentication
+
+- A runner token uses the `sfr_` prefix. A job token uses the `sfj_` prefix.
+- The server stores a hash of each token and never stores the clear value.
+- A revoked runner stops authenticating at once. The job claim dies with the runner.
+- A live job token needs a claimed job and a live runner. Access loss revokes every live token of the job first.
+- Finish and cancel revoke the job tokens and the git token. The secret shows once at mint time.
+- Each claim mints one fence. The runner sends the fence in `X-Starforge-Fence` on each job route.
+- A stale fence answers `409`. The lease deadline runs from claim time and expired leases lose the job.
+- The git credential route mints one short lived git token per job. The token shows once and the server stores its hash.
+- An artifact token uses the `sfa_` prefix. It allows one upload or download and expires in ten minutes.
+- The runner scrubs known secret values from log chunks before trace upload. Scrub also covers the URL encoded form.
+
+### CI secret handling
+
+- The server seals CI secrets with XChaCha20 Poly1305 through `CiSecretBox`. The seal uses the `ci-secrets-v1` key.
+- Secret views never carry sealed values or plaintexts. List routes show names only.
+- Resolution returns values in memory for header injection at the egress proxy. The response sends `Cache-Control: no-store`.
+- Secret values never enter the job environment. The runner keeps them out of sandbox environment variables.
+- A `refs/for` run resolves no secrets. The constant `ALLOW_SECRETS_ON_REFS_FOR` is false, and no setting changes it.
+- The egress proxy injects secret headers for allowlisted hosts only. Unbound hosts receive no secret header.
+- The proxy and its bindings redact values in `Debug` output. Values never reach logs, rendered pages, or URLs.
+- The runner does not call the resolution route at this time. A job so receives no repository secret.
+
+### Sandbox isolation
+
+- The local provider shells out to rootless podman through the sandbox daemon. The daemon never runs as root.
+- gVisor runs through `runsc` as an opt in runtime. The runtime table reports gVisor availability.
+- The `e2b` provider talks to a remote cloud through the E2B shaped API. The adapter sends the API key on each call.
+- The provider seam keeps isolation inside the provider. Core enforces policy, quotas, and ownership around it.
+- File paths validate in Core before the provider runs. Absolute paths and `..` escapes fail validation.
+- A per sandbox egress proxy meters socket traffic. The proxy trusts one CA per sandbox.
+- The proxy enforces a host allowlist. Non HTTP ports need CIDR allowlisted addresses.
+- The sandbox trusts the per sandbox CA. The CA keys rest in a directory with mode `0600`.
+- The local provider starts each container with `--network none`. The container cannot reach the proxy on the host, so a local sandbox has no network access.
+- The allowlist and the secret headers have no effect until the container network routes traffic to the proxy.
+
+### CI and sandbox abuse controls
+
+- Sandbox limits cap concurrent sandboxes per user and per repository. A time limit caps sandbox seconds per user per hour.
+- The limits default to zero, which disables each limit. Refusals answer `429`.
+- Native CI limits cap runner minutes per calendar month and artifact bytes per repository. Zero disables each limit.
+- An exhausted minutes month refuses the run and records the reason on its check. Refusals answer `422` with code `invalid`.
+- An artifact quota check runs before each upload authorization. Oversize artifacts fail the size cap check.
+- Depot usage comes from Depot and Depot enforces its own limits. Starforge never blocks Depot work.
 
 ## Interfaces
 
@@ -227,6 +277,7 @@ It covers secrets at rest, audit reads, and known limits.
 - Read the accounts and permissions page at [accounts-and-permissions.md](accounts-and-permissions.md).
 - Read the git hosting page at [git-hosting.md](git-hosting.md).
 - Read the trace and redaction page at [trace-and-redaction.md](trace-and-redaction.md).
+- Read the CI and sandboxes page at [ci-and-sandboxes.md](ci-and-sandboxes.md).
 
 <!-- ste-sources
 crates/starforged-core/src/permission.rs
@@ -236,5 +287,11 @@ crates/starforged-core/src/totp.rs
 crates/starforged-core/src/oauth.rs
 crates/starforged-core/src/sshkeys.rs
 crates/starforged-web/src/auth.rs
+crates/starforged-core/src/ci.rs
+crates/starforged-core/src/ci_usage.rs
+crates/starforged-core/src/sandboxes.rs
+crates/starforged-api/src/ci_auth.rs
+crates/starforge-sandboxd/src/proxy.rs
+crates/starforge-runner/src/lib.rs
 crates/starforged-web/src/markdown.rs
 -->

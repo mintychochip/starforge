@@ -66,7 +66,11 @@ search, webhooks, and mirrors, on SQLite or Postgres.
   storage metered and limited by Starforge (`[ci.limits]`), and a linked
   Depot repository's usage read from Depot's API with its limits left to
   Depot (`GET /repos/{owner}/{repo}/ci/usage`). External CI statuses and
-  webhooks are unchanged, and the server never runs job code.
+  webhooks are unchanged, and the server never runs job code. Known
+  limitation: local sandboxes still run with `--network none`, so they
+  cannot reach the egress proxy, and the runner's in-sandbox `git clone`
+  and session sync fail there; and expired artifacts stop downloading
+  and counting after 30 days but are not yet deleted from disk.
 - **CLI:** `starforge` — `auth login` (device flow, scopes `repo:read
   trail:write session:upload`), `auth ssh-key add` (one-time `repo:write`
   device flow; both tokens are revoked and never stored), `enable`/`disable`
@@ -82,6 +86,11 @@ search, webhooks, and mirrors, on SQLite or Postgres.
 - **Configuration:** `server.base_url` must be an origin
   (`https://forge.example.com`); Starforge cannot be served under a path
   prefix.
+- **Documentation:** maintainer technical documentation in
+  `docs/technical/`, written in ASD-STE100 Simplified Technical English and
+  checked by `scripts/ste_check.py` (the mechanical STE rules, source
+  paths, links, the index, and coverage of every workspace crate and
+  configuration key, nested tables included) in CI and `scripts/check.sh`.
 
 ### Migrations
 

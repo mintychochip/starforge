@@ -34,6 +34,7 @@ confirms that the paths exist and that the text follows the mechanical rules.
 | [web-and-auth.md](web-and-auth.md) | Web routes, templates, web sessions, CSRF, sign-in |
 | [http-api.md](http-api.md) | REST API conventions, scopes, errors, pagination |
 | [sessions.md](sessions.md) | Capture, spool, sync, ingest, quotas, viewer |
+| [ci-and-sandboxes.md](ci-and-sandboxes.md) | CI spec, runners, sandboxes, secrets, quotas, usage |
 | [trace-and-redaction.md](trace-and-redaction.md) | Trace Format v1, segments, redaction, quarantine |
 | [search.md](search.md) | Tantivy index, query path, code search |
 | [webhooks.md](webhooks.md) | Events, signatures, delivery, retries |

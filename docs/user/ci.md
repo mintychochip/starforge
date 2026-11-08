@@ -51,9 +51,10 @@ runs_on = ["linux"]
   claims the job, so time spent waiting for a runner does not count; a
   job still running past it fails with `the job exceeded its timeout`.
 - `env` injects plain environment variables into the job.
-- `secrets` lists secret **names** (never values) to resolve for the
-  job. A name that does not exist for the repo, or that the trust rule
-  (below) forbids, fails the job.
+- `secrets` lists secret **names** (never values) for the job. Delivery
+  of secrets to jobs is not wired yet (see [Secrets](#secrets)): a job
+  receives none of them today, and a missing or forbidden name is not an
+  error.
 - `artifacts` lists globs for files the runner harvests on completion:
   relative paths only, no `..`; each artifact upload is capped at 1 GiB.
 - `runs_on` lists runner labels that may claim the job (empty means any
@@ -112,7 +113,7 @@ run page.
 
 Files matching a job's `artifacts` globs are uploaded after a
 successful run (authorize-then-PUT, download authenticated). Artifacts
-expire after 30 days and are garbage-collected with the blob store.
+expire after 30 days; an expired artifact can no longer be downloaded.
 Artifact names must be relative and stay inside the workspace.
 
 ## Secrets
@@ -137,6 +138,11 @@ Values never enter the sandbox environment or filesystem — the egress
 proxy injects them as headers for allowlisted destinations only. A
 secret's value is registered for dynamic redaction in the job's
 sessions, so it cannot appear in session text, logs, or search results.
+
+**Not wired yet:** the runner does not resolve a job's secrets and creates
+its sandbox with an empty network policy, and local sandboxes have no
+network at all, so no secret reaches a job today. Creating, listing,
+rotating, and deleting secrets works.
 
 ## Usage and quotas
 

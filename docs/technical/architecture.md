@@ -16,6 +16,12 @@ crates/starforged-db/src/lib.rs
 crates/starforged-git/src/lib.rs
 crates/starforged-blob/src/lib.rs
 crates/starforged-index/src/lib.rs
+crates/starforge-runner/src/lib.rs
+crates/starforge-sandbox-protocol/src/lib.rs
+crates/starforge-sandboxd/src/lib.rs
+crates/starforged-core/src/ci.rs
+crates/starforged-core/src/sandboxes.rs
+crates/starforged-core/src/ci_usage.rs
 -->
 
 ## Purpose
@@ -44,6 +50,13 @@ No separate worker process exists.
 Jobs live in `starforged-core`.
 The workers run inside the server process.
 
+The CI control plane lives in `starforged-core`.
+The `ci` module owns runners, runs, jobs, artifacts, and CI secrets.
+The `sandboxes` module owns the sandbox control plane.
+The `ci_usage` module meters native runner use.
+Depot usage comes from Depot through `ci_usage_depot`.
+The control plane never enforces Depot limits.
+
 The binary entry point lives in `crates/starforged/src/main.rs`.
 `main` parses command line arguments with `Cli::parse`.
 The `serve` command calls `serve::run`.
@@ -63,6 +76,10 @@ flowchart TB
     Core --> Index[("Tantivy index")]
     Workers["Two job workers"] --> Core
     Hook["Hook process"] --> Policy["Ref policy"]
+    Runner["starforge-runner"] --> HTTP
+    Core --> Daemon["Sandbox daemon"]
+    Daemon --> Podman["Rootless podman"]
+    Daemon --> Proxy["Egress proxy"]
 ```
 
 The layer rule separates the crates.
@@ -94,6 +111,11 @@ The router build then merges web, API, and operations routes.
 The HTTP bind then opens the TCP listener.
 The SSH start then opens the SSH listener when enabled.
 SSH starts before the HTTP serve loop begins.
+
+Each job worker sweeps CI jobs when a sweep is due.
+The sweep interval is 30 seconds.
+The sweep requeues jobs with expired leases.
+The sweep fails jobs past deadline plus a 60 second grace period.
 
 Shutdown uses one signal future.
 `shutdown_signal` listens for ctrl-c.
@@ -162,6 +184,39 @@ The route accepts one segment body.
 `Core` inserts the session and segment rows.
 `Core` enqueues index jobs for the new segment.
 
+A CI run enters `starforged-api`.
+The runner registers with a runner token.
+The runner long-polls for a job with `POST /runners/jobs/request`.
+The server claims the job under a fence token.
+The runner mints a short-lived git credential.
+The runner creates a sandbox through the sandbox API.
+
+The runner runs job commands in the sandbox.
+The runner streams log bytes with `Content-Range`.
+The runner sends a heartbeat every 30 seconds.
+The runner finishes with state, exit code, checksum, and session identifiers.
+A stale fence returns 409 and stops the runner.
+A canceled job kills the sandbox and stops the runner.
+
+The sandbox daemon is a separate process.
+The daemon listens on a Unix socket.
+The socket path comes from `sandbox.local.socket`.
+The server sends a bearer token from `sandbox.local.token_file`.
+The daemon runs containers with rootless podman.
+The daemon also runs sandboxes with `gvisor` on request.
+
+Each sandbox gets one egress proxy task.
+The proxy denies all egress by default.
+The proxy allows only `sandbox.local.egress.allowlist` hosts.
+The proxy terminates TLS with a per-sandbox CA.
+The proxy injects secret headers for allowlisted hosts.
+Secret values never enter the sandbox.
+
+The local provider starts each container with `--network none`.
+The proxy listens on a host address that such a container cannot reach.
+A local sandbox so has no network access at this time.
+The allowlist and the secret headers have no effect until the container network routes traffic to the proxy.
+
 ## Failure behavior
 
 Invalid configuration stops startup.
@@ -209,3 +264,4 @@ python3 scripts/ste_check.py docs/technical/architecture.md
 - [operations documentation](operations.md)
 - [web and auth documentation](web-and-auth.md)
 - [http api documentation](http-api.md)
+- [CI and sandboxes](ci-and-sandboxes.md)

@@ -6,6 +6,14 @@ scripts/check.sh
 crates/starforged-db/src/testing.rs
 crates/starforged/tests/common/mod.rs
 crates/starforged/tests/e2e_binary.rs
+crates/starforged/tests/api_ci_jobs.rs
+crates/starforged/tests/api_ci_runners.rs
+crates/starforged/tests/api_ci_runs.rs
+crates/starforged/tests/api_ci_usage.rs
+crates/starforged/tests/api_sandboxes.rs
+crates/starforged/tests/ci_e2e.rs
+crates/starforged/tests/ci_security.rs
+crates/starforged/tests/web_ci.rs
 scripts/browser-tests.sh
 scripts/docs-smoke.sh
 scripts/build-release.sh
@@ -38,7 +46,9 @@ Unit tests live inline in source files. Crates without a `tests/` directory rely
 
 Property tests use the `proptest` crate, version 1.12.0. The workspace defines the dependency in `Cargo.toml`. Cases live in `starforge-format/src/segments.rs`, `starforged-core/src/permission.rs`, `starforged-core/src/read.rs`, and `starforged-git/src/refpolicy.rs`. The format crate also holds ULID round-trip cases in `starforge-format/tests/v1_fixtures.rs`. Contract tests live in `crates/starforge-redact/tests/corpus.rs` and `crates/starforged-blob/tests/store.rs`.
 
-Integration tests exercise the full server in process. The server crate holds about 100 test files. The CLI crate holds 15 test files. The capture crate holds 7 test files. They cover the API, the web interface, search, mirrors, import, backup, and SSH git transport.
+Integration tests exercise the full server in process. The server crate holds about 113 test files. The CLI crate holds 17 test files. The capture crate holds 7 test files. They cover the API, the web interface, search, mirrors, import, backup, and SSH git transport.
+
+M6 adds `api_ci_jobs.rs`, `api_ci_runners.rs`, `api_ci_runs.rs`, `api_ci_usage.rs`, and `api_sandboxes.rs`. M6 also adds `ci_e2e.rs`, `ci_security.rs`, and `web_ci.rs` for CI and sandbox behavior. Unit tests in `crates/starforged-core/src/ci.rs` and `crates/starforged-core/src/ci_spec.rs` cover job specs and usage metering.
 
 Binary end-to-end tests spawn real binaries. The server test file is `crates/starforged/tests/e2e_binary.rs`. The CLI test file is `crates/starforge-cli/tests/e2e_binary.rs`. They prove the process boundary, not just the library boundary.
 

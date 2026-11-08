@@ -7,6 +7,9 @@ crates/starforged/src/admin.rs
 crates/starforged-core/src/lib.rs
 crates/starforged-core/src/mail.rs
 crates/starforged-core/src/crypto.rs
+crates/starforged-core/src/sandboxes.rs
+crates/starforged-core/src/ci_usage.rs
+crates/starforged-core/src/ci.rs
 -->
 
 ## Purpose
@@ -36,6 +39,11 @@ It generates a random `secret_key` with 32 bytes. It creates `repos`, `tmp`, and
 The code ignores variables without the `STARFORGE__` prefix. The prefix is case-sensitive and must use uppercase. The section and key remainder is case-insensitive. Unknown keys with the prefix cause a fatal error.
 
 Booleans accept only `true`, `1`, `false`, or `0`. List keys accept comma-separated values. The code drops empty list entries.
+
+Nested keys use one `__` per level.
+The code accepts `STARFORGE__SANDBOX__LOCAL__SOCKET`.
+The code accepts `STARFORGE__CI__LIMITS__MINUTES_PER_MONTH`.
+The code rejects an unknown nested key as fatal.
 
 `STARFORGE_CONFIG` selects the file path.
 
@@ -88,8 +96,26 @@ Booleans accept only `true`, `1`, `false`, or `0`. List keys accept comma-separa
 | `log` | `format` | string | `text` | Log output format |
 | `log` | `level` | string | `info` | Log level filter |
 | `metrics` | `token` | string | none, disabled | Bearer token for metrics |
+| `sandbox` | `provider` | string | `local` | Sandbox provider: `local` or `e2b` |
+| `sandbox` | `default_ttl_secs` | number | 3600 | Default sandbox lifetime in seconds |
+| `sandbox.local` | `socket` | path | `/run/starforge/sandboxd.sock` | Sandbox daemon Unix socket |
+| `sandbox.local` | `token_file` | path | `/run/starforge/sandboxd.token` | Sandbox daemon token file |
+| `sandbox.local.egress` | `proxy_listen` | string | `127.0.0.1:8888` | Egress proxy listen address |
+| `sandbox.local.egress` | `ca_dir` | path | `/run/starforge/sandbox-ca` | Per-sandbox CA directory |
+| `sandbox.local.egress` | `allowlist` | list | empty | Hosts the sandbox can reach |
+| `sandbox.e2b` | `api_url` | string | `https://api.e2b.dev` | E2B API base URL |
+| `sandbox.e2b` | `api_key` | string | empty | E2B API key |
+| `sandbox.limits` | `max_concurrent_per_user` | number | 0, disabled | Concurrent sandboxes per user |
+| `sandbox.limits` | `max_concurrent_per_repo` | number | 0, disabled | Concurrent sandboxes per repository |
+| `sandbox.limits` | `sandbox_seconds_per_hour` | number | 0, disabled | Sandbox seconds per user per hour |
+| `ci.limits` | `minutes_per_month` | number | 0, disabled | Native runner minutes per month |
+| `ci.limits` | `artifact_bytes` | number | 0, disabled | Unexpired artifact bytes per repository |
+| `ci.depot` | `api_url` | string | `https://api.depot.dev` | Depot API base URL |
+| `ci.depot` | `api_token` | string | empty, disabled | Depot organization token |
 
-Missing sections take the defaults above. Old files keep working without new sections. A `limits.*` value of `0` disables that control. A session `*_bytes` quota of `0` rejects every upload.
+Missing sections take the defaults above. Old files keep working without new sections. A `limits.*` value of `0` disables that control. A session `*_bytes` quota of `0` rejects every upload. A `sandbox.limits.*` value of `0` disables that control. A `ci.limits.*` value of `0` disables that control.
+
+The `sandbox.provider` override accepts `local` or `e2b` only. An unknown provider value stops startup. Number overrides must parse as non-negative counts. An empty `ci.depot.api_token` disables the Depot supplier. An empty `sandbox.e2b.api_key` leaves the E2B provider without an API key. `Config::validate` checks no `sandbox.*` or `ci.*` value beyond environment parsing.
 
 ### Derived values
 
@@ -110,9 +136,15 @@ Missing sections take the defaults above. Old files keep working without new sec
 
 `security.secret_key` seals webhook secrets. `security.secret_key` derives the mirror credential key. The webhook key uses the key directly. The credential box uses HKDF from the key.
 
-Loss of `secret_key` makes sealed webhook secrets unreadable. It does not by itself end a web session, because web sessions store only a hash of a random token. It also makes sealed mirror credentials unreadable. A replacement has the same effect. Webhook deliveries fail until operators reset the secrets.
+The key also seals TOTP secrets with the webhook key. The key also seals CI secrets through `CiSecretBox`. `CiSecretBox` uses HKDF info `ci-secrets-v1` and XChaCha20-Poly1305.
 
-Mirror synchronization fails until operators reset credentials. `Debug` output redacts `secret_key`. `Debug` output redacts mail credentials. `Debug` output redacts OIDC client secrets. `Debug` output redacts metrics tokens.
+Loss of `secret_key` makes sealed webhook secrets unreadable. Loss of `secret_key` makes sealed mirror credentials unreadable. Loss of `secret_key` makes sealed TOTP secrets unreadable. TOTP codes stop working after loss. Recovery codes still work after loss, because recovery codes store SHA-256 hashes.
+
+Loss of `secret_key` makes sealed CI secrets unreadable. Web sessions do not depend on the key, because web sessions store only a hash of a random token. Loss of `secret_key` does not sign anyone out. A replacement has the same effect. Webhook deliveries fail until operators reset the secrets.
+
+Mirror synchronization fails until operators reset credentials. TOTP sign-in fails until operators reset TOTP secrets. CI secret resolution fails until operators reset CI secrets. `Debug` output redacts `secret_key`. `Debug` output redacts mail credentials.
+
+`Debug` output redacts OIDC client secrets. `Debug` output redacts metrics tokens. `Debug` output redacts `sandbox.e2b.api_key`. `Debug` output redacts `ci.depot.api_token`.
 
 ## Interfaces
 

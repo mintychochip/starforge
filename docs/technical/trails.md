@@ -75,6 +75,14 @@ Status states are `pending`, `success`, `failure`, and `error`. A context holds 
 
 Combined precedence ranks `error` above `failure` above `pending` above `success`. An unknown SHA returns `pending` with an empty list. Writes record no timeline or audit rows. Writes fire the `check` webhook event. Reads below read permission return `NotFound`.
 
+CI writes checks with two context forms. A job result uses context `ci/<job>`. `finish_ci_job` writes the terminal check through `submit_ci_status`. The sweep, cancel, and quota refusal also write terminal `ci/<job>` checks.
+
+A spec failure uses context `ci/spec`. The server writes an `error` check when a commit spec fails to parse or validate. It writes the check only when the queue call names a creator. A system trigger with no creator writes no check.
+
+`evaluate_gates` reads checks from the checks table. A required context passes only with `success` on the current head. A gate can require `ci/<job>` or `ci/spec` by name.
+
+Read the [CI and sandboxes page](ci-and-sandboxes.md) for CI runs and quotas.
+
 ### Gates
 
 `GateRuleDto` describes one gate rule. The fields include pattern, required approvals, dismiss flag, request-changes block, required contexts, up-to-date flag, threads flag, session evidence flag, allowed methods, and push rules. `GateRuleInput` uses absent versus null semantics for updates.
@@ -136,5 +144,6 @@ crates/starforged-core/src/checks.rs
 crates/starforged-core/src/gates.rs
 crates/starforged-core/src/gate_rules.rs
 crates/starforged-core/src/merge.rs
+crates/starforged-core/src/ci.rs
 crates/starforged-db/src
 -->

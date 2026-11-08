@@ -6,6 +6,9 @@ crates/starforge-capture
 crates/starforge-cli
 crates/starforge-format
 crates/starforge-redact
+crates/starforge-runner
+crates/starforge-sandbox-protocol
+crates/starforge-sandboxd
 crates/starforged-api
 crates/starforged-blob
 crates/starforged-core
@@ -17,8 +20,10 @@ crates/starforged-web
 crates/starforged
 crates/starforged/src/lib.rs
 crates/starforged-core/src/lib.rs
+crates/starforge-runner/src/lib.rs
+crates/starforge-sandbox-protocol/src/lib.rs
+crates/starforge-sandboxd/src/lib.rs
 -->
-
 ## Purpose
 
 This page lists every crate in the workspace.
@@ -39,8 +44,8 @@ The [storage and database page](storage-and-database.md) describes stored state.
 Server code and client code have different licenses.
 The workspace package license is AGPL-3.0-or-later.
 `publish` is false for every server crate.
-The four client crates publish separately.
-Those four crates use MIT OR Apache-2.0.
+The seven client crates publish separately.
+Those seven crates use MIT OR Apache-2.0.
 The split keeps the server under copyleft.
 
 The client format stays reusable by other tools.
@@ -58,10 +63,12 @@ Dependency direction follows the layer rule.
 `starforged` depends on every server crate.
 `starforged-core` depends on storage crates only.
 
+`starforged-core` also depends on `starforge-sandbox-protocol`.
 `starforged-core` depends on `starforged-db`.
 `starforged-core` depends on `starforged-git`.
 `starforged-core` depends on `starforged-blob`.
 `starforged-core` depends on `starforged-index`.
+
 `starforged-core` also depends on the two client crates.
 The client crates share Trace Format v1 and redaction rules.
 
@@ -83,10 +90,13 @@ flowchart BT
     starforged-core --> starforged-index
     starforged-core --> starforge-format
     starforged-core --> starforge-redact
+    starforged-core --> starforge-sandbox-protocol
     starforge-cli --> starforge-capture
     starforge-cli --> starforge-format
     starforge-capture --> starforge-format
     starforge-cli --> starforge-redact
+    starforge-runner --> starforge-sandbox-protocol
+    starforge-sandboxd --> starforge-sandbox-protocol
 ```
 
 ## Interfaces
@@ -100,15 +110,18 @@ Relevant build files live in each crate directory.
 | `starforge-redact` | Secret redaction engine | `detectors`, `json`, `rules` | `regex`, `blake3`, `starforge-format` | `tests/corpus.rs` |
 | `starforge-capture` | Agent transcript adapters | `adapter`, `agents`, `cursor`, `discover` | `rusqlite`, `starforge-format` | `tests/` golden files |
 | `starforge-cli` | `starforge` command client | `api`, `auth`, `cli`, `commands`, `discovery`, `git`, `hooks`, `ingest`, `queue`, `spool`, `upload` | `clap`, `reqwest`, `starforge-capture`, `starforge-format`, `starforge-redact` | `tests/` end to end |
-| `starforged-core` | Domain rules and service layer | `accounts`, `jobs`, `mail`, `permission`, `ingest`, `trails`, `gitaccess`, `metrics` | `starforged-db`, `starforged-git`, `starforged-blob`, `starforged-index`, `starforge-format`, `starforge-redact`, `argon2`, `lettre` | `src/` unit tests |
-| `starforged-db` | Relational persistence both engines | `audit`, `changes`, `jobs`, `repos`, `sessions`, `trails`, `users`, `web_sessions` | `sqlx`, `thiserror` | `src/` unit tests |
+| `starforged-core` | Domain rules and service layer | `accounts`, `ci`, `ci_spec`, `ci_usage`, `ci_usage_depot`, `jobs`, `mail`, `permission`, `ingest`, `sandboxes`, `sandboxes_e2b`, `trails`, `gitaccess`, `metrics` | `starforged-db`, `starforged-git`, `starforged-blob`, `starforged-index`, `starforge-format`, `starforge-redact`, `starforge-sandbox-protocol`, `argon2`, `lettre` | `src/` unit tests |
+| `starforged-db` | Relational persistence both engines | `audit`, `changes`, `ci`, `jobs`, `repos`, `sandboxes`, `sessions`, `trails`, `users`, `web_sessions` | `sqlx`, `thiserror` | `src/` unit tests |
 | `starforged-git` | Repositories on disk | `blame`, `command`, `diff`, `grep`, `http`, `init`, `merge`, `refpolicy`, `write` | `gix`, `tokio`, `serde` | `src/` unit tests |
 | `starforged-ssh` | Git over SSH server | `command`, `server` | `russh`, `starforged-core`, `starforged-git` | `src/` unit tests |
 | `starforged-web` | HTML pages and smart HTTP | `auth`, `error`, `githttp`, `highlight`, `markdown`, `pages`, `views` | `axum`, `askama`, `starforged-core`, `starforged-git`, `syntect` | `starforged/tests/` integration |
-| `starforged-api` | JSON REST API | `admin`, `auth`, `changes`, `openapi`, `repos`, `sessions`, `trails` | `axum`, `utoipa`, `starforged-core` | `starforged/tests/` integration |
+| `starforged-api` | JSON REST API | `admin`, `auth`, `changes`, `ci`, `ci_auth`, `openapi`, `repos`, `sandboxes`, `sessions`, `trails` | `axum`, `utoipa`, `starforged-core` | `starforged/tests/` integration |
 | `starforged-blob` | Content addressed blob store | `BlobStore`, `FsBlobStore`, `BlobError` | `blake3`, `tokio`, `thiserror` | `tests/store.rs` |
 | `starforged-index` | Tantivy search index | `SearchIndex`, `TrailDoc`, `EventDoc` | `tantivy`, `thiserror` | `src/` unit tests |
 | `starforged` | Server binary and setup | `admin`, `backup`, `config`, `doctor`, `hook`, `index_cmd`, `init`, `restore`, `serve` | `starforged-api`, `starforged-web`, `starforged-ssh`, `starforged-core`, `clap`, `axum` | `tests/` integration |
+| `starforge-runner` | CI runner binary and job executor | `Executor`, `Client`, `HttpSandboxProvider`, `FakeSandboxProvider` | `clap`, `reqwest`, `starforge-sandbox-protocol`, `tokio` | `src/` unit tests |
+| `starforge-sandbox-protocol` | Shared sandbox wire types | `CreateSandboxRequest`, `ExecRequest`, `FileOp`, `NetworkPolicy`, `ProviderError` | `serde`, `serde_json`, `thiserror` | `src/` unit tests |
+| `starforge-sandboxd` | Local sandbox daemon | `DaemonState`, `podman`, `proxy` | `axum`, `starforge-sandbox-protocol`, `tokio`, `nix` | `src/` unit tests |
 
 `starforge-format` defines `Event` and `SessionMeta`.
 `starforge-format` also defines segment split and assemble.
@@ -126,6 +139,31 @@ The CLI talks to a server over HTTPS.
 The library half builds the HTTP app in process.
 `crates/starforged/src/lib.rs` exports each module.
 Integration tests use that library surface.
+
+`starforge-sandbox-protocol` defines the wire types for sandbox providers.
+The wire types include create, exec, file, state, and error types.
+The crate depends on no `starforged-*` crate.
+`starforged-core` and `starforge-sandboxd` both depend on it.
+`starforge-runner` also depends on it.
+
+`starforge-sandboxd` ships the local sandbox daemon binary.
+The daemon serves an HTTP control plane over a Unix socket.
+The daemon runs rootless podman containers through `podman`.
+The daemon also runs a per-sandbox egress proxy through `proxy`.
+The containers run with `--network none` and cannot reach the proxy at this time.
+The opt-in `gvisor` runtime runs through the same daemon.
+
+`starforge-runner` ships the `starforge-runner` binary.
+The same executor also runs inside the `starforge` command.
+`Executor` claims jobs, runs job commands in a sandbox, and finishes jobs.
+`FakeSandboxProvider` supports tests and dry runs.
+
+`starforged-core` holds the CI control plane in `ci` and `ci_spec`.
+`starforged-core` holds sandbox control in `sandboxes` and `sandboxes_e2b`.
+`starforged-core` holds CI usage in `ci_usage` and `ci_usage_depot`.
+`starforged-api` exposes CI and sandbox routes.
+`starforged-web` renders CI pages and admin sandbox pages.
+`starforged-db` stores CI and sandbox state.
 
 ## Failure behavior
 

@@ -133,6 +133,17 @@ host; non-allowlisted hosts are refused, DNS is pinned before connect,
 CA keys are `0600` and destroyed with the sandbox, and secret values
 never enter the sandbox environment or filesystem.
 
+**Current limitation:** the local provider still starts every container
+with `--network none`, so a local sandbox cannot reach the proxy (it
+listens on a host address) and has no network access at all. The
+allowlist and secret header injection therefore have no effect yet, and
+every step that needs the network fails: the runner's `git clone` of the
+commit (when `--repo-url` is set), `starforge sync` of job sessions, and
+any download a job makes. This fails closed; nothing leaves the sandbox.
+The runner also creates every sandbox with an empty network policy and
+never resolves the job's repository secrets, so repository secrets reach
+no job yet.
+
 ## Quotas
 
 Sandbox quotas answer `429` with `Retry-After` when exceeded:
@@ -164,7 +175,9 @@ CI usage and its limits belong to whoever runs the compute:
   usage caps are set and enforced in Depot, and Starforge only reports.
 
 Per-item caps apply to every run: logs cap at 100 MiB per job;
-artifacts at 1 GiB each, with a 30-day expiry and CAS-blob GC.
+artifacts at 1 GiB each, with a 30-day expiry. An expired artifact can no
+longer be downloaded and stops counting toward `ci.limits.artifact_bytes`,
+but no scheduled job deletes it yet: its row and blob stay on disk.
 
 ## Audit
 

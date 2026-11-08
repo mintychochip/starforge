@@ -6,6 +6,9 @@ crates/starforged-db/migrations
 crates/starforged-blob/src/lib.rs
 crates/starforged/src/backup.rs
 crates/starforged/src/restore.rs
+crates/starforged-db/src/ci.rs
+crates/starforged-db/src/sandboxes.rs
+crates/starforged-core/src/ci.rs
 -->
 
 ## Purpose
@@ -50,9 +53,19 @@ Reads inside open transactions use the writer pool. The engine enforces foreign 
 
 ### Migrations
 
-Embedded migrators live in `crates/starforged-db/migrations`. The SQLite and Postgres sets share filenames. Versions run from `0001` to `0029`, then `0034` and `0035`, so `0030` to `0033` are absent. `Db::migrate` runs versions in order. Bookkeeping lives in `_sqlx_migrations`. Rerun of `migrate` is safe and idempotent.
+Embedded migrators live in `crates/starforged-db/migrations`. The SQLite and Postgres sets share filenames. Versions run from `0001` to `0039`, so `0030` to `0033` are absent. `Db::migrate` runs versions in order. Bookkeeping lives in `_sqlx_migrations`. Rerun of `migrate` is safe and idempotent.
 
-Migrations are forward only. A released migration must not change, because sqlx validates its checksum. `0034` rebuilds the SSH fingerprint table and drops orphan rows during the rebuild.
+Migrations are forward only. A released migration must not change, because sqlx validates its checksum. `0034` rebuilds the SSH fingerprint table and drops orphan rows during the rebuild. `0035` adds the `jobs.rerun_at` column for rerun requests on deduplicated jobs. A request that arrives while a deduplicated job runs records its time in `rerun_at`, so the worker runs the job again after it finishes.
+
+`0036` adds the CI tables. `runners` stores registered runners. `runner_registration_tokens` stores hashed registration tokens. `ci_jobs` stores CI jobs in a queue separate from the internal `jobs` table. `ci_job_logs` stores log chunk rows. `ci_artifacts` stores artifact rows.
+
+`ci_job_sessions` links CI jobs to sessions. `ci_job_tokens` stores hashed per-job tokens. `0036` also adds `sessions.ci_job_id`.
+
+`0037` adds `sandboxes` and `sandbox_usage`. `sandboxes` records one sandbox per API create. `sandbox_usage` meters sandbox seconds per owner and repository in hourly windows. `0038` adds `ci_secrets`, `ci_job_secrets`, and `ci_artifact_tokens`.
+
+`ci_secrets` stores sealed CI secret values. `ci_job_secrets` records which secrets one job resolved. `ci_artifact_tokens` stores hashed one-time artifact upload tokens.
+
+`0039` adds `ci_jobs.claimed_at`, `ci_usage`, and `ci_supplier_links`. `claimed_at` records when each claim happens. `ci_usage` records one row per ended attempt of a native runner job. `ci_supplier_links` links a repository to an external CI supplier. The supplier check allows `depot` only.
 
 `auto_migrate` runs migrations at start. `starforged migrate` runs them manually. `doctor` compares latest and known versions. A difference reports a migrate action.
 
@@ -71,6 +84,10 @@ Migrations are forward only. A released migration must not change, because sqlx 
 | Mirrors and imports | `repo_remotes`, `github_imports` | Sealed credentials at rest |
 | Audit | `audit_log` | Append-only by API convention |
 
+| CI runners and jobs | `runners`, `runner_registration_tokens`, `ci_jobs`, `ci_job_logs`, `ci_artifacts`, `ci_job_sessions`, `ci_job_tokens` | Hashed tokens only; one active job per commit and job name |
+| Sandboxes | `sandboxes`, `sandbox_usage` | Idempotency key unique per owner |
+| CI secrets | `ci_secrets`, `ci_job_secrets`, `ci_artifact_tokens` | Sealed values; secret name unique per repository |
+| CI usage | `ci_usage`, `ci_supplier_links` | One usage row per ended native attempt |
 Users and organizations share the `owners` table. User rows cascade from owner rows. Segments cascade from session rows. Blobs track reference counts in rows. Trail numbers live in `trail_sequences`. Each group keeps its own data access module.
 
 Modules live under `crates/starforged-db/src`. Each module owns rows for one group. Business rules live above this layer. The core crate enforces permissions.
@@ -78,6 +95,10 @@ Modules live under `crates/starforged-db/src`. Each module owns rows for one gro
 ### Blob store
 
 `FsBlobStore` stores exact bytes under a root. The hash is the BLAKE3 digest in hex. The layout is `<root>/<hash[0..2]>/<hash>`. `put` skips work when bytes exist. Writes create shard directories as needed. Writes use a same-directory temporary file.
+
+CI log chunks and CI artifacts use the same blob store. `put_log_chunk` writes log bytes through the blob store. Chunk rows record the blob BLAKE3 digest. `upload_ci_artifact` writes artifact bytes through the blob store. Artifact rows record the blob BLAKE3 digest.
+
+Expired artifacts stay out of downloads and out of the artifact quota. No scheduled job deletes expired artifacts. `gc_expired_artifacts` exists, but no caller runs it. Expired artifact rows and blobs stay in place. Read the [CI and sandboxes page](ci-and-sandboxes.md) for the full detail.
 
 The temporary name carries the process identifier. The code writes the temporary file, then renames it. The code does not fsync the file, so a crash can lose the blob. Concurrent identical puts rename over each other. Readers rebuild the hash on every read. Hash mismatch returns a corrupt error.
 
