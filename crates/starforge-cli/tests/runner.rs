@@ -32,6 +32,7 @@ struct FakeState {
     record: Arc<Mutex<Record>>,
     cancel_on_trace: bool,
     stale_on_finish: bool,
+    secret: Option<Value>,
 }
 
 fn job_json() -> Value {
@@ -65,6 +66,15 @@ async fn git_credential() -> impl IntoResponse {
         StatusCode::CREATED,
         Json(json!({ "token": GIT_TOKEN, "token_id": 1 })),
     )
+}
+
+async fn secrets(State(s): State<FakeState>) -> impl IntoResponse {
+    let secrets = s
+        .secret
+        .clone()
+        .map(|secret| vec![secret])
+        .unwrap_or_default();
+    (StatusCode::OK, Json(json!({ "secrets": secrets })))
 }
 
 async fn trace(
@@ -128,6 +138,7 @@ fn app(state: FakeState) -> Router {
     Router::new()
         .route("/api/v1/runners/jobs/request", post(request_job))
         .route("/api/v1/ci/jobs/{id}/git-credential", post(git_credential))
+        .route("/api/v1/runners/jobs/{id}/secrets", post(secrets))
         .route("/api/v1/runners/jobs/{id}/trace", patch(trace))
         .route("/api/v1/runners/jobs/{id}", put(finish))
         .route(
@@ -250,6 +261,50 @@ async fn stale_fence_on_finish_is_reported() {
     let exec = Executor::new(config(&server), FakeSandboxProvider::new());
     let outcome = exec.execute_job(claimed()).await;
     assert!(matches!(outcome, JobOutcome::StaleFence), "{outcome:?}");
+}
+
+#[tokio::test]
+async fn resolved_secret_is_scrubbed_and_bound_to_the_sandbox() {
+    let state = FakeState {
+        secret: Some(json!({
+            "name": "TOKEN",
+            "value": "super-secret",
+            "host": "registry.example",
+            "header": "Authorization",
+        })),
+        ..Default::default()
+    };
+    let server = serve(state.clone()).await;
+    let exec = Executor::new(
+        config(&server),
+        FakeSandboxProvider::new().with_script("cargo test", "leaking super-secret\n", 0),
+    );
+    let outcome = exec.execute_job(claimed()).await;
+    assert!(
+        matches!(outcome, JobOutcome::Succeeded { .. }),
+        "{outcome:?}"
+    );
+    let req = exec.provider.requests.lock().unwrap()[0].clone();
+    assert_eq!(req.envs.get("STARFORGE_TOKEN"), Some(&JOB_TOKEN.to_owned()));
+    assert_eq!(
+        req.network.secret_headers.get("registry.example"),
+        Some(&"Authorization".to_owned())
+    );
+    assert!(
+        req.network
+            .allow_out
+            .iter()
+            .any(|h| h == "registry.example"),
+        "allow_out: {:?}",
+        req.network.allow_out
+    );
+    let rec = state.record.lock().unwrap();
+    let log = String::from_utf8_lossy(&rec.traces.concat()).into_owned();
+    assert!(
+        !log.contains("super-secret"),
+        "secret leaked into logs: {log}"
+    );
+    assert!(log.contains("***"), "the value was scrubbed: {log}");
 }
 
 #[tokio::test]

@@ -690,6 +690,13 @@ pub struct SecretBody {
     /// The plaintext value. It is sealed before storage and never logged
     /// or returned; responses carry metadata only.
     pub value: String,
+    /// The one egress-proxy destination host the secret is bound to;
+    /// empty or absent means the secret is not proxy-injected.
+    #[serde(default)]
+    pub host: Option<String>,
+    /// The header the egress proxy injects (default `Authorization`).
+    #[serde(default)]
+    pub header: Option<String>,
     pub redact_in_sessions: Option<bool>,
 }
 
@@ -698,6 +705,8 @@ pub struct SecretBody {
 pub struct SecretJson {
     pub id: i64,
     pub name: String,
+    pub host: String,
+    pub header: String,
     pub redact_in_sessions: bool,
     pub created_at: String,
     pub updated_at: String,
@@ -709,6 +718,8 @@ pub struct SecretJson {
 pub struct ResolvedSecretJson {
     pub name: String,
     pub value: String,
+    pub host: String,
+    pub header: String,
 }
 
 /// Response of the secret-resolution route.
@@ -1045,9 +1056,13 @@ pub async fn create_secret(
             &auth.user,
             &owner,
             &repo,
-            &body.name,
-            &body.value,
-            body.redact_in_sessions.unwrap_or(true),
+            starforged_core::ci::CiSecretInput {
+                name: &body.name,
+                value: &body.value,
+                host: body.host.as_deref().unwrap_or(""),
+                header: body.header.as_deref().unwrap_or(""),
+                redact_in_sessions: body.redact_in_sessions.unwrap_or(true),
+            },
         )
         .await?;
     Ok((
@@ -1055,6 +1070,8 @@ pub async fn create_secret(
         Json(SecretJson {
             id: view.id,
             name: view.name,
+            host: view.host,
+            header: view.header,
             redact_in_sessions: view.redact_in_sessions,
             created_at: rfc3339(view.created_at),
             updated_at: rfc3339(view.updated_at),
@@ -1093,6 +1110,8 @@ pub async fn list_secrets(
         "secrets": secrets.into_iter().map(|secret| SecretJson {
             id: secret.id,
             name: secret.name,
+            host: secret.host,
+            header: secret.header,
             redact_in_sessions: secret.redact_in_sessions,
             created_at: rfc3339(secret.created_at),
             updated_at: rfc3339(secret.updated_at),
@@ -1167,6 +1186,8 @@ pub async fn resolve_job_secrets(
                 .map(|secret| ResolvedSecretJson {
                     name: secret.name,
                     value: secret.value,
+                    host: secret.host,
+                    header: secret.header,
                 })
                 .collect(),
         }),

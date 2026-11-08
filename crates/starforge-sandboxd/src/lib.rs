@@ -270,31 +270,50 @@ pub async fn sweep_expired(state: &DaemonState, now_unix: i64) -> Vec<String> {
 pub const PROXY_CA_PATH: &str = ".starforge-proxy/ca.pem";
 
 /// Build the per-sandbox egress policy from the create request's network
-/// policy and the daemon's secret bindings. Only bindings whose host is
-/// named in `secret_headers` (and allowlisted) become injectable.
+/// policy, the daemon's static secret bindings, and the request's
+/// server-resolved secret bindings. Only bindings whose host is named in
+/// `secret_headers` with the exact header (and allowlisted) become
+/// injectable.
 pub fn egress_policy(
     network: &starforge_sandbox_protocol::NetworkPolicy,
     daemon_bindings: &[proxy::SecretBinding],
+    request_bindings: &[starforge_sandbox_protocol::SecretBindingWire],
 ) -> proxy::EgressPolicy {
-    let bindings = daemon_bindings
-        .iter()
-        .filter_map(|b| {
-            network
-                .secret_headers
-                .get(&b.host)
-                .map(|header| proxy::SecretBinding {
-                    host: b.host.clone(),
-                    header: header.clone(),
-                    value: b.value.clone(),
-                })
-        })
-        .collect();
-    proxy::EgressPolicy {
+    let mut policy = proxy::EgressPolicy {
         allow_out: network.allow_out.clone(),
         deny_out: network.deny_out.clone(),
-        bindings,
+        bindings: Vec::new(),
         cidr_allow: Vec::new(),
+    };
+    // Request bindings (server-resolved secrets): honor only when
+    // `secret_headers` names the exact header for the host and the host is
+    // allowlisted.
+    for b in request_bindings {
+        if network.secret_headers.get(&b.host) == Some(&b.header) && policy.host_allowed(&b.host) {
+            policy.bindings.push(proxy::SecretBinding {
+                host: b.host.clone(),
+                header: b.header.clone(),
+                value: b.value.clone(),
+            });
+        }
     }
+    // Daemon static bindings: same host/header naming rule, but only for
+    // hosts the request did not already bind.
+    for b in daemon_bindings {
+        if policy.bindings.iter().any(|x| x.host == b.host) {
+            continue;
+        }
+        if let Some(header) = network.secret_headers.get(&b.host)
+            && policy.host_allowed(&b.host)
+        {
+            policy.bindings.push(proxy::SecretBinding {
+                host: b.host.clone(),
+                header: header.clone(),
+                value: b.value.clone(),
+            });
+        }
+    }
+    policy
 }
 
 /// Start egress for a sandbox (CA + proxy). No container contact: must run
@@ -391,7 +410,14 @@ pub fn teardown_egress(state: &DaemonState, id: &str) {
 pub fn proxy_env(state: &DaemonState, id: &str) -> Vec<(String, String)> {
     match state.proxy_addr(id) {
         Some(addr) => {
-            let url = format!("http://{addr}");
+            // Inside the container the host proxy is reachable over the
+            // pasta/slirp loopback gateway, not the daemon's own listen IP.
+            let host = if addr.ip().is_loopback() || addr.ip().is_unspecified() {
+                "10.0.2.2".to_owned()
+            } else {
+                addr.ip().to_string()
+            };
+            let url = format!("http://{host}:{}", addr.port());
             vec![
                 ("HTTPS_PROXY".to_owned(), url.clone()),
                 ("https_proxy".to_owned(), url.clone()),
@@ -490,10 +516,11 @@ async fn create_sandbox(
             format!("failed to generate sandbox id: {e}")
         ))?
     );
-    // Egress (B7): start the per-sandbox proxy + CA first so its env can be
-    // injected into the container at create time, then create, then install
-    // the CA into the trust store.
-    let policy = egress_policy(&req.network, &state.config.secret_bindings);
+    let policy = egress_policy(
+        &req.network,
+        &state.config.secret_bindings,
+        &req.secret_bindings,
+    );
     if let Err(err) = start_egress(&state, &id, &policy).await {
         return Err(ApiError(err));
     }
@@ -501,6 +528,7 @@ async fn create_sandbox(
     for (key, value) in proxy_env(&state, &id) {
         req.envs.insert(key, value);
     }
+    req.network_enabled = state.proxy_addr(&id).is_some();
     if let Err(err) = state.runtime.create(&id, &req).await {
         teardown_egress(&state, &id);
         return Err(ApiError(err));
@@ -1257,6 +1285,93 @@ mod tests {
         assert_eq!(status, StatusCode::NO_CONTENT);
         assert!(state.proxy_addr(&id).is_none());
         assert!(!key_path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn request_secret_bindings_honored_only_when_bound_and_allowlisted() {
+        use std::collections::BTreeMap;
+
+        use starforge_sandbox_protocol::{NetworkPolicy, SecretBindingWire};
+        let network = NetworkPolicy {
+            allow_out: vec!["bound.test".to_owned()],
+            secret_headers: BTreeMap::from([("bound.test".to_owned(), "Authorization".to_owned())]),
+            ..Default::default()
+        };
+        let wire = |host: &str, header: &str| SecretBindingWire {
+            host: host.to_owned(),
+            header: header.to_owned(),
+            value: "wire-secret-123".to_owned(),
+        };
+        // Bound + allowlisted: honored.
+        let policy = egress_policy(&network, &[], &[wire("bound.test", "Authorization")]);
+        assert_eq!(policy.bindings.len(), 1);
+        assert_eq!(policy.bindings[0].host, "bound.test");
+        assert_eq!(policy.bindings[0].header, "Authorization");
+        assert_eq!(policy.bindings[0].value, "wire-secret-123");
+        // Header disagrees with secret_headers: ignored.
+        let policy = egress_policy(&network, &[], &[wire("bound.test", "X-Other")]);
+        assert!(policy.bindings.is_empty());
+        // Host not allowlisted (secret_headers names it, allow_out doesn't):
+        // ignored.
+        let mut expanded = network.clone();
+        expanded
+            .secret_headers
+            .insert("other.test".to_owned(), "Authorization".to_owned());
+        let policy = egress_policy(&expanded, &[], &[wire("other.test", "Authorization")]);
+        assert!(policy.bindings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_with_request_secret_binding_injects_without_env() {
+        let dir =
+            std::env::temp_dir().join(format!("starforge-egress-req-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = DaemonConfig {
+            images: vec!["docker.io/library/rust".to_owned()],
+            egress_listen: Some(([127, 0, 0, 1], 0).into()),
+            egress_ca_dir: dir.clone(),
+            ..DaemonConfig::default()
+        };
+        let runtime = Arc::new(FakeRuntime::new());
+        let state = DaemonState::new(
+            Arc::clone(&runtime) as Arc<dyn Runtime>,
+            "test-token".to_owned(),
+            config,
+        );
+        let (status, body) = req(
+            &state,
+            "POST",
+            "/sandboxes",
+            Some("test-token"),
+            Some(serde_json::json!({
+                "template": "docker.io/library/rust",
+                "network": {
+                    "allow_out": ["bound.test"],
+                    "secret_headers": { "bound.test": "Authorization" },
+                },
+                "secret_bindings": [{
+                    "host": "bound.test",
+                    "header": "Authorization",
+                    "value": "wire-secret-123",
+                }],
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "create body: {body}");
+        let id = body["id"].as_str().unwrap().to_owned();
+        let (_, created_req) = &runtime.created()[0];
+        assert!(created_req.network_enabled);
+        assert!(
+            !created_req.envs.values().any(|v| v.contains("wire-secret")),
+            "secret must not be in env: {:?}",
+            created_req.envs
+        );
+        // Loopback proxy is reachable from the container at 10.0.2.2.
+        let port = state.proxy_addr(&id).unwrap().port();
+        let env = proxy_env(&state, &id);
+        let get = |key: &str| env.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone());
+        assert_eq!(get("HTTP_PROXY"), Some(format!("http://10.0.2.2:{port}")));
+        assert_eq!(get("HTTPS_PROXY"), Some(format!("http://10.0.2.2:{port}")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

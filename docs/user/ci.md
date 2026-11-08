@@ -52,9 +52,8 @@ runs_on = ["linux"]
   job still running past it fails with `the job exceeded its timeout`.
 - `env` injects plain environment variables into the job.
 - `secrets` lists secret **names** (never values) for the job. Delivery
-  of secrets to jobs is not wired yet (see [Secrets](#secrets)): a job
-  receives none of them today, and a missing or forbidden name is not an
-  error.
+  is wired (see [Secrets](#secrets)): a missing or forbidden name
+  resolves nothing and is not an error.
 - `artifacts` lists globs for files the runner harvests on completion:
   relative paths only, no `..`; each artifact upload is capped at 1 GiB.
 - `runs_on` lists runner labels that may claim the job (empty means any
@@ -104,17 +103,20 @@ A runner is a machine the repo admin registers (see
 match `runs_on` is online; otherwise they stay queued. The runner
 itself is what an agent session inside a job uploads with: the agent
 runs in the sandbox image (`packaging/sandbox/`), and
-`starforge sync` there uses the per-job token from the environment plus
-the `starforge.server` / `starforge.repo` git config — no interactive
-login, no long-lived PAT. The session appears on the commit / Trail /
-run page.
+The runner puts the per-job token in `STARFORGE_TOKEN` and sets the
+`starforge.server` / `starforge.repo` git config, so `starforge sync`
+there needs no interactive login and no long-lived PAT. The session
+appears on the commit / Trail / run page. The egress proxy forwards
+HTTPS `CONNECT` only, so use an `https://` server and repo URL; a plain
+`http://` origin or a non-443 port is not proxied.
 
 ## Artifacts
 
 Files matching a job's `artifacts` globs are uploaded after a
 successful run (authorize-then-PUT, download authenticated). Artifacts
 expire after 30 days; an expired artifact can no longer be downloaded.
-Artifact names must be relative and stay inside the workspace.
+Expired artifacts are deleted by the hourly cleanup. Artifact names
+must be relative and stay inside the workspace.
 
 ## Secrets
 
@@ -124,7 +126,7 @@ Repo secrets are created and rotated by repo admins (at least Admin):
 curl -X POST "$SERVER/api/v1/repos/$OWNER/$REPO/ci/secrets" \
   -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
-  -d '{"name": "CARGO_REGISTRY_TOKEN", "value": "…"}'
+  -d '{"name": "CARGO_REGISTRY_TOKEN", "value": "…", "host": "crates.io", "header": "Authorization"}'
 curl "$SERVER/api/v1/repos/$OWNER/$REPO/ci/secrets" \
   -H "Authorization: Bearer $TOKEN"
 curl -X DELETE "$SERVER/api/v1/repos/$OWNER/$REPO/ci/secrets/CARGO_REGISTRY_TOKEN" \
@@ -133,16 +135,40 @@ curl -X DELETE "$SERVER/api/v1/repos/$OWNER/$REPO/ci/secrets/CARGO_REGISTRY_TOKE
 
 Values are sealed (XChaCha20-Poly1305) and never stored or logged in
 plaintext; the spec carries names only. Secrets resolve only for runs
-on protected branches or approved Trails; `refs/for` runs get none.
-Values never enter the sandbox environment or filesystem — the egress
-proxy injects them as headers for allowlisted destinations only. A
-secret's value is registered for dynamic redaction in the job's
-sessions, so it cannot appear in session text, logs, or search results.
+on protected branches or approved Trails; `refs/for` runs get none
+unless the repository opts in (see below). A missing or forbidden
+name resolves nothing and is not an error.
 
-**Not wired yet:** the runner does not resolve a job's secrets and creates
-its sandbox with an empty network policy, and local sandboxes have no
-network at all, so no secret reaches a job today. Creating, listing,
-rotating, and deleting secrets works.
+Each secret accepts optional `host` and `header` fields on create.
+`host` is an exact DNS name (lowercase, no scheme, port, or wildcard);
+`header` is a safe request header (hop-by-hop names are rejected).
+`host` defaults to empty and `header` defaults to `Authorization`.
+List and resolve responses include both fields. A secret with an
+empty host is not proxy-injected; it still registers for session
+redaction. Values never enter the sandbox environment or filesystem
+on the local provider — the egress proxy injects them as headers for
+the bound host only. A secret's value is registered for dynamic
+redaction in the job's sessions, so it cannot appear in session text,
+logs, or search results.
+
+A repository Admin sets the per-repository secret policy with
+`PATCH /api/v1/repos/{owner}/{repo}`:
+
+```shell
+curl -X PATCH "$SERVER/api/v1/repos/$OWNER/$REPO" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"ci_allow_secrets_on_refs_for": true, "ci_env_secrets": false}'
+```
+
+Both fields default to off. `ci_allow_secrets_on_refs_for` lets
+`refs/for` runs resolve secrets. `ci_env_secrets` is an E2B-only
+opt-in: with it on, the E2B provider injects the values as
+environment variables instead of through the proxy. Delivery is
+wired: the runner resolves a job's secrets after its git credential,
+adds the values to its log-scrub list, and the server resolves secrets
+for a job-token sandbox create and passes the bindings to the local
+daemon, which injects only for the named host and header.
 
 ## Usage and quotas
 

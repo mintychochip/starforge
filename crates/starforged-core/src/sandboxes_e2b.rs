@@ -117,6 +117,10 @@ impl SandboxProvider for E2bSandboxProvider {
         request: CreateSandboxRequest,
     ) -> Pin<Box<dyn Future<Output = Result<SandboxInfo, ProviderError>> + Send + '_>> {
         Box::pin(async move {
+            // Local-daemon-only field: never send secret values to the
+            // remote gateway, even if a caller populated it.
+            let mut request = request;
+            request.secret_bindings.clear();
             let body = serde_json::to_value(&request).expect("JSON");
             self.json(reqwest::Method::POST, "/sandboxes", Some(&body))
                 .await
@@ -303,8 +307,10 @@ impl SandboxProvider for E2bSandboxProvider {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use super::*;
-    use starforge_sandbox_protocol::{ExecChunk, SandboxInfo, SandboxState};
+    use starforge_sandbox_protocol::{ExecChunk, SandboxInfo, SandboxState, SecretBindingWire};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// A tiny fake E2B server over TCP: routes the adapter's paths to
@@ -540,5 +546,57 @@ mod tests {
         let (provider, _url) = e2b().await;
         let err = provider.get("missing".into()).await.unwrap_err();
         assert_eq!(err.code, "not_found");
+    }
+
+    #[tokio::test]
+    async fn create_never_sends_secret_bindings() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let recorded = Arc::new(Mutex::new(Vec::<String>::new()));
+        let rec = Arc::clone(&recorded);
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 65536];
+            let n = stream.read(&mut buf).await.unwrap_or(0);
+            rec.lock()
+                .unwrap()
+                .push(String::from_utf8_lossy(&buf[..n]).into_owned());
+            let body = serde_json::to_string(&SandboxInfo {
+                id: "sbx-1".into(),
+                state: SandboxState::Running,
+                runtime: "e2b".into(),
+                expires_at: None,
+                provider: "e2b".into(),
+            })
+            .unwrap();
+            let _ = stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .as_bytes(),
+                )
+                .await;
+        });
+        let provider = E2bSandboxProvider::new(url, "key".to_owned());
+        let info = provider
+            .create(CreateSandboxRequest {
+                runtime: "e2b".into(),
+                template: "starforge/rust".into(),
+                secret_bindings: vec![SecretBindingWire {
+                    host: "registry.example".into(),
+                    header: "Authorization".into(),
+                    value: "super-secret".into(),
+                }],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(info.id, "sbx-1");
+        let req = recorded.lock().unwrap()[0].clone();
+        assert!(!req.contains("secret_bindings"), "{req}");
+        assert!(!req.contains("super-secret"), "{req}");
     }
 }

@@ -105,14 +105,14 @@ Explicit v0.1.0 non-goals and deferrals (program rulings):
   status API and webhooks. The server never executes job code: operators
   run `starforge-runner` and `starforge-sandboxd`. The E2B adapter is
   E2B-shaped, not a wire-compatibility promise; Firecracker and Kata are
-  reserved runtime names for a later release. Local sandboxes still run
-  with `--network none`, so they cannot reach the egress proxy: the
-  allowlist and secret header injection have no effect yet, and the
-  runner's in-sandbox `git clone` and session sync fail. Of external
+  reserved runtime names for a later release. Local sandbox egress uses
+  pasta host-loopback mapping; the proxy forwards HTTPS `CONNECT` only
+  (plain HTTP and non-443 ports are not proxied), and host loopback ports
+  are reachable directly. Use an `https://` server and repo URL, and keep
+  untrusted services off host loopback. Of external
   CI suppliers, only Depot is integrated, and only to read usage; GitHub
   Actions, Namespace, Blacksmith, and Buildkite usage is not read. Cost:
-  those runtimes and suppliers need an adapter, not a config change; local
-  sandbox networking needs the container network routed to the proxy.
+  those runtimes and suppliers need an adapter, not a config change.
 - **Antigravity CLI capture:** current Antigravity CLI releases keep sessions
   under `~/.gemini/antigravity-cli/brain/<id>/` in an undocumented, closed
   format, which the Gemini adapter does not read. Gemini CLI sessions are

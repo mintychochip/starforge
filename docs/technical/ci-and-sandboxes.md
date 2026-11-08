@@ -78,15 +78,15 @@ The full payload description lives in the [CI format reference](../format/ci-v1.
 
 A runner harvests files that match the job artifact globs. A file name stays relative and holds no `..` entry. `authorize_artifact_upload` binds one token to the job, the name, the size, and the SHA-256. The token prefix reads `sfa_`. The token expires in 10 minutes.
 
-`upload_ci_artifact` checks the bytes against the bound SHA-256. The token is one-time use. A replay answers `Conflict`. Each artifact caps at 1 GiB. Each artifact expires after 30 days.
-
-The blob store keeps the bytes under a BLAKE3 address. Downloads need an artifact token or the job token.
+`upload_ci_artifact` checks the bytes against the bound SHA-256. The token is one-time use. A replay answers `Conflict`. Each artifact caps at 1 GiB. Each artifact expires after 30 days. The hourly cleanup deletes expired artifact rows and zero-ref blobs.
 
 The runner fetches one short-lived git credential per job. `git_credential_for_runner` mints one `sfp_` token. The token scope holds `repo:read` and `repo:write`. The token expires at the earlier of the deadline and now plus 1 hour. The server revokes the token at finish or cancel.
 
 ### Session capture inside jobs
 
-A job runs agent commands in the sandbox. The runner runs `starforge sync` in the sandbox. The sync uses the per-job token from the environment. The sync uses the `starforge.server` and `starforge.repo` git settings. No interactive sign in occurs. No long-lived token enters the sandbox.
+A job runs agent commands in the sandbox. The runner puts the per-job token in `STARFORGE_TOKEN` in the sandbox environment. The runner sets the `starforge.server` and `starforge.repo` git settings in the checkout.
+
+The runner runs `starforge sync` in the sandbox. The sync uses the per-job token from the environment. The sync uses the `starforge.server` and `starforge.repo` git settings. No interactive sign in occurs. No long-lived token enters the sandbox.
 
 `finish_ci_job` links each uploaded session to the job. The run page lists those sessions.
 
@@ -96,13 +96,19 @@ A job runs agent commands in the sandbox. The runner runs `starforge sync` in th
 
 `create_ci_secret` seals each secret value. `CiSecretBox` uses XChaCha20-Poly1305. The server derives the key with HKDF under the domain `ci-secrets-v1`. The sealed form carries the prefix `c1:`. The database, the audit log, and the logs never receive the plain value.
 
-`resolve_runner_job_secrets` resolves the secret names of one claimed job. The runner owns the claim and presents the fence. The returned values exist in memory only.
+`resolve_runner_job_secrets` resolves the secret names of one claimed job. The runner owns the claim and presents the fence. The returned values exist in memory only. After the git credential, the runner calls `POST /api/v1/runners/jobs/{id}/secrets` with its fence. The runner adds resolved values to its log-scrub list. A stale fence or a not-found answer aborts the job.
 
-`secrets_trusted_for_job` applies the trust rule. A job trusts secrets only on a protected branch or an approved Trail. `ALLOW_SECRETS_ON_REFS_FOR` is false. A `refs/for` run so resolves no secrets. `ENV_SECRETS` is false. A secret value never enters the job environment.
+A repository admin sets two per-repository policies. `ci_allow_secrets_on_refs_for` opts a repository in to secret trust on `refs/for` runs. `ci_env_secrets` opts a repository in to secret delivery as environment variables on the E2B provider only. Both policies default to off. A repository admin changes them with `PATCH /api/v1/repos/{owner}/{repo}`.
+
+Each secret carries an optional `host` and an optional `header` binding. `host` defaults to empty. `header` defaults to `Authorization`. The host is an exact DNS name. The header is a safe request header.
+
+An empty host means no proxy injection. The secret still registers for session redaction.
+
+For a job-token sandbox create, the server resolves the job secrets itself. The server records the resolved secrets in `ci_job_secrets`. The server sends host, header, and value bindings to the local daemon over the Unix socket. The daemon injects a value only when the request `secret_headers` names the same host and the same header. Secret values never enter the sandbox environment or filesystem on the local provider. On the E2B provider only, a repository with `ci_env_secrets` set injects values as environment variables.
+
+`secrets_trusted_for_job` applies the trust rule. A job trusts secrets only on a protected branch or an approved Trail. A `refs/for` run trusts secrets only when the repository opts in with `ci_allow_secrets_on_refs_for`.
 
 The egress proxy injects the value as a header for an allowlisted host. Each secret row also holds a redaction flag. Dynamic redaction uses the values of redaction-enabled resolved secrets.
-
-The runner does not call the resolution route at this time. The runner creates each sandbox with the default network policy, so a job receives no secret header.
 
 ### Sandboxes
 
@@ -116,7 +122,11 @@ Each sandbox gets its own egress proxy task. The proxy terminates TLS under a pe
 
 The proxy refuses a non-allowlisted host. The CA keys carry mode `0600`. The daemon destroys the CA with the sandbox. The daemon refuses host mounts and privileged containers. The server rejects a secret header host outside the allowlist.
 
-The `local` provider starts each container with `--network none`. The proxy listens on a host address, and the container cannot reach that address. A local sandbox so has no network access at this time. The allowlist and the secret headers have no effect until the container network routes traffic to the proxy.
+When the daemon provisions egress, it starts the container with `--network pasta:--map-host-loopback=10.0.2.2`. The daemon uses `slirp4netns:allow_host_loopback=true` when pasta is unavailable.
+
+The proxy listens on host loopback. The container reaches the proxy at `10.0.2.2:<port>`. The daemon sets `HTTP_PROXY` and `HTTPS_PROXY` to that address. The proxy forwards HTTPS `CONNECT` to allowlisted hosts on ports 80 and 443. The proxy refuses a plain `http://` request and any other port, so a local job needs an `https://` server and repository URL.
+
+Pasta maps host loopback to `10.0.2.2`, so a sandbox can also reach host loopback ports directly. The proxy is not the only reachable host service. Do not expose untrusted services on host loopback. Secret values never enter the sandbox. With egress disabled, the container stays with `--network none`.
 
 Sandbox limits answer 429 for a limit breach. `max_concurrent_per_user` caps concurrent sandboxes per user. `max_concurrent_per_repo` caps concurrent sandboxes per repository. `sandbox_seconds_per_hour` caps seconds per user per hour. `default_ttl_secs` records the default lifetime at 3600 seconds. A request can set its own `timeout_s`.
 
@@ -154,7 +164,7 @@ Depot metrics are `depot_ci_vcpu_minutes`, `depot_ci_minutes`, `depot_ci_attempt
 
 `CiSpec::parse` and `read_ci_spec_at_commit` handle the spec. `ci_trigger_push`, `ci_trigger_trail`, and `ci_trigger_manual` start runs. `claim_ci_job`, `trace_ci_job`, `heartbeat_ci_job`, and `finish_ci_job` drive the runner protocol. `cancel_ci_job` requests a cancel. `sweep_ci_jobs` reaps expired leases and missed deadlines.
 
-`run_ci_sweep_if_due` gates the sweep by time. `authorize_artifact_upload` and `upload_ci_artifact` move artifacts. `git_credential_for_runner` mints the git credential. `resolve_runner_job_secrets` returns in-memory secret values. `create_ci_secret` seals a secret value.
+`run_ci_sweep_if_due` gates the sweep by time. `authorize_artifact_upload` and `upload_ci_artifact` move artifacts. `git_credential_for_runner` mints the git credential. `resolve_runner_job_secrets` returns in-memory secret values. `create_ci_secret` seals a secret value. `set_ci_secret_policy` stores the per-repository opt-ins.
 
 `redact_ci_secrets` and `redact_ci_secrets_with_history` redact session text. `create_sandbox` and `sandbox_runtimes` drive sandboxes. The HTTP routes live in `starforged-api/src/sandboxes.rs` and `starforged-api/src/ci.rs`. The CI runs page lives in `starforged-web/src/pages/ci.rs`. Route and scope detail lives in [HTTP API conventions](http-api.md).
 
@@ -170,7 +180,7 @@ A sandbox create that names `firecracker` or `kata` answers 422. A sandbox creat
 
 Unit tests cover `CiSpec::parse` and every cap. The test names hold validation cases for each field. The seal test proves a round trip and proves that `Debug` redacts the key. The redaction tests prove every variant and every seam split.
 
-The `GetUsage` tests decode a fixture response and record each request. Integration tests cover the full job lifecycle and the sweep. The test `api_ci_jobs.rs` exercises the runner routes. The `db_ci` tests prove idempotent usage rows and reap timing.
+The `GetUsage` tests decode a fixture response and record each request. Integration tests cover the full job lifecycle and the sweep. The test `api_ci_jobs.rs` exercises the runner routes. The `db_ci` tests prove idempotent usage rows and reap timing. The suites cover the network path, the bindings, the per-repository policy, and artifact GC.
 
 The E2B tests record each HTTP request against a fake server. Run the core, API, and DB suites after a lifecycle change.
 
@@ -190,14 +200,17 @@ crates/starforged-core/src/ci.rs
 crates/starforged-core/src/ci_spec.rs
 crates/starforged-core/src/ci_usage.rs
 crates/starforged-core/src/ci_usage_depot.rs
+crates/starforged-core/src/repos.rs
 crates/starforged-core/src/sandboxes.rs
 crates/starforged-core/src/sandboxes_e2b.rs
 crates/starforged-core/src/webhooks.rs
 crates/starforged-core/src/jobs.rs
 crates/starforged-api/src/ci.rs
 crates/starforged-api/src/ci_auth.rs
+crates/starforged-api/src/repos.rs
 crates/starforged-api/src/sandboxes.rs
 crates/starforged-db/src/ci.rs
+crates/starforged-db/src/repos.rs
 crates/starforged-db/src/sandboxes.rs
 crates/starforge-runner/src/lib.rs
 crates/starforge-sandbox-protocol/src/lib.rs

@@ -804,7 +804,7 @@ impl Core {
     ) -> CoreResult<SandboxView> {
         let caller = SandboxCaller::user(user);
         let access = self.repo_for(Some(user), owner, repo).await?;
-        self.create_sandbox_inner(caller, access.repo.id, job_id, req)
+        self.create_sandbox_inner(caller, access.repo.id, job_id, req, Vec::new())
             .await
     }
 
@@ -817,8 +817,15 @@ impl Core {
         req: CreateSandboxRequest,
     ) -> CoreResult<SandboxView> {
         let caller = SandboxCaller::job(principal);
-        self.create_sandbox_inner(caller, principal.repo_id, Some(principal.job_id), req)
-            .await
+        let resolved = self.resolve_secrets_for_job(principal).await?;
+        self.create_sandbox_inner(
+            caller,
+            principal.repo_id,
+            Some(principal.job_id),
+            req,
+            resolved,
+        )
+        .await
     }
 
     async fn create_sandbox_inner(
@@ -826,7 +833,8 @@ impl Core {
         caller: SandboxCaller,
         repo_id: i64,
         job_id: Option<i64>,
-        req: CreateSandboxRequest,
+        mut req: CreateSandboxRequest,
+        resolved: Vec<crate::ci::ResolvedSecret>,
     ) -> CoreResult<SandboxView> {
         let runtime = req.runtime.trim().to_ascii_lowercase();
         let runtime = if runtime.is_empty() {
@@ -858,6 +866,47 @@ impl Core {
                 return Err(CoreError::Invalid(format!(
                     "secret header for '{host}' requires the host to be allow-listed"
                 )));
+            }
+        }
+        // Apply the job's resolved secrets (the `JobAuth` path; the user
+        // path resolves none). The local provider gets egress-proxy
+        // header bindings (`secret_bindings` is local-daemon-only); the
+        // E2B provider gets env vars only with the repo's `ci_env_secrets`
+        // opt-in, and nothing otherwise. A local binding needs a host; an
+        // env delivery does not, because no proxy is involved.
+        if !resolved.is_empty() {
+            let local_provider =
+                !(runtime == "e2b" || self.config().sandbox.provider == SandboxProviderKind::E2b);
+            let env_delivery =
+                !local_provider && starforged_db::repos::ci_env_secrets(self.db(), repo_id).await?;
+            for secret in resolved {
+                if local_provider {
+                    if secret.host.is_empty() {
+                        continue;
+                    }
+                    let host = secret.host.clone();
+                    if req.network.deny_out.contains(&host) {
+                        return Err(CoreError::Invalid(format!(
+                            "secret host '{host}' is denied"
+                        )));
+                    }
+                    req.network
+                        .secret_headers
+                        .insert(host.clone(), secret.header.clone());
+                    if !req.network.allow_out.contains(&host) {
+                        req.network.allow_out.push(host.clone());
+                    }
+                    req.secret_bindings
+                        .push(crate::sandboxes::protocol::SecretBindingWire {
+                            host,
+                            header: secret.header.clone(),
+                            value: secret.value.clone(),
+                        });
+                } else if env_delivery {
+                    req.envs
+                        .entry(secret.name.clone())
+                        .or_insert(secret.value.clone());
+                }
             }
         }
         // Idempotent replay returns the original sandbox.

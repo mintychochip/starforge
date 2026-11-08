@@ -212,10 +212,7 @@ The proxy terminates TLS with a per-sandbox CA.
 The proxy injects secret headers for allowlisted hosts.
 Secret values never enter the sandbox.
 
-The local provider starts each container with `--network none`.
-The proxy listens on a host address that such a container cannot reach.
-A local sandbox so has no network access at this time.
-The allowlist and the secret headers have no effect until the container network routes traffic to the proxy.
+When the daemon provisions egress, it starts the container with pasta and maps host loopback to `10.0.2.2`. The container reaches the proxy at `10.0.2.2:<port>`. The daemon uses slirp4netns when pasta is unavailable. With egress disabled, the container stays with `--network none`. The proxy enforces the allowlist for proxied traffic.
 
 ## Failure behavior
 

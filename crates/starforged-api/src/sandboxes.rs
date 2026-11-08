@@ -269,6 +269,8 @@ pub async fn create_sandbox(
         network: body.network.into(),
         metadata: body.metadata,
         idempotency_key: body.idempotency_key,
+        secret_bindings: Vec::new(),
+        network_enabled: false,
     };
     let view = match &auth {
         SandboxAuth::Pat(token_auth) => {

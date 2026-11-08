@@ -24,6 +24,29 @@ pub struct NetworkPolicy {
     pub secret_headers: BTreeMap<String, String>,
 }
 
+/// One secret header the egress proxy injects for an allowlisted host.
+/// The value travels only from the server to the local daemon over the
+/// trusted Unix socket; it never enters the sandbox. `Debug` redacts it.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecretBindingWire {
+    /// Exact destination host the header is bound to.
+    pub host: String,
+    /// Header name to inject (e.g. `Authorization`).
+    pub header: String,
+    /// Header value; never logged.
+    pub value: String,
+}
+
+impl std::fmt::Debug for SecretBindingWire {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SecretBindingWire")
+            .field("host", &self.host)
+            .field("header", &self.header)
+            .field("value", &"<redacted>")
+            .finish()
+    }
+}
+
 /// Create a sandbox (E2B-shaped, plan M6b B1).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct CreateSandboxRequest {
@@ -58,6 +81,16 @@ pub struct CreateSandboxRequest {
     /// Idempotency key; a retry with the same key returns the same sandbox.
     #[serde(default)]
     pub idempotency_key: Option<String>,
+    /// Secret header bindings the server resolved for a job sandbox. The
+    /// public sandbox API does not accept this field; only the server's
+    /// local provider fills it. Values never enter the sandbox.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secret_bindings: Vec<SecretBindingWire>,
+    /// Set by the local daemon before it creates the container: whether
+    /// egress is provisioned (the container then gets a network that can
+    /// reach the host-side proxy). Not part of the public API.
+    #[serde(default)]
+    pub network_enabled: bool,
 }
 
 /// Lifecycle state of a sandbox.
@@ -198,8 +231,17 @@ mod tests {
             },
             metadata: BTreeMap::from([("job_id".to_owned(), "42".to_owned())]),
             idempotency_key: Some("key-1".to_owned()),
+            secret_bindings: vec![SecretBindingWire {
+                host: "api.github.com".to_owned(),
+                header: "Authorization".to_owned(),
+                value: "sf-secret-value".to_owned(),
+            }],
+            network_enabled: true,
         };
         round_trips(&request);
+        let debug = format!("{request:?}");
+        assert!(!debug.contains("sf-secret-value"), "debug: {debug}");
+        assert!(debug.contains("<redacted>"), "debug: {debug}");
     }
 
     #[test]

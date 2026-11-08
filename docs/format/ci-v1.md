@@ -42,7 +42,7 @@ runs_on = ["linux"]
 | `jobs[].commands` | array of strings | Non-empty; at most 100 commands, 4096 chars each; run in order at `/workspace`. |
 | `jobs[].timeout` | string | `90s`, `30m`, `1h`, or bare seconds; at most 4 hours. Default 1 hour. Counted from the moment a runner claims the job, so time spent waiting for a runner does not count. |
 | `jobs[].env` | table | At most 64 entries; key 128 chars, value 4096 chars. Plain values only. |
-| `jobs[].secrets` | array of names | At most 32 names, 128 chars each. Secret **names**, never values; the trust rule is applied at resolution. |
+| `jobs[].secrets` | array of names | At most 32 names, 128 chars each. Secret **names**, never values; the trust rule is applied at resolution. The optional `host`/`header` binding is set on the secret, not in the spec. |
 | `jobs[].artifacts` | array of globs | At most 32; relative, non-empty, no `..`, 256 chars; each artifact at most 1 GiB, retained 30 days. |
 | `jobs[].runs_on` | array of labels | At most 16 labels, 64 chars each; empty means any runner for the repo. |
 

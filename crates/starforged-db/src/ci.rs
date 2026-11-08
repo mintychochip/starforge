@@ -1195,38 +1195,48 @@ pub struct CiSecretRow {
     pub repo_id: i64,
     pub name: String,
     pub sealed_value: String,
+    pub host: String,
+    pub header: String,
     pub redact_in_sessions: bool,
     pub created_by: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
 }
 
+/// One secret to create or rotate. `host`/`header` bind egress-proxy
+/// injection; `host` empty means the secret is not proxy-injected.
+pub struct NewCiSecret<'a> {
+    pub repo_id: i64,
+    pub name: &'a str,
+    pub sealed_value: &'a str,
+    pub redact_in_sessions: bool,
+    pub host: &'a str,
+    pub header: &'a str,
+    pub created_by: Option<i64>,
+    pub now_ts: i64,
+}
+
 /// Creates or replaces the secret named `name` in one repository (the
 /// rotation path writes the same shape). Returns the stored row.
-pub async fn upsert_secret(
-    db: &Db,
-    repo_id: i64,
-    name: &str,
-    sealed_value: &str,
-    redact_in_sessions: bool,
-    created_by: Option<i64>,
-    now_ts: i64,
-) -> DbResult<CiSecretRow> {
+pub async fn upsert_secret(db: &Db, secret: NewCiSecret<'_>) -> DbResult<CiSecretRow> {
     let row = sqlx::query(
-        "INSERT INTO ci_secrets (repo_id, name, sealed_value, redact_in_sessions, created_by, created_at, updated_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7) \
+        "INSERT INTO ci_secrets (repo_id, name, sealed_value, host, header, redact_in_sessions, created_by, created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
          ON CONFLICT (repo_id, name) DO UPDATE SET sealed_value = EXCLUDED.sealed_value, \
+         host = EXCLUDED.host, header = EXCLUDED.header, \
          redact_in_sessions = EXCLUDED.redact_in_sessions, created_by = EXCLUDED.created_by, \
          updated_at = EXCLUDED.updated_at \
-         RETURNING id, repo_id, name, sealed_value, redact_in_sessions, created_by, created_at, updated_at",
+         RETURNING id, repo_id, name, sealed_value, host, header, redact_in_sessions, created_by, created_at, updated_at",
     )
-    .bind(repo_id)
-    .bind(name)
-    .bind(sealed_value)
-    .bind(i64::from(redact_in_sessions))
-    .bind(created_by)
-    .bind(now_ts)
-    .bind(now_ts)
+    .bind(secret.repo_id)
+    .bind(secret.name)
+    .bind(secret.sealed_value)
+    .bind(secret.host)
+    .bind(secret.header)
+    .bind(i64::from(secret.redact_in_sessions))
+    .bind(secret.created_by)
+    .bind(secret.now_ts)
+    .bind(secret.now_ts)
     .fetch_one(db.pool())
     .await?;
     secret_from_row(&row)
@@ -1238,6 +1248,8 @@ fn secret_from_row(row: &AnyRow) -> DbResult<CiSecretRow> {
         repo_id: row.try_get("repo_id")?,
         name: row.try_get("name")?,
         sealed_value: row.try_get("sealed_value")?,
+        host: row.try_get("host")?,
+        header: row.try_get("header")?,
         redact_in_sessions: row.try_get::<i64, _>("redact_in_sessions")? != 0,
         created_by: row.try_get("created_by")?,
         created_at: row.try_get("created_at")?,
@@ -1249,7 +1261,7 @@ fn secret_from_row(row: &AnyRow) -> DbResult<CiSecretRow> {
 /// always miss: the caller scopes every read by `repo_id` first.
 pub async fn secret_by_name(db: &Db, repo_id: i64, name: &str) -> DbResult<Option<CiSecretRow>> {
     let row = sqlx::query(
-        "SELECT id, repo_id, name, sealed_value, redact_in_sessions, created_by, created_at, updated_at \
+        "SELECT id, repo_id, name, sealed_value, host, header, redact_in_sessions, created_by, created_at, updated_at \
          FROM ci_secrets WHERE repo_id = $1 AND name = $2",
     )
     .bind(repo_id)
@@ -1263,7 +1275,7 @@ pub async fn secret_by_name(db: &Db, repo_id: i64, name: &str) -> DbResult<Optio
 /// rows must not carry `sealed_value`.
 pub async fn secrets_for_repo(db: &Db, repo_id: i64) -> DbResult<Vec<CiSecretRow>> {
     let rows = sqlx::query(
-        "SELECT id, repo_id, name, sealed_value, redact_in_sessions, created_by, created_at, updated_at \
+        "SELECT id, repo_id, name, sealed_value, host, header, redact_in_sessions, created_by, created_at, updated_at \
          FROM ci_secrets WHERE repo_id = $1 ORDER BY name ASC",
     )
     .bind(repo_id)
@@ -1303,6 +1315,7 @@ pub async fn insert_job_secret(db: &Db, job_id: i64, secret_id: i64, now_ts: i64
 pub async fn job_secrets_for_job(db: &Db, job_id: i64) -> DbResult<Vec<CiSecretRow>> {
     let rows = sqlx::query(
         "SELECT ci_secrets.id, ci_secrets.repo_id, ci_secrets.name, ci_secrets.sealed_value, \
+         ci_secrets.host, ci_secrets.header, \
          ci_secrets.redact_in_sessions, ci_secrets.created_by, ci_secrets.created_at, \
          ci_secrets.updated_at \
          FROM ci_job_secrets \
@@ -1332,6 +1345,17 @@ pub async fn artifact_by_name(
     .fetch_optional(db.read_pool())
     .await?;
     row.as_ref().map(artifact_from_row).transpose()
+}
+
+/// How many CI log chunks reference the blob `blake3`. The CAS is shared
+/// with artifacts and session blobs, so artifact GC must not delete a blob
+/// that a log chunk still uses.
+pub async fn ci_log_refcount(db: &Db, blake3: &str) -> DbResult<i64> {
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ci_job_logs WHERE blake3 = $1")
+        .bind(blake3)
+        .fetch_one(db.read_pool())
+        .await?;
+    Ok(count)
 }
 
 /// How many artifact rows reference the blob `blake3`: the CAS refcount.
@@ -1838,27 +1862,37 @@ mod tests {
             .unwrap();
         let first = upsert_secret(
             &t.db,
-            repo_id,
-            "TOKEN",
-            "x1:AAA",
-            true,
-            Some(alice),
-            1_700_000_000,
+            NewCiSecret {
+                repo_id,
+                name: "TOKEN",
+                sealed_value: "x1:AAA",
+                redact_in_sessions: true,
+                host: "registry.example",
+                header: "Authorization",
+                created_by: Some(alice),
+                now_ts: 1_700_000_000,
+            },
         )
         .await
         .unwrap();
         let rotated = upsert_secret(
             &t.db,
-            repo_id,
-            "TOKEN",
-            "x1:BBB",
-            true,
-            Some(alice),
-            1_700_000_010,
+            NewCiSecret {
+                repo_id,
+                name: "TOKEN",
+                sealed_value: "x1:BBB",
+                redact_in_sessions: true,
+                host: "registry.example",
+                header: "Authorization",
+                created_by: Some(alice),
+                now_ts: 1_700_000_010,
+            },
         )
         .await
         .unwrap();
         assert_eq!(first.id, rotated.id, "rotation reuses the row");
+        assert_eq!(rotated.host, "registry.example");
+        assert_eq!(rotated.header, "Authorization");
         assert_eq!(rotated.sealed_value, "x1:BBB");
         assert!(
             secret_by_name(&t.db, other, "TOKEN")

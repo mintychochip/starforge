@@ -206,6 +206,37 @@ struct GitCredentialBody {
     token_id: i64,
 }
 
+/// One repository secret resolved for a claimed job. `Debug` redacts
+/// `value`; secret values are never logged.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedSecret {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub value: String,
+    #[serde(default)]
+    pub host: String,
+    #[serde(default)]
+    pub header: String,
+}
+
+impl std::fmt::Debug for ResolvedSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedSecret")
+            .field("name", &self.name)
+            .field("value", &"<redacted>")
+            .field("host", &self.host)
+            .field("header", &self.header)
+            .finish()
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ResolveSecretsBody {
+    #[serde(default)]
+    secrets: Vec<ResolvedSecret>,
+}
+
 #[derive(Debug, Serialize)]
 struct AuthorizeArtifactBody<'a> {
     name: &'a str,
@@ -544,6 +575,37 @@ impl Client {
             .map_err(|e| RunnerError::Malformed(e.to_string()))
     }
 
+    /// Resolves the claimed job's repository secrets. The response body
+    /// carries secret values and is never logged.
+    pub async fn resolve_secrets(
+        &self,
+        job_id: i64,
+        fence: &str,
+    ) -> Result<Vec<ResolvedSecret>, RunnerError> {
+        let resp = self
+            .http
+            .post(format!("{}/runners/jobs/{job_id}/secrets", self.base))
+            .bearer_auth(&self.token)
+            .header(FENCE_HEADER, fence)
+            .send()
+            .await
+            .map_err(RunnerError::from_reqwest)?;
+        if resp.status() == StatusCode::CONFLICT {
+            return Err(RunnerError::StaleFence);
+        }
+        if resp.status() == StatusCode::NOT_FOUND {
+            return Err(RunnerError::NotFound);
+        }
+        if !resp.status().is_success() {
+            let s = resp.status();
+            return Err(RunnerError::Http(s, resp.text().await.unwrap_or_default()));
+        }
+        resp.json::<ResolveSecretsBody>()
+            .await
+            .map(|b| b.secrets)
+            .map_err(|e| RunnerError::Malformed(e.to_string()))
+    }
+
     pub async fn trace(
         &self,
         job_id: i64,
@@ -697,6 +759,58 @@ impl Client {
 // Executor
 // ---------------------------------------------------------------------------
 
+/// The `owner/repo` part of a clone URL, for `starforge.repo`.
+fn repo_full_name(repo_url: &str) -> Option<String> {
+    let url = url::Url::parse(repo_url).ok()?;
+    let path = url.path().trim_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let mut parts = path.split('/');
+    let owner = parts.next()?;
+    let repo = parts.next()?;
+    if owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+    Some(format!("{owner}/{repo}"))
+}
+
+/// Single-quote a shell argument.
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// Egress allowlist for a job sandbox: the server and repo hosts, plus the
+/// host of every bound secret (with the header the proxy injects for it).
+fn network_policy(server_url: &str, repo_url: &str, resolved: &[ResolvedSecret]) -> NetworkPolicy {
+    let mut allow_out: Vec<String> = Vec::new();
+    let mut secret_headers: BTreeMap<String, String> = BTreeMap::new();
+    for url in [server_url, repo_url] {
+        if url.is_empty() {
+            continue;
+        }
+        if let Some(host) = url::Url::parse(url)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_owned))
+            && !allow_out.contains(&host)
+        {
+            allow_out.push(host);
+        }
+    }
+    for secret in resolved {
+        if secret.host.is_empty() {
+            continue;
+        }
+        if !allow_out.contains(&secret.host) {
+            allow_out.push(secret.host.clone());
+        }
+        secret_headers.insert(secret.host.clone(), secret.header.clone());
+    }
+    NetworkPolicy {
+        allow_out,
+        deny_out: Vec::new(),
+        secret_headers,
+    }
+}
+
 pub struct Executor<P: SandboxProvider> {
     pub config: RunnerConfig,
     pub client: Client,
@@ -716,7 +830,11 @@ impl<P: SandboxProvider> Executor<P> {
         }
     }
 
-    fn sandbox_request(&self, job: &ClaimedJob) -> CreateSandboxRequest {
+    fn sandbox_request(
+        &self,
+        job: &ClaimedJob,
+        resolved: &[ResolvedSecret],
+    ) -> CreateSandboxRequest {
         let template = job
             .spec
             .template
@@ -728,6 +846,8 @@ impl<P: SandboxProvider> Executor<P> {
             .timeout_duration()
             .map(|d| d.as_secs())
             .unwrap_or(0);
+        let mut envs = job.spec.env.clone();
+        envs.insert("STARFORGE_TOKEN".to_owned(), job.job_token.clone());
         CreateSandboxRequest {
             runtime: self.config.runtime.clone(),
             template,
@@ -735,13 +855,15 @@ impl<P: SandboxProvider> Executor<P> {
             cpu: 0.0,
             mem_mb: 0,
             disk_gb: 0,
-            envs: job.spec.env.clone(),
-            network: NetworkPolicy::default(),
+            envs,
+            network: network_policy(&self.config.server_url, &self.config.repo_url, resolved),
             metadata: BTreeMap::from([
                 ("job_id".to_owned(), job.job_id.to_string()),
                 ("commit_sha".to_owned(), job.commit_sha.clone()),
             ]),
             idempotency_key: Some(format!("job-{}-{}", job.job_id, job.commit_sha)),
+            secret_bindings: Vec::new(),
+            network_enabled: false,
         }
     }
 
@@ -849,8 +971,27 @@ impl<P: SandboxProvider> Executor<P> {
         };
         secrets.push(git_token.clone());
 
+        // 1b. Repository secrets for this job.
+        let resolved = match self.client.resolve_secrets(job.job_id, &job.fence).await {
+            Ok(v) => v,
+            Err(RunnerError::StaleFence) => return JobOutcome::StaleFence,
+            Err(RunnerError::NotFound) => {
+                return JobOutcome::TransportFailed("job not found".into());
+            }
+            Err(e) => return JobOutcome::TransportFailed(e.to_string()),
+        };
+        for secret in &resolved {
+            if !secret.value.is_empty() {
+                secrets.push(secret.value.clone());
+            }
+        }
+
         // 2. Create sandbox.
-        let sandbox_id = match self.provider.create(job, self.sandbox_request(job)).await {
+        let sandbox_id = match self
+            .provider
+            .create(job, self.sandbox_request(job, &resolved))
+            .await
+        {
             Ok(id) => id,
             Err(e) => {
                 let _ = self
@@ -885,6 +1026,27 @@ impl<P: SandboxProvider> Executor<P> {
                     return o;
                 }
             }
+        }
+
+        // 3b. Point `starforge sync` at the server and repository. The
+        // worktree may be pre-populated (no clone), so this is best effort.
+        let mut config_cmd = format!(
+            "git config starforge.server {}",
+            shell_quote(&self.config.server_url)
+        );
+        if let Some(repo) = repo_full_name(&self.config.repo_url) {
+            config_cmd.push_str(&format!(
+                " && git config starforge.repo {}",
+                shell_quote(&repo)
+            ));
+        }
+        config_cmd.push_str(" 2>/dev/null || true");
+        if let Err(o) = self
+            .run_cmd(job, &sandbox_id, &config_cmd, &mut offset, &secrets)
+            .await
+        {
+            self.kill_sandbox(job, &sandbox_id).await;
+            return o;
         }
 
         // 4. Run commands.
@@ -1168,6 +1330,8 @@ pub struct FakeSandboxProvider {
     pub killed: std::sync::Mutex<Vec<String>>,
     /// Created sandbox ids.
     pub created: std::sync::Mutex<Vec<String>>,
+    /// Create requests, in order (for tests that inspect the policy).
+    pub requests: std::sync::Mutex<Vec<CreateSandboxRequest>>,
 }
 
 impl FakeSandboxProvider {
@@ -1194,7 +1358,7 @@ impl SandboxProvider for FakeSandboxProvider {
     async fn create(
         &self,
         _job: &ClaimedJob,
-        _req: CreateSandboxRequest,
+        req: CreateSandboxRequest,
     ) -> Result<String, RunnerError> {
         let id = format!(
             "sbx-fake-{}",
@@ -1202,6 +1366,9 @@ impl SandboxProvider for FakeSandboxProvider {
         );
         if let Ok(mut c) = self.created.lock() {
             c.push(id.clone());
+        }
+        if let Ok(mut r) = self.requests.lock() {
+            r.push(req);
         }
         Ok(id)
     }
@@ -1306,5 +1473,60 @@ mod tests {
         let plan = cfg.plan_text();
         assert!(plan.contains("podman"));
         assert!(!plan.contains("sfr_secret"));
+    }
+
+    #[test]
+    fn sandbox_request_allows_server_repo_and_secret_hosts() {
+        let mut cfg = RunnerConfig::new("http://127.0.0.1:3000", "sfr_token");
+        cfg.repo_url = "https://git.example.com/alice/proj".to_owned();
+        let executor = Executor::new(cfg, FakeSandboxProvider::new());
+        let job = ClaimedJob {
+            job_id: 7,
+            job_name: "test".to_owned(),
+            commit_sha: "abc123".to_owned(),
+            spec: CiJobSpec::default(),
+            fence: "fence".to_owned(),
+            job_token: "job_token".to_owned(),
+            deadline: String::new(),
+            lease_until: String::new(),
+        };
+        let resolved = vec![ResolvedSecret {
+            name: "TOKEN".to_owned(),
+            value: "v".to_owned(),
+            host: "registry.example".to_owned(),
+            header: "Authorization".to_owned(),
+        }];
+        let req = executor.sandbox_request(&job, &resolved);
+        assert!(req.network.allow_out.iter().any(|h| h == "127.0.0.1"));
+        assert!(req.network.allow_out.iter().any(|h| h == "git.example.com"));
+        assert!(
+            req.network
+                .allow_out
+                .iter()
+                .any(|h| h == "registry.example")
+        );
+        assert_eq!(
+            req.network
+                .secret_headers
+                .get("registry.example")
+                .map(String::as_str),
+            Some("Authorization")
+        );
+        assert!(req.network.deny_out.is_empty());
+        assert!(req.secret_bindings.is_empty());
+        assert!(!req.network_enabled);
+    }
+
+    #[test]
+    fn resolved_secret_debug_redacts_value() {
+        let secret = ResolvedSecret {
+            name: "TOKEN".to_owned(),
+            value: "supersecretvalue".to_owned(),
+            host: "registry.example".to_owned(),
+            header: "Authorization".to_owned(),
+        };
+        let debug = format!("{secret:?}");
+        assert!(!debug.contains("supersecretvalue"));
+        assert!(debug.contains("registry.example"));
     }
 }

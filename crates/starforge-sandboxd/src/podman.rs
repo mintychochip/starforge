@@ -277,6 +277,66 @@ impl PodmanRuntime {
     }
 }
 
+/// Build the `podman run` argument vector for creating `id` from `req`.
+///
+/// Pure: no I/O or validation (callers validate `req` first). When
+/// `req.network_enabled` the container gets pasta networking with host
+/// loopback mapped to `10.0.2.2` (where the egress proxy listens
+/// host-side); otherwise it stays `--network none`.
+pub fn create_args(id: &str, req: &CreateSandboxRequest) -> Vec<String> {
+    let cpu = if req.cpu > 0.0 { req.cpu } else { 1.0 };
+    let mem_mb = if req.mem_mb > 0 { req.mem_mb } else { 512 };
+    let network = if req.network_enabled {
+        "pasta:--map-host-loopback=10.0.2.2"
+    } else {
+        "none"
+    };
+    let mut args: Vec<String> = vec![
+        "run".into(),
+        "-d".into(),
+        "--name".into(),
+        id.into(),
+        "--network".into(),
+        network.into(),
+        "--security-opt".into(),
+        "no-new-privileges=true".into(),
+        "--cap-drop".into(),
+        "ALL".into(),
+        "--read-only".into(),
+        "--pids-limit".into(),
+        "512".into(),
+        "--stop-timeout".into(),
+        "5".into(),
+        "--workdir".into(),
+        WORKSPACE_ROOT.into(),
+        "--tmpfs".into(),
+        "/tmp:rw,noexec,nosuid".into(),
+        "--volume".into(),
+        format!("{id}-workspace:{WORKSPACE_ROOT}"),
+        "--label".into(),
+        format!("starforge.sandbox={id}"),
+        "--label".into(),
+        "starforge.runtime=podman".into(),
+        "--memory".into(),
+        format!("{mem_mb}m"),
+        "--cpus".into(),
+        format!("{cpu}"),
+    ];
+    for (key, value) in &req.envs {
+        args.push("--env".into());
+        args.push(format!("{key}={value}"));
+    }
+    for (key, value) in &req.metadata {
+        args.push("--label".into());
+        args.push(format!("starforge.meta.{key}={value}"));
+    }
+    args.push("--".into());
+    args.push(req.template.clone());
+    args.push("sleep".into());
+    args.push("infinity".into());
+    args
+}
+
 impl Runtime for PodmanRuntime {
     fn create<'a>(&'a self, id: &'a str, req: &'a CreateSandboxRequest) -> Fute<'a, ()> {
         Box::pin(async move {
@@ -284,54 +344,33 @@ impl Runtime for PodmanRuntime {
                 return Err(err_invalid("image/template must not be empty"));
             }
             validate_env(&req.envs)?;
-            let cpu = if req.cpu > 0.0 { req.cpu } else { 1.0 };
-            let mem_mb = if req.mem_mb > 0 { req.mem_mb } else { 512 };
-            let mut args: Vec<String> = vec![
-                "run".into(),
-                "-d".into(),
-                "--name".into(),
-                id.into(),
-                "--network".into(),
-                "none".into(),
-                "--security-opt".into(),
-                "no-new-privileges=true".into(),
-                "--cap-drop".into(),
-                "ALL".into(),
-                "--read-only".into(),
-                "--pids-limit".into(),
-                "512".into(),
-                "--stop-timeout".into(),
-                "5".into(),
-                "--workdir".into(),
-                WORKSPACE_ROOT.into(),
-                "--tmpfs".into(),
-                "/tmp:rw,noexec,nosuid".into(),
-                "--volume".into(),
-                format!("{id}-workspace:{WORKSPACE_ROOT}"),
-                "--label".into(),
-                format!("starforge.sandbox={id}"),
-                "--label".into(),
-                "starforge.runtime=podman".into(),
-                "--memory".into(),
-                format!("{mem_mb}m"),
-                "--cpus".into(),
-                format!("{cpu}"),
-            ];
-            for (key, value) in &req.envs {
-                args.push("--env".into());
-                args.push(format!("{key}={value}"));
-            }
-            for (key, value) in &req.metadata {
-                args.push("--label".into());
-                args.push(format!("starforge.meta.{key}={value}"));
-            }
-            args.push("--".into());
-            args.push(req.template.clone());
-            args.push("sleep".into());
-            args.push("infinity".into());
+            let args = create_args(id, req);
             let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-            self.run_ok(&refs, None).await?;
-            Ok(())
+            match self.run_ok(&refs, None).await {
+                Ok(_) => Ok(()),
+                Err(err) => {
+                    let message = err.message.to_lowercase();
+                    let network_related = message.contains("pasta")
+                        || message.contains("network")
+                        || message.contains("slirp4netns");
+                    if !req.network_enabled || !network_related {
+                        return Err(err);
+                    }
+                    // Networking backend unavailable: drop any partial
+                    // container and retry with slirp4netns, which maps host
+                    // loopback via its own gateway.
+                    Runtime::remove(self, id).await.ok();
+                    let mut retry_args = args;
+                    if let Some(pos) = retry_args.iter().position(|a| a == "--network")
+                        && let Some(value) = retry_args.get_mut(pos + 1)
+                    {
+                        *value = "slirp4netns:allow_host_loopback=true".to_owned();
+                    }
+                    let retry_refs: Vec<&str> = retry_args.iter().map(String::as_str).collect();
+                    self.run_ok(&retry_refs, None).await?;
+                    Ok(())
+                }
+            }
         })
     }
 
@@ -894,6 +933,49 @@ mod tests {
             rt.create("sbx-1", &CreateSandboxRequest::default())
                 .await
                 .is_err()
+        );
+    }
+
+    fn arg_value(args: &[String], flag: &str) -> Option<String> {
+        args.windows(2)
+            .find(|pair| pair[0] == flag)
+            .map(|pair| pair[1].clone())
+    }
+
+    #[test]
+    fn create_args_network_and_hardening() {
+        let off = CreateSandboxRequest {
+            template: "docker.io/library/rust:1.85".into(),
+            ..Default::default()
+        };
+        let args = create_args("sbx-x", &off);
+        assert_eq!(
+            arg_value(&args, "--network").as_deref(),
+            Some("none"),
+            "args: {args:?}"
+        );
+        let on = CreateSandboxRequest {
+            template: "docker.io/library/rust:1.85".into(),
+            network_enabled: true,
+            ..Default::default()
+        };
+        let args = create_args("sbx-x", &on);
+        assert_eq!(
+            arg_value(&args, "--network").as_deref(),
+            Some("pasta:--map-host-loopback=10.0.2.2"),
+            "args: {args:?}"
+        );
+        // Hardened flags survive in both modes.
+        assert_eq!(arg_value(&args, "--cap-drop").as_deref(), Some("ALL"));
+        assert!(args.iter().any(|a| a == "--read-only"));
+        assert_eq!(
+            arg_value(&args, "--security-opt").as_deref(),
+            Some("no-new-privileges=true")
+        );
+        assert!(args.iter().any(|a| a == "--pids-limit"));
+        assert_eq!(
+            arg_value(&args, "--volume").as_deref(),
+            Some("sbx-x-workspace:/workspace")
         );
     }
 

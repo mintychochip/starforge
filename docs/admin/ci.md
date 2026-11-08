@@ -62,8 +62,10 @@ short-lived git credential (`POST /ci/jobs/{id}/git-credential`, or
 uses an operator-configured deploy key), creates a sandbox through the
 server sandbox API with the per-job token, checks out the commit,
 runs the job commands, streams logs (`PATCH /runners/jobs/{id}/trace`
-with `Content-Range`), runs `starforge sync` in the sandbox, uploads
-artifacts, and finishes (`PUT /runners/jobs/{id}`).
+with `Content-Range`), runs `starforge sync` in the sandbox with the
+per-job token in `STARFORGE_TOKEN` and the `starforge.server` /
+`starforge.repo` git config, uploads artifacts, and finishes
+(`PUT /runners/jobs/{id}`).
 
 Every trace/result/artifact call carries the per-claim `lease_token`
 fence; a stale fence answers `409` and the job is fenced out.
@@ -133,16 +135,44 @@ host; non-allowlisted hosts are refused, DNS is pinned before connect,
 CA keys are `0600` and destroyed with the sandbox, and secret values
 never enter the sandbox environment or filesystem.
 
-**Current limitation:** the local provider still starts every container
-with `--network none`, so a local sandbox cannot reach the proxy (it
-listens on a host address) and has no network access at all. The
-allowlist and secret header injection therefore have no effect yet, and
-every step that needs the network fails: the runner's `git clone` of the
-commit (when `--repo-url` is set), `starforge sync` of job sessions, and
-any download a job makes. This fails closed; nothing leaves the sandbox.
-The runner also creates every sandbox with an empty network policy and
-never resolves the job's repository secrets, so repository secrets reach
-no job yet.
+When egress is provisioned, the daemon starts the container with
+`--network pasta:--map-host-loopback=10.0.2.2` (or
+`slirp4netns:allow_host_loopback=true` when pasta is unavailable).
+The proxy listens on host loopback and the container reaches it at
+`10.0.2.2:<port>`; the sandbox gets `HTTP_PROXY`/`HTTPS_PROXY` with
+that address. The proxy forwards HTTPS `CONNECT` to allowlisted hosts
+on ports 80 and 443. A plain `http://` request or another port is not
+forwarded, so a local job needs an `https://` server and repo URL.
+Pasta maps host loopback to `10.0.2.2`, so a sandbox can also reach
+host loopback ports directly; the proxy is not the only reachable
+host service. Do not expose untrusted services on host loopback. Each
+proxy listens on a random host loopback port and has no per-sandbox
+credential in this release: a sibling sandbox that finds another
+sandbox's port can use its proxy. Run one daemon per trust domain, or
+add network isolation. With egress disabled the container stays
+`--network none`. Secret values never enter the sandbox.
+
+For a job-token sandbox create, the server resolves the job's
+secrets itself, records them in `ci_job_secrets`, and passes the
+host/header/value bindings to the local daemon over the Unix socket
+(never into the sandbox). The daemon injects a value only when the
+request's `secret_headers` names the same host and header. The
+runner also resolves after its git credential and adds the values to
+its log-scrub list.
+
+### Repository secret policy
+
+A repository Admin sets two policies with
+`PATCH /api/v1/repos/{owner}/{repo}`, for example
+`{"ci_allow_secrets_on_refs_for": true, "ci_env_secrets": false}`
+(the body may also carry `refs_for_access`). Both default to off.
+`ci_allow_secrets_on_refs_for` opts `refs/for` runs in to secret
+resolution. `ci_env_secrets` is an E2B-only opt-in: only the E2B
+provider injects values as environment variables. Each secret binds
+delivery with `host` (default empty) and `header` (default
+`Authorization`). An empty host is not proxy-injected but still
+registers for session redaction. Changes are audited as
+`ci.secret.policy` (values only, never secret material).
 
 ## Quotas
 
@@ -176,15 +206,17 @@ CI usage and its limits belong to whoever runs the compute:
 
 Per-item caps apply to every run: logs cap at 100 MiB per job;
 artifacts at 1 GiB each, with a 30-day expiry. An expired artifact can no
-longer be downloaded and stops counting toward `ci.limits.artifact_bytes`,
-but no scheduled job deletes it yet: its row and blob stay on disk.
+longer be downloaded and stops counting toward `ci.limits.artifact_bytes`.
+The hourly cleanup deletes expired artifact rows (up to 1000 per pass)
+and collects zero-ref blobs.
 
 ## Audit
 
 Audited actions: runner registration and revocation, job enqueue /
 cancel / finish, quota refusals (`ci.job.quota`), supplier link and
 unlink (`ci.supplier.link`, `ci.supplier.unlink`), secret create /
-rotate / resolve, sandbox create / kill. Per-log-chunk and per-status
+rotate / resolve, secret policy change (`ci.secret.policy`), sandbox
+create / kill. Per-log-chunk and per-status
 events are not audited. Audit details never carry token hashes, secret
 values, or sealed material.
 

@@ -334,11 +334,20 @@ pub async fn remove_collaborator(
 #[derive(Deserialize, utoipa::ToSchema)]
 pub struct PatchRepoBody {
     pub refs_for_access: Option<String>,
+    /// Per-repo CI secret policy: resolve secrets for `refs/for` jobs.
+    #[serde(default)]
+    pub ci_allow_secrets_on_refs_for: Option<bool>,
+    /// Per-repo CI secret policy: deliver secrets as env vars on E2B.
+    #[serde(default)]
+    pub ci_env_secrets: Option<bool>,
 }
 
 /// `PATCH /repos/{owner}/{repo}` (`{"refs_for_access": …}`): flips the
-/// `refs/for` push policy between `anyone_with_read` and `members`.
-/// Maintain+ via the repo-settings power; anything else in the body is 422.
+/// `anyone_with_read` and `members`, and/or the per-repo CI secret policy
+/// (`ci_allow_secrets_on_refs_for`, `ci_env_secrets`; Admin).
+/// Maintain+ via the repo-settings power for `refs_for_access`; Admin for
+/// the CI secret policy. At least one field is required; anything else in
+/// the body is 422.
 #[utoipa::path(
     patch,
     path = "/api/v1/repos/{owner}/{repo}",
@@ -365,14 +374,54 @@ pub async fn patch(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let auth = auth.require(Scope::RepoWrite)?;
     let Json(body) = body.map_err(|e| ApiError::Invalid(e.body_text()))?;
-    let Some(value) = body.refs_for_access else {
-        return Err(ApiError::Invalid("refs_for_access is required".into()));
-    };
-    let value = state
-        .core
-        .set_refs_for_access(&auth.user, &owner, &repo, &value)
-        .await?;
-    Ok(Json(serde_json::json!({ "refs_for_access": value })))
+    if body.refs_for_access.is_none()
+        && body.ci_allow_secrets_on_refs_for.is_none()
+        && body.ci_env_secrets.is_none()
+    {
+        return Err(ApiError::Invalid(
+            "at least one of refs_for_access, ci_allow_secrets_on_refs_for, ci_env_secrets is required"
+                .into(),
+        ));
+    }
+    let mut out = serde_json::Map::new();
+    // The CI policy needs Admin, the stricter check: apply it first so a
+    // Maintain caller that sends both fields cannot change `refs_for_access`
+    // and then be refused.
+    if body.ci_allow_secrets_on_refs_for.is_some() || body.ci_env_secrets.is_some() {
+        let (allow_refs_for, env_secrets) = state
+            .core
+            .set_ci_secret_policy(
+                &auth.user,
+                &owner,
+                &repo,
+                body.ci_allow_secrets_on_refs_for,
+                body.ci_env_secrets,
+            )
+            .await?;
+        if body.ci_allow_secrets_on_refs_for.is_some() {
+            out.insert(
+                "ci_allow_secrets_on_refs_for".to_owned(),
+                serde_json::Value::Bool(allow_refs_for),
+            );
+        }
+        if body.ci_env_secrets.is_some() {
+            out.insert(
+                "ci_env_secrets".to_owned(),
+                serde_json::Value::Bool(env_secrets),
+            );
+        }
+    }
+    if let Some(value) = body.refs_for_access.clone() {
+        let value = state
+            .core
+            .set_refs_for_access(&auth.user, &owner, &repo, &value)
+            .await?;
+        out.insert(
+            "refs_for_access".to_owned(),
+            serde_json::Value::String(value),
+        );
+    }
+    Ok(Json(serde_json::Value::Object(out)))
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]

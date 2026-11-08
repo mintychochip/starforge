@@ -200,11 +200,13 @@ It covers secrets at rest, audit reads, and known limits.
 - The server seals CI secrets with XChaCha20 Poly1305 through `CiSecretBox`. The seal uses the `ci-secrets-v1` key.
 - Secret views never carry sealed values or plaintexts. List routes show names only.
 - Resolution returns values in memory for header injection at the egress proxy. The response sends `Cache-Control: no-store`.
-- Secret values never enter the job environment. The runner keeps them out of sandbox environment variables.
-- A `refs/for` run resolves no secrets. The constant `ALLOW_SECRETS_ON_REFS_FOR` is false, and no setting changes it.
+- Each secret carries an optional `host` and an optional `header` binding. `host` defaults to empty. `header` defaults to `Authorization`. An empty host means no proxy injection.
+- The server resolves a job sandbox create by itself. The server sends the bindings to the local daemon over the Unix socket. The daemon injects a value only when `secret_headers` names the same host and the same header.
+- Secret values never enter the sandbox environment or filesystem on the local provider.
+- Only the E2B provider delivers values as environment variables. The E2B path needs the repository opt-in `ci_env_secrets`.
+- A `refs/for` run resolves no secrets by default. A repository admin can opt in with `ci_allow_secrets_on_refs_for`.
 - The egress proxy injects secret headers for allowlisted hosts only. Unbound hosts receive no secret header.
 - The proxy and its bindings redact values in `Debug` output. Values never reach logs, rendered pages, or URLs.
-- The runner does not call the resolution route at this time. A job so receives no repository secret.
 
 ### Sandbox isolation
 
@@ -216,8 +218,10 @@ It covers secrets at rest, audit reads, and known limits.
 - A per sandbox egress proxy meters socket traffic. The proxy trusts one CA per sandbox.
 - The proxy enforces a host allowlist. Non HTTP ports need CIDR allowlisted addresses.
 - The sandbox trusts the per sandbox CA. The CA keys rest in a directory with mode `0600`.
-- The local provider starts each container with `--network none`. The container cannot reach the proxy on the host, so a local sandbox has no network access.
-- The allowlist and the secret headers have no effect until the container network routes traffic to the proxy.
+- When the daemon provisions egress, it starts the container with pasta and maps host loopback to `10.0.2.2`. The container reaches the proxy at `10.0.2.2:<port>`. The daemon uses slirp4netns when pasta is unavailable. With egress disabled, the container stays with `--network none`.
+- The proxy forwards HTTPS `CONNECT` to allowlisted hosts on ports 80 and 443. The proxy refuses plain HTTP and other ports. Pasta also exposes host loopback ports directly, so the proxy is not the only reachable host service. Do not expose untrusted services on host loopback.
+- Each proxy listens on a random host loopback port and has no per sandbox credential in this release. A sibling sandbox that finds another sandbox's port can use its proxy. Run one daemon per trust domain, or add network isolation.
+- The proxy enforces the allowlist for proxied traffic. Secret values never enter the sandbox.
 
 ### CI and sandbox abuse controls
 

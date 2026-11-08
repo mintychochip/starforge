@@ -1327,15 +1327,6 @@ fn job_timeout_secs(spec: &CiJobSpec) -> i64 {
         .unwrap_or(DEFAULT_JOB_TIMEOUT_SECS)
 }
 
-/// `ci.allow_secrets_on_refs_for` (plan decision 7): `refs/for` runs get no
-/// secrets unless the repo opts in. The server-wide default is false.
-pub const ALLOW_SECRETS_ON_REFS_FOR: bool = false;
-/// `ci.env_secrets` (plan decision 7): env injection of secrets is an
-/// explicit per-repo opt-in for providers without an egress proxy. The
-/// server-wide default is false; resolution below returns values to the
-/// runner for proxy header injection, never to the sandbox environment.
-pub const ENV_SECRETS: bool = false;
-
 /// A CI run as listed to repository users.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CiRunView {
@@ -1406,6 +1397,8 @@ pub struct SecretView {
     pub id: i64,
     pub repo_id: i64,
     pub name: String,
+    pub host: String,
+    pub header: String,
     pub redact_in_sessions: bool,
     pub created_at: i64,
     pub updated_at: i64,
@@ -1417,6 +1410,8 @@ impl From<starforged_db::ci::CiSecretRow> for SecretView {
             id: row.id,
             repo_id: row.repo_id,
             name: row.name,
+            host: row.host,
+            header: row.header,
             redact_in_sessions: row.redact_in_sessions,
             created_at: row.created_at,
             updated_at: row.updated_at,
@@ -1430,6 +1425,8 @@ impl From<starforged_db::ci::CiSecretRow> for SecretView {
 pub struct ResolvedSecret {
     pub name: String,
     pub value: String,
+    pub host: String,
+    pub header: String,
 }
 
 impl std::fmt::Debug for ResolvedSecret {
@@ -1437,6 +1434,8 @@ impl std::fmt::Debug for ResolvedSecret {
         f.debug_struct("ResolvedSecret")
             .field("name", &self.name)
             .field("value", &"<redacted>")
+            .field("host", &self.host)
+            .field("header", &self.header)
             .finish()
     }
 }
@@ -1480,6 +1479,74 @@ pub fn validate_secret_name(name: &str) -> CoreResult<()> {
         return Err(CoreError::Invalid(
             "secret name may only contain [A-Za-z0-9_]".into(),
         ));
+    }
+    Ok(())
+}
+
+/// Validates a secret's egress-proxy destination host: empty means the
+/// secret is not proxy-injected. Otherwise a bare DNS-style host (already
+/// lowercased by the caller): 1–253 chars of `a-z0-9.-`, no `..`, no
+/// leading/trailing `.` or `-`.
+pub fn validate_secret_host(host: &str) -> CoreResult<()> {
+    if host.is_empty() {
+        return Ok(());
+    }
+    if host.len() > 253 {
+        return Err(CoreError::Invalid(
+            "secret host must be at most 253 characters".into(),
+        ));
+    }
+    if !host.is_ascii()
+        || !host
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-')
+    {
+        return Err(CoreError::Invalid(
+            "secret host must be a bare hostname of lowercase letters, digits, '.', '-'".into(),
+        ));
+    }
+    if host.contains("..") || host.starts_with(['.', '-']) || host.ends_with(['.', '-']) {
+        return Err(CoreError::Invalid(
+            "secret host must not contain '..' or start/end with '.' or '-'".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Validates a secret's egress-proxy injection header: 1–64 chars of HTTP
+/// token characters, excluding hop-by-hop and framing headers a proxy
+/// must never inject.
+pub fn validate_secret_header(header: &str) -> CoreResult<()> {
+    if header.is_empty() || header.len() > 64 {
+        return Err(CoreError::Invalid(
+            "secret header must be 1-64 characters".into(),
+        ));
+    }
+    const TOKEN: &[u8] = b"!#$%&'*+-.^_`|~";
+    if !header
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || TOKEN.contains(&b))
+    {
+        return Err(CoreError::Invalid(
+            "secret header must be an HTTP token".into(),
+        ));
+    }
+    const DENIED: &[&str] = &[
+        "host",
+        "content-length",
+        "transfer-encoding",
+        "connection",
+        "proxy-connection",
+        "keep-alive",
+        "upgrade",
+        "te",
+        "trailer",
+        "set-cookie",
+    ];
+    if DENIED.contains(&header.to_ascii_lowercase().as_str()) {
+        return Err(CoreError::Invalid(format!(
+            "secret header '{header}' is not allowed"
+        )));
     }
     Ok(())
 }
@@ -1536,6 +1603,15 @@ fn glob_match(pat: &[char], text: &[char]) -> bool {
         return glob_match(&pat[1..], &text[1..]);
     }
     pat[0] == text[0] && glob_match(&pat[1..], &text[1..])
+}
+
+/// One secret create/rotate request from the API layer.
+pub struct CiSecretInput<'a> {
+    pub name: &'a str,
+    pub value: &'a str,
+    pub host: &'a str,
+    pub header: &'a str,
+    pub redact_in_sessions: bool,
 }
 
 impl Core {
@@ -1954,8 +2030,8 @@ impl Core {
 
     /// The secret-trust rule (plan decision 7) for one job: secrets resolve
     /// only on a protected branch or a Trail change with maintainer
-    /// approval. `refs/for` runs are only trusted when
-    /// [`ALLOW_SECRETS_ON_REFS_FOR`] is set (false by default).
+    /// approval. `refs/for` runs are only trusted when the repository has
+    /// opted in via `ci_allow_secrets_on_refs_for` (off by default).
     pub async fn secrets_trusted_for_job(
         &self,
         job: &starforged_db::ci::CiJobRow,
@@ -1963,7 +2039,7 @@ impl Core {
         if let Some(change_id) = job.change_id {
             // Trail/`refs/for` job: trusted only with an approval, or with
             // the explicit per-repo opt-in.
-            if ALLOW_SECRETS_ON_REFS_FOR {
+            if db_repos::ci_allow_secrets_on_refs_for(self.db(), job.repo_id).await? {
                 return Ok(true);
             }
             let reviews = db_changes::reviews_of_change(self.db(), change_id).await?;
@@ -1999,10 +2075,15 @@ impl Core {
         user: &crate::accounts::User,
         owner: &str,
         repo: &str,
-        name: &str,
-        value: &str,
-        redact_in_sessions: bool,
+        secret: CiSecretInput<'_>,
     ) -> CoreResult<SecretView> {
+        let CiSecretInput {
+            name,
+            value,
+            host,
+            header,
+            redact_in_sessions,
+        } = secret;
         let access = self
             .require_repo(Some(user), owner, repo, Permission::Admin)
             .await?;
@@ -2010,15 +2091,28 @@ impl Core {
         if value.is_empty() {
             return Err(CoreError::Invalid("secret value must not be empty".into()));
         }
+        let host = host.trim().to_ascii_lowercase();
+        validate_secret_host(&host)?;
+        let header = header.trim();
+        let header = if header.is_empty() {
+            "Authorization"
+        } else {
+            header
+        };
+        validate_secret_header(header)?;
         let sealed = self.seal_ci_secret(value);
         let row = db_ci::upsert_secret(
             self.db(),
-            access.repo.id,
-            name,
-            &sealed,
-            redact_in_sessions,
-            Some(user.id),
-            now(),
+            db_ci::NewCiSecret {
+                repo_id: access.repo.id,
+                name,
+                sealed_value: &sealed,
+                redact_in_sessions,
+                host: &host,
+                header,
+                created_by: Some(user.id),
+                now_ts: now(),
+            },
         )
         .await?;
         self.audit(
@@ -2099,24 +2193,11 @@ impl Core {
                 return Err(CoreError::Invalid("job is canceled".into()));
             }
         };
-        if !self.secrets_trusted_for_job(&job).await? {
+        let resolved = self.resolve_job_secrets(&job).await?;
+        if resolved.is_empty() && !self.secrets_trusted_for_job(&job).await? {
             return Ok(Vec::new());
         }
-        let spec: CiJobSpec = serde_json::from_str(&job.spec)
-            .map_err(|_| CoreError::Invalid("job spec is not parseable".into()))?;
-        let mut resolved = Vec::new();
-        let mut names = Vec::new();
-        for name in &spec.secrets {
-            if let Some(row) = db_ci::secret_by_name(self.db(), job.repo_id, name).await? {
-                let value = self.open_ci_secret(&row.sealed_value)?;
-                db_ci::insert_job_secret(self.db(), job.id, row.id, now()).await?;
-                names.push(name.clone());
-                resolved.push(ResolvedSecret {
-                    name: name.clone(),
-                    value,
-                });
-            }
-        }
+        let names: Vec<String> = resolved.iter().map(|s| s.name.clone()).collect();
         self.audit(
             job.created_by,
             "ci.job.secrets.resolve",
@@ -2125,6 +2206,55 @@ impl Core {
         )
         .await?;
         Ok(resolved)
+    }
+
+    /// Resolves the secrets a job named in its spec: trust check, parse the
+    /// spec, and for each spec secret name look up the repository secret,
+    /// open it, and record the resolution in `ci_job_secrets`. Shared by
+    /// the runner resolution path and the job-sandbox create path.
+    async fn resolve_job_secrets(
+        &self,
+        job: &starforged_db::ci::CiJobRow,
+    ) -> CoreResult<Vec<ResolvedSecret>> {
+        if !self.secrets_trusted_for_job(job).await? {
+            return Ok(Vec::new());
+        }
+        let spec: CiJobSpec = serde_json::from_str(&job.spec)
+            .map_err(|_| CoreError::Invalid("job spec is not parseable".into()))?;
+        let mut resolved = Vec::new();
+        for name in &spec.secrets {
+            if let Some(row) = db_ci::secret_by_name(self.db(), job.repo_id, name).await? {
+                let value = self.open_ci_secret(&row.sealed_value)?;
+                db_ci::insert_job_secret(self.db(), job.id, row.id, now()).await?;
+                resolved.push(ResolvedSecret {
+                    name: name.clone(),
+                    value,
+                    host: row.host,
+                    header: row.header,
+                });
+            }
+        }
+        Ok(resolved)
+    }
+
+    /// Resolves the secrets for a job-sandbox create (the `JobAuth` path):
+    /// the job must exist and match the principal's `(repo, commit)`, and
+    /// must be `claimed` or `running`. No audit row here — the sandbox
+    /// create that consumes the values is audited.
+    pub async fn resolve_secrets_for_job(
+        &self,
+        principal: &JobPrincipal,
+    ) -> CoreResult<Vec<ResolvedSecret>> {
+        let job = db_ci::ci_job_by_id(self.db(), principal.job_id)
+            .await?
+            .ok_or(CoreError::NotFound)?;
+        if job.repo_id != principal.repo_id || job.commit_sha != principal.commit_sha {
+            return Err(CoreError::NotFound);
+        }
+        if job.state != "claimed" && job.state != "running" {
+            return Err(CoreError::Conflict("job is not running".into()));
+        }
+        self.resolve_job_secrets(&job).await
     }
 
     /// Mints a one-time artifact upload token ([`ARTIFACT_TOKEN_PREFIX`])
@@ -2312,13 +2442,19 @@ impl Core {
     }
 
     /// Deletes expired artifact rows and collects blobs whose CAS refcount
-    /// dropped to zero. Returns the deleted artifact ids.
+    /// dropped to zero. The CAS is shared with session blobs and CI log
+    /// chunks, so a blob still referenced by either is left for the
+    /// zero-ref sweep. Returns the deleted artifact ids.
     pub async fn gc_expired_artifacts(&self) -> CoreResult<Vec<i64>> {
         let expired = db_ci::expired_artifacts(self.db(), now(), 1000).await?;
         let mut ids = Vec::new();
         for row in expired {
             if db_ci::delete_artifact(self.db(), row.id).await?
                 && db_ci::artifact_refcount(self.db(), &row.blake3).await? == 0
+                && db_ci::ci_log_refcount(self.db(), &row.blake3).await? == 0
+                && !db_sessions::blob_by_hash(self.db(), &row.blake3)
+                    .await?
+                    .is_some_and(|blob| blob.refcount > 0)
             {
                 let _ = self
                     .config()
@@ -3047,7 +3183,16 @@ mod tests {
         let sealed = bx.seal(b"ci-secret-value");
         assert!(sealed.starts_with("c1:"), "{sealed}");
         assert_eq!(bx.open(&sealed).unwrap(), b"ci-secret-value");
-        assert!(bx.open(&sealed.replace(&sealed[3..4], "A")).is_err());
+        // Flip the first ciphertext character to a different value; a
+        // no-op replacement (the byte is already `A`) would not tamper.
+        let mut tampered = sealed.clone();
+        let replacement = if tampered.as_bytes()[3] == b'A' {
+            "B"
+        } else {
+            "A"
+        };
+        tampered.replace_range(3..4, replacement);
+        assert!(bx.open(&tampered).is_err());
         assert_eq!(format!("{bx:?}"), "CiSecretBox(<redacted>)");
     }
 

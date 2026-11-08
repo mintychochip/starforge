@@ -51,10 +51,12 @@ It covers limits, the doctor command, backup, restore, and upgrade rules.
 - A same key enqueue records a rerun for index and mergeability jobs while the job runs. A collision with a queued copy records nothing.
 - The hourly pass deletes expired web sessions, email tokens, and OAuth codes. It deletes invites that expired more than 30 days ago.
 - The hourly pass blanks failed mail bodies older than 7 days. It prunes webhook delivery rows older than 30 days. It reconciles mirror schedules.
-- The hourly pass garbage collects zero reference blobs under the blob garbage collection lock.
+- The hourly pass garbage collects zero reference blobs under the blob garbage collection lock. The hourly pass deletes expired CI artifact rows and collects zero-ref artifact blobs.
 - The hourly pass enqueues at most 100 unrecorded revision commits.
 
 Each job worker also runs the CI sweep. `run_ci_sweep_if_due` calls `sweep_ci_jobs` at most once every 30 seconds across all workers. A compare-exchange on the due time lets one worker sweep per interval. Sweep errors only log warnings. A sweep failure never stops job work.
+
+A job sandbox create resolves the job secrets on the server side. The hourly pass runs artifact GC.
 
 The sweep requeues claimed or running CI jobs with expired leases. A lease lasts 60 seconds. A reaped job returns to `queued`, or ends `failed` after 3 attempts. A cancel request ends the job as `canceled`. A requeued job writes no terminal check and emits no event.
 

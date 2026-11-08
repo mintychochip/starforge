@@ -478,6 +478,62 @@ pub async fn set_refs_for_access(db: &Db, id: i64, value: &str) -> DbResult<()> 
     Ok(())
 }
 
+/// Whether the repository has opted into resolving CI secrets for
+/// `refs/for` (Trail) jobs without maintainer approval (M6c C3 follow-up).
+/// A missing repository reads as false (off by default).
+pub async fn ci_allow_secrets_on_refs_for(db: &Db, id: i64) -> DbResult<bool> {
+    let value: Option<i64> =
+        sqlx::query_scalar("SELECT ci_allow_secrets_on_refs_for FROM repos WHERE id = $1")
+            .bind(id)
+            .fetch_optional(db.read_pool())
+            .await?
+            .flatten();
+    Ok(value.unwrap_or(0) != 0)
+}
+
+/// Whether the repository has opted into delivering CI secrets as sandbox
+/// environment variables on providers without an egress proxy (M6c C3
+/// follow-up). A missing repository reads as false (off by default).
+pub async fn ci_env_secrets(db: &Db, id: i64) -> DbResult<bool> {
+    let value: Option<i64> = sqlx::query_scalar("SELECT ci_env_secrets FROM repos WHERE id = $1")
+        .bind(id)
+        .fetch_optional(db.read_pool())
+        .await?
+        .flatten();
+    Ok(value.unwrap_or(0) != 0)
+}
+
+/// Sets the per-repository CI secret policy. `None` leaves a column
+/// unchanged, in one statement, so concurrent PATCHes of different fields
+/// do not clobber each other. Returns the resulting pair, or `None` when
+/// the repository is missing.
+pub async fn set_ci_secret_policy(
+    db: &Db,
+    id: i64,
+    allow_refs_for: Option<bool>,
+    env_secrets: Option<bool>,
+) -> DbResult<Option<(bool, bool)>> {
+    let row = sqlx::query(
+        "UPDATE repos SET \
+         ci_allow_secrets_on_refs_for = COALESCE($1, ci_allow_secrets_on_refs_for), \
+         ci_env_secrets = COALESCE($2, ci_env_secrets) \
+         WHERE id = $3 \
+         RETURNING ci_allow_secrets_on_refs_for, ci_env_secrets",
+    )
+    .bind(allow_refs_for.map(i64::from))
+    .bind(env_secrets.map(i64::from))
+    .bind(id)
+    .fetch_optional(db.pool())
+    .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    Ok(Some((
+        row.try_get::<i64, _>("ci_allow_secrets_on_refs_for")? != 0,
+        row.try_get::<i64, _>("ci_env_secrets")? != 0,
+    )))
+}
+
 /// The one-time import state (`none|pending|running|done|failed`) of the
 /// repository, for the hook's push-refusal snapshot (M4b D3).
 pub async fn import_state(db: &Db, id: i64) -> DbResult<String> {

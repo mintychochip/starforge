@@ -138,6 +138,8 @@ The `sandbox.provider` override accepts `local` or `e2b` only. An unknown provid
 
 The key also seals TOTP secrets with the webhook key. The key also seals CI secrets through `CiSecretBox`. `CiSecretBox` uses HKDF info `ci-secrets-v1` and XChaCha20-Poly1305.
 
+A repository admin can set two per-repository CI secret policies. The policies are `ci_allow_secrets_on_refs_for` and `ci_env_secrets`. Both policies default to off. The admin sets them with `PATCH /api/v1/repos/{owner}/{repo}`. The server-wide `[ci]` table stays unchanged.
+
 Loss of `secret_key` makes sealed webhook secrets unreadable. Loss of `secret_key` makes sealed mirror credentials unreadable. Loss of `secret_key` makes sealed TOTP secrets unreadable. TOTP codes stop working after loss. Recovery codes still work after loss, because recovery codes store SHA-256 hashes.
 
 Loss of `secret_key` makes sealed CI secrets unreadable. Web sessions do not depend on the key, because web sessions store only a hash of a random token. Loss of `secret_key` does not sign anyone out. A replacement has the same effect. Webhook deliveries fail until operators reset the secrets.

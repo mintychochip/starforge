@@ -456,6 +456,9 @@ impl Core {
         // snapshot references before deletion resumes (plan M5b O1).
         let _blob_gc_lock =
             crate::repolock::BlobGcLock::exclusive_async(&self.config().blob_dir).await?;
+        // Expired CI artifacts (30-day retention) are deleted here; each
+        // CAS blob is removed when its refcount drops to zero (M6c C2).
+        self.gc_expired_artifacts().await?;
         for blob in db_sessions::zero_ref_blobs(self.db(), 100).await? {
             match db_sessions::delete_blob_if_unreferenced(self.db(), &blob.hash).await {
                 Ok(true) => {}

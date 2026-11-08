@@ -5,6 +5,7 @@
 //! trust rule (protected branch / approved Trail; `refs/for` denied).
 mod common;
 
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use common::*;
@@ -12,7 +13,10 @@ use reqwest::StatusCode;
 use serde_json::{Value, json};
 use sha2::Digest as _;
 use starforged_core::permission::Visibility;
+use starforged_core::sandboxes::SandboxProviderKind;
 use starforged_core::tokens::Scope;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::UnixListener;
 
 const CI_TOML: &str = r#"version = 1
 
@@ -25,7 +29,7 @@ name = "test"
 image = "example.test/image:1"
 commands = ["true"]
 timeout = "30m"
-secrets = ["CARGO_REGISTRY_TOKEN"]
+secrets = ["CARGO_REGISTRY_TOKEN", "HOSTLESS_TOKEN"]
 artifacts = ["out/**"]
 "#;
 
@@ -39,6 +43,8 @@ async fn api(
     let req = match method {
         "GET" => client.get(url),
         "POST" => client.post(url),
+        "PUT" => client.put(url),
+        "PATCH" => client.patch(url),
         "DELETE" => client.delete(url),
         _ => unreachable!(),
     };
@@ -449,6 +455,104 @@ async fn artifacts_authorize_upload_download_and_reject() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    // The hourly cleanup's artifact GC deletes the expired row and, once
+    // its refcount is zero, the CAS blob.
+    let artifact = starforged_db::ci::artifact_by_name(s.db(), job_id, "out/result.bin", -1)
+        .await
+        .unwrap()
+        .expect("artifact row");
+    let blob_hash = artifact.blake3.clone();
+    let deleted = s.core.gc_expired_artifacts().await.unwrap();
+    assert!(deleted.contains(&artifact.id), "deleted: {deleted:?}");
+    assert!(
+        starforged_db::ci::artifact_by_name(s.db(), job_id, "out/result.bin", -1)
+            .await
+            .unwrap()
+            .is_none(),
+        "expired artifact row is gone"
+    );
+    assert!(
+        s.core
+            .config()
+            .blob_store
+            .get_by_hash(&blob_hash)
+            .await
+            .is_err(),
+        "unreferenced artifact blob is gone"
+    );
+
+    // A blob shared with a live session or CI log chunk must survive the
+    // artifact GC: the CAS is shared across all three.
+    let shared = b"shared artifact\n";
+    let shared_sha = hex::encode(sha2::Sha256::digest(shared));
+    let resp = client
+        .post(s.url(&format!(
+            "/api/v1/runners/jobs/{job_id}/artifacts/authorize"
+        )))
+        .bearer_auth(&runner)
+        .header("X-Starforge-Fence", &fence)
+        .json(&json!({
+            "name": "out/second.bin",
+            "size": shared.len(),
+            "sha256": shared_sha,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let value: Value = resp.json().await.unwrap();
+    let shared_token = value["token"].as_str().unwrap().to_owned();
+    let resp = client
+        .put(s.url(&format!(
+            "/api/v1/runners/jobs/{job_id}/artifacts/out/second.bin"
+        )))
+        .bearer_auth(&shared_token)
+        .header("X-Starforge-Sha256", &shared_sha)
+        .body(shared.to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let stored2: Value = resp.json().await.unwrap();
+    let shared_hash = stored2["blake3"].as_str().unwrap().to_owned();
+    starforged_db::sessions::blob_incref(s.db(), &shared_hash, shared.len() as i64, &shared_hash)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO ci_job_logs (job_id, start_offset, end_offset, blake3, created_at) \
+         VALUES ($1, 0, 1, $2, $3)",
+    )
+    .bind(job_id)
+    .bind(&shared_hash)
+    .bind(starforged_db::now())
+    .execute(s.db().pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE ci_artifacts SET expires_at = 0 WHERE job_id = $1 AND name = 'out/second.bin'",
+    )
+    .bind(job_id)
+    .execute(s.db().pool())
+    .await
+    .unwrap();
+    let deleted = s.core.gc_expired_artifacts().await.unwrap();
+    assert!(!deleted.is_empty(), "deleted: {deleted:?}");
+    assert!(
+        starforged_db::ci::artifact_by_name(s.db(), job_id, "out/second.bin", -1)
+            .await
+            .unwrap()
+            .is_none(),
+        "expired shared artifact row is gone"
+    );
+    assert!(
+        s.core
+            .config()
+            .blob_store
+            .get_by_hash(&shared_hash)
+            .await
+            .is_ok(),
+        "shared blob survives artifact GC"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -466,10 +570,12 @@ async fn secrets_crud_and_trust_rule() {
         "POST",
         &s.url("/api/v1/repos/alice/proj/ci/secrets"),
         &pat,
-        Some(json!({ "name": "CARGO_REGISTRY_TOKEN", "value": secret_value })),
+        Some(json!({ "name": "CARGO_REGISTRY_TOKEN", "value": secret_value, "host": "registry.example", "header": "Authorization" })),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "{value}");
+    assert_eq!(value["host"], "registry.example");
+    assert_eq!(value["header"], "Authorization");
     let sealed = starforged_db::ci::secret_by_name(s.db(), repo.id, "CARGO_REGISTRY_TOKEN")
         .await
         .unwrap()
@@ -489,6 +595,8 @@ async fn secrets_crud_and_trust_rule() {
     .await;
     assert_eq!(status, StatusCode::OK, "{value}");
     assert_eq!(value["secrets"].as_array().unwrap().len(), 1);
+    assert_eq!(value["secrets"][0]["host"], "registry.example");
+    assert_eq!(value["secrets"][0]["header"], "Authorization");
     let listed = value.to_string();
     assert!(
         !listed.contains(secret_value),
@@ -596,6 +704,8 @@ async fn secrets_crud_and_trust_rule() {
     assert_eq!(secrets.len(), 1);
     assert_eq!(secrets[0]["name"], "CARGO_REGISTRY_TOKEN");
     assert_eq!(secrets[0]["value"], secret_value);
+    assert_eq!(secrets[0]["host"], "registry.example");
+    assert_eq!(secrets[0]["header"], "Authorization");
     assert_eq!(
         starforged_db::ci::job_secrets_for_job(s.db(), protected_job)
             .await
@@ -720,6 +830,73 @@ async fn refs_for_jobs_get_no_secrets_without_approval() {
         "unapproved refs/for runs get no secrets (ci.allow_secrets_on_refs_for is off)"
     );
 
+    // A non-admin (Write collaborator) cannot flip the policy.
+    let bob = s.user("bob").await;
+    let bob_pat = s.token(&bob, &[Scope::RepoWrite]).await;
+    let (status, value) = api(
+        &client,
+        "PUT",
+        &s.url("/api/v1/repos/alice/proj/collaborators/bob"),
+        &pat,
+        Some(json!({ "permission": "write" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{value}");
+    let (status, value) = api(
+        &client,
+        "PATCH",
+        &s.url("/api/v1/repos/alice/proj"),
+        &bob_pat,
+        Some(json!({ "ci_allow_secrets_on_refs_for": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{value}");
+
+    // Admin opts the repo in; the same claimed job now resolves.
+    let (status, value) = api(
+        &client,
+        "PATCH",
+        &s.url("/api/v1/repos/alice/proj"),
+        &pat,
+        Some(json!({ "ci_allow_secrets_on_refs_for": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert_eq!(value["ci_allow_secrets_on_refs_for"], true);
+    let resp = client
+        .post(s.url(&format!("/api/v1/runners/jobs/{trail_job}/secrets")))
+        .bearer_auth(&runner)
+        .header("X-Starforge-Fence", &fence)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resolved: Value = resp.json().await.unwrap();
+    assert_eq!(resolved["secrets"].as_array().unwrap().len(), 1);
+    assert_eq!(resolved["secrets"][0]["value"], "trail-secret");
+
+    // Admin resets the opt-in; resolution goes back to empty.
+    let (status, value) = api(
+        &client,
+        "PATCH",
+        &s.url("/api/v1/repos/alice/proj"),
+        &pat,
+        Some(json!({ "ci_allow_secrets_on_refs_for": false })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert_eq!(value["ci_allow_secrets_on_refs_for"], false);
+    let resp = client
+        .post(s.url(&format!("/api/v1/runners/jobs/{trail_job}/secrets")))
+        .bearer_auth(&runner)
+        .header("X-Starforge-Fence", &fence)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resolved: Value = resp.json().await.unwrap();
+    assert_eq!(resolved["secrets"].as_array().unwrap().len(), 0);
+
     // Supersede: a second revision cancels the first revision's job.
     commit_files(&work, &[("feature2.txt", b"feature2\n")], "feature 2").await;
     git_ok(
@@ -781,5 +958,480 @@ async fn refs_for_jobs_get_no_secrets_without_approval() {
     assert_eq!(
         check.description.as_deref(),
         Some("superseded by a newer revision")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn secret_create_rejects_bad_host_and_header() {
+    let s = TestServer::start().await;
+    let alice = s.user("alice").await;
+    let _repo = s.repo(&alice, "proj", Visibility::Private).await;
+    let pat = s.token(&alice, &[Scope::RepoWrite]).await;
+    let client = s.browser();
+    for body in [
+        json!({ "name": "TOKEN", "value": "v", "host": "https://evil.example" }),
+        json!({ "name": "TOKEN", "value": "v", "header": "Content-Length" }),
+    ] {
+        let (status, value) = api(
+            &client,
+            "POST",
+            &s.url("/api/v1/repos/alice/proj/ci/secrets"),
+            &pat,
+            Some(body),
+        )
+        .await;
+        assert!(
+            status == StatusCode::UNPROCESSABLE_ENTITY || status == StatusCode::BAD_REQUEST,
+            "expected 422/400, got {status}: {value}"
+        );
+    }
+}
+
+/// A fake E2B gateway that records every `POST /sandboxes` body and
+/// answers with one running sandbox.
+async fn spawn_recording_e2b() -> (String, Arc<Mutex<Vec<Value>>>) {
+    let bodies = Arc::new(Mutex::new(Vec::new()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let recorded = Arc::clone(&bodies);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            let recorded = Arc::clone(&recorded);
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    let n = stream.read(&mut chunk).await.unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&buf[..end]);
+                        let len: usize = head
+                            .lines()
+                            .find_map(|l| {
+                                l.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .and_then(|v| v.trim().parse().ok())
+                            })
+                            .unwrap_or(0);
+                        if buf.len() >= end + 4 + len {
+                            break;
+                        }
+                    }
+                }
+                let text = String::from_utf8_lossy(&buf);
+                let line = text.lines().next().unwrap_or_default();
+                let mut parts = line.split_whitespace();
+                let method = parts.next().unwrap_or_default();
+                let target = parts.next().unwrap_or_default();
+                let body = text
+                    .split_once("\r\n\r\n")
+                    .map(|(_, b)| b)
+                    .unwrap_or_default();
+                if method == "POST" && target == "/sandboxes" {
+                    if let Ok(value) = serde_json::from_str::<Value>(body) {
+                        recorded.lock().unwrap().push(value);
+                    }
+                    let resp = r#"{"id":"sbx-e2b-1","state":"running","runtime":"e2b","expires_at":null,"provider":"e2b"}"#;
+                    let _ = stream
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                                resp.len(),
+                                resp
+                            )
+                            .as_bytes(),
+                        )
+                        .await;
+                } else {
+                    let _ = stream
+                        .write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n")
+                        .await;
+                }
+            });
+        }
+    });
+    (url, bodies)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn job_sandbox_delivers_secrets_only_to_e2b_with_the_repo_opt_in() {
+    let (e2b_url, recorded) = spawn_recording_e2b().await;
+    let s = TestServer::start_with(|config| {
+        config.sandbox.provider = SandboxProviderKind::E2b;
+        config.sandbox.e2b.api_url = e2b_url.clone();
+        config.sandbox.e2b.api_key = "test-key".to_owned();
+    })
+    .await;
+    let alice = s.user("alice").await;
+    let repo = s.repo(&alice, "proj", Visibility::Private).await;
+    let pat = s.token(&alice, &[Scope::RepoWrite]).await;
+    let secret_value = "e2b-secret-value";
+    let (status, value) = api(
+        &s.browser(),
+        "POST",
+        &s.url("/api/v1/repos/alice/proj/ci/secrets"),
+        &pat,
+        Some(json!({
+            "name": "CARGO_REGISTRY_TOKEN",
+            "value": secret_value,
+            "host": "registry.example",
+            "header": "Authorization",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{value}");
+    let (status, value) = api(
+        &s.browser(),
+        "POST",
+        &s.url("/api/v1/repos/alice/proj/ci/secrets"),
+        &pat,
+        Some(json!({
+            "name": "HOSTLESS_TOKEN",
+            "value": "hostless-secret-value",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{value}");
+    // Protect main so the job is trusted for secret resolution.
+    let (status, value) = api(
+        &s.browser(),
+        "POST",
+        &s.url("/api/v1/repos/alice/proj/gate-rules"),
+        &pat,
+        Some(json!({
+            "pattern": "main",
+            "required_approvals": 0,
+            "dismiss_on_push": false,
+            "block_on_request_changes": false,
+            "required_contexts": [],
+            "require_up_to_date": false,
+            "require_threads_resolved": false,
+            "require_session_evidence": false,
+            "allowed_methods": [],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{value}");
+    let tmp = tempfile::tempdir().unwrap();
+    let work = work_repo(
+        tmp.path(),
+        "work",
+        &[(".starforge/ci.toml", CI_TOML), ("README.md", "# proj\n")],
+    )
+    .await;
+    git_ok(
+        &work,
+        &[
+            "push",
+            "-q",
+            &s.git_url("alice", "proj", Some(&pat)),
+            "main",
+        ],
+    )
+    .await;
+    let job = wait_for_job(&s, repo.id, "test").await;
+    let runner = register_runner(&s, &pat).await;
+    let (claimed, _fence, job_token) = claim(&s, &runner).await;
+    assert_eq!(claimed, job);
+
+    // E2B without the repo opt-in: the server resolves and registers the
+    // secret for redaction, but sends neither envs nor bindings.
+    let (status, value) = api(
+        &s.browser(),
+        "POST",
+        &s.url("/api/v1/sandboxes"),
+        &job_token,
+        Some(json!({ "template": "starforge/rust", "runtime": "e2b" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{value}");
+    let first = recorded.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(
+        starforged_db::ci::job_secrets_for_job(s.db(), job)
+            .await
+            .unwrap()
+            .len(),
+        2,
+        "resolution is recorded for session redaction"
+    );
+    assert!(
+        first.get("secret_bindings").is_none(),
+        "E2B must never receive secret bindings: {first}"
+    );
+    assert!(
+        !first["envs"]
+            .as_object()
+            .unwrap()
+            .values()
+            .any(|v| v.as_str() == Some(secret_value)),
+        "no env delivery without the opt-in: {first}"
+    );
+
+    // With the per-repo opt-in, the E2B provider gets the value as env.
+    let (status, value) = api(
+        &s.browser(),
+        "PATCH",
+        &s.url("/api/v1/repos/alice/proj"),
+        &pat,
+        Some(json!({ "ci_env_secrets": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    let (status, value) = api(
+        &s.browser(),
+        "POST",
+        &s.url("/api/v1/sandboxes"),
+        &job_token,
+        Some(json!({
+            "template": "starforge/rust",
+            "runtime": "e2b",
+            "idempotency_key": "second-sandbox",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{value}");
+    let second = recorded.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(second["envs"]["CARGO_REGISTRY_TOKEN"], secret_value);
+    assert_eq!(second["envs"]["HOSTLESS_TOKEN"], "hostless-secret-value");
+    assert!(
+        second.get("secret_bindings").is_none(),
+        "E2B must never receive secret bindings: {second}"
+    );
+}
+
+/// A fake local sandbox daemon over a Unix socket. It records every
+/// `POST /sandboxes` body and answers with one running sandbox.
+async fn spawn_recording_local_daemon(
+    token: &str,
+) -> (
+    tempfile::TempDir,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    Arc<Mutex<Vec<Value>>>,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("sandboxd.sock");
+    let token_file = dir.path().join("sandboxd.token");
+    std::fs::write(&token_file, token).unwrap();
+    let listener = UnixListener::bind(&socket).unwrap();
+    let recorded = Arc::new(Mutex::new(Vec::new()));
+    let rec = Arc::clone(&recorded);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            let rec = Arc::clone(&rec);
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    let n = stream.read(&mut chunk).await.unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&buf[..end]);
+                        let len: usize = head
+                            .lines()
+                            .find_map(|l| {
+                                l.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .and_then(|v| v.trim().parse().ok())
+                            })
+                            .unwrap_or(0);
+                        if buf.len() >= end + 4 + len {
+                            break;
+                        }
+                    }
+                }
+                let text = String::from_utf8_lossy(&buf);
+                let line = text.lines().next().unwrap_or_default();
+                let mut parts = line.split_whitespace();
+                let method = parts.next().unwrap_or_default();
+                let target = parts.next().unwrap_or_default();
+                let body = text
+                    .split_once("\r\n\r\n")
+                    .map(|(_, b)| b)
+                    .unwrap_or_default();
+                if method == "POST" && target == "/sandboxes" {
+                    if let Ok(value) = serde_json::from_str::<Value>(body) {
+                        rec.lock().unwrap().push(value);
+                    }
+                    let resp = r#"{"id":"sbx-local-1","state":"running","runtime":"podman","expires_at":null,"provider":"local"}"#;
+                    let _ = stream
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                                resp.len(),
+                                resp
+                            )
+                            .as_bytes(),
+                        )
+                        .await;
+                } else {
+                    let _ = stream
+                        .write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n")
+                        .await;
+                }
+            });
+        }
+    });
+    (dir, socket, token_file, recorded)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn job_sandbox_sends_secret_bindings_to_the_local_daemon() {
+    let (_dir, socket, token_file, recorded) = spawn_recording_local_daemon("daemon-token").await;
+    let s = TestServer::start_with(|config| {
+        config.sandbox.provider = SandboxProviderKind::Local;
+        config.sandbox.local.socket = socket.clone();
+        config.sandbox.local.token_file = token_file.clone();
+    })
+    .await;
+    let alice = s.user("alice").await;
+    let repo = s.repo(&alice, "proj", Visibility::Private).await;
+    let pat = s.token(&alice, &[Scope::RepoWrite]).await;
+    let secret_value = "local-secret-value";
+    let (status, value) = api(
+        &s.browser(),
+        "POST",
+        &s.url("/api/v1/repos/alice/proj/ci/secrets"),
+        &pat,
+        Some(json!({
+            "name": "CARGO_REGISTRY_TOKEN",
+            "value": secret_value,
+            "host": "registry.example",
+            "header": "Authorization",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{value}");
+    let (status, value) = api(
+        &s.browser(),
+        "POST",
+        &s.url("/api/v1/repos/alice/proj/gate-rules"),
+        &pat,
+        Some(json!({
+            "pattern": "main",
+            "required_approvals": 0,
+            "dismiss_on_push": false,
+            "block_on_request_changes": false,
+            "required_contexts": [],
+            "require_up_to_date": false,
+            "require_threads_resolved": false,
+            "require_session_evidence": false,
+            "allowed_methods": [],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{value}");
+    let tmp = tempfile::tempdir().unwrap();
+    let work = work_repo(
+        tmp.path(),
+        "work",
+        &[(".starforge/ci.toml", CI_TOML), ("README.md", "# proj\n")],
+    )
+    .await;
+    git_ok(
+        &work,
+        &[
+            "push",
+            "-q",
+            &s.git_url("alice", "proj", Some(&pat)),
+            "main",
+        ],
+    )
+    .await;
+    let job = wait_for_job(&s, repo.id, "test").await;
+    let runner = register_runner(&s, &pat).await;
+    let (claimed, _fence, job_token) = claim(&s, &runner).await;
+    assert_eq!(claimed, job);
+
+    let (status, value) = api(
+        &s.browser(),
+        "POST",
+        &s.url("/api/v1/sandboxes"),
+        &job_token,
+        Some(json!({ "template": "example.test/image:1", "runtime": "podman" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{value}");
+    let create = recorded.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(
+        starforged_db::ci::job_secrets_for_job(s.db(), job)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "resolution is recorded for session redaction"
+    );
+    let bindings = create["secret_bindings"].as_array().unwrap();
+    assert_eq!(bindings.len(), 1, "one binding: {create}");
+    assert_eq!(bindings[0]["host"], "registry.example");
+    assert_eq!(bindings[0]["header"], "Authorization");
+    assert_eq!(bindings[0]["value"], secret_value);
+    assert_eq!(
+        create["network"]["secret_headers"]["registry.example"],
+        "Authorization"
+    );
+    assert!(
+        create["network"]["allow_out"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|h| h == "registry.example"),
+        "secret host is allowlisted: {create}"
+    );
+    assert!(
+        !create["envs"]
+            .as_object()
+            .unwrap()
+            .values()
+            .any(|v| v.as_str() == Some(secret_value)),
+        "local provider never gets the value in env: {create}"
+    );
+
+    // A PAT create may name a job, but only the JobAuth path resolves
+    // secrets; the PAT path must bind nothing.
+    let sandbox_pat = s
+        .token(&alice, &[Scope::RepoWrite, Scope::SandboxRun])
+        .await;
+    let (status, value) = api(
+        &s.browser(),
+        "POST",
+        &s.url("/api/v1/sandboxes"),
+        &sandbox_pat,
+        Some(json!({
+            "owner": "alice",
+            "repo": "proj",
+            "job_id": job,
+            "template": "example.test/image:1",
+            "runtime": "podman",
+            "idempotency_key": "pat-foreign-job",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{value}");
+    let pat_create = recorded.lock().unwrap().last().cloned().unwrap();
+    assert!(
+        pat_create.get("secret_bindings").is_none()
+            || pat_create["secret_bindings"].as_array().unwrap().is_empty(),
+        "PAT create binds no secrets: {pat_create}"
+    );
+    assert!(
+        !pat_create["envs"]
+            .as_object()
+            .unwrap()
+            .values()
+            .any(|v| v.as_str() == Some(secret_value)),
+        "PAT create gets no secret env: {pat_create}"
     );
 }

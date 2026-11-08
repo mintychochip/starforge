@@ -532,6 +532,41 @@ impl Core {
 }
 
 impl Core {
+    /// Admin: sets the per-repository CI secret policy (`None` keeps the
+    /// current value for that side). At least one side must be given.
+    /// Returns the resulting `(allow_secrets_on_refs_for, env_secrets)`.
+    pub async fn set_ci_secret_policy(
+        &self,
+        user: &User,
+        owner: &str,
+        repo: &str,
+        allow_refs_for: Option<bool>,
+        env_secrets: Option<bool>,
+    ) -> CoreResult<(bool, bool)> {
+        let access = self
+            .require_repo(Some(user), owner, repo, Permission::Admin)
+            .await?;
+        if allow_refs_for.is_none() && env_secrets.is_none() {
+            return Err(CoreError::Invalid(
+                "at least one CI secret policy field is required".into(),
+            ));
+        }
+        let (allow_refs_for, env_secrets) =
+            db_repos::set_ci_secret_policy(self.db(), access.repo.id, allow_refs_for, env_secrets)
+                .await?
+                .ok_or(CoreError::NotFound)?;
+        self.audit(
+            Some(user.id),
+            "ci.secret.policy",
+            &format!("repo:{}", access.repo.id),
+            &format!("allow_secrets_on_refs_for={allow_refs_for} env_secrets={env_secrets}"),
+        )
+        .await?;
+        Ok((allow_refs_for, env_secrets))
+    }
+}
+
+impl Core {
     /// Maintainers and up: replaces the description (forge-basics design §5.2).
     pub async fn set_repo_description(
         &self,

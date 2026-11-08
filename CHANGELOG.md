@@ -66,11 +66,19 @@ search, webhooks, and mirrors, on SQLite or Postgres.
   storage metered and limited by Starforge (`[ci.limits]`), and a linked
   Depot repository's usage read from Depot's API with its limits left to
   Depot (`GET /repos/{owner}/{repo}/ci/usage`). External CI statuses and
-  webhooks are unchanged, and the server never runs job code. Known
-  limitation: local sandboxes still run with `--network none`, so they
-  cannot reach the egress proxy, and the runner's in-sandbox `git clone`
-  and session sync fail there; and expired artifacts stop downloading
-  and counting after 30 days but are not yet deleted from disk.
+  webhooks are unchanged, and the server never runs job code.
+- **CI secret delivery and sandbox egress:** local sandboxes reach the
+  egress proxy at `10.0.2.2` through pasta (slirp4netns fallback) when
+  egress is provisioned, and stay `--network none` when it is disabled.
+  The runner resolves secrets after its git credential and adds the
+  values to its log-scrub list; the server resolves secrets for a
+  job-token sandbox create and passes host/header bindings to the local
+  daemon. Per-repository policies `ci_allow_secrets_on_refs_for` and
+  `ci_env_secrets` (both off by default) gate `refs/for` trust and the
+  E2B-only environment opt-in. The proxy forwards HTTPS `CONNECT` only;
+  plain HTTP and non-443 ports are not proxied, and pasta exposes host
+  loopback directly. The hourly cleanup deletes expired artifacts and
+  collects zero-ref blobs.
 - **CLI:** `starforge` — `auth login` (device flow, scopes `repo:read
   trail:write session:upload`), `auth ssh-key add` (one-time `repo:write`
   device flow; both tokens are revoked and never stored), `enable`/`disable`
@@ -135,6 +143,7 @@ before upgrading (see `docs/admin/backup-and-restore.md`).
 | 0037 | Sandboxes and sandbox-second usage windows |
 | 0038 | CI secrets and one-time artifact tokens |
 | 0039 | CI usage per job attempt and CI supplier links |
+| 0040 | Per-repository CI secret policy and secret host/header bindings |
 
 Note: migration numbers 0030–0033 do not exist; the series jumps from 0029
 to 0034.

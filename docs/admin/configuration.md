@@ -66,9 +66,15 @@ suppliers whose usage Starforge reads:
 | `ci.depot.api_url` | Base URL of the Depot API (default `https://api.depot.dev`) |
 | `ci.depot.api_token` | Depot organization token, used only to read linked repositories' usage (never logged or rendered; empty disables the Depot supplier) |
 
-Two secret policies are fixed in this release, not settings: `refs/for`
-runs never resolve repository secrets, and secret values never enter the
-job environment (only the egress proxy's headers).
+Secret policy is per repository, not server-wide. A repository Admin
+sets `ci_allow_secrets_on_refs_for` and `ci_env_secrets` with
+`PATCH /api/v1/repos/{owner}/{repo}` (for example
+`{"ci_allow_secrets_on_refs_for": true, "ci_env_secrets": false}`).
+Both default to off. `ci_allow_secrets_on_refs_for` opts `refs/for`
+runs in to secret resolution. `ci_env_secrets` is an E2B-only opt-in
+that injects secret values as environment variables. On the local
+provider, secret values never enter the job environment; only the
+egress proxy injects them as headers for the bound host.
 
 Any key can be overridden with an environment variable such as `STARFORGE__SERVER__HTTP_ADDR` or
 `STARFORGE__DATABASE__URL`. `STARFORGE_CONFIG` sets the config file path.
