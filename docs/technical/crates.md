@@ -150,7 +150,7 @@ The crate depends on no `starforged-*` crate.
 The daemon serves an HTTP control plane over a Unix socket.
 The daemon runs rootless podman containers through `podman`.
 The daemon also runs a per-sandbox egress proxy through `proxy`.
-When the daemon provisions egress, the containers reach the proxy at `10.0.2.2:<port>` through pasta or slirp4netns.
+When the daemon provisions egress, the sandbox keeps `--network none` and reaches the proxy through an in-sandbox forwarder on `127.0.0.1:3128`.
 The opt-in `gvisor` runtime runs through the same daemon.
 
 `starforge-runner` ships the `starforge-runner` binary.

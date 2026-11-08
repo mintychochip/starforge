@@ -234,9 +234,9 @@ It covers secrets at rest, audit reads, and known limits.
 - A repository secret bound to an internal host needs the host range in `--egress-allow-cidr`. The forge `host:port` entry lets a job reach the whole forge service on that port, on any path. A job holds no forge credential after checkout.
 - File API reads follow symlinks inside the container only. The server refuses a path that escapes `/workspace`. A racing job reads at most files of its own container. A racing job reads no host files.
 - The sandbox trusts the per sandbox CA. The CA keys rest in a directory with mode `0600`.
-- When the daemon provisions egress, it starts the container with pasta and maps host loopback to `10.0.2.2`. The container reaches the proxy at `10.0.2.2:<port>`. The daemon uses slirp4netns when pasta is unavailable. With egress disabled, the container stays with `--network none`.
-- The proxy forwards HTTPS `CONNECT` to allowlisted hosts on ports 80 and 443. The proxy refuses plain HTTP and other ports. Pasta also exposes host loopback ports directly, so the proxy is not the only reachable host service. Do not expose untrusted services on host loopback.
-- Each proxy listens on a random host loopback port and requires a per sandbox Basic credential in the proxy URL. A sibling sandbox that finds the port cannot use the proxy without the credential. Pasta still exposes other host loopback services directly. Run one daemon per trust domain, or add network isolation.
+- The sandbox keeps `--network none`. The daemon mounts a per sandbox egress directory and starts an in sandbox forwarder. The forwarder listens on `127.0.0.1:3128` and creates a Unix socket in that directory. The host daemon connects into the socket with a connection pool. SELinux denies the reverse direction. The sandbox has no other network route, so host loopback is not reachable.
+- The proxy forwards HTTPS `CONNECT` and absolute form plain HTTP to allowlisted hosts. A bare `host` entry permits ports 80 and 443 only. A `host:port` entry permits exactly that port. The daemon can add a private HTTPS port with `--egress-https-port`.
+- The forwarder socket exists only inside its sandbox. A sibling sandbox cannot reach it. The daemon copies its own binary into the sandbox, so the daemon must be a static binary.
 - The proxy enforces the allowlist for proxied traffic. Secret values never enter the sandbox.
 
 ### CI and sandbox abuse controls

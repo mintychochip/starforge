@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Real CI end-to-end (plan M6d D7): a real server, runner, sandboxd, and
-# rootless podman run a fixture repo's `.starforge/ci.toml`. The runner
-# clones and syncs through the per-sandbox egress proxy over HTTPS; the
-# job uploads an artifact and a Pi session; the run detail shows both.
+# rootless podman run a fixture repo's `.starforge/ci.toml`. The sandbox
+# keeps `--network none`; sandboxd copies its static binary in and starts
+# the forwarder, and the host connects into the forwarder's Unix socket.
+# The runner clones and syncs through the per-sandbox egress proxy over
+# HTTPS; the job uploads an artifact and a Pi session.
 #
 # Gated by STARFORGE_TEST_SANDBOX=1 (podman + the sf-ci-test image).
 # Uses the local x86_64 musl release tarball for the in-sandbox CLI.
@@ -22,10 +24,17 @@ done
 
 TARGET_DIR="${CARGO_TARGET_DIR:-target}"
 cargo build -p starforged -p starforge-cli -p starforge-runner -p starforge-sandboxd
+# The daemon copies its own binary into the (musl/Alpine) sandbox to run the
+# forwarder, so the e2e daemon must be the static musl build, not the
+# glibc debug binary.
+if [[ -x "$HOME/.local/bin/zig" ]]; then
+  export PATH="$HOME/.local/bin:$PATH"
+fi
+cargo zigbuild --release --target x86_64-unknown-linux-musl -p starforge-sandboxd
 TARGET_DIR="$(cd "$TARGET_DIR" && pwd)"
 SERVER_BIN="$TARGET_DIR/debug/starforged"
 RUNNER_BIN="$TARGET_DIR/debug/starforge-runner"
-SANDBOXD_BIN="$TARGET_DIR/debug/starforge-sandboxd"
+SANDBOXD_BIN="$TARGET_DIR/x86_64-unknown-linux-musl/release/starforge-sandboxd"
 TARBALL="$(ls "$TARGET_DIR"/release-artifacts/starforged-*-x86_64-unknown-linux-musl.tar.gz 2>/dev/null | head -1 || true)"
 if [[ -z "$TARBALL" ]]; then
   echo "ci-e2e: run scripts/build-release.sh first (missing x86_64 musl tarball)" >&2
@@ -179,7 +188,7 @@ start_sandboxd() {
   "$SANDBOXD_BIN" \
     --socket "$WORK/sandboxd.sock" --token-file "$WORK/sandboxd.token" \
     --image localhost/sf-ci-e2e \
-    --egress-listen 127.0.0.1:0 \
+    --egress-dir "$WORK/egress" \
     --egress-ca-dir "$WORK/ca" \
     --egress-upstream-ca "$WORK/ca.pem" \
     --egress-https-port "$HTTPS_PORT" \

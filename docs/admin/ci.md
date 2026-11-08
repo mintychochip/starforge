@@ -109,61 +109,58 @@ Server-side configuration (`[sandbox]`, see
 | `sandbox.limits.sandbox_seconds_per_hour` | `0` (disabled) |
 | `sandbox.default_ttl_secs` | `3600` |
 
-The egress proxy listen address and the CA directory are
-`starforge-sandboxd` flags, not server config: `--egress-listen`
-(default `127.0.0.1:0`) sets the proxy listen address, and
-`--egress-ca-dir` (default `/run/starforge/egress-ca`) sets the
+The egress directory and the CA directory are `starforge-sandboxd`
+flags, not server config: `--egress-dir` (required for egress) holds one
+subdirectory per sandbox, `<dir>/<id>/` (mode `0777`, removed with the
+sandbox), mounted into the container at `/run/starforge/egress` with
+`:Z`; `--egress-ca-dir` (default `/run/starforge/egress-ca`) sets the
 per-sandbox CA directory. One more sandboxd flag widens egress:
 `--egress-allow-cidr CIDR` (repeatable) allows one special-use address
 range per occurrence. Without it the proxy refuses every special-use
 address except the forge's own `host:port`. The daemon reads only its
 own flags; the server only reads `sandbox.local.egress.allowlist`.
 
-## E2B adapter
-
-The E2B adapter is a server-side Rust `reqwest` client (create / get /
-kill / exec / files / ports) with a sealed API key, idempotent create,
-and provider error mapping. It sits behind the same provider trait as
-the local daemon, so `GET /sandboxes/runtimes` reports the configured
-runtimes and their availability, and a job runs on any runtime without
-changing the runner. The adapter targets an E2B-shaped gateway, not
-`api.e2b.dev`: real E2B uses `/v2/sandboxes` for the control plane and
-envd for exec/files/ports, while this adapter's data-plane routes are
-Starforge's own REST shape. It is not a wire-compatibility promise.
-
 ## Egress proxy and per-sandbox CA
 
-Each sandbox's outbound HTTPS goes through a Rust MITM proxy in
+Each sandbox's outbound traffic goes through a Rust MITM proxy in
 sandboxd. The proxy terminates TLS with a per-sandbox CA whose X.509
 name constraints cover only the allowlisted destinations, and installs
 that CA in the sandbox trust store (`SSL_CERT_FILE` /
 `NODE_EXTRA_CA_CERTS` plus the system bundle). Secret header injection
-happens only when the `CONNECT` host matches the secret's binding
-host; non-allowlisted hosts are refused, DNS is pinned before connect,
-CA keys are `0600` and destroyed with the sandbox, and secret values
-never enter the sandbox environment or filesystem.
+happens only when the request `Host` (and, for absolute-form requests,
+the request authority) matches the secret's binding host; a mismatch
+answers `403`. Non-allowlisted hosts are refused, DNS is pinned before
+connect, CA keys are `0600` and destroyed with the sandbox, and secret
+values never enter the sandbox environment or filesystem.
 
-When egress is provisioned, the daemon starts the container with
-`--network pasta:--map-host-loopback=10.0.2.2` (or
-`slirp4netns:allow_host_loopback=true` when pasta is unavailable).
-The proxy listens on host loopback and the container reaches it at
-`10.0.2.2:<port>`; the sandbox gets `HTTP_PROXY`/`HTTPS_PROXY` with
-that address. The proxy forwards HTTPS `CONNECT` to allowlisted hosts
-on ports 80 and 443; `--egress-https-port` adds a private HTTPS port.
-A plain `http://` request or another port is not forwarded, so a local
-job needs an `https://` server and repo URL. The daemon sets
+Sandboxes keep `--network none`. The daemon mounts the per-sandbox
+egress directory at `/run/starforge/egress` (`:Z`), copies its own
+binary into `/workspace/.starforge-proxy/sandboxd`, and starts it
+detached:
+
+```shell
+starforge-sandboxd forward --listen 127.0.0.1:3128 --unix /run/starforge/egress/shim.sock
+```
+
+The forwarder listens on `127.0.0.1:3128` for sandbox clients and
+creates the Unix socket. The host daemon connects into that socket and
+keeps a pool of four idle connections; each sandbox TCP client is
+paired with one pooled connection. SELinux denies a container process
+connecting to a host-owned socket, while the host may connect to a
+socket the container creates. The sandbox gets `HTTP_PROXY`,
+`HTTPS_PROXY`, `http_proxy`, and `https_proxy` set to
+`http://127.0.0.1:3128`, plus the CA variables. The daemon must be a
+static binary because it runs inside the sandbox; the release musl
+binary is.
+
+The proxy forwards HTTPS `CONNECT` and absolute-form plain HTTP to
+allowlisted hosts. A bare `host` allowlist entry permits ports 80 and
+443 only; a `host:port` entry permits exactly that port.
+`--egress-https-port` adds a private HTTPS port. The daemon sets
 `SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`, and `GIT_SSL_CAINFO` to the
 per-sandbox CA, and `--egress-upstream-ca` trusts a private upstream
-CA.
-Pasta maps host loopback to `10.0.2.2`, so a sandbox can also reach
-host loopback ports directly; the proxy is not the only reachable
-host service. Do not expose untrusted services on host loopback. Each
-proxy listens on a random host loopback port and requires a per-sandbox
-Basic credential in the proxy URL: a sibling sandbox that finds the
-port cannot use the proxy without the credential. Pasta still exposes
-other host loopback services directly; run one daemon per trust
-domain, or add network isolation. With egress disabled the container
-stays `--network none`. Secret values never enter the sandbox.
+CA. With egress disabled the container stays `--network none`. Secret
+values never enter the sandbox.
 
 After DNS resolution the proxy dials only addresses that pass the
 policy. Loopback, private, link-local, CGNAT, multicast, reserved, and
@@ -174,12 +171,9 @@ ranges the operator allows with the repeatable sandboxd flag
 `--egress-allow-cidr CIDR`. A repository secret bound to an internal
 host therefore needs that host's range in `--egress-allow-cidr`.
 
-A secret header is injected only when the inner request `Host` (and, for
-absolute-form requests, the request authority) matches the bound host; a
-mismatch answers `403`. A Trail job gets secrets only after an approval
-of its own revision. The runner fetches with the credential URL without
-storing it in git config, and the sandbox's workspace volume is removed
-with the sandbox.
+A Trail job gets secrets only after an approval of its own revision. The
+runner fetches with the credential URL without storing it in git config,
+and the sandbox's workspace volume is removed with the sandbox.
 
 For a job-token sandbox create, the server resolves the job's
 secrets itself, records them in `ci_job_secrets`, and passes the

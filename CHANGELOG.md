@@ -107,28 +107,31 @@ and opt-in CI runners with sandboxed jobs, on SQLite or Postgres.
   secrets on a settings page as well as through the API; the OCI image
   ships `starforge-runner` and `starforge-sandboxd`. The never-read server
   keys `sandbox.local.egress.proxy_listen` and `ca_dir` are removed (the
-  daemon's `--egress-listen` and `--egress-ca-dir` flags set them); an
+  daemon's `--egress-dir` and `--egress-ca-dir` flags set them); an
   environment override for either now fails startup as an unknown key.
-- **CI secret delivery and sandbox egress:** local sandboxes reach the
-  egress proxy at `10.0.2.2` through pasta (slirp4netns fallback) when
-  egress is provisioned, and stay `--network none` when it is disabled.
-  The runner resolves secrets after its git credential and adds the
-  values to its log-scrub list; the server resolves secrets for a
-  job-token sandbox create and passes host/header bindings to the local
-  daemon. Per-repository policies `ci_allow_secrets_on_refs_for` and
+- **CI secret delivery and sandbox egress:** sandboxes keep
+  `--network none`. `starforge-sandboxd --egress-dir` mounts a
+  per-sandbox directory at `/run/starforge/egress`; the daemon copies its
+  own static binary in and starts `forward`, which listens on
+  `127.0.0.1:3128` and creates a Unix socket the host daemon connects
+  into with a connection pool. The proxy forwards HTTPS `CONNECT` and
+  absolute-form plain HTTP; a bare `host` entry permits ports 80 and 443
+  only, and a `host:port` entry permits exactly that port. The runner
+  resolves secrets after its git credential and adds the values to its
+  log-scrub list; the server resolves secrets for a job-token sandbox
+  create and passes host/header bindings to the local daemon.
+  Per-repository policies `ci_allow_secrets_on_refs_for` and
   `ci_env_secrets` (both off by default) gate `refs/for` trust and the
-  E2B-only environment opt-in. The proxy forwards HTTPS `CONNECT` only;
-  plain HTTP and non-443 ports are not proxied, and pasta exposes host
-  loopback directly. The proxy requires a per-sandbox credential. The
-  proxy dials only addresses that pass its policy: loopback, private,
-  link-local, and other special-use addresses are refused even for an
-  allowlisted name, except the forge's own `host:port` and ranges the
-  operator allows with `--egress-allow-cidr`. A secret header is injected
-  only when the inner `Host` matches the bound host; a Trail job gets
-  secrets only after an approval of its own revision; the runner never
-  writes its credential URL into git config; a sandbox's workspace volume
-  is removed with the sandbox. The hourly cleanup deletes expired
-  artifacts and collects zero-ref blobs.
+  E2B-only environment opt-in. The proxy dials only addresses that pass
+  its policy: loopback, private, link-local, and other special-use
+  addresses are refused even for an allowlisted name, except the forge's
+  own `host:port` and ranges the operator allows with
+  `--egress-allow-cidr`. A secret header is injected only when the inner
+  `Host` matches the bound host; a Trail job gets secrets only after an
+  approval of its own revision; the runner never writes its credential
+  URL into git config; a sandbox's workspace volume is removed with the
+  sandbox. The hourly cleanup deletes expired artifacts and collects
+  zero-ref blobs.
 - **CI end-to-end:** `scripts/ci-e2e.sh` runs a real server, runner,
   sandboxd, and rootless podman through a fixture job. It proves the
   HTTPS clone and sync through the per-sandbox proxy, the artifact, and

@@ -6,7 +6,7 @@
 > documented: E2B is E2B-shaped, not wire-compatible; Firecracker and
 > Kata are reserved runtime names (422); no GPU; only Depot usage is
 > read. The egress proxy is HTTPS `CONNECT` only and local sandboxes
-> reach it through pasta host-loopback mapping.
+> reach it through an in-sandbox forwarder over a Unix socket.
 
 > **For agentic workers:** Implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 

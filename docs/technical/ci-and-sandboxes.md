@@ -134,17 +134,15 @@ The `e2b` provider talks to an E2B-shaped gateway over HTTP. The wire shapes mat
 
 Each sandbox gets its own egress proxy task. The proxy terminates TLS under a per-sandbox CA. The CA name constraints cover only allowlisted destinations. The proxy resolves each DNS name once and pins the answer. The proxy injects a secret header only for a bound host and a matching `Host`. The proxy answers `403` when the `Host` does not match.
 
-A `host:port` entry permits exactly that port. A `host` entry permits every port. The proxy forwards HTTPS `CONNECT` only. The proxy does not forward plain HTTP or non-443 ports.
+A `host:port` entry permits exactly that port. A bare `host` entry permits ports 80 and 443 only. The proxy forwards HTTPS `CONNECT` and absolute-form plain HTTP.
 
 The proxy refuses a non-allowlisted host. The CA keys carry mode `0600`. The daemon destroys the CA with the sandbox. The daemon refuses host mounts and privileged containers. The server rejects a secret header host outside the allowlist.
 
-When the daemon provisions egress, it starts the container with `--network pasta:--map-host-loopback=10.0.2.2`. The daemon uses `slirp4netns:allow_host_loopback=true` when pasta is unavailable.
+The sandbox keeps `--network none`. The daemon mounts the per-sandbox egress directory at `/run/starforge/egress` with the `:Z` option. It copies its own binary into `/workspace/.starforge-proxy/sandboxd` and starts `forward` detached. The forwarder listens on `127.0.0.1:3128` for sandbox clients and creates the Unix socket `/run/starforge/egress/shim.sock`. The host daemon connects into that socket with a pool of four idle connections. The forwarder pairs each sandbox TCP client with one pooled host connection.
 
-The proxy listens on host loopback. The container reaches the proxy at `10.0.2.2:<port>`. The daemon sets `HTTP_PROXY` and `HTTPS_PROXY` to that address. The proxy forwards HTTPS `CONNECT` to allowlisted hosts on ports 80 and 443. The daemon can add a private HTTPS port with `--egress-https-port`.
+SELinux denies a container process connecting to a host-owned socket. The host can connect to a socket the container creates. The daemon must be a static binary because it runs inside the sandbox.
 
-The proxy refuses a plain `http://` request and any other port. A local job needs an `https://` server and repository URL. A client that sends an unauthenticated `CONNECT` gets a 407. The client can retry with `Proxy-Authorization` on the same connection. The proxy keeps the socket open for that retry.
-
-Pasta maps host loopback to `10.0.2.2`, so a sandbox can also reach host loopback ports directly. The proxy is not the only reachable host service. The proxy requires a per-sandbox Basic credential from the proxy URL, so a sibling sandbox cannot borrow it. Do not expose untrusted services on host loopback.
+The sandbox sets `HTTP_PROXY`, `HTTPS_PROXY`, `http_proxy`, and `https_proxy` to `http://127.0.0.1:3128`. The proxy forwards HTTPS `CONNECT` and absolute-form plain HTTP to allowlisted hosts. The daemon can add a private HTTPS port with `--egress-https-port`. A non-allowlisted host or port answers `403`. A sibling sandbox cannot reach another sandbox's forwarder socket.
 
 After DNS resolution the proxy dials only addresses that pass the policy. The proxy refuses loopback, private, link local, CGNAT, multicast, reserved, and unique local addresses. The proxy also refuses IPv4 mapped forms of these addresses. The proxy refuses these addresses even for an allowlisted name or IP literal. The forge `host:port` and the operator ranges form the only exceptions.
 

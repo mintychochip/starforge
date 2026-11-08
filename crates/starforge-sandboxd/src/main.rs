@@ -22,6 +22,8 @@ use tokio::net::{UnixListener, UnixStream, unix::SocketAddr};
     about = "Local sandbox provider daemon (rootless podman)"
 )]
 struct Args {
+    #[command(subcommand)]
+    command: Option<Command>,
     /// Unix socket to listen on.
     #[arg(long, default_value = "/run/starforge/sandboxd.sock")]
     socket: PathBuf,
@@ -29,8 +31,9 @@ struct Args {
     #[arg(long, default_value = "/run/starforge/sandboxd.token")]
     token_file: PathBuf,
     /// Image allowlist entries (exact image, or image:tag / image@digest).
-    /// Required: the daemon refuses to boot without an allowlist.
-    #[arg(long = "image", required = true)]
+    /// Required for daemon mode: the daemon refuses to boot without an
+    /// allowlist (checked in `run()` so `forward` needs none).
+    #[arg(long = "image")]
     images: Vec<String>,
     /// Default sandbox TTL in seconds.
     #[arg(long, default_value_t = 3600)]
@@ -41,9 +44,11 @@ struct Args {
     /// podman binary path.
     #[arg(long, default_value = "podman")]
     podman: PathBuf,
-    /// Egress proxy listen address (default: loopback ephemeral port).
-    #[arg(long, default_value = "127.0.0.1:0")]
-    egress_listen: std::net::SocketAddr,
+    /// Directory for per-sandbox egress directories; each `<dir>/<id>` is
+    /// mounted into its sandbox at `/run/starforge/egress`. Absent disables
+    /// per-sandbox egress provisioning.
+    #[arg(long)]
+    egress_dir: Option<PathBuf>,
     /// Directory for per-sandbox CA certs/keys (keys are 0600; destroyed
     /// with the sandbox).
     #[arg(long, default_value = "/run/starforge/egress-ca")]
@@ -65,6 +70,22 @@ struct Args {
     /// proxy may dial even when special-use. Repeatable.
     #[arg(long = "egress-allow-cidr")]
     egress_allow_cidr: Vec<String>,
+}
+
+#[derive(Debug, clap::Subcommand)]
+enum Command {
+    /// Forward TCP on `--listen` to a queued host connection, creating the
+    /// Unix socket at `--unix` itself (runs inside a sandbox; see
+    /// `starforge_sandboxd::forward`).
+    Forward {
+        /// TCP address to listen on inside the sandbox.
+        #[arg(long, default_value = "127.0.0.1:3128")]
+        listen: std::net::SocketAddr,
+        /// Unix socket this forwarder creates/listens on (inside the
+        /// mounted egress directory; the host daemon connects to it).
+        #[arg(long)]
+        unix: PathBuf,
+    },
 }
 
 /// Peer uid of an accepted Unix-stream connection (SO_PEERCRED on Linux).
@@ -140,6 +161,16 @@ impl axum::serve::Listener for PeerCheckedListener {
 
 async fn run() -> io::Result<()> {
     let args = Args::parse();
+    if let Some(Command::Forward { listen, unix }) = args.command {
+        starforge_sandboxd::forward::run_forward(listen, unix).await?;
+        return Ok(());
+    }
+    if args.images.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "at least one --image allowlist entry is required",
+        ));
+    }
 
     // Fresh token every boot (rotation), written with 0600 via rename so a
     // reader never sees a partial file.
@@ -231,7 +262,7 @@ async fn run() -> io::Result<()> {
         images: args.images,
         default_ttl_s: args.default_ttl,
         max_sandboxes: args.max_sandboxes,
-        egress_listen: Some(args.egress_listen),
+        egress_dir: args.egress_dir,
         egress_ca_dir: args.egress_ca_dir,
         egress_upstream_ca: args.egress_upstream_ca,
         egress_https_ports: if args.egress_https_ports.is_empty() {

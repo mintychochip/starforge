@@ -212,7 +212,7 @@ The proxy terminates TLS with a per-sandbox CA.
 The proxy injects secret headers for allowlisted hosts.
 Secret values never enter the sandbox.
 
-When the daemon provisions egress, it starts the container with pasta and maps host loopback to `10.0.2.2`. The container reaches the proxy at `10.0.2.2:<port>`. The daemon uses slirp4netns when pasta is unavailable. With egress disabled, the container stays with `--network none`. The proxy enforces the allowlist for proxied traffic.
+The sandbox keeps `--network none`. The daemon mounts a per-sandbox egress directory and starts an in-sandbox forwarder. The forwarder listens on `127.0.0.1:3128` and creates a Unix socket. The host daemon connects into that socket with a connection pool. The proxy enforces the allowlist for proxied traffic.
 
 ## Failure behavior
 

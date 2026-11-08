@@ -175,7 +175,12 @@ type Fute<'a, T> = Pin<Box<dyn Future<Output = Result<T, ProviderError>> + Send 
 /// relative paths (see [`validate_relative_path`]) and stay within the byte
 /// caps. `create` receives the container id the daemon generated.
 pub trait Runtime: Send + Sync {
-    fn create<'a>(&'a self, id: &'a str, req: &'a CreateSandboxRequest) -> Fute<'a, ()>;
+    fn create<'a>(
+        &'a self,
+        id: &'a str,
+        req: &'a CreateSandboxRequest,
+        egress_volume: Option<&'a str>,
+    ) -> Fute<'a, ()>;
     fn inspect<'a>(&'a self, id: &'a str) -> Fute<'a, SandboxState>;
     fn remove<'a>(&'a self, id: &'a str) -> Fute<'a, ()>;
     fn pause<'a>(&'a self, id: &'a str) -> Fute<'a, ()>;
@@ -186,6 +191,15 @@ pub trait Runtime: Send + Sync {
     fn file_list<'a>(&'a self, id: &'a str, rel_path: &'a str) -> Fute<'a, Vec<String>>;
     fn file_delete<'a>(&'a self, id: &'a str, rel_path: &'a str) -> Fute<'a, ()>;
     fn port_url<'a>(&'a self, id: &'a str, port: u16) -> Fute<'a, PortUrl>;
+    /// Copy a host file into the container (`podman cp`).
+    fn copy_host_file<'a>(
+        &'a self,
+        id: &'a str,
+        host_path: &'a std::path::Path,
+        container_path: &'a str,
+    ) -> Fute<'a, ()>;
+    /// Start a detached process in the container (`podman exec -d`).
+    fn exec_detached<'a>(&'a self, id: &'a str, args: &'a [String]) -> Fute<'a, ()>;
 }
 
 // ---------------------------------------------------------------- podman --
@@ -279,25 +293,24 @@ impl PodmanRuntime {
 
 /// Build the `podman run` argument vector for creating `id` from `req`.
 ///
-/// Pure: no I/O or validation (callers validate `req` first). When
-/// `req.network_enabled` the container gets pasta networking with host
-/// loopback mapped to `10.0.2.2` (where the egress proxy listens
-/// host-side); otherwise it stays `--network none`.
-pub fn create_args(id: &str, req: &CreateSandboxRequest) -> Vec<String> {
+/// Pure: no I/O or validation (callers validate `req` first). The
+/// container always stays `--network none`; when `egress_volume` is set,
+/// the per-sandbox egress directory is mounted for the in-sandbox
+/// forwarder.
+pub fn create_args(
+    id: &str,
+    req: &CreateSandboxRequest,
+    egress_volume: Option<&str>,
+) -> Vec<String> {
     let cpu = if req.cpu > 0.0 { req.cpu } else { 1.0 };
     let mem_mb = if req.mem_mb > 0 { req.mem_mb } else { 512 };
-    let network = if req.network_enabled {
-        "pasta:--map-host-loopback=10.0.2.2"
-    } else {
-        "none"
-    };
     let mut args: Vec<String> = vec![
         "run".into(),
         "-d".into(),
         "--name".into(),
         id.into(),
         "--network".into(),
-        network.into(),
+        "none".into(),
         "--security-opt".into(),
         "no-new-privileges=true".into(),
         "--cap-drop".into(),
@@ -325,6 +338,12 @@ pub fn create_args(id: &str, req: &CreateSandboxRequest) -> Vec<String> {
     for (key, value) in &req.envs {
         args.push("--env".into());
         args.push(format!("{key}={value}"));
+    }
+    if let Some(volume) = egress_volume {
+        // Per-sandbox egress directory, mounted read-write so the
+        // in-sandbox forwarder can create/listen on its shim socket there.
+        args.push("--volume".into());
+        args.push(volume.to_owned());
     }
     for (key, value) in &req.metadata {
         args.push("--label".into());
@@ -393,39 +412,21 @@ fn write_args(id: &str, resolved: &str) -> Vec<String> {
 }
 
 impl Runtime for PodmanRuntime {
-    fn create<'a>(&'a self, id: &'a str, req: &'a CreateSandboxRequest) -> Fute<'a, ()> {
+    fn create<'a>(
+        &'a self,
+        id: &'a str,
+        req: &'a CreateSandboxRequest,
+        egress_volume: Option<&'a str>,
+    ) -> Fute<'a, ()> {
         Box::pin(async move {
             if req.template.is_empty() {
                 return Err(err_invalid("image/template must not be empty"));
             }
             validate_env(&req.envs)?;
-            let args = create_args(id, req);
+            let args = create_args(id, req, egress_volume);
             let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-            match self.run_ok(&refs, None).await {
-                Ok(_) => Ok(()),
-                Err(err) => {
-                    let message = err.message.to_lowercase();
-                    let network_related = message.contains("pasta")
-                        || message.contains("network")
-                        || message.contains("slirp4netns");
-                    if !req.network_enabled || !network_related {
-                        return Err(err);
-                    }
-                    // Networking backend unavailable: drop any partial
-                    // container and retry with slirp4netns, which maps host
-                    // loopback via its own gateway.
-                    Runtime::remove(self, id).await.ok();
-                    let mut retry_args = args;
-                    if let Some(pos) = retry_args.iter().position(|a| a == "--network")
-                        && let Some(value) = retry_args.get_mut(pos + 1)
-                    {
-                        *value = "slirp4netns:allow_host_loopback=true".to_owned();
-                    }
-                    let retry_refs: Vec<&str> = retry_args.iter().map(String::as_str).collect();
-                    self.run_ok(&retry_refs, None).await?;
-                    Ok(())
-                }
-            }
+            self.run_ok(&refs, None).await?;
+            Ok(())
         })
     }
 
@@ -595,6 +596,48 @@ impl Runtime for PodmanRuntime {
         })
     }
 
+    fn copy_host_file<'a>(
+        &'a self,
+        id: &'a str,
+        host_path: &'a std::path::Path,
+        container_path: &'a str,
+    ) -> Fute<'a, ()> {
+        Box::pin(async move {
+            if !container_path.starts_with('/') || container_path.contains('\0') {
+                return Err(err_invalid("container path must be absolute"));
+            }
+            let parent = container_path
+                .rsplit_once('/')
+                .map(|(dir, _)| dir)
+                .unwrap_or("/");
+            self.run_ok(&["exec", id, "mkdir", "-p", "--", parent], None)
+                .await?;
+            let host = host_path
+                .to_str()
+                .ok_or_else(|| err_invalid("host path is not UTF-8"))?;
+            let dest = format!("{id}:{container_path}");
+            self.run_ok(&["cp", "--", host, &dest], None).await?;
+            Ok(())
+        })
+    }
+
+    fn exec_detached<'a>(&'a self, id: &'a str, args: &'a [String]) -> Fute<'a, ()> {
+        Box::pin(async move {
+            if args.is_empty() {
+                return Err(err_invalid("command must not be empty"));
+            }
+            for part in args {
+                if part.contains('\0') {
+                    return Err(err_invalid("command argument contains NUL"));
+                }
+            }
+            let mut argv: Vec<&str> = vec!["exec", "-d", id];
+            argv.extend(args.iter().map(String::as_str));
+            self.run_ok(&argv, None).await?;
+            Ok(())
+        })
+    }
+
     fn port_url<'a>(&'a self, id: &'a str, port: u16) -> Fute<'a, PortUrl> {
         Box::pin(async move {
             // B7 (egress proxy) makes this URL routable; until then the
@@ -706,7 +749,12 @@ impl FakeRuntime {
 }
 
 impl Runtime for FakeRuntime {
-    fn create<'a>(&'a self, id: &'a str, req: &'a CreateSandboxRequest) -> Fute<'a, ()> {
+    fn create<'a>(
+        &'a self,
+        id: &'a str,
+        req: &'a CreateSandboxRequest,
+        _egress_volume: Option<&'a str>,
+    ) -> Fute<'a, ()> {
         Box::pin(async move {
             if req.template.is_empty() {
                 return Err(err_invalid("image/template must not be empty"));
@@ -859,6 +907,19 @@ impl Runtime for FakeRuntime {
         })
     }
 
+    fn copy_host_file<'a>(
+        &'a self,
+        _id: &'a str,
+        _host_path: &'a std::path::Path,
+        _container_path: &'a str,
+    ) -> Fute<'a, ()> {
+        Box::pin(async move { Ok(()) })
+    }
+
+    fn exec_detached<'a>(&'a self, _id: &'a str, _args: &'a [String]) -> Fute<'a, ()> {
+        Box::pin(async move { Ok(()) })
+    }
+
     fn port_url<'a>(&'a self, id: &'a str, port: u16) -> Fute<'a, PortUrl> {
         Box::pin(async move {
             let inner = self.inner.lock().unwrap();
@@ -927,6 +988,7 @@ mod tests {
                 template: "x".into(),
                 ..Default::default()
             },
+            None,
         )
         .await
         .unwrap();
@@ -953,6 +1015,7 @@ mod tests {
                 template: "x".into(),
                 ..Default::default()
             },
+            None,
         )
         .await
         .unwrap();
@@ -976,6 +1039,7 @@ mod tests {
                 template: "x".into(),
                 ..Default::default()
             },
+            None,
         )
         .await
         .unwrap();
@@ -984,7 +1048,7 @@ mod tests {
         rt.remove("sbx-1").await.unwrap();
         assert_eq!(rt.kills(), vec!["sbx-1".to_owned()]);
         assert!(
-            rt.create("sbx-1", &CreateSandboxRequest::default())
+            rt.create("sbx-1", &CreateSandboxRequest::default(), None)
                 .await
                 .is_err()
         );
@@ -1032,24 +1096,31 @@ mod tests {
             template: "docker.io/library/rust:1.85".into(),
             ..Default::default()
         };
-        let args = create_args("sbx-x", &off);
+        let args = create_args("sbx-x", &off, None);
         assert_eq!(
             arg_value(&args, "--network").as_deref(),
             Some("none"),
             "args: {args:?}"
         );
+        // The socket transport always keeps `--network none`; egress is a
+        // mounted directory plus the in-sandbox forwarder.
         let on = CreateSandboxRequest {
             template: "docker.io/library/rust:1.85".into(),
             network_enabled: true,
             ..Default::default()
         };
-        let args = create_args("sbx-x", &on);
+        let args = create_args("sbx-x", &on, Some("egress:/run/starforge/egress:Z"));
         assert_eq!(
             arg_value(&args, "--network").as_deref(),
-            Some("pasta:--map-host-loopback=10.0.2.2"),
+            Some("none"),
             "args: {args:?}"
         );
-        // Hardened flags survive in both modes.
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--volume" && w[1] == "egress:/run/starforge/egress:Z"),
+            "egress volume missing: {args:?}"
+        );
+        // Hardened flags survive.
         assert_eq!(arg_value(&args, "--cap-drop").as_deref(), Some("ALL"));
         assert!(args.iter().any(|a| a == "--read-only"));
         assert_eq!(
@@ -1079,6 +1150,7 @@ mod tests {
                 template: "docker.io/library/rust:1.85".into(),
                 ..Default::default()
             },
+            None,
         )
         .await
         .expect("podman create");

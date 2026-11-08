@@ -23,6 +23,7 @@
 //!
 //! Errors are [`ProviderError`] JSON with a status taken from the code.
 
+pub mod forward;
 pub mod podman;
 pub mod proxy;
 
@@ -57,9 +58,10 @@ pub struct DaemonConfig {
     pub max_sandboxes: usize,
     /// Cap on one exec (seconds; `0` = no cap).
     pub exec_timeout_s: u64,
-    /// Egress proxy listen address (e.g. `127.0.0.1:0`); `None` disables
-    /// per-sandbox egress provisioning (pre-B7 behavior).
-    pub egress_listen: Option<std::net::SocketAddr>,
+    /// Directory for per-sandbox egress directories; each `<dir>/<id>` is
+    /// mounted into its sandbox at `/run/starforge/egress`. `None`
+    /// disables per-sandbox egress provisioning.
+    pub egress_dir: Option<std::path::PathBuf>,
     /// Directory holding per-sandbox CA certs/keys (keys are `0600`).
     pub egress_ca_dir: std::path::PathBuf,
     /// Optional PEM CA bundle the proxy trusts for upstream TLS. Use it
@@ -83,7 +85,7 @@ impl Default for DaemonConfig {
             default_ttl_s: 3600,
             max_sandboxes: 0,
             exec_timeout_s: 300,
-            egress_listen: None,
+            egress_dir: None,
             egress_ca_dir: std::path::PathBuf::from("/run/starforge/egress-ca"),
             egress_upstream_ca: None,
             egress_https_ports: vec![443],
@@ -100,17 +102,27 @@ struct SandboxRecord {
     deadline_unix: i64,
 }
 
-/// Per-sandbox egress state (proxy task + CA files on the daemon host).
+/// Per-sandbox egress state (connection pool + CA files on the daemon host).
 pub struct SandboxProxy {
-    /// Proxy task (aborted on kill/expire).
-    pub proxy: proxy::EgressProxy,
+    /// Connection pool to the in-sandbox forwarder (started after the
+    /// forwarder, aborted on kill/expire).
+    pub pool: Option<proxy::EgressPool>,
+    /// Proxy log buffer (set when the pool starts).
+    pub logs: Option<Arc<proxy::ProxyLog>>,
+    /// Per-sandbox egress directory on the daemon host
+    /// (`<egress_dir>/<id>`, mode `0777`; mounted at `/run/starforge/egress`).
+    pub egress_dir: std::path::PathBuf,
+    /// Forwarder Unix socket path on the daemon host
+    /// (`<egress_dir>/<id>/shim.sock`, created by the forwarder).
+    pub socket_path: std::path::PathBuf,
+    /// CA material for leaf minting (moved into the pool at pool start).
+    pub ca: Arc<proxy::CaMaterial>,
+    /// Egress policy enforced on every pooled connection.
+    pub policy: Arc<proxy::EgressPolicy>,
     /// CA cert path on the daemon host (installed into the sandbox).
     pub ca_cert_path: std::path::PathBuf,
     /// CA key path on the daemon host (`0600`, destroyed on kill/expire).
     pub ca_key_path: std::path::PathBuf,
-    /// Per-sandbox proxy credential (`sbx:<random>`); the proxy rejects
-    /// unauthenticated CONNECT so a sibling sandbox cannot borrow it.
-    pub credential: String,
 }
 
 /// Shared daemon state (cheap to clone).
@@ -142,13 +154,24 @@ impl DaemonState {
     }
 
     /// Proxy listen address for a live sandbox, if egress is provisioned.
-    pub fn proxy_addr(&self, id: &str) -> Option<std::net::SocketAddr> {
-        self.proxies.lock().unwrap().get(id).map(|p| p.proxy.addr())
+    /// The per-sandbox egress directory on the daemon host, if egress is
+    /// configured.
+    pub fn egress_dir_for(&self, id: &str) -> Option<std::path::PathBuf> {
+        self.config.egress_dir.as_ref().map(|dir| dir.join(id))
+    }
+
+    /// Whether this sandbox has egress state (the CA and pool were set up).
+    pub fn egress_enabled(&self, id: &str) -> bool {
+        self.proxies.lock().unwrap().contains_key(id)
     }
 
     /// Proxy log buffer for a live sandbox, if egress is provisioned.
     pub fn proxy_logs(&self, id: &str) -> Option<Arc<proxy::ProxyLog>> {
-        self.proxies.lock().unwrap().get(id).map(|p| p.proxy.logs())
+        self.proxies
+            .lock()
+            .unwrap()
+            .get(id)
+            .and_then(|p| p.logs.clone())
     }
 }
 
@@ -283,6 +306,16 @@ pub async fn sweep_expired(state: &DaemonState, now_unix: i64) -> Vec<String> {
 
 /// Workspace-relative path of the installed CA cert inside every sandbox.
 pub const PROXY_CA_PATH: &str = ".starforge-proxy/ca.pem";
+/// Mount point of the per-sandbox egress directory inside the container.
+pub const EGRESS_DIR_IN_CONTAINER: &str = "/run/starforge/egress";
+/// The forwarder's Unix socket name inside the egress directory.
+pub const EGRESS_SHIM_NAME: &str = "shim.sock";
+/// The forwarder's Unix socket inside the container.
+pub const EGRESS_SOCKET_IN_CONTAINER: &str = "/run/starforge/egress/shim.sock";
+/// The daemon binary copied into the sandbox to run `forward`.
+pub const FORWARDER_PATH: &str = ".starforge-proxy/sandboxd";
+/// The forwarder's TCP listen address inside the sandbox.
+pub const FORWARDER_LISTEN: &str = "127.0.0.1:3128";
 
 /// Build the per-sandbox egress policy from the create request's network
 /// policy, the daemon's static secret bindings, and the request's
@@ -377,9 +410,32 @@ pub async fn start_egress(
     id: &str,
     policy: &proxy::EgressPolicy,
 ) -> Result<(), ProviderError> {
-    let Some(listen) = state.config.egress_listen else {
+    let Some(dir) = state.config.egress_dir.clone() else {
         return Ok(());
     };
+    // 0711 on the parent: traversable by the container's mount namespace,
+    // not listable.
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| ProviderError::new("internal", format!("egress dir: {e}")))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o711))
+            .map_err(|e| ProviderError::new("internal", format!("egress dir mode: {e}")))?;
+    }
+    // 0777 on the per-sandbox directory: the in-sandbox forwarder (root or
+    // uid 1000) creates/listens on the shim socket here, and the host-side
+    // daemon connects to it.
+    let egress_dir = dir.join(id);
+    std::fs::create_dir_all(&egress_dir)
+        .map_err(|e| ProviderError::new("internal", format!("egress dir: {e}")))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&egress_dir, std::fs::Permissions::from_mode(0o777))
+            .map_err(|e| ProviderError::new("internal", format!("egress dir mode: {e}")))?;
+    }
+    let socket_path = egress_dir.join(EGRESS_SHIM_NAME);
     // The forge host is also a permitted name: the proxy may MITM it on
     // 443 via the forge exact match even when it is not in `allow_out`.
     let mut ca_hosts = policy.allow_out.clone();
@@ -398,34 +454,95 @@ pub async fn start_egress(
         proxy::destroy_ca_key(&ca_key_path);
         return Err(ProviderError::new("internal", "failed to write CA cert"));
     }
-    let credential = format!(
-        "sbx:{}",
-        random_hex(16)
-            .map_err(|e| ProviderError::new("internal", format!("proxy credential: {e}")))?
+    state.proxies.lock().unwrap().insert(
+        id.to_owned(),
+        SandboxProxy {
+            pool: None,
+            logs: None,
+            egress_dir,
+            socket_path,
+            ca: Arc::new(ca),
+            policy: Arc::new(policy.clone()),
+            ca_cert_path,
+            ca_key_path,
+        },
     );
+    Ok(())
+}
+
+/// Copy the daemon binary into the sandbox, make it executable, and start
+/// the `forward` subcommand detached. The forwarder listens on
+/// `127.0.0.1:3128` for sandbox clients and creates the Unix socket the
+/// host-side pool connects into.
+pub async fn install_forwarder(state: &DaemonState, id: &str) -> Result<(), ProviderError> {
+    let exe = std::env::current_exe()
+        .map_err(|e| ProviderError::new("internal", format!("current exe: {e}")))?;
+    let container_path = format!("/workspace/{FORWARDER_PATH}");
+    state
+        .runtime
+        .copy_host_file(id, &exe, &container_path)
+        .await
+        .map_err(|_| ProviderError::new("internal", "failed to install egress forwarder"))?;
+    let chmod = starforge_sandbox_protocol::ExecRequest {
+        command: vec![
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            format!("chmod +x {container_path}"),
+        ],
+        ..Default::default()
+    };
+    if state.runtime.exec(id, &chmod).await.is_err() {
+        return Err(ProviderError::new(
+            "internal",
+            "failed to install egress forwarder",
+        ));
+    }
+    state
+        .runtime
+        .exec_detached(
+            id,
+            &[
+                container_path,
+                "forward".to_owned(),
+                "--listen".to_owned(),
+                FORWARDER_LISTEN.to_owned(),
+                "--unix".to_owned(),
+                EGRESS_SOCKET_IN_CONTAINER.to_owned(),
+            ],
+        )
+        .await
+        .map_err(|_| ProviderError::new("internal", "failed to start egress forwarder"))?;
+    Ok(())
+}
+
+/// Start the per-sandbox connection pool to the in-sandbox forwarder's
+/// socket. Must run after [`install_forwarder`]; retries while the
+/// forwarder starts and fails with "failed to start egress forwarder" if
+/// it never connects.
+pub async fn start_pool(state: &DaemonState, id: &str) -> Result<(), ProviderError> {
+    let (socket_path, ca, policy) = {
+        let guard = state.proxies.lock().unwrap();
+        let entry = guard
+            .get(id)
+            .ok_or_else(|| ProviderError::new("internal", "egress not provisioned"))?;
+        (
+            entry.socket_path.clone(),
+            Arc::clone(&entry.ca),
+            Arc::clone(&entry.policy),
+        )
+    };
     let upstream_roots = match &state.config.egress_upstream_ca {
         Some(path) => Some(load_upstream_ca(path)?),
         None => None,
     };
-    let proxy_inst = proxy::start_proxy(
-        listen,
-        Arc::new(ca),
-        Arc::new(policy.clone()),
-        Some(credential.clone()),
-        None,
-        upstream_roots,
-    )
-    .await
-    .map_err(|e| ProviderError::new("internal", format!("egress proxy: {e}")))?;
-    state.proxies.lock().unwrap().insert(
-        id.to_owned(),
-        SandboxProxy {
-            proxy: proxy_inst,
-            ca_cert_path,
-            ca_key_path,
-            credential,
-        },
-    );
+    let pool = proxy::start_connection_pool(&socket_path, ca, policy, None, None, upstream_roots)
+        .await
+        .map_err(|_| ProviderError::new("internal", "failed to start egress forwarder"))?;
+    let logs = pool.logs();
+    if let Some(entry) = state.proxies.lock().unwrap().get_mut(id) {
+        entry.logs = Some(logs);
+        entry.pool = Some(pool);
+    }
     Ok(())
 }
 
@@ -476,53 +593,40 @@ pub async fn install_ca(state: &DaemonState, id: &str) -> Result<(), ProviderErr
 /// key. Idempotent.
 pub fn teardown_egress(state: &DaemonState, id: &str) {
     if let Some(entry) = state.proxies.lock().unwrap().remove(id) {
-        drop(entry.proxy);
+        drop(entry.pool);
         proxy::destroy_ca_key(&entry.ca_key_path);
         let _ = std::fs::remove_file(&entry.ca_cert_path);
+        let _ = std::fs::remove_dir_all(&entry.egress_dir);
     }
 }
 
 /// Env vars pointing a sandbox at its egress proxy (injected into the
 /// create request's env, or usable by future exec callers).
 pub fn proxy_env(state: &DaemonState, id: &str) -> Vec<(String, String)> {
-    let credential = state
-        .proxies
-        .lock()
-        .unwrap()
-        .get(id)
-        .map(|entry| entry.credential.clone());
-    match (state.proxy_addr(id), credential) {
-        (Some(addr), Some(credential)) => {
-            // Inside the container the host proxy is reachable over the
-            // pasta/slirp loopback gateway, not the daemon's own listen IP.
-            let host = if addr.ip().is_loopback() || addr.ip().is_unspecified() {
-                "10.0.2.2".to_owned()
-            } else {
-                addr.ip().to_string()
-            };
-            let url = format!("http://{credential}@{host}:{}", addr.port());
-            vec![
-                ("HTTPS_PROXY".to_owned(), url.clone()),
-                ("https_proxy".to_owned(), url.clone()),
-                ("HTTP_PROXY".to_owned(), url.clone()),
-                ("http_proxy".to_owned(), url),
-                (
-                    "SSL_CERT_FILE".to_owned(),
-                    format!("/workspace/{PROXY_CA_PATH}"),
-                ),
-                (
-                    "NODE_EXTRA_CA_CERTS".to_owned(),
-                    format!("/workspace/{PROXY_CA_PATH}"),
-                ),
-                (
-                    "GIT_SSL_CAINFO".to_owned(),
-                    format!("/workspace/{PROXY_CA_PATH}"),
-                ),
-            ]
-        }
-        _ => Vec::new(),
+    const URL: &str = "http://127.0.0.1:3128";
+    if !state.egress_enabled(id) {
+        return Vec::new();
     }
+    vec![
+        ("HTTP_PROXY".to_owned(), URL.to_owned()),
+        ("HTTPS_PROXY".to_owned(), URL.to_owned()),
+        ("http_proxy".to_owned(), URL.to_owned()),
+        ("https_proxy".to_owned(), URL.to_owned()),
+        (
+            "SSL_CERT_FILE".to_owned(),
+            format!("/workspace/{PROXY_CA_PATH}"),
+        ),
+        (
+            "NODE_EXTRA_CA_CERTS".to_owned(),
+            format!("/workspace/{PROXY_CA_PATH}"),
+        ),
+        (
+            "GIT_SSL_CAINFO".to_owned(),
+            format!("/workspace/{PROXY_CA_PATH}"),
+        ),
+    ]
 }
+
 // -------------------------------------------------------------- middleware --
 
 async fn auth_middleware(
@@ -613,16 +717,36 @@ async fn create_sandbox(
     if let Err(err) = start_egress(&state, &id, &policy).await {
         return Err(ApiError(err));
     }
+    let egress_volume = state
+        .egress_dir_for(&id)
+        .map(|dir| format!("{}:{}:Z", dir.display(), EGRESS_DIR_IN_CONTAINER));
     let mut req = req;
     for (key, value) in proxy_env(&state, &id) {
         req.envs.insert(key, value);
     }
-    req.network_enabled = state.proxy_addr(&id).is_some();
-    if let Err(err) = state.runtime.create(&id, &req).await {
+    if let Err(err) = state
+        .runtime
+        .create(&id, &req, egress_volume.as_deref())
+        .await
+    {
         teardown_egress(&state, &id);
         return Err(ApiError(err));
     }
-    if state.proxy_addr(&id).is_some()
+    if state.egress_enabled(&id)
+        && let Err(err) = install_forwarder(&state, &id).await
+    {
+        let _ = state.runtime.remove(&id).await;
+        teardown_egress(&state, &id);
+        return Err(ApiError(err));
+    }
+    if state.egress_enabled(&id)
+        && let Err(err) = start_pool(&state, &id).await
+    {
+        let _ = state.runtime.remove(&id).await;
+        teardown_egress(&state, &id);
+        return Err(ApiError(err));
+    }
+    if state.egress_enabled(&id)
         && let Err(err) = install_ca(&state, &id).await
     {
         let _ = state.runtime.remove(&id).await;
@@ -1300,14 +1424,50 @@ mod tests {
         assert!(url["url"].as_str().unwrap().contains("8080"));
     }
 
+    /// The fake runtime does not run the forwarder binary, so stand in for
+    /// it: watch for the per-sandbox egress directory, bind its shim socket,
+    /// and hold the daemon's pooled connections.
+    fn spawn_fake_forwarder(watch_dir: std::path::PathBuf) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let listener = loop {
+                let mut found = None;
+                if let Ok(entries) = std::fs::read_dir(&watch_dir) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.is_dir() {
+                            let sock = path.join(EGRESS_SHIM_NAME);
+                            let _ = std::fs::remove_file(&sock);
+                            if let Ok(listener) = tokio::net::UnixListener::bind(&sock) {
+                                found = Some(listener);
+                                break;
+                            }
+                        }
+                    }
+                }
+                if let Some(listener) = found {
+                    break listener;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            };
+            let mut held = Vec::new();
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                held.push(stream);
+            }
+        })
+    }
+
     #[tokio::test]
     async fn create_provisions_proxy_ca_env_and_kill_cleans_up() {
         let dir =
             std::env::temp_dir().join(format!("starforge-egress-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
+        let egress_dir = dir.join("egress");
         let config = DaemonConfig {
             images: vec!["docker.io/library/rust".to_owned()],
-            egress_listen: Some(([127, 0, 0, 1], 0).into()),
+            egress_dir: Some(egress_dir.clone()),
             egress_ca_dir: dir.clone(),
             secret_bindings: vec![proxy::SecretBinding {
                 host: "bound.test".to_owned(),
@@ -1316,6 +1476,7 @@ mod tests {
             }],
             ..DaemonConfig::default()
         };
+        let _forwarder = spawn_fake_forwarder(egress_dir);
         let runtime = Arc::new(FakeRuntime::new());
         let state = DaemonState::new(
             Arc::clone(&runtime) as Arc<dyn Runtime>,
@@ -1338,8 +1499,8 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "create body: {body}");
         let id = body["id"].as_str().unwrap().to_owned();
-        // Proxy is live, env was injected at create time (no secret in env).
-        assert!(state.proxy_addr(&id).is_some());
+        // Egress is live, env was injected at create time (no secret in env).
+        assert!(state.egress_enabled(&id));
         let (_, created_req) = &runtime.created()[0];
         assert!(
             created_req.envs.contains_key("HTTPS_PROXY"),
@@ -1372,7 +1533,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::NO_CONTENT);
-        assert!(state.proxy_addr(&id).is_none());
+        assert!(!state.egress_enabled(&id));
         assert!(!key_path.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1439,12 +1600,14 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("starforge-egress-req-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
+        let egress_dir = dir.join("egress");
         let config = DaemonConfig {
             images: vec!["docker.io/library/rust".to_owned()],
-            egress_listen: Some(([127, 0, 0, 1], 0).into()),
+            egress_dir: Some(egress_dir.clone()),
             egress_ca_dir: dir.clone(),
             ..DaemonConfig::default()
         };
+        let _forwarder = spawn_fake_forwarder(egress_dir);
         let runtime = Arc::new(FakeRuntime::new());
         let state = DaemonState::new(
             Arc::clone(&runtime) as Arc<dyn Runtime>,
@@ -1473,19 +1636,16 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "create body: {body}");
         let id = body["id"].as_str().unwrap().to_owned();
         let (_, created_req) = &runtime.created()[0];
-        assert!(created_req.network_enabled);
         assert!(
             !created_req.envs.values().any(|v| v.contains("wire-secret")),
             "secret must not be in env: {:?}",
             created_req.envs
         );
-        // Loopback proxy is reachable from the container at 10.0.2.2.
-        let port = state.proxy_addr(&id).unwrap().port();
+        // The in-sandbox forwarder listens on 127.0.0.1:3128.
         let env = proxy_env(&state, &id);
         let get = |key: &str| env.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone());
         let http = get("HTTP_PROXY").expect("HTTP_PROXY");
-        assert!(http.starts_with("http://sbx:"), "{http}");
-        assert!(http.ends_with(&format!("@10.0.2.2:{port}")), "{http}");
+        assert_eq!(http, "http://127.0.0.1:3128");
         assert_eq!(get("HTTPS_PROXY").as_deref(), Some(http.as_str()));
         let _ = std::fs::remove_dir_all(&dir);
     }
