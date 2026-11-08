@@ -61,6 +61,9 @@ SystemCallArchitectures=native
 CapabilityBoundingSet=
 # Make the data directory writable while the rest of the tree stays read-only.
 ReadWritePaths=/var/lib/starforge
+# A backup.dir outside /var/lib/starforge must also be added to
+# ReadWritePaths: ProtectSystem=strict mounts the rest of the filesystem
+# read-only, so scheduled backups could not write there.
 # Create /var/lib/starforge owned by the service user on first start.
 # Mode 0750 keeps other local users from listing repositories, the
 # database, and sealed secrets; UMask=0027 keeps new files group-only.

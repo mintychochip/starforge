@@ -838,6 +838,7 @@ fn network_policy(server_url: &str, repo_url: &str, resolved: &[ResolvedSecret])
         allow_out,
         deny_out: Vec::new(),
         secret_headers,
+        forge: None,
     }
 }
 

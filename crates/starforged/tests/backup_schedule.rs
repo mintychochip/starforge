@@ -157,3 +157,116 @@ async fn scheduled_run_writes_valid_manifest_backup() {
         .collect();
     assert!(names.len() <= 3, "rotation bounds the count: {names:?}");
 }
+
+/// Rotation never counts or deletes a manual backup under another name,
+/// however new, nor a symlink (even one named `starforge-backup-*`
+/// pointing at a valid backup).
+#[test]
+fn rotation_never_touches_manual_backups_or_symlinks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    make_backup(dir, "starforge-backup-20240102-000000", 200);
+    make_backup(dir, "starforge-backup-20240103-000000", 300);
+    // A manual `starforged backup <dir>/quarterly`: valid, and newest,
+    // but never a scheduled backup.
+    make_backup(dir, "quarterly", 9999);
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(
+        dir.join("starforge-backup-20240103-000000"),
+        dir.join("starforge-backup-link"),
+    )
+    .unwrap();
+
+    backup::rotate(dir, 1).unwrap();
+    assert!(dir.join("starforge-backup-20240103-000000").is_dir());
+    assert!(!dir.join("starforge-backup-20240102-000000").exists());
+    assert!(
+        dir.join("quarterly").join("manifest.json").is_file(),
+        "manual backup survives rotation"
+    );
+    #[cfg(unix)]
+    assert!(
+        std::fs::symlink_metadata(dir.join("starforge-backup-link"))
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "symlink survives rotation"
+    );
+}
+
+/// Startup validation creates the backup directory, accepts a writable
+/// one, and refuses one it cannot use, naming the directory.
+#[test]
+fn backup_dir_validation_refuses_unusable_dir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let good = tmp.path().join("backups");
+    backup::validate_backup_dir(&good).unwrap();
+    assert!(good.is_dir());
+    assert!(
+        std::fs::read_dir(&good).unwrap().next().is_none(),
+        "the writability probe leaves nothing behind"
+    );
+
+    // A regular file where the directory must be: creation fails.
+    let bad = tmp.path().join("not-a-dir");
+    std::fs::write(&bad, b"keep me").unwrap();
+    let err = backup::validate_backup_dir(&bad).unwrap_err();
+    assert!(
+        format!("{err:?}").contains(&bad.display().to_string()),
+        "error names the directory: {err:?}"
+    );
+}
+
+/// A scheduled run that fails partway (here: a symlink in the blob
+/// store, which `copy_tree` refuses) leaves no partial backup behind.
+#[cfg(unix)]
+#[tokio::test]
+async fn failed_scheduled_run_leaves_no_partial_backup() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config_path = tmp.path().join("starforged.toml");
+    let data_dir = tmp.path().join("data");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_starforged"))
+        .args([
+            "--config",
+            config_path.to_str().unwrap(),
+            "init",
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "init failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut config = Config::load(&config_path).unwrap();
+    let backup_dir = tmp.path().join("backups");
+    config.backup.dir = backup_dir.clone();
+    config.backup.interval_hours = 1;
+    config.backup.keep = 2;
+
+    let db = starforged_db::Db::connect(&config.database_url())
+        .await
+        .unwrap();
+    db.migrate().await.unwrap();
+    drop(db);
+
+    // A symlink in the blob store makes the copy bail after the database
+    // snapshot has already been written into the target.
+    std::fs::create_dir_all(config.blob_dir()).unwrap();
+    std::os::unix::fs::symlink(config_path.clone(), config.blob_dir().join("stray-link")).unwrap();
+
+    let err = backup::run_scheduled(&config, Some(&config_path))
+        .await
+        .unwrap_err();
+    assert!(format!("{err:?}").contains("symlink"), "{err:?}");
+    let leftovers: Vec<_> = std::fs::read_dir(&backup_dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "no partial backup remains: {leftovers:?}"
+    );
+}

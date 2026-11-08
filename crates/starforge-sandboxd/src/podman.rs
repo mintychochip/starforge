@@ -464,6 +464,19 @@ impl Runtime for PodmanRuntime {
                     )));
                 }
             }
+            // Remove the per-sandbox workspace volume; a missing volume is
+            // success (sandbox never created, or already removed).
+            let volume = format!("{id}-workspace");
+            let (code, _, stderr) = self.run(&["volume", "rm", "-f", &volume], None).await?;
+            if code != 0 {
+                let text = String::from_utf8_lossy(&stderr).to_lowercase();
+                if !text.contains("no such volume") {
+                    return Err(err_runtime(format!(
+                        "podman volume rm failed ({code}): {}",
+                        String::from_utf8_lossy(&stderr).trim()
+                    )));
+                }
+            }
             Ok(())
         })
     }
@@ -1059,6 +1072,7 @@ mod tests {
         let rt = PodmanRuntime::new(PathBuf::from("podman"));
         let id = "sbx-smoke";
         rt.remove(id).await.ok();
+
         rt.create(
             id,
             &CreateSandboxRequest {
@@ -1086,5 +1100,19 @@ mod tests {
         rt.file_write(id, "hello.txt", b"data").await.unwrap();
         assert_eq!(rt.file_read(id, "hello.txt").await.unwrap(), b"data");
         rt.remove(id).await.unwrap();
+        // The workspace volume must be gone with the sandbox.
+        let (code, out, err) = rt
+            .run(&["volume", "inspect", &format!("{id}-workspace")], None)
+            .await
+            .expect("volume inspect");
+        let text = format!(
+            "{} {}",
+            String::from_utf8_lossy(&out).to_lowercase(),
+            String::from_utf8_lossy(&err).to_lowercase()
+        );
+        assert!(
+            code != 0 || text.contains("no such volume"),
+            "workspace volume must be removed with the sandbox: {text}"
+        );
     }
 }

@@ -2034,21 +2034,46 @@ impl Core {
     }
 
     /// The secret-trust rule (plan decision 7) for one job: secrets resolve
-    /// only on a protected branch or a Trail change with maintainer
-    /// approval. `refs/for` runs are only trusted when the repository has
-    /// opted in via `ci_allow_secrets_on_refs_for` (off by default).
+    /// only on a protected branch or a Trail change with approval of the
+    /// job's own revision. `refs/for` runs are only trusted when the
+    /// repository has opted in via `ci_allow_secrets_on_refs_for` (off by
+    /// default).
     pub async fn secrets_trusted_for_job(
         &self,
         job: &starforged_db::ci::CiJobRow,
     ) -> CoreResult<bool> {
         if let Some(change_id) = job.change_id {
-            // Trail/`refs/for` job: trusted only with an approval, or with
-            // the explicit per-repo opt-in.
+            // Trail/`refs/for` job: trusted only with an approval of the
+            // job's own revision, or with the explicit per-repo opt-in.
+            // An approval of an earlier revision hands secrets to code it
+            // never saw, so only the job's revision counts — and only a
+            // reviewer's latest review on that revision speaks for them:
+            // a later `request_changes` (or any non-approval verdict) from
+            // the same reviewer cancels their approval.
             if db_repos::ci_allow_secrets_on_refs_for(self.db(), job.repo_id).await? {
                 return Ok(true);
             }
+            let Some(revision_id) = job.revision_id else {
+                return Ok(false);
+            };
             let reviews = db_changes::reviews_of_change(self.db(), change_id).await?;
-            return Ok(reviews.iter().any(|review| review.verdict == "approved"));
+            // Latest review per reviewer on this revision (`reviews_of_change`
+            // is id order, so the last write per reviewer wins). A review
+            // identity is the local author, or the imported GitHub login.
+            let mut latest: std::collections::HashMap<
+                (Option<i64>, Option<String>),
+                &db_changes::ReviewRow,
+            > = std::collections::HashMap::new();
+            for review in reviews
+                .iter()
+                .filter(|review| review.revision_id == revision_id)
+            {
+                latest.insert((review.author_id, review.imported_author.clone()), review);
+            }
+            return Ok(latest.values().any(|review| {
+                review.state == "submitted"
+                    && matches!(review.verdict.as_str(), "approve" | "approved")
+            }));
         }
         // Branch job: trusted when a protected branch currently points at
         // the job's commit (a gate rule whose pattern matches that branch).
@@ -3293,5 +3318,179 @@ mod tests {
         assert!(validate_secret_name("has-dash").is_err());
         assert!(validate_secret_name("").is_err());
         assert!(validate_secret_name(&"A".repeat(129)).is_err());
+    }
+    /// Seeds a Trail change with two revisions and a job on `revision_id`
+    /// whose spec names the `MY_SECRET` secret.
+    async fn seed_trail_job(
+        core: &Core,
+        creator: &User,
+        repo_id: i64,
+        revision_id: Option<i64>,
+    ) -> (i64, i64, i64, starforged_db::ci::CiJobRow) {
+        let trail = starforged_db::trails::insert_trail(
+            core.db(),
+            &starforged_db::trails::NewTrail {
+                repo_id,
+                title: "t",
+                intent: "i",
+                author_id: creator.id,
+            },
+            now(),
+        )
+        .await
+        .unwrap();
+        let change = db_changes::insert_change(
+            core.db(),
+            trail.id,
+            "agit",
+            Some("topic"),
+            "main",
+            creator.id,
+            now(),
+        )
+        .await
+        .unwrap();
+        let rev1 =
+            db_changes::insert_revision(core.db(), change.id, SHA, "bbbb", Some(creator.id), now())
+                .await
+                .unwrap();
+        let rev2 =
+            db_changes::insert_revision(core.db(), change.id, SHA, "bbbb", Some(creator.id), now())
+                .await
+                .unwrap();
+        let spec = serde_json::json!({
+            "name": "test",
+            "image": "example.test/image:1",
+            "commands": ["true"],
+            "secrets": ["MY_SECRET"],
+        })
+        .to_string();
+        let job = db_ci::insert_ci_job(
+            core.db(),
+            &NewCiJob {
+                repo_id,
+                trail_id: Some(trail.id),
+                change_id: Some(change.id),
+                revision_id,
+                // Distinct (sha, name) per job: `ci_jobs` is unique on
+                // (repo, sha, name) and `seed` already has a "test" job at SHA.
+                commit_sha: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                base_sha: None,
+                job_name: "test",
+                spec: &spec,
+                run_at: now(),
+                deadline: now() + 3600,
+                created_by: Some(creator.id),
+                now: now(),
+            },
+        )
+        .await
+        .unwrap();
+        (change.id, rev1.id, rev2.id, job)
+    }
+
+    #[tokio::test]
+    async fn trail_secrets_trust_requires_approval_of_the_job_revision() {
+        let (core, _f) = test_core().await;
+        let alice = user(&core, "alice").await;
+        let bob = user(&core, "bob").await;
+        let carol = user(&core, "carol").await;
+        let s = seed(&core, &alice).await;
+        core.create_ci_secret(
+            &alice,
+            "alice",
+            "proj",
+            CiSecretInput {
+                name: "MY_SECRET",
+                value: "s3cr3t",
+                host: "api.example.com",
+                header: "Authorization",
+                redact_in_sessions: false,
+            },
+        )
+        .await
+        .unwrap();
+        let (change_id, rev1, rev2, job_no_revision) =
+            seed_trail_job(&core, &alice, s.repo_id, None).await;
+        // A job on revision 2 (the helper's no-revision job is unused here).
+        let job_rev2 = db_ci::insert_ci_job(
+            core.db(),
+            &NewCiJob {
+                repo_id: s.repo_id,
+                trail_id: job_no_revision.trail_id,
+                change_id: Some(change_id),
+                revision_id: Some(rev2),
+                // As real revisions do: its own commit SHA (uniqueness (repo, sha, name)).
+                commit_sha: "ffffffffffffffffffffffffffffffffffffffff",
+                base_sha: None,
+                job_name: "test",
+                spec: &job_no_revision.spec,
+                run_at: now(),
+                deadline: now() + 3600,
+                created_by: Some(alice.id),
+                now: now(),
+            },
+        )
+        .await
+        .unwrap();
+        // Bob approves revision 1 only: the revision-2 job stays untrusted.
+        db_changes::insert_review(
+            core.db(),
+            change_id,
+            rev1,
+            bob.id,
+            "approve",
+            "lgtm",
+            None,
+            now(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !core.secrets_trusted_for_job(&job_rev2).await.unwrap(),
+            "revision-1 approval must not trust a revision-2 job"
+        );
+        // Carol approves the job's own revision: secrets are trusted.
+        db_changes::insert_review(
+            core.db(),
+            change_id,
+            rev2,
+            carol.id,
+            "approve",
+            "lgtm",
+            None,
+            now(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            core.secrets_trusted_for_job(&job_rev2).await.unwrap(),
+            "approval of the job's revision trusts it"
+        );
+        // Carol's later request_changes on that revision cancels her approval.
+        db_changes::insert_review(
+            core.db(),
+            change_id,
+            rev2,
+            carol.id,
+            "request_changes",
+            "no",
+            None,
+            now(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !core.secrets_trusted_for_job(&job_rev2).await.unwrap(),
+            "a later request_changes from the same reviewer cancels the approval"
+        );
+        // A Trail job without a revision_id is untrusted.
+        assert!(
+            !core
+                .secrets_trusted_for_job(&job_no_revision)
+                .await
+                .unwrap(),
+            "a Trail job without a revision_id is untrusted"
+        );
     }
 }

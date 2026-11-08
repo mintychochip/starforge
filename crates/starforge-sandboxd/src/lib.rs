@@ -71,6 +71,9 @@ pub struct DaemonConfig {
     /// Operator-configured secret bindings for header injection. Values
     /// never enter the sandbox env/filesystem and are never logged.
     pub secret_bindings: Vec<proxy::SecretBinding>,
+    /// Operator CIDRs that may be dialed even when they are special-use
+    /// (loopback/private/…) addresses. Set via `--egress-allow-cidr`.
+    pub egress_allow_cidr: Vec<proxy::IpNet>,
 }
 
 impl Default for DaemonConfig {
@@ -85,6 +88,7 @@ impl Default for DaemonConfig {
             egress_upstream_ca: None,
             egress_https_ports: vec![443],
             secret_bindings: Vec::new(),
+            egress_allow_cidr: Vec::new(),
         }
     }
 }
@@ -290,12 +294,14 @@ pub fn egress_policy(
     daemon_bindings: &[proxy::SecretBinding],
     request_bindings: &[starforge_sandbox_protocol::SecretBindingWire],
     https_ports: &[u16],
+    cidr_allow: &[proxy::IpNet],
 ) -> proxy::EgressPolicy {
     let mut policy = proxy::EgressPolicy {
         allow_out: network.allow_out.clone(),
         deny_out: network.deny_out.clone(),
         bindings: Vec::new(),
-        cidr_allow: Vec::new(),
+        forge: network.forge.clone(),
+        cidr_allow: cidr_allow.to_vec(),
         https_ports: https_ports.to_vec(),
     };
     // Request bindings (server-resolved secrets): honor only when
@@ -374,7 +380,13 @@ pub async fn start_egress(
     let Some(listen) = state.config.egress_listen else {
         return Ok(());
     };
-    let ca = proxy::CaMaterial::generate(&policy.allow_out)
+    // The forge host is also a permitted name: the proxy may MITM it on
+    // 443 via the forge exact match even when it is not in `allow_out`.
+    let mut ca_hosts = policy.allow_out.clone();
+    if let Some(forge) = &policy.forge {
+        ca_hosts.push(forge.clone());
+    }
+    let ca = proxy::CaMaterial::generate(&ca_hosts)
         .map_err(|e| ProviderError::new("internal", format!("egress CA: {e}")))?;
     let (ca_cert_path, ca_key_path) = proxy::ca_paths(&state.config.egress_ca_dir, id);
     proxy::write_ca_key(&ca_key_path, &ca.key_pem)
@@ -596,6 +608,7 @@ async fn create_sandbox(
         &state.config.secret_bindings,
         &req.secret_bindings,
         &state.config.egress_https_ports,
+        &state.config.egress_allow_cidr,
     );
     if let Err(err) = start_egress(&state, &id, &policy).await {
         return Err(ApiError(err));
@@ -1396,13 +1409,14 @@ mod tests {
             &[],
             &[wire("bound.test", "Authorization")],
             &[443],
+            &[],
         );
         assert_eq!(policy.bindings.len(), 1);
         assert_eq!(policy.bindings[0].host, "bound.test");
         assert_eq!(policy.bindings[0].header, "Authorization");
         assert_eq!(policy.bindings[0].value, "wire-secret-123");
         // Header disagrees with secret_headers: ignored.
-        let policy = egress_policy(&network, &[], &[wire("bound.test", "X-Other")], &[443]);
+        let policy = egress_policy(&network, &[], &[wire("bound.test", "X-Other")], &[443], &[]);
         assert!(policy.bindings.is_empty());
         // Host not allowlisted (secret_headers names it, allow_out doesn't):
         // ignored.
@@ -1415,6 +1429,7 @@ mod tests {
             &[],
             &[wire("other.test", "Authorization")],
             &[443],
+            &[],
         );
         assert!(policy.bindings.is_empty());
     }
@@ -1473,5 +1488,20 @@ mod tests {
         assert!(http.ends_with(&format!("@10.0.2.2:{port}")), "{http}");
         assert_eq!(get("HTTPS_PROXY").as_deref(), Some(http.as_str()));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn egress_policy_carries_forge_and_cidr() {
+        let network = starforge_sandbox_protocol::NetworkPolicy {
+            allow_out: vec!["crates.io".to_owned()],
+            forge: Some("[::1]:3000".to_owned()),
+            ..Default::default()
+        };
+        let cidr = vec![proxy::IpNet::parse("127.0.0.1/32").unwrap()];
+        let policy = egress_policy(&network, &[], &[], &[443], &cidr);
+        assert_eq!(policy.forge.as_deref(), Some("[::1]:3000"));
+        assert_eq!(policy.cidr_allow, cidr);
+        assert!(policy.forge_exact("::1", 3000));
+        assert!(!policy.forge_exact("::1", 3001));
     }
 }

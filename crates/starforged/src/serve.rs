@@ -283,6 +283,11 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let app = build(&config, std::env::current_exe()?).await?;
     recover_search_index(&app.core).await?;
     starforged_core::jobs::start_workers(&app.core, JOB_WORKERS).await?;
+    if config.backup.enabled() {
+        crate::backup::validate_backup_dir(&config.backup.dir).with_context(|| {
+            format!("scheduled backup directory {}", config.backup.dir.display())
+        })?;
+    }
     let backup_task = config.backup.enabled().then(|| {
         tracing::info!(
             dir = %config.backup.dir.display(),

@@ -79,12 +79,15 @@ search, webhooks, and mirrors, on SQLite or Postgres.
   (`tests/browser/`).
 - **Public-instance hardening:** `[limits]` gains `max_push_bytes` (git's
   `receive.maxInputSize` for HTTP and SSH pushes), `max_repo_bytes` (the
-  pre-receive hook refuses pushes once the repository's packed and loose
-  objects reach the limit), and `git_per_ip_per_minute` (one per-IP window
-  for git smart HTTP, which answers `429` with `Retry-After`, and SSH
-  public-key auth attempts); `[audit] retention_days` deletes older audit
-  rows in the daily prune; `[backup] dir`, `interval_hours`, and `keep`
-  run scheduled backups while serving and rotate the oldest valid ones; a
+  pre-receive hook counts the repository plus the incoming objects, so a
+  push that would cross the limit is refused whole; pull mirrors and
+  imports stop fetching at the limit), and `git_per_ip_per_minute` (one
+  per-IP window for git smart HTTP requests, which answers `429` with
+  `Retry-After`, and SSH public-key auth attempts); `[audit]
+  retention_days` deletes older audit rows in the daily prune; `[backup]
+  dir`, `interval_hours`, and `keep` run scheduled backups while serving
+  (rotation touches only `starforge-backup-*` directories, a failed run
+  leaves no partial copy, and `serve` refuses an unwritable directory); a
   systemd unit (`packaging/systemd/starforged.service`) ships in the
   release tarballs. Every new setting defaults to off.
 - **CI runners and sandboxes (M6):** opt-in `.starforge/ci.toml` jobs
@@ -116,7 +119,15 @@ search, webhooks, and mirrors, on SQLite or Postgres.
   E2B-only environment opt-in. The proxy forwards HTTPS `CONNECT` only;
   plain HTTP and non-443 ports are not proxied, and pasta exposes host
   loopback directly. The proxy requires a per-sandbox credential. The
-  hourly cleanup deletes expired artifacts and collects zero-ref blobs.
+  proxy dials only addresses that pass its policy: loopback, private,
+  link-local, and other special-use addresses are refused even for an
+  allowlisted name, except the forge's own `host:port` and ranges the
+  operator allows with `--egress-allow-cidr`. A secret header is injected
+  only when the inner `Host` matches the bound host; a Trail job gets
+  secrets only after an approval of its own revision; the runner never
+  writes its credential URL into git config; a sandbox's workspace volume
+  is removed with the sandbox. The hourly cleanup deletes expired
+  artifacts and collects zero-ref blobs.
 - **CI end-to-end:** `scripts/ci-e2e.sh` runs a real server, runner,
   sandboxd, and rootless podman through a fixture job. It proves the
   HTTPS clone and sync through the per-sandbox proxy, the artifact, and

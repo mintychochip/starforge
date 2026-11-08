@@ -91,15 +91,80 @@ impl IpNet {
     }
 
     pub fn contains(&self, ip: &IpAddr) -> bool {
-        let IpAddr::V4(v4) = ip else {
-            return false;
+        let bits: u32 = match ip {
+            IpAddr::V4(v4) => u32::from(*v4),
+            IpAddr::V6(v6) => {
+                let o = v6.octets();
+                // Match IPv4-mapped addresses against their IPv4 form so
+                // a `127.0.0.1/32` operator CIDR also covers
+                // `::ffff:127.0.0.1`.
+                if o[..10] == [0u8; 10] && o[10..12] == [0xff, 0xff] {
+                    u32::from(std::net::Ipv4Addr::new(o[12], o[13], o[14], o[15]))
+                } else {
+                    return false;
+                }
+            }
         };
-        let bits: u32 = u32::from(*v4);
         if self.prefix == 0 {
             return true;
         }
         let mask = u32::MAX << (32 - self.prefix);
         bits & mask == self.addr & mask
+    }
+}
+
+/// Whether `ip` is in a special-use (non-public) range that may only be
+/// dialed via an operator CIDR or the forge exact match. Covers IPv4
+/// loopback/private/link-local/CGNAT/0/8/broadcast/multicast/reserved/
+/// documentation addresses, IPv6 loopback/unspecified/link-local/
+/// unique-local/multicast, and IPv4-mapped/compatible forms of any
+/// blocked IPv4 address.
+pub fn is_special_use(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_multicast()
+                || v4.is_broadcast()
+                || v4.is_unspecified()
+                // reserved 240.0.0.0/4
+                || o[0] >= 240
+                // 0.0.0.0/8 ("this network")
+                || o[0] == 0
+                // 100.64.0.0/10 CGNAT
+                || (o[0] == 100 && (o[1] & 0xc0) == 0x40)
+                // 198.18.0.0/15 benchmarking
+                || (o[0] == 198 && (o[1] & 0xfe) == 18)
+                // documentation: 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24
+                || (o[0] == 192 && o[1] == 0 && o[2] == 2)
+                || (o[0] == 198 && o[1] == 51 && o[2] == 100)
+                || (o[0] == 203 && o[1] == 0 && o[2] == 113)
+        }
+        IpAddr::V6(v6) => {
+            // IPv4-mapped/compatible: ::ffff:a.b.c.d (first 80 bits zero,
+            // next 16 ones) or ::a.b.c.d (first 96 zero).
+            let o = v6.octets();
+            let v4_mapped = o[..10] == [0u8; 10] && o[10..12] == [0xff, 0xff];
+            let v4_compat =
+                o[..12] == [0u8; 12] && !(o[12] == 0 && o[13] == 0 && o[14] == 0 && o[15] <= 1);
+            if v4_mapped || v4_compat {
+                return is_special_use(&IpAddr::V4(std::net::Ipv4Addr::new(
+                    o[12], o[13], o[14], o[15],
+                )));
+            }
+            let seg = v6.segments();
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                // link-local fe80::/10 (IPv6 `is_link_local` is unstable)
+                || (seg[0] & 0xffc0) == 0xfe80
+                // unique-local fc00::/7 (IPv6 `is_unique_local` is unstable)
+                || (seg[0] & 0xfe00) == 0xfc00
+                // documentation 2001:db8::/32
+                || (seg[0] == 0x2001 && seg[1] == 0x0db8)
+        }
     }
 }
 
@@ -111,6 +176,7 @@ pub struct EgressPolicy {
     pub allow_out: Vec<String>,
     pub deny_out: Vec<String>,
     pub bindings: Vec<SecretBinding>,
+    pub forge: Option<String>,
     pub cidr_allow: Vec<IpNet>,
     /// Ports the proxy treats as HTTPS and MITMs for allowlisted hosts.
     /// `443` is the default; operators can add a private HTTPS port.
@@ -118,15 +184,39 @@ pub struct EgressPolicy {
 }
 
 impl EgressPolicy {
+    /// Split an allowlist entry into `(host, Option<port>)`. Handles
+    /// `host`, `host:port`, `[v6]`, and `[v6]:port`; the returned host has
+    /// no brackets so it compares with a parsed CONNECT authority.
+    fn parse_entry(entry: &str) -> (String, Option<u16>) {
+        if let Some(rest) = entry.strip_prefix('[') {
+            if let Some((host, port)) = rest.split_once("]:") {
+                return (host.to_owned(), port.parse().ok());
+            }
+            if let Some(host) = rest.strip_suffix(']') {
+                return (host.to_owned(), None);
+            }
+        }
+        match entry.rsplit_once(':') {
+            Some((host, port)) if !host.contains(':') => match port.parse() {
+                Ok(port) => (host.to_owned(), Some(port)),
+                Err(_) => (entry.to_owned(), None),
+            },
+            _ => (entry.to_owned(), None),
+        }
+    }
+
     /// Does `entry` (exact host, or `*.example.com` suffix wildcard) match?
+    /// A port on the entry is ignored here; port matching is
+    /// [`Self::host_port_allowed`].
     fn entry_matches(entry: &str, host: &str) -> bool {
-        let entry = entry.split(':').next().unwrap_or(entry);
+        let (entry_host, _) = Self::parse_entry(entry);
+        let entry = entry_host.as_str();
         if let Some(suffix) = entry.strip_prefix("*.") {
             host.len() > suffix.len() + 1
                 && host.ends_with(suffix)
                 && host.as_bytes()[host.len() - suffix.len() - 1] == b'.'
         } else {
-            entry == host
+            entry.eq_ignore_ascii_case(host)
         }
     }
 
@@ -138,6 +228,22 @@ impl EgressPolicy {
         self.allow_out.iter().any(|e| Self::entry_matches(e, host))
     }
 
+    /// Whether the policy may tunnel to `host:port`. An entry is `host`
+    /// (any port) or `host:port` (exactly that port); a wildcard entry
+    /// matches any port. Deny wins over allow.
+    pub fn host_port_allowed(&self, host: &str, port: u16) -> bool {
+        if self.deny_out.iter().any(|e| Self::entry_matches(e, host)) {
+            return false;
+        }
+        self.allow_out.iter().any(|e| {
+            if e.contains('*') {
+                return Self::entry_matches(e, host);
+            }
+            let (entry_host, entry_port) = Self::parse_entry(e);
+            entry_host.eq_ignore_ascii_case(host) && entry_port.is_none_or(|p| p == port)
+        })
+    }
+
     /// Secret header to inject for `host`, if a binding matches exactly.
     pub fn binding_for(&self, host: &str) -> Option<&SecretBinding> {
         self.bindings.iter().find(|b| b.host == host)
@@ -146,6 +252,58 @@ impl EgressPolicy {
     /// Whether `ip` is CIDR-allowlisted (non-HTTP egress escape hatch).
     pub fn ip_allowed(&self, ip: &IpAddr) -> bool {
         self.cidr_allow.iter().any(|net| net.contains(ip))
+    }
+
+    /// Whether the request's `host:port` equals the policy's forge entry
+    /// exactly (host compared case-insensitively, port exactly). This is
+    /// the only per-sandbox allow entry that may resolve to a
+    /// loopback/private address without an operator CIDR.
+    pub fn forge_exact(&self, host: &str, port: u16) -> bool {
+        let Some(forge) = self.forge.as_deref() else {
+            return false;
+        };
+        let (fhost, fport) = Self::parse_entry(forge);
+        match fport {
+            Some(want) => want == port && fhost.eq_ignore_ascii_case(host),
+            None => false,
+        }
+    }
+
+    /// Whether `host` is the policy's forge host, on any port. Used by the
+    /// CA minting re-check; the port gate is [`Self::forge_exact`].
+    pub fn forge_host_matches(&self, host: &str) -> bool {
+        self.forge.as_deref().is_some_and(|forge| {
+            let (fhost, _) = Self::parse_entry(forge);
+            fhost.eq_ignore_ascii_case(host)
+        })
+    }
+
+    /// Whether one resolved address passes the policy for `host:port`.
+    /// Special-use addresses pass only via an operator CIDR or the forge
+    /// exact match; every other address passes only if the name (or the
+    /// literal IP) is allowed (or CIDR-allowed).
+    pub fn addr_passes(&self, host: &str, port: u16, ip: &IpAddr) -> bool {
+        if is_special_use(ip) {
+            self.ip_allowed(ip) || self.forge_exact(host, port)
+        } else {
+            self.host_port_allowed(host, port) || self.ip_allowed(ip)
+        }
+    }
+
+    /// Keep only the resolved addresses that pass the policy, preserving
+    /// order. The caller dials from this set only (never a raw `pinned[0]`
+    /// that the policy did not vet).
+    pub fn filter_passing(
+        &self,
+        host: &str,
+        port: u16,
+        resolved: &[SocketAddr],
+    ) -> Vec<SocketAddr> {
+        resolved
+            .iter()
+            .copied()
+            .filter(|addr| self.addr_passes(host, port, &addr.ip()))
+            .collect()
     }
 }
 
@@ -258,7 +416,7 @@ impl CaMaterial {
     /// guarantee behind "the CA cannot sign an unbound host": the proxy
     /// calls this only after the allow check, and this method re-checks.
     pub fn mint_leaf(&self, policy: &EgressPolicy, host: &str) -> Result<LeafMaterial, ProxyError> {
-        if !policy.host_allowed(host) {
+        if !policy.host_allowed(host) && !policy.forge_host_matches(host) {
             return Err(ProxyError::HostDenied(host.to_owned()));
         }
         let mut params = CertificateParams::default();
@@ -511,6 +669,100 @@ fn split_head(buf: &[u8]) -> io::Result<(Vec<u8>, Vec<u8>)> {
         .ok_or_else(|| io::Error::other("header block not terminated"))
 }
 
+/// Parse a `host` / `host:port` authority (bracketed or bare) into
+/// `(host, Option<port>)`. Comparison is case-insensitive on the host.
+fn parse_authority(authority: &str) -> Option<(String, Option<u16>)> {
+    let authority = authority.trim();
+    if let Some(rest) = authority.strip_prefix('[') {
+        let (host, maybe_port) = match rest.split_once("]:") {
+            Some((h, p)) => (h, p.parse::<u16>().ok()),
+            None => {
+                let h = rest.strip_suffix(']')?;
+                (h, None)
+            }
+        };
+        return Some((host.to_owned(), maybe_port));
+    }
+    match authority.rsplit_once(':') {
+        Some((h, p)) if !h.is_empty() && !h.contains(':') => {
+            let port = p.parse::<u16>().ok()?;
+            Some((h.to_owned(), Some(port)))
+        }
+        Some(_) if authority.contains(':') => {
+            // Bare IPv6 literal without brackets: whole thing is the host.
+            Some((authority.to_owned(), None))
+        }
+        _ => Some((authority.to_owned(), None)),
+    }
+}
+
+/// Whether an inner authority matches the outer `host:port`. A missing
+/// inner port means the scheme default (`default_port`) and must equal
+/// the outer port; a present port must equal the outer port.
+fn authority_matches_outer(
+    authority: &str,
+    outer_host: &str,
+    outer_port: u16,
+    default_port: u16,
+) -> bool {
+    let Some((inner_host, inner_port)) = parse_authority(authority) else {
+        return false;
+    };
+    if !inner_host.eq_ignore_ascii_case(outer_host) {
+        return false;
+    }
+    inner_port.unwrap_or(default_port) == outer_port
+}
+
+/// Extract the `Host` header value from a request head, if present.
+fn host_header_value(head: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(head);
+    for line in text.lines().skip(1) {
+        if line.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = line.split_once(':')
+            && name.trim().eq_ignore_ascii_case("host")
+        {
+            return Some(value.trim().to_owned());
+        }
+    }
+    None
+}
+
+/// Extract the authority from an absolute-form request target, if the
+/// request line is absolute-form (`http://…` / `https://…`). Returns
+/// `(authority, default_port)` for scheme comparison.
+fn absolute_authority(head: &[u8]) -> Option<(String, u16)> {
+    let text = String::from_utf8_lossy(head);
+    let request_line = text.lines().next()?;
+    let target = request_line.split_whitespace().nth(1)?;
+    let (rest, default_port) = if let Some(r) = target.strip_prefix("http://") {
+        (r, 80)
+    } else {
+        (target.strip_prefix("https://")?, 443)
+    };
+    let authority = rest.split('/').next().unwrap_or(rest);
+    Some((authority.to_owned(), default_port))
+}
+
+/// I1 check: when a binding applies to the outer host, the inner
+/// request's `Host` header (and absolute-form authority, if present)
+/// must equal the outer host. Returns `true` if injection may proceed.
+fn injection_host_ok(head: &[u8], outer_host: &str, outer_port: u16, default_port: u16) -> bool {
+    let Some(host_header) = host_header_value(head) else {
+        return false;
+    };
+    if !authority_matches_outer(&host_header, outer_host, outer_port, default_port) {
+        return false;
+    }
+    if let Some((authority, abs_default)) = absolute_authority(head)
+        && !authority_matches_outer(&authority, outer_host, outer_port, abs_default)
+    {
+        return false;
+    }
+    true
+}
 /// Inject (or strip, for unbound hosts) the bound secret header in an HTTP
 /// request head. `host` is the CONNECT destination. Returns the rewritten
 /// head. Injection replaces any client-supplied header of the same name so
@@ -661,13 +913,21 @@ async fn handle_connection(
             }
         },
     };
-    let allowed = if is_http_port {
-        policy.host_allowed(&host)
+    // SSRF gate: dial only addresses that themselves pass the policy.
+    // A name that is allowlisted but resolves to a special-use address
+    // is refused unless the address is in an operator CIDR or the
+    // request host:port is the forge exact match. Non-HTTP(S) ports stay
+    // denied unless CIDR-allowlisted.
+    let passing: Vec<SocketAddr> = if is_http_port {
+        policy.filter_passing(&host, port, &pinned)
     } else {
-        // Non-HTTP(S): denied unless CIDR-allowlisted.
-        pinned.iter().any(|addr| policy.ip_allowed(&addr.ip()))
+        pinned
+            .iter()
+            .copied()
+            .filter(|addr| policy.ip_allowed(&addr.ip()))
+            .collect()
     };
-    if !allowed {
+    if passing.is_empty() {
         logs.record(format!("CONNECT {host}:{port} -> 403 denied"));
         let _ = client
             .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
@@ -694,7 +954,7 @@ async fn handle_connection(
     // every resolved address: `localhost` often resolves to `::1` first
     // while the origin listens on IPv4 only.
     let mut upstream = None;
-    for addr in &pinned {
+    for addr in &passing {
         if let Ok(stream) = tokio::net::TcpStream::connect(addr).await {
             upstream = Some(stream);
             break;
@@ -750,7 +1010,7 @@ async fn handle_connection(
                 Ok(stream) => stream,
                 Err(_) => return,
             };
-            relay_http(client_tls, upstream_tls, &policy, &host, logs).await;
+            relay_http(client_tls, upstream_tls, &policy, &host, 443, logs).await;
         }
         (_, None) => {
             // Plain HTTP (80) or CIDR-allowlisted raw TCP: inject into the
@@ -764,7 +1024,7 @@ async fn handle_connection(
                 return;
             }
             if port == 80 {
-                relay_http(client, upstream, &policy, &host, logs).await;
+                relay_http(client, upstream, &policy, &host, 80, logs).await;
             } else {
                 let (client_read, client_write) = client.into_split();
                 relay_raw(client_read, client_write, upstream).await;
@@ -793,6 +1053,7 @@ async fn relay_http<C, U>(
     upstream: U,
     policy: &EgressPolicy,
     host: &str,
+    port: u16,
     logs: Arc<ProxyLog>,
 ) where
     C: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -818,6 +1079,18 @@ async fn relay_http<C, U>(
         .next()
         .unwrap_or("")
         .to_owned();
+    // I1 (tunneled): when a binding applies, the inner Host (and
+    // absolute-form authority) must equal the outer CONNECT host.
+    if policy.binding_for(host).is_some() {
+        let default_port = if port == 443 { 443 } else { 80 };
+        if !injection_host_ok(&head_bytes, host, port, default_port) {
+            logs.record(format!("{method} {host}:{port} -> 403 host mismatch"));
+            let _ = client_write
+                .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+                .await;
+            return;
+        }
+    }
     let rewritten = inject_binding(&head_bytes, policy, host);
     if let Some(binding) = policy.binding_for(host) {
         logs.record(format!("{method} {host} -> inject {}", binding.header));
@@ -929,9 +1202,19 @@ mod tests {
                 header: "Authorization".to_owned(),
                 value: secret.to_owned(),
             }],
+            forge: None,
             cidr_allow: Vec::new(),
             https_ports: vec![443],
         }
+    }
+
+    /// Success-path policy whose override origins sit on loopback: the
+    /// operator CIDR admits the loopback origin (SSRF rule still refuses
+    /// special addresses without CIDR/forge).
+    fn test_policy_with_loopback_cidr(secret: &str) -> EgressPolicy {
+        let mut policy = test_policy(secret);
+        policy.cidr_allow = vec![IpNet::parse("127.0.0.1/32").unwrap()];
+        policy
     }
 
     async fn start_test_proxy(
@@ -1045,7 +1328,7 @@ mod tests {
     async fn localhost_with_a_configured_https_port_is_mitm() {
         let (origin, upstream_roots, _) = spawn_origin().await;
         let ca = Arc::new(CaMaterial::generate(&["localhost".to_owned()]).unwrap());
-        let mut policy = test_policy("secret");
+        let mut policy = test_policy_with_loopback_cidr("secret");
         policy.allow_out.push("localhost".to_owned());
         policy.https_ports = vec![443, 8443];
         let proxy = start_test_proxy(policy, Arc::clone(&ca), origin, upstream_roots).await;
@@ -1057,7 +1340,7 @@ mod tests {
     async fn mitm_on_a_configured_https_port() {
         let (origin, upstream_roots, _) = spawn_origin().await;
         let ca = Arc::new(CaMaterial::generate(&["bound.test".to_owned()]).unwrap());
-        let mut policy = test_policy("secret");
+        let mut policy = test_policy_with_loopback_cidr("secret");
         policy.https_ports = vec![443, 8443];
         let proxy = start_test_proxy(policy, Arc::clone(&ca), origin, upstream_roots).await;
         let body = fetch_via_proxy(proxy.addr(), &ca, "bound.test", 8443).await;
@@ -1072,8 +1355,13 @@ mod tests {
         let ca = Arc::new(
             CaMaterial::generate(&["bound.test".to_owned(), "unbound.test".to_owned()]).unwrap(),
         );
-        let proxy =
-            start_test_proxy(test_policy(secret), Arc::clone(&ca), origin, upstream_roots).await;
+        let proxy = start_test_proxy(
+            test_policy_with_loopback_cidr(secret),
+            Arc::clone(&ca),
+            origin,
+            upstream_roots,
+        )
+        .await;
 
         // Bound host: secret header arrives at the origin.
         let bound = fetch_via_proxy(proxy.addr(), &ca, "bound.test", 443).await;
@@ -1178,8 +1466,13 @@ mod tests {
         let ca = Arc::new(
             CaMaterial::generate(&["bound.test".to_owned(), "unbound.test".to_owned()]).unwrap(),
         );
-        let proxy =
-            start_test_proxy(test_policy(secret), Arc::clone(&ca), origin, upstream_roots).await;
+        let proxy = start_test_proxy(
+            test_policy_with_loopback_cidr(secret),
+            Arc::clone(&ca),
+            origin,
+            upstream_roots,
+        )
+        .await;
         let _ = fetch_via_proxy(proxy.addr(), &ca, "bound.test", 443).await;
         let _ = fetch_via_proxy(proxy.addr(), &ca, "unbound.test", 443).await;
         for line in proxy.logs().lines() {
@@ -1225,7 +1518,7 @@ mod tests {
         let proxy = start_proxy(
             (Ipv4Addr::LOCALHOST, 0).into(),
             Arc::clone(&ca),
-            Arc::new(test_policy("secret")),
+            Arc::new(test_policy_with_loopback_cidr("secret")),
             Some("sbx:test-token".to_owned()),
             Some(overrides),
             Some(upstream_roots),
@@ -1243,6 +1536,7 @@ mod tests {
             "Basic {}",
             base64::engine::general_purpose::STANDARD.encode("sbx:test-token")
         );
+
         stream
             .write_all(
                 format!(
@@ -1267,7 +1561,7 @@ mod tests {
         let proxy = start_proxy(
             (Ipv4Addr::LOCALHOST, 0).into(),
             Arc::clone(&ca),
-            Arc::new(test_policy("secret")),
+            Arc::new(test_policy_with_loopback_cidr("secret")),
             Some("sbx:test-token".to_owned()),
             Some(overrides),
             Some(upstream_roots),
@@ -1289,5 +1583,223 @@ mod tests {
         );
         let refused = connect_status(addr, "bound.test", 443, Some(&wrong)).await;
         assert!(refused.contains("407"), "{refused}");
+    }
+
+    // ------------------------------------------------------------ SSRF (I1/I2) --
+    fn policy_allow(name: &str, forge: Option<String>, cidr: Vec<IpNet>) -> EgressPolicy {
+        let port = name
+            .rsplit_once(':')
+            .and_then(|(_, port)| port.parse::<u16>().ok());
+        EgressPolicy {
+            allow_out: vec![name.to_owned()],
+            deny_out: Vec::new(),
+            bindings: Vec::new(),
+            forge,
+            cidr_allow: cidr,
+            https_ports: port.into_iter().collect(),
+        }
+    }
+
+    #[test]
+    fn selection_skips_blocked_first_and_keeps_allowed_later() {
+        let policy = policy_allow("good.test", None, Vec::new());
+        let resolved = vec![
+            SocketAddr::new("127.0.0.1".parse().unwrap(), 443),
+            SocketAddr::new("93.184.215.14".parse().unwrap(), 443),
+        ];
+        let passing = policy.filter_passing("good.test", 443, &resolved);
+        assert_eq!(
+            passing,
+            vec![resolved[1]],
+            "blocked loopback must be skipped"
+        );
+    }
+
+    #[test]
+    fn mapped_ipv6_loopback_is_special_and_blocked() {
+        let mapped: IpAddr = "::ffff:127.0.0.1".parse().unwrap();
+        assert!(is_special_use(&mapped));
+        let policy = policy_allow("good.test", None, Vec::new());
+        assert!(!policy.addr_passes("good.test", 443, &mapped));
+        // Operator CIDR covering the IPv4 form also covers the mapped form.
+        let with_cidr = policy_allow(
+            "good.test",
+            None,
+            vec![IpNet::parse("127.0.0.1/32").unwrap()],
+        );
+        assert!(with_cidr.addr_passes("good.test", 443, &mapped));
+    }
+
+    #[test]
+    fn forge_exact_allows_only_that_port_cidr_allows_loopback() {
+        let forge = "127.0.0.1:3000".to_owned();
+        let with_forge = policy_allow("127.0.0.1:3000", Some(forge.clone()), Vec::new());
+        let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+        assert!(with_forge.addr_passes("127.0.0.1", 3000, &loopback));
+        assert!(
+            !with_forge.addr_passes("127.0.0.1", 3001, &loopback),
+            "same host, other port must be refused"
+        );
+        let with_cidr = policy_allow(
+            "127.0.0.1:3000",
+            None,
+            vec![IpNet::parse("127.0.0.1/32").unwrap()],
+        );
+        assert!(with_cidr.addr_passes("127.0.0.1", 3000, &loopback));
+        assert!(with_cidr.addr_passes("127.0.0.1", 9999, &loopback));
+    }
+
+    async fn connect_head(proxy: SocketAddr, target: &str) -> String {
+        let stream = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        let (mut read, mut write) = tokio::io::split(stream);
+        write
+            .write_all(format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let head = read_until_header_end(&mut read, Duration::from_secs(10))
+            .await
+            .unwrap();
+        let (head_bytes, _) = split_head(&head).unwrap();
+        String::from_utf8_lossy(&head_bytes).into_owned()
+    }
+
+    #[tokio::test]
+    async fn allowlisted_name_resolving_to_loopback_is_refused() {
+        let (origin, upstream_roots, _) = spawn_origin().await;
+        let ca = Arc::new(CaMaterial::generate(&["bound.test".to_owned()]).unwrap());
+        let proxy =
+            start_test_proxy(test_policy("s"), Arc::clone(&ca), origin, upstream_roots).await;
+        let head = connect_head(proxy.addr(), "bound.test:443").await;
+        assert!(head.contains("403"), "expected 403: {head}");
+    }
+
+    #[tokio::test]
+    async fn allowlisted_ip_literal_loopback_is_refused_without_forge() {
+        let (origin, _roots, _) = spawn_origin().await;
+        let entry = format!("127.0.0.1:{}", origin.port());
+        let ca = Arc::new(CaMaterial::generate(std::slice::from_ref(&entry)).unwrap());
+        let policy = policy_allow(&entry, None, Vec::new());
+        let proxy = start_proxy(
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            ca,
+            Arc::new(policy),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let head = connect_head(proxy.addr(), &entry).await;
+        assert!(head.contains("403"), "expected 403: {head}");
+    }
+
+    #[tokio::test]
+    async fn forge_exact_is_allowed_other_port_refused() {
+        let (origin, _roots, _) = spawn_origin().await;
+        let entry = format!("127.0.0.1:{}", origin.port());
+        let ca = Arc::new(CaMaterial::generate(std::slice::from_ref(&entry)).unwrap());
+        let policy = policy_allow(&entry, Some(entry.clone()), Vec::new());
+        let proxy = start_proxy(
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            ca,
+            Arc::new(policy),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let head = connect_head(proxy.addr(), &entry).await;
+        assert!(head.contains("200"), "forge exact must be 200: {head}");
+        let other_port = origin.port().saturating_add(1).max(2);
+        let other = format!("127.0.0.1:{other_port}");
+        let head = connect_head(proxy.addr(), &other).await;
+        assert!(
+            head.contains("403"),
+            "same host other port must be 403: {head}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cidr_loopback_is_allowed() {
+        let (origin, _roots, _) = spawn_origin().await;
+        let entry = format!("127.0.0.1:{}", origin.port());
+        let ca = Arc::new(CaMaterial::generate(std::slice::from_ref(&entry)).unwrap());
+        let cidr = vec![IpNet::parse("127.0.0.1/32").unwrap()];
+        let policy = policy_allow(&entry, None, cidr);
+        let proxy = start_proxy(
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            ca,
+            Arc::new(policy),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let head = connect_head(proxy.addr(), &entry).await;
+        assert!(head.contains("200"), "CIDR loopback must be 200: {head}");
+    }
+
+    #[tokio::test]
+    async fn mitm_injection_refused_on_host_mismatch() {
+        let secret = "s3cr3t-mismatch";
+        let (origin, upstream_roots, _) = spawn_origin().await;
+        let ca = Arc::new(CaMaterial::generate(&["bound.test".to_owned()]).unwrap());
+        let proxy = start_test_proxy(
+            test_policy_with_loopback_cidr(secret),
+            Arc::clone(&ca),
+            origin,
+            upstream_roots,
+        )
+        .await;
+        // CONNECT bound.test:443 then TLS with a mismatched inner Host.
+        let mut stream = tokio::net::TcpStream::connect(proxy.addr()).await.unwrap();
+        stream
+            .write_all(b"CONNECT bound.test:443 HTTP/1.1\r\nHost: bound.test:443\r\n\r\n")
+            .await
+            .unwrap();
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+            stream.read_exact(&mut byte).await.unwrap();
+            head.extend_from_slice(&byte);
+        }
+        assert!(
+            String::from_utf8_lossy(&head).contains("200"),
+            "CONNECT failed: {}",
+            String::from_utf8_lossy(&head)
+        );
+        let mut roots = RootCertStore::empty();
+        roots
+            .add(CertificateDer::from(ca.cert_der.clone()))
+            .unwrap();
+        let config = ClientConfig::builder_with_provider(ring_provider())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = tokio_rustls::client::TlsConnector::from(Arc::new(config));
+        let tls = connector
+            .connect(
+                ServerName::try_from("bound.test".to_owned()).unwrap(),
+                stream,
+            )
+            .await
+            .unwrap();
+        let (mut tls_read, mut tls_write) = tokio::io::split(tls);
+        tls_write
+            .write_all(b"GET / HTTP/1.1\r\nHost: evil.test\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut body = Vec::new();
+        let _ =
+            tokio::time::timeout(Duration::from_secs(10), tls_read.read_to_end(&mut body)).await;
+        let text = String::from_utf8_lossy(&body).into_owned();
+        assert!(
+            text.contains("403"),
+            "MITM host mismatch must be 403: {text}"
+        );
+        assert!(!text.contains(secret), "secret must not leak: {text}");
     }
 }

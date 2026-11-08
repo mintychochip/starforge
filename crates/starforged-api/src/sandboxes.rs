@@ -94,6 +94,7 @@ impl From<NetworkPolicyJson> for NetworkPolicy {
             allow_out: value.allow_out,
             deny_out: value.deny_out,
             secret_headers: value.secret_headers,
+            forge: None,
         }
     }
 }

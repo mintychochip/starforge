@@ -795,6 +795,10 @@ impl Core {
         req: CreateSandboxRequest,
     ) -> CoreResult<SandboxView> {
         let caller = SandboxCaller::job(principal);
+        let mut req = req;
+        if let Some(forge) = self.forge_host_port() {
+            req.network.forge = Some(forge);
+        }
         let resolved = self.resolve_secrets_for_job(principal).await?;
         self.create_sandbox_inner(
             caller,
@@ -806,6 +810,23 @@ impl Core {
         .await
     }
 
+    /// The forge's `host:port` from the server `base_url` (the port is the
+    /// URL's own port, defaulted by scheme), for the job sandbox's egress
+    /// allowlist so the runner can reach `clone_url` through the proxy.
+    fn forge_host_port(&self) -> Option<String> {
+        Self::forge_host_port_for_url(&self.config().base_url)
+    }
+
+    /// `host:port` for a server `base_url`, folding in the scheme's default
+    /// port. Note `host_str` already returns IPv6 literals bracketed
+    /// (`[::1]`), so no extra bracketing is needed here.
+    fn forge_host_port_for_url(base_url: &str) -> Option<String> {
+        let url = url::Url::parse(base_url).ok()?;
+        let host = url.host_str()?;
+        let port = url.port_or_known_default()?;
+        Some(format!("{host}:{port}"))
+    }
+
     async fn create_sandbox_inner(
         &self,
         caller: SandboxCaller,
@@ -814,6 +835,14 @@ impl Core {
         mut req: CreateSandboxRequest,
         resolved: Vec<crate::ci::ResolvedSecret>,
     ) -> CoreResult<SandboxView> {
+        // The forge `host:port` is a server-only network field (the job path
+        // sets it); a non-job create must never carry one. Reject rather
+        // than clear, so a future API field cannot smuggle it in silently.
+        if job_id.is_none() && req.network.forge.is_some() {
+            return Err(CoreError::Invalid(
+                "network forge is set by the server and must not be supplied".into(),
+            ));
+        }
         let runtime = req.runtime.trim().to_ascii_lowercase();
         let runtime = if runtime.is_empty() {
             "podman"
@@ -1388,6 +1417,26 @@ sandbox_seconds_per_hour = 1800
         assert!(validate_sandbox_path("", true).is_ok());
     }
 
+    #[test]
+    fn forge_host_port_brackets_ipv6_literals() {
+        assert_eq!(
+            Core::forge_host_port_for_url("http://[::1]:3000").as_deref(),
+            Some("[::1]:3000")
+        );
+        assert_eq!(
+            Core::forge_host_port_for_url("http://[2001:db8::1]").as_deref(),
+            Some("[2001:db8::1]:80")
+        );
+        assert_eq!(
+            Core::forge_host_port_for_url("http://127.0.0.1:8080").as_deref(),
+            Some("127.0.0.1:8080")
+        );
+        assert_eq!(
+            Core::forge_host_port_for_url("https://forge.example.com").as_deref(),
+            Some("forge.example.com:443")
+        );
+        assert_eq!(Core::forge_host_port_for_url("not a url"), None);
+    }
     #[tokio::test]
     async fn local_provider_reports_missing_socket() {
         let provider = LocalSandboxProvider::new(

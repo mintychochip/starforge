@@ -46,10 +46,13 @@ pub struct HookCtx {
     /// Repository-size limit in bytes (`STARFORGE_MAX_REPO_BYTES`); `0`
     /// disables the limit.
     pub max_repo_bytes: u64,
-    /// Current on-disk repository size in bytes
-    /// (`STARFORGE_REPO_SIZE_BYTES`); `0` when the RPC layer could not
-    /// measure it, which allows every push.
-    pub repo_size_bytes: u64,
+    /// Quarantined incoming objects for this push (`GIT_QUARANTINE_PATH`):
+    /// git stages the incoming pack under
+    /// `$GIT_DIR/objects/tmp_objdir-incoming-*` and points this variable at
+    /// it before running the hook, so the repository-size check below can
+    /// measure existing objects plus the incoming ones. `None` outside a
+    /// real receive-pack run (tests inject it or rely on the glob scan).
+    pub quarantine_path: Option<PathBuf>,
 }
 
 fn env(name: &str) -> Option<String> {
@@ -109,11 +112,77 @@ impl HookCtx {
             max_repo_bytes: env("STARFORGE_MAX_REPO_BYTES")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0),
-            repo_size_bytes: env("STARFORGE_REPO_SIZE_BYTES")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0),
+            quarantine_path: env("GIT_QUARANTINE_PATH").map(PathBuf::from),
         }
     }
+}
+
+/// Sum of the file sizes under `root`, not descending into any path in
+/// `skip`. A missing root measures as zero (an empty repository has no
+/// objects directory to speak of); any other read failure is an error so
+/// the caller can fail open with a warning instead of a wrong total.
+fn dir_size(root: &std::path::Path, skip: &[PathBuf]) -> Result<u64, String> {
+    let mut total = 0u64;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        if skip.contains(&path) {
+            continue;
+        }
+        let metadata = match std::fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(format!("measuring {}: {err}", path.display())),
+        };
+        if metadata.is_file() {
+            total = total.saturating_add(metadata.len());
+            continue;
+        }
+        if !metadata.is_dir() {
+            continue;
+        }
+        let entries = std::fs::read_dir(&path)
+            .map_err(|err| format!("measuring {}: {err}", path.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|err| format!("measuring {}: {err}", path.display()))?;
+            stack.push(entry.path());
+        }
+    }
+    Ok(total)
+}
+
+/// Total object storage for the size limit: everything under
+/// `$GIT_DIR/objects` plus the quarantined incoming objects. The
+/// quarantine directory (git's `$GIT_DIR/objects/tmp_objdir-incoming-*`,
+/// named by `GIT_QUARANTINE_PATH`) lives inside `objects`, so it is
+/// excluded from the first walk and added back explicitly — never counted
+/// twice, never missed. Without the environment variable the incoming
+/// directories are found by the same name glob git uses.
+fn repo_size_at_hook_time(ctx: &HookCtx) -> Result<u64, String> {
+    let objects = ctx.git_dir.join("objects");
+    let mut quarantine: Vec<PathBuf> = match &ctx.quarantine_path {
+        Some(path) => vec![path.clone()],
+        None => {
+            let mut found = Vec::new();
+            if let Ok(entries) = std::fs::read_dir(&objects) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    if name.to_string_lossy().starts_with("tmp_objdir-incoming-") {
+                        found.push(entry.path());
+                    }
+                }
+            }
+            found
+        }
+    };
+    // The explicit path may not sit directly in `objects`; the skip list
+    // only ever matches exact paths, so an outside path skips nothing.
+    quarantine.sort();
+    quarantine.dedup();
+    let mut total = dir_size(&objects, &quarantine)?;
+    for path in &quarantine {
+        total = total.saturating_add(dir_size(path, &[])?);
+    }
+    Ok(total)
 }
 
 /// `starforged hook pre-receive`: checks every pushed ref; returns the process exit code.
@@ -135,16 +204,30 @@ pub fn pre_receive_with(input: impl BufRead, mut err: impl Write, ctx: &HookCtx)
         );
         return 1;
     }
-    // Repository-size limit: while the repository is at or above the
-    // limit, pushes are refused outright — no ref moves.
-    if ctx.max_repo_bytes > 0 && ctx.repo_size_bytes >= ctx.max_repo_bytes {
-        let _ = writeln!(
-            err,
-            "starforge: repository size limit reached ({} MiB of {} MiB); pushes are refused",
-            ctx.repo_size_bytes / (1024 * 1024),
-            ctx.max_repo_bytes / (1024 * 1024)
-        );
-        return 1;
+    // Repository-size limit, measured now — at hook time, so the incoming
+    // objects quarantined by receive-pack count towards the total and a
+    // single push can never land the repository above the limit. Refused
+    // objects are discarded by git with the push. A measurement failure
+    // fails open with a warning (the pusher sees it as `remote: …`).
+    if ctx.max_repo_bytes > 0 {
+        match repo_size_at_hook_time(ctx) {
+            Ok(total) if total >= ctx.max_repo_bytes => {
+                let _ = writeln!(
+                    err,
+                    "starforge: repository size limit reached ({} MiB of {} MiB); pushes are refused",
+                    total / (1024 * 1024),
+                    ctx.max_repo_bytes / (1024 * 1024)
+                );
+                return 1;
+            }
+            Ok(_) => {}
+            Err(measure_err) => {
+                let _ = writeln!(
+                    err,
+                    "starforge: warning: repository size measurement failed ({measure_err}); allowing push"
+                );
+            }
+        }
     }
     let permission = ctx.permission.as_deref();
     let mut code = 0;
@@ -411,7 +494,7 @@ mod tests {
             import_in_progress: false,
             mirror: false,
             max_repo_bytes: 0,
-            repo_size_bytes: 0,
+            quarantine_path: None,
         }
     }
 
@@ -436,24 +519,60 @@ mod tests {
         );
     }
 
+    fn write_sized(path: &std::path::Path, bytes: usize) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, vec![b'x'; bytes]).unwrap();
+    }
+
     #[test]
     fn refuses_pushes_at_repository_size_limit() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut c = ctx(tmp.path().to_owned());
+        let git_dir = tmp.path().to_owned();
+        // Existing object storage: 1024 bytes under objects/pack.
+        write_sized(&git_dir.join("objects/pack/pack-existing"), 1024);
+        // Quarantined incoming objects: 2048 bytes — found by the
+        // tmp_objdir-incoming-* glob when GIT_QUARANTINE_PATH is absent.
+        write_sized(
+            &git_dir.join("objects/tmp_objdir-incoming-abc/pack/pack-incoming"),
+            2048,
+        );
+        let mut c = ctx(git_dir.clone());
         c.permission = Some("write".to_owned());
-        // At the limit: refused with the size message.
-        c.max_repo_bytes = 2 * 1024 * 1024;
-        c.repo_size_bytes = 2 * 1024 * 1024;
+        // 1024 existing + 2048 incoming = 3072: at/above a 3072 limit the
+        // push is refused with the size message (and not double-counted).
+        c.max_repo_bytes = 3072;
         let (code, err) = run("0 1 refs/heads/main\n", &c);
         assert_eq!(code, 1);
         assert!(err.contains("repository size limit reached"), "{err}");
-        // Below the limit: accepted.
-        c.repo_size_bytes = 1024 * 1024;
+        // Below the limit the same total is accepted.
+        c.max_repo_bytes = 4096;
         assert_eq!(run("0 1 refs/heads/main\n", &c), (0, String::new()));
-        // Disabled: any size accepted.
+        // An explicit quarantine path outside objects counts too.
+        let incoming = tmp.path().join("elsewhere-incoming");
+        write_sized(&incoming.join("pack-incoming"), 2048);
+        c.quarantine_path = Some(incoming);
+        c.max_repo_bytes = 3072;
+        let (code, err) = run("0 1 refs/heads/main\n", &c);
+        assert_eq!(code, 1);
+        assert!(err.contains("repository size limit reached"), "{err}");
+        // Disabled: any size accepted, and no measurement happens.
         c.max_repo_bytes = 0;
-        c.repo_size_bytes = 100 * 1024 * 1024;
         assert_eq!(run("0 1 refs/heads/main\n", &c), (0, String::new()));
+    }
+
+    #[test]
+    fn size_measurement_failure_fails_open_with_a_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A file where the git dir should be: walking objects under it
+        // fails, so the push is allowed with a warning, never refused.
+        let not_a_dir = tmp.path().join("not-a-dir");
+        std::fs::write(&not_a_dir, b"not a git dir").unwrap();
+        let mut c = ctx(not_a_dir);
+        c.permission = Some("write".to_owned());
+        c.max_repo_bytes = 1;
+        let (code, err) = run("0 1 refs/heads/main\n", &c);
+        assert_eq!(code, 0);
+        assert!(err.contains("measurement failed"), "{err}");
     }
 
     #[test]

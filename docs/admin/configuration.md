@@ -38,8 +38,8 @@
 | `limits.api_per_token_per_hour` | API requests per token per hour (default `5000`; `0` disables) |
 | `limits.refs_for_new_changes_per_hour` | New `refs/for` changes per user per hour (default `30`; `0` disables) |
 | `limits.max_push_bytes` | Maximum bytes accepted in one push (default `0`; `0` disables) |
-| `limits.max_repo_bytes` | Maximum on-disk bytes a repository may reach before pushes are refused (default `0`; `0` disables) |
-| `limits.git_per_ip_per_minute` | Git smart-HTTP and SSH public-key auth attempts per client IP per minute (default `0`; `0` disables) |
+| `limits.max_repo_bytes` | Maximum on-disk bytes a repository may reach before pushes are refused (default `0`; `0` disables). The pre-receive hook measures the repository plus the incoming objects, so a push that would exceed the limit is refused whole. Pull mirrors and imports refuse to start a fetch once the repository is at the limit, but one fetch can exceed the limit by its own size; pair with `max_push_bytes` to bound a single push |
+| `limits.git_per_ip_per_minute` | Git smart-HTTP HTTP requests and SSH public-key auth attempts per client IP per minute (default `0`; `0` disables). One HTTP clone, fetch, or push takes two or three requests (`info/refs` plus one or two pack requests). Behind a reverse proxy every client shares the proxy's address (same as the login limiter); prefer rate limiting at the proxy there |
 | `audit.retention_days` | Days to keep `audit_log` rows before the daily prune deletes them (default `0`; `0` keeps everything) |
 | `backup.dir` | Directory holding scheduled backups; empty disables scheduled backups (default empty) |
 | `backup.interval_hours` | Hours between scheduled backups (default `0`; `0` disables) |
@@ -99,7 +99,7 @@ segment) and their existing errors.
 | API requests | `limits.api_per_token_per_hour` | `5000` | Requests per token per fixed 1-hour window (in-memory) |
 | New `refs/for` changes | `limits.refs_for_new_changes_per_hour` | `30` | `agit` changes created by the user in all repositories in the last hour (database) |
 | Push size | `limits.max_push_bytes` | `0` | Bytes in one push, enforced by `receive.maxInputSize` on HTTP and SSH (git) |
-| Repository size | `limits.max_repo_bytes` | `0` | On-disk repository bytes at push time, from `git count-objects -v` (git) |
+| Repository size | `limits.max_repo_bytes` | `0` | On-disk repository bytes at push time: the repository plus the incoming objects (git) |
 | Git requests | `limits.git_per_ip_per_minute` | `0` | Git smart-HTTP requests and SSH public-key auth attempts per client IP per fixed 1-minute window (in-memory) |
 
 **Client IP.** The login limiter, the login page, and the audit writer all use
@@ -110,6 +110,9 @@ address, and behind one the limiter and the audit log see the proxy, not the
 client. The per-account limit counts failures for existing and non-existing
 login names identically (by the normalized name), so probing unknown names is
 limited the same way.
+The git rate limiter uses the same address, so behind a proxy every
+client shares the proxy's address there too; rate limit git at the proxy
+in that setup.
 
 **Response shapes.** Over the API limit: `429` with the error envelope
 `{"error": {"code": "rate_limited", "message": "rate limit exceeded"}}`,

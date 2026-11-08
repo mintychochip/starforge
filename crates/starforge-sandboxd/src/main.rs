@@ -61,6 +61,10 @@ struct Args {
     /// management over plaintext CLI use.
     #[arg(long = "secret-binding")]
     secret_bindings: Vec<String>,
+    /// Operator CIDR (e.g. `10.0.0.0/8` or `127.0.0.1/32`) that the egress
+    /// proxy may dial even when special-use. Repeatable.
+    #[arg(long = "egress-allow-cidr")]
+    egress_allow_cidr: Vec<String>,
 }
 
 /// Peer uid of an accepted Unix-stream connection (SO_PEERCRED on Linux).
@@ -211,6 +215,18 @@ async fn run() -> io::Result<()> {
             }
         })
         .collect::<io::Result<Vec<_>>>()?;
+    let egress_allow_cidr = args
+        .egress_allow_cidr
+        .iter()
+        .map(|spec| {
+            starforge_sandboxd::proxy::IpNet::parse(spec).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("--egress-allow-cidr: {e}"),
+                )
+            })
+        })
+        .collect::<io::Result<Vec<_>>>()?;
     let config = DaemonConfig {
         images: args.images,
         default_ttl_s: args.default_ttl,
@@ -224,6 +240,7 @@ async fn run() -> io::Result<()> {
             args.egress_https_ports
         },
         secret_bindings,
+        egress_allow_cidr,
         ..DaemonConfig::default()
     };
     let runtime = Arc::new(PodmanRuntime::new(args.podman));

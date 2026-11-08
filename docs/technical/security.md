@@ -165,13 +165,14 @@ It covers secrets at rest, audit reads, and known limits.
 - Deploy keys push as `Write` without a user identity.
 - Archived repositories refuse pushes.
 - `limits.max_push_bytes` caps push input for HTTP and SSH pushes. Git receive pack runs with `receive.maxInputSize` at this value.
-- `limits.max_repo_bytes` caps on disk size per repository. The pre receive hook refuses each push at or above the cap.
-- The refusal text reads `starforge: repository size limit reached` with sizes in MiB. A measurement error logs a warning and allows the push.
-- `limits.git_per_ip_per_minute` caps git requests per address per 60 seconds. The cap covers smart HTTP and SSH public key attempts.
+- `limits.max_repo_bytes` caps on disk size per repository. The pre receive hook measures the repository size plus the incoming objects. The hook refuses a push whole when the sum reaches the cap. The refusal text reads `starforge: repository size limit reached` with sizes in MiB. A measurement error logs a warning and allows the push.
+- Pull mirrors and imports refuse to start a fetch once the repository reaches the limit. One fetch can still exceed the limit by its own size. Operators pair `max_repo_bytes` with `max_push_bytes` to bound a single push.
+- `limits.git_per_ip_per_minute` caps git requests per address per 60 seconds. One HTTP clone, fetch, or push takes two or three requests. The requests include `info/refs` plus one or two pack requests. SSH counts each public key authentication attempt.
+- Behind a reverse proxy every client shares the proxy address for this limit, as for the sign-in limiter. Operators prefer rate limiting at the proxy there.
 - An HTTP breach answers 429 with `Retry-After` and a plain text body. The body reads `rate limit exceeded`.
 - An SSH breach rejects the attempt before key lookup. The cap reduces key lookup abuse from one address.
 - The daily prune deletes `audit_log` rows older than `audit.retention_days` days. A value of 0 keeps rows forever.
-- Scheduled backups write to `backup.dir` every `backup.interval_hours` hours. Rotation keeps `backup.keep` backups with a valid `manifest.json`.
+- Scheduled backups write to `backup.dir` every `backup.interval_hours` hours. Rotation keeps `backup.keep` backups. Rotation counts and deletes only `starforge-backup-*` directories. Rotation never deletes other entries or symlinks.
 
 ### Secrets handling
 
@@ -213,7 +214,10 @@ It covers secrets at rest, audit reads, and known limits.
 - Secret values never enter the sandbox environment or filesystem on the local provider.
 - Only the E2B provider delivers values as environment variables. The E2B path needs the repository opt-in `ci_env_secrets`.
 - A `refs/for` run resolves no secrets by default. A repository admin can opt in with `ci_allow_secrets_on_refs_for`.
-- The egress proxy injects secret headers for allowlisted hosts only. Unbound hosts receive no secret header.
+- The server resolves job secrets only when the reviewer's latest review of the job's own revision is an approval. An approval of an earlier revision does not carry over to a later revision.
+- The egress proxy injects secret headers for allowlisted hosts only. The proxy injects a secret header only when the inner request `Host` matches the bound host. The proxy also checks the authority of an absolute form request. The proxy answers `403` for a mismatch. Unbound hosts receive no secret header. A `host:port` allowlist entry permits exactly one port.
+- The proxy refuses special use addresses after DNS resolution. The proxy refuses loopback, private, link local, CGNAT, multicast, reserved, and unique local addresses, and their IPv4 mapped forms, even for an allowlisted name or IP literal. The forge `host:port` and the operator ranges from the repeatable `--egress-allow-cidr` flag are the only exceptions.
+- `create_sandbox_inner` refuses a caller-supplied `forge` value. Only the server sets it, on the job sandbox path.
 - The proxy and its bindings redact values in `Debug` output. Values never reach logs, rendered pages, or URLs.
 
 ### Sandbox isolation
@@ -225,6 +229,10 @@ It covers secrets at rest, audit reads, and known limits.
 - File paths validate in Core before the provider runs. Absolute paths and `..` escapes fail validation.
 - A per sandbox egress proxy meters socket traffic. The proxy trusts one CA per sandbox.
 - The proxy enforces a host allowlist. Non HTTP ports need CIDR allowlisted addresses.
+- The proxy refuses special use addresses after DNS resolution. The proxy refuses loopback, private, link local, CGNAT, multicast, reserved, and unique local addresses. The proxy also refuses IPv4 mapped forms of these addresses. The proxy refuses these addresses even for an allowlisted name or IP literal.
+- The proxy allows two exceptions. The forge `host:port` from the server per job sandbox is the first exception. Operator ranges from the repeatable `--egress-allow-cidr CIDR` flag form the second exception.
+- A repository secret bound to an internal host needs the host range in `--egress-allow-cidr`. The forge `host:port` entry lets a job reach the whole forge service on that port, on any path. A job holds no forge credential after checkout.
+- File API reads follow symlinks inside the container only. The server refuses a path that escapes `/workspace`. A racing job reads at most files of its own container. A racing job reads no host files.
 - The sandbox trusts the per sandbox CA. The CA keys rest in a directory with mode `0600`.
 - When the daemon provisions egress, it starts the container with pasta and maps host loopback to `10.0.2.2`. The container reaches the proxy at `10.0.2.2:<port>`. The daemon uses slirp4netns when pasta is unavailable. With egress disabled, the container stays with `--network none`.
 - The proxy forwards HTTPS `CONNECT` to allowlisted hosts on ports 80 and 443. The proxy refuses plain HTTP and other ports. Pasta also exposes host loopback ports directly, so the proxy is not the only reachable host service. Do not expose untrusted services on host loopback.

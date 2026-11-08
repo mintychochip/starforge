@@ -184,9 +184,31 @@ pub async fn run_scheduled(config: &Config, config_path: Option<&Path>) -> anyho
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     let target = scheduled_target(dir, secs);
-    run_with_config(config, config_path, &target, true).await?;
+    if let Err(err) = run_with_config(config, config_path, &target, true).await {
+        if let Err(remove_err) = std::fs::remove_dir_all(&target) {
+            tracing::error!(
+                target = %target.display(),
+                error = %remove_err,
+                "removing partial scheduled backup"
+            );
+        }
+        return Err(err);
+    }
     rotate(dir, config.backup.keep)?;
     Ok(target)
+}
+
+/// Creates `dir` if absent and probes that it is writable, so the server
+/// can refuse to start (instead of failing every scheduled backup later)
+/// when the scheduled-backup directory is unusable.
+pub fn validate_backup_dir(dir: &Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("creating backup directory {}", dir.display()))?;
+    let probe = dir.join(".starforge-backup-write-probe");
+    std::fs::write(&probe, b"")
+        .with_context(|| format!("backup directory {} is not writable", dir.display()))?;
+    let _ = std::fs::remove_file(&probe);
+    Ok(())
 }
 
 /// The `<dir>/starforge-backup-<UTC YYYYMMDD-HHMMSS>` path for `secs`. If
@@ -238,10 +260,12 @@ fn read_manifest(dir: &Path) -> anyhow::Result<Manifest> {
     Ok(manifest)
 }
 
-/// Keeps the newest `keep` backups in `dir` and removes the older ones.
-/// Only directories holding a valid manifest count; a directory without
-/// one is left alone. The newest backup always survives: `keep` is at
-/// least 1.
+/// Keeps the newest `keep` scheduled backups in `dir` and removes the
+/// older ones. Only entries that are real directories (not symlinks)
+/// named `starforge-backup-*` and holding a valid manifest count;
+/// everything else in `dir` (a manual `starforged backup <dir>/quarterly`,
+/// symlinks, plain files) is never counted or deleted. The newest
+/// backup always survives: `keep` is at least 1.
 pub fn rotate(dir: &Path, keep: u64) -> anyhow::Result<()> {
     let keep = usize::try_from(keep.max(1)).unwrap_or(usize::MAX);
     let mut valid: Vec<(i64, PathBuf)> = Vec::new();
@@ -249,9 +273,12 @@ pub fn rotate(dir: &Path, keep: u64) -> anyhow::Result<()> {
     for entry in entries {
         let entry = entry.with_context(|| format!("reading {}", dir.display()))?;
         let path = entry.path();
-        if path.is_dir()
-            && let Ok(manifest) = read_manifest(&path)
-        {
+        let is_scheduled_dir = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with("starforge-backup-"))
+            && std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_dir());
+        if is_scheduled_dir && let Ok(manifest) = read_manifest(&path) {
             valid.push((manifest.created_at, path));
         }
     }

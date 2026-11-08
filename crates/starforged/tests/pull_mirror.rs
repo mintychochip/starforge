@@ -192,6 +192,78 @@ async fn pull_mirror_configures_syncs_and_prunes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pull_mirror_fetch_refused_when_repository_at_size_limit() {
+    let s = TestServer::start_with(|c| {
+        c.remotes.allow_file_urls = true;
+        c.limits.max_repo_bytes = 1;
+    })
+    .await;
+    let alice = s.user("alice").await;
+    let rw = s.token(&alice, &[Scope::RepoRead, Scope::RepoWrite]).await;
+    let repo = s.repo(&alice, "proj", Visibility::Private).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (url, src) = make_source(dir.path(), "src").await;
+
+    let client = reqwest::Client::new();
+    let (status, v) = api(
+        &client,
+        "PUT",
+        &s.url("/api/v1/repos/alice/proj/mirror/pull"),
+        &rw,
+        Some(&json!({"url": url, "interval_secs": 300})),
+    )
+    .await;
+    assert_eq!(status, 200, "{v}");
+
+    // The empty repository is below the 1-byte limit, so the first sync
+    // fetches — and leaves the repository above it.
+    let done = poll_mirror(&s, &rw, "alice", "proj").await;
+    assert!(done["last_success_at"].is_number(), "{done}");
+    let refs = server_refs(&s, repo.id).await;
+    assert!(refs.contains("refs/heads/main"), "{refs}");
+
+    // The next sync must be refused before any fetch starts: the error is
+    // recorded on the remote row and the new upstream branch never lands.
+    commit_files(&src, &[("more.txt", b"more\n")], "advance main").await;
+    git_ok(&src, &["branch", "topic"]).await;
+    let (status, _) = api(
+        &client,
+        "POST",
+        &s.url("/api/v1/repos/alice/proj/mirror/pull/sync"),
+        &rw,
+        None,
+    )
+    .await;
+    assert_eq!(status, 200);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let error = loop {
+        s.core.run_due_jobs().await.unwrap();
+        let (_, v) = api(
+            &client,
+            "GET",
+            &s.url("/api/v1/repos/alice/proj/mirror/pull"),
+            &rw,
+            None,
+        )
+        .await;
+        let error = v["last_error"].as_str().unwrap_or("").to_owned();
+        if !error.is_empty() || Instant::now() > deadline {
+            break error;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert!(
+        error.contains("repository size limit reached"),
+        "sync at the limit must record the size limit: {error}"
+    );
+    let refs = server_refs(&s, repo.id).await;
+    assert!(
+        !refs.contains("refs/heads/topic"),
+        "fetch must not start at the limit: {refs}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pull_mirror_revisions_and_webhook_sender_null() {
     let s = TestServer::start_with(|c| {
         c.remotes.allow_file_urls = true;

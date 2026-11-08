@@ -22,6 +22,13 @@ pub struct NetworkPolicy {
     pub deny_out: Vec<String>,
     #[serde(default)]
     pub secret_headers: BTreeMap<String, String>,
+    /// The forge's own `host:port` as the server sees it (IPv6 bracketed,
+    /// e.g. `[::1]:3000`). Only the server sets it, on the job sandbox
+    /// create; the public sandbox API never accepts it from callers.
+    /// The daemon treats it as the ONE allow entry that may resolve to
+    /// a loopback/private address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forge: Option<String>,
 }
 
 /// One secret header the egress proxy injects for an allowlisted host.
@@ -228,6 +235,7 @@ mod tests {
                     "api.github.com".to_owned(),
                     "Authorization".to_owned(),
                 )]),
+                forge: None,
             },
             metadata: BTreeMap::from([("job_id".to_owned(), "42".to_owned())]),
             idempotency_key: Some("key-1".to_owned()),

@@ -113,8 +113,11 @@ The egress proxy listen address and the CA directory are
 `starforge-sandboxd` flags, not server config: `--egress-listen`
 (default `127.0.0.1:0`) sets the proxy listen address, and
 `--egress-ca-dir` (default `/run/starforge/egress-ca`) sets the
-per-sandbox CA directory. The daemon reads only its own flags; the
-server only reads `sandbox.local.egress.allowlist`.
+per-sandbox CA directory. One more sandboxd flag widens egress:
+`--egress-allow-cidr CIDR` (repeatable) allows one special-use address
+range per occurrence. Without it the proxy refuses every special-use
+address except the forge's own `host:port`. The daemon reads only its
+own flags; the server only reads `sandbox.local.egress.allowlist`.
 
 ## E2B adapter
 
@@ -161,6 +164,22 @@ port cannot use the proxy without the credential. Pasta still exposes
 other host loopback services directly; run one daemon per trust
 domain, or add network isolation. With egress disabled the container
 stays `--network none`. Secret values never enter the sandbox.
+
+After DNS resolution the proxy dials only addresses that pass the
+policy. Loopback, private, link-local, CGNAT, multicast, reserved, and
+unique-local addresses (and their IPv4-mapped forms) are refused, even
+for an allowlisted name or IP literal. The only exceptions are the
+forge's own `host:port` (declared by the server per job sandbox) and
+ranges the operator allows with the repeatable sandboxd flag
+`--egress-allow-cidr CIDR`. A repository secret bound to an internal
+host therefore needs that host's range in `--egress-allow-cidr`.
+
+A secret header is injected only when the inner request `Host` (and, for
+absolute-form requests, the request authority) matches the bound host; a
+mismatch answers `403`. A Trail job gets secrets only after an approval
+of its own revision. The runner fetches with the credential URL without
+storing it in git config, and the sandbox's workspace volume is removed
+with the sandbox.
 
 For a job-token sandbox create, the server resolves the job's
 secrets itself, records them in `ci_job_secrets`, and passes the

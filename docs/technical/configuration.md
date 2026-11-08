@@ -86,8 +86,8 @@ The code rejects an unknown nested key as fatal.
 | `limits` | `api_per_token_per_hour` | number | 5000 | API calls per token |
 | `limits` | `refs_for_new_changes_per_hour` | number | 30 | New changes per hour |
 | `limits` | `max_push_bytes` | number | 0, disabled | Maximum bytes in one push |
-| `limits` | `max_repo_bytes` | number | 0, disabled | Maximum repository bytes before refusal |
-| `limits` | `git_per_ip_per_minute` | number | 0, disabled | Git requests per IP per minute |
+| `limits` | `max_repo_bytes` | number | 0, disabled | Repository plus incoming objects before refusal; fetches refuse to start at the limit |
+| `limits` | `git_per_ip_per_minute` | number | 0, disabled | Git HTTP requests per IP per minute; one clone takes two or three requests |
 | `audit` | `retention_days` | number | 0, keep forever | Audit row retention in days |
 | `backup` | `dir` | path | empty, off | Directory for scheduled backups |
 | `backup` | `interval_hours` | number | 0, off | Hours between scheduled backups |
@@ -120,7 +120,7 @@ The code rejects an unknown nested key as fatal.
 
 Missing sections take the defaults above. Old files keep working without new sections. A `limits.*` value of `0` disables that control. A session `*_bytes` quota of `0` rejects every upload. A `sandbox.limits.*` value of `0` disables that control. A `ci.limits.*` value of `0` disables that control.
 
-`audit.retention_days` of `0` keeps every row. Scheduled backups need a non-empty `backup.dir` and a positive `backup.interval_hours`. `backup.enabled` reports both conditions. `Config::validate` rejects `backup.keep` of `0` for enabled backups.
+`audit.retention_days` of `0` keeps every row. Scheduled backups need a non-empty `backup.dir` and a positive `backup.interval_hours`. `backup.enabled` reports both conditions. `Config::validate` rejects `backup.keep` of `0` for enabled backups. `serve` aborts startup when the server cannot create or write `backup.dir`.
 
 The `sandbox.provider` override accepts `local` or `e2b` only. An unknown provider value stops startup. Number overrides must parse as non-negative counts. An empty `ci.depot.api_token` disables the Depot supplier. An empty `sandbox.e2b.api_key` leaves the E2B provider without an API key. `Config::validate` checks no `sandbox.*` or `ci.*` value beyond environment parsing.
 

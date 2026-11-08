@@ -614,6 +614,30 @@ pub(crate) struct PreparedImport {
     pub(crate) ssh_public_key: Option<String>,
 }
 
+/// Refuses to start an import/pull-mirror fetch when the repository is
+/// already at or above `limits.max_repo_bytes` (0 disables the check).
+/// The error is a plain message: the callers record it on the remote row
+/// exactly like a fetch failure. A measurement failure fails open with a
+/// warning, matching the pre-receive hook.
+async fn check_repo_size_for_fetch(core: &Core, repo_id: i64) -> Result<(), String> {
+    let limit = core.config().max_repo_bytes;
+    if limit == 0 {
+        return Ok(());
+    }
+    match crate::protection::repo_disk_size(&core.repo_path(repo_id)).await {
+        Ok(size) if size >= limit => Err(format!(
+            "repository size limit reached ({} MiB of {} MiB); fetch refused",
+            size / (1024 * 1024),
+            limit / (1024 * 1024)
+        )),
+        Ok(_) => Ok(()),
+        Err(err) => {
+            tracing::warn!(error = %err, repo_id, "measuring repository size failed; allowing fetch");
+            Ok(())
+        }
+    }
+}
+
 impl Core {
     /// Validates an import URL and seals its credentials. `Invalid` maps to
     /// 422 at creation (M4b D3). For SSH this generates a fresh ed25519
@@ -815,6 +839,7 @@ impl Core {
             .repo_lock_shared(repo_id)
             .await
             .map_err(|e| e.to_string())?;
+        check_repo_size_for_fetch(self, repo_id).await?;
         let pinned = self
             .check_remote_url(&row.url)
             .map_err(|e| starforged_git::remote::scrub(&e.to_string(), &row.url))?;
@@ -1193,6 +1218,7 @@ impl Core {
             .repo_lock_shared(repo_id)
             .await
             .map_err(|e| e.to_string())?;
+        check_repo_size_for_fetch(self, repo_id).await?;
         let pinned = self
             .check_remote_url(&row.url)
             .map_err(|e| starforged_git::remote::scrub(&e.to_string(), &row.url))?;

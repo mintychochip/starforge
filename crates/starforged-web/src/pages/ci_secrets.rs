@@ -9,7 +9,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect, Response};
 use axum_extra::extract::Form;
 use serde::Deserialize;
-use starforged_core::ci::SecretView;
+use starforged_core::ci::{CiSecretInput, SecretView};
 use starforged_core::permission::Permission;
 use starforged_core::sessions::WebSession;
 use starforged_core::{CoreError, CoreResult};
@@ -66,7 +66,20 @@ pub async fn create_or_rotate(
     verify_csrf(&session.csrf_token, &form.csrf)?;
     match state
         .core
-        .create_ci_secret(&session.user, &owner, &repo, &form.name, &form.value, true)
+        .create_ci_secret(
+            &session.user,
+            &owner,
+            &repo,
+            CiSecretInput {
+                name: &form.name,
+                value: &form.value,
+                // The settings form sets the value only; the proxy binding
+                // is set through the API (empty host = no proxy injection).
+                host: "",
+                header: "Authorization",
+                redact_in_sessions: true,
+            },
+        )
         .await
     {
         Ok(_) => Ok(Redirect::to(&settings_url(&owner, &repo)).into_response()),

@@ -54,12 +54,17 @@ Every interval the server writes one backup to
 `<dir>/starforge-backup-<UTC YYYYMMDD-HHMMSS>` with the same code as
 `starforged backup`, and the backup includes the configuration copy.
 After each backup the server deletes the oldest backup directories
-beyond `keep`. Rotation considers only directories that hold a valid
-backup `manifest.json`, so it never deletes unrelated directories.
+beyond `keep`. Rotation counts and deletes only
+`starforge-backup-*` directories; it never deletes any other entry or
+a symlink.
+A failed scheduled backup removes its partial directory. `serve`
+refuses to start when `backup.dir` cannot be created or written.
 Backup failures log an error and never stop the server. The backup
 directory holds secrets, so keep it encrypted at rest and
 access-limited like every other backup.
 
 Under systemd, give the service write access to the backup directory
 with an extra `ReadWritePaths=` entry in the unit, then reload and
-restart the service to apply the change.
+restart the service to apply the change. With the shipped systemd
+unit, a `backup.dir` outside `/var/lib/starforge` must be added to
+`ReadWritePaths=`.

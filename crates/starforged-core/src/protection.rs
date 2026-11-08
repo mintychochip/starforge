@@ -87,8 +87,11 @@ fn default_true() -> bool {
 }
 
 /// On-disk size of a repository in bytes: `git count-objects -v` reports
-/// `size` (loose) and `size-pack` (packed) in KiB.
-async fn repo_disk_size(path: &std::path::Path) -> Result<u64, String> {
+/// `size` (loose) and `size-pack` (packed) in KiB. The pre-receive hook
+/// measures the size itself at hook time (existing objects plus the
+/// quarantined incoming ones); the internal writers in `remotes` use this
+/// for their at-the-limit pre-check before fetching.
+pub(crate) async fn repo_disk_size(path: &std::path::Path) -> Result<u64, String> {
     let path = path.to_str().ok_or("repository path is not UTF-8")?;
     let out = starforged_git::command::run(["-C", path, "count-objects", "-v"])
         .await
@@ -210,21 +213,16 @@ impl Core {
                 self.config().max_push_bytes.to_string(),
             ));
         }
-        // Repository-size limit: measure the on-disk size here and hand
-        // limit plus size to the hook, which refuses every push at or
-        // above the limit. A measurement error warns and allows the push
-        // (the hook sees no size and refuses nothing).
+        // Repository-size limit: hand the hook only the limit. The hook
+        // measures the total itself at hook time — existing object storage
+        // plus the quarantined incoming objects — so one push can never
+        // land the repository above the limit. (Measuring here, before
+        // receive-pack runs, would count neither the incoming pack.)
         if self.config().max_repo_bytes > 0 {
             env.push((
                 "STARFORGE_MAX_REPO_BYTES",
                 self.config().max_repo_bytes.to_string(),
             ));
-            match repo_disk_size(&self.repo_path(access.repo.id)).await {
-                Ok(size) => env.push(("STARFORGE_REPO_SIZE_BYTES", size.to_string())),
-                Err(err) => {
-                    tracing::warn!(error = %err, "measuring repository size failed; allowing push")
-                }
-            }
         }
         Ok(env)
     }
