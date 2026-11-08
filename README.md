@@ -4,8 +4,8 @@ A self-hostable git forge built around agent-assisted development. It hosts
 git over HTTP and SSH with local accounts, personal access tokens,
 user-owned repositories with collaborators, code and history browsing, a
 REST API, Trails (issue-like objects with changes, revisions, reviews, and
-gates), agent session traces with redaction, search, webhooks, mirrors, and
-opt-in CI runners with sandboxed jobs.
+gates), agent session traces with redaction, search, webhooks, mirrors,
+notifications, releases, and opt-in CI runners with sandboxed jobs.
 See `docs/superpowers/specs/2026-11-03-starforge-design.md`.
 
 ## Requirements
@@ -50,15 +50,15 @@ starforge trail push --title "smoke change"
 
 ```bash
 scripts/build-release.sh
-tar -xzf target/release-artifacts/starforged-0.1.0-x86_64-unknown-linux-musl.tar.gz
+tar -xzf target/release-artifacts/starforged-0.1.0-pre.1-x86_64-unknown-linux-musl.tar.gz
 ./x86_64-unknown-linux-musl/starforged init --data-dir ./data
 ```
 
 ### OCI image
 
 ```bash
-podman build --build-arg STARFORGE_TARGET=x86_64-unknown-linux-musl -t starforge:0.1.0 .
-podman run --rm -p 3000:3000 -p 2222:2222 -v starforge-data:/data starforge:0.1.0
+podman build --build-arg STARFORGE_TARGET=x86_64-unknown-linux-musl -t starforge:0.1.0-pre.1 .
+podman run --rm -p 3000:3000 -p 2222:2222 -v starforge-data:/data starforge:0.1.0-pre.1
 ```
 
 ## Documentation
