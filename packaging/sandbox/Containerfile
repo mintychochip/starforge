@@ -43,6 +43,10 @@ RUN apk add --no-cache git ca-certificates bash zstd \
 # Static musl binaries (cargo-zigbuild), installed side by side with the
 # server image's layout so `starforge` resolves identically.
 COPY target/release-artifacts/starforged-*-${STARFORGE_TARGET}.tar.gz /tmp/artifacts.tar.gz
+RUN mkdir -p /tmp/starforge \
+  && tar -xzf /tmp/artifacts.tar.gz -C /tmp/starforge \
+  && install -m 0755 "/tmp/starforge/${STARFORGE_TARGET}/starforge" /usr/local/bin/starforge \
+  && rm -rf /tmp/artifacts.tar.gz /tmp/starforge
 # One agent CLI: Pi (which also serves omp transcripts). Starforge does
 # not build the agent — it is an external binary the operator stages
 # into the build context before building (see

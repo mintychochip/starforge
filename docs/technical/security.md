@@ -216,7 +216,7 @@ It covers secrets at rest, audit reads, and known limits.
 - A `refs/for` run resolves no secrets by default. A repository admin can opt in with `ci_allow_secrets_on_refs_for`.
 - The server resolves job secrets only when the reviewer's latest review of the job's own revision is an approval. An approval of an earlier revision does not carry over to a later revision.
 - The egress proxy injects secret headers for allowlisted hosts only. The proxy injects a secret header only when the inner request `Host` matches the bound host. The proxy also checks the authority of an absolute form request. The proxy answers `403` for a mismatch. Unbound hosts receive no secret header. A `host:port` allowlist entry permits exactly one port.
-- The proxy refuses special use addresses after DNS resolution. The proxy refuses loopback, private, link local, CGNAT, multicast, reserved, and unique local addresses, and their IPv4 mapped forms, even for an allowlisted name or IP literal. The forge `host:port` and the operator ranges from the repeatable `--egress-allow-cidr` flag are the only exceptions.
+- The proxy refuses special use addresses after DNS resolution. It refuses loopback, private, link local, CGNAT, multicast, reserved, and unique local addresses. It also refuses their IPv4 mapped forms. It refuses these addresses even for an allowlisted name or IP literal. The forge `host:port` and the operator ranges from the repeatable `--egress-allow-cidr` flag are the only exceptions.
 - `create_sandbox_inner` refuses a caller-supplied `forge` value. Only the server sets it, on the job sandbox path.
 - The proxy and its bindings redact values in `Debug` output. Values never reach logs, rendered pages, or URLs.
 

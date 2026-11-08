@@ -114,7 +114,11 @@ Each secret carries an optional `host` and an optional `header` binding. `host` 
 
 An empty host means no proxy injection. The secret still registers for session redaction.
 
-For a job-token sandbox create, the server resolves the job secrets itself. The server records the resolved secrets in `ci_job_secrets`. The server sends host, header, and value bindings to the local daemon over the Unix socket. The daemon injects a value only when the request `secret_headers` names the same host and the same header. The proxy also injects a value only when the inner request `Host` (and, for absolute-form requests, the request authority) matches the bound host; a mismatch answers `403`. Secret values never enter the sandbox environment or filesystem on the local provider. On the E2B provider only, a repository with `ci_env_secrets` set injects values as environment variables.
+For a job-token sandbox create, the server resolves the job secrets itself. The server records the resolved secrets in `ci_job_secrets`. The server sends host, header, and value bindings to the local daemon over the Unix socket. The daemon injects a value only when the request `secret_headers` names the same host and the same header.
+
+The proxy injects a value only when the inner request `Host` matches the bound host. The proxy also checks the authority of an absolute form request. A mismatch answers `403`.
+
+Secret values never enter the sandbox environment or filesystem on the local provider. On the E2B provider only, a repository with `ci_env_secrets` set injects values as environment variables.
 
 `secrets_trusted_for_job` applies the trust rule. A job trusts secrets only on a protected branch or an approved Trail. A `refs/for` run trusts secrets only when the repository opts in with `ci_allow_secrets_on_refs_for`.
 
@@ -128,7 +132,9 @@ Runtime `podman` is the default. Runtime `gvisor` selects `runsc` on request. Th
 
 The `e2b` provider talks to an E2B-shaped gateway over HTTP. The wire shapes match `starforge-sandbox-protocol`. The adapter is not wire-compatible with real E2B. The admin guide describes the gap in full. The API key never reaches logs.
 
-Each sandbox gets its own egress proxy task. The proxy terminates TLS under a per-sandbox CA. The CA name constraints cover only allowlisted destinations. The proxy resolves each DNS name once and pins the answer. The proxy injects a secret header only for a bound host and a matching `Host`. The proxy answers `403` when the `Host` does not match. A `host:port` entry permits exactly that port. A `host` entry permits every port. The proxy forwards HTTPS `CONNECT` only; plain HTTP and non-443 ports are not proxied.
+Each sandbox gets its own egress proxy task. The proxy terminates TLS under a per-sandbox CA. The CA name constraints cover only allowlisted destinations. The proxy resolves each DNS name once and pins the answer. The proxy injects a secret header only for a bound host and a matching `Host`. The proxy answers `403` when the `Host` does not match.
+
+A `host:port` entry permits exactly that port. A `host` entry permits every port. The proxy forwards HTTPS `CONNECT` only. The proxy does not forward plain HTTP or non-443 ports.
 
 The proxy refuses a non-allowlisted host. The CA keys carry mode `0600`. The daemon destroys the CA with the sandbox. The daemon refuses host mounts and privileged containers. The server rejects a secret header host outside the allowlist.
 
@@ -140,9 +146,13 @@ The proxy refuses a plain `http://` request and any other port. A local job need
 
 Pasta maps host loopback to `10.0.2.2`, so a sandbox can also reach host loopback ports directly. The proxy is not the only reachable host service. The proxy requires a per-sandbox Basic credential from the proxy URL, so a sibling sandbox cannot borrow it. Do not expose untrusted services on host loopback.
 
-After DNS resolution the proxy dials only addresses that pass the policy. The proxy refuses loopback, private, link local, CGNAT, multicast, reserved, and unique local addresses. The proxy also refuses IPv4 mapped forms of these addresses. The proxy refuses these addresses even for an allowlisted name or IP literal. The forge `host:port` and the operator ranges form the only exceptions. The daemon flag `--egress-allow-cidr CIDR` is repeatable; the operator allows one special use range per flag.
+After DNS resolution the proxy dials only addresses that pass the policy. The proxy refuses loopback, private, link local, CGNAT, multicast, reserved, and unique local addresses. The proxy also refuses IPv4 mapped forms of these addresses. The proxy refuses these addresses even for an allowlisted name or IP literal. The forge `host:port` and the operator ranges form the only exceptions.
 
-`create_sandbox_for_job` adds the forge `host:port` from `server.base_url` to the network policy `forge` entry. The server declares this value per job sandbox. The port defaults by scheme. The forge entry lets a job reach the whole forge service on that port, on any path. The runner checks out the job commit in place and fetches with the credential URL without storing it in git config. The daemon removes the workspace volume with the sandbox. The daemon sets `SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`, and `GIT_SSL_CAINFO` to the per-sandbox CA. The daemon trusts a private upstream CA with `--egress-upstream-ca`. Secret values never enter the sandbox. With egress disabled, the container stays with `--network none`.
+The daemon flag `--egress-allow-cidr CIDR` is repeatable. The operator allows one special use range per flag.
+
+`create_sandbox_for_job` adds the forge `host:port` from `server.base_url` to the network policy `forge` entry. The server declares this value per job sandbox. The port defaults by scheme. The forge entry lets a job reach the whole forge service on that port, on any path. The runner checks out the job commit in place and fetches with the credential URL without storing it in git config.
+
+The daemon removes the workspace volume with the sandbox. The daemon sets `SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`, and `GIT_SSL_CAINFO` to the per-sandbox CA. The daemon trusts a private upstream CA with `--egress-upstream-ca`. Secret values never enter the sandbox. With egress disabled, the container stays with `--network none`.
 
 Sandbox limits answer 429 for a limit breach. `max_concurrent_per_user` caps concurrent sandboxes per user. `max_concurrent_per_repo` caps concurrent sandboxes per repository. `sandbox_seconds_per_hour` caps seconds per user per hour. `default_ttl_secs` records the default lifetime at 3600 seconds. A request can set its own `timeout_s`.
 
