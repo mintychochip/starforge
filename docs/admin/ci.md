@@ -120,6 +120,13 @@ range per occurrence. Without it the proxy refuses every special-use
 address except the forge's own `host:port`. The daemon reads only its
 own flags; the server only reads `sandbox.local.egress.allowlist`.
 
+### E2B port URLs
+
+The E2B adapter sets `allowPublicTraffic` to true. An E2B port URL is
+public. It needs no traffic-access token, and it does not expire before
+the sandbox does. The URL is not signed. Treat it as a credential while
+the sandbox runs.
+
 ## Egress proxy and per-sandbox CA
 
 Each sandbox's outbound traffic goes through a Rust MITM proxy in

@@ -219,11 +219,25 @@ impl CiSpec {
             validate_job(job)?;
             validate_matrix(job)?;
         }
-        let expanded = self.expanded_jobs().len();
-        if expanded > MAX_EXPANDED_JOBS {
+        let expanded = self.expanded_jobs();
+        if expanded.len() > MAX_EXPANDED_JOBS {
             return Err(invalid(format!(
-                "ci.toml: {expanded} jobs after matrix expansion, over the {MAX_EXPANDED_JOBS}-job limit"
+                "ci.toml: {} jobs after matrix expansion, over the {MAX_EXPANDED_JOBS}-job limit",
+                expanded.len()
             )));
+        }
+        // Expanded names must be unique across the whole spec, not only
+        // within one job's matrix: a base job named like another job's
+        // expansion would otherwise collide on (repo, sha, name) and be
+        // dropped silently by the enqueue's unique-violation handling.
+        let mut expanded_names = HashSet::new();
+        for job in &expanded {
+            if !expanded_names.insert(job.name.as_str()) {
+                return Err(invalid(format!(
+                    "ci.toml: duplicate job name `{}` after matrix expansion",
+                    job.name
+                )));
+            }
         }
         Ok(())
     }
@@ -951,6 +965,30 @@ rust = ["1.85", "1.90"]
         assert_eq!(
             os_values,
             HashSet::from(["linux".to_owned(), "mac".to_owned()])
+        );
+    }
+
+    #[test]
+    fn expanded_names_are_unique_across_jobs() {
+        let text = r#"
+version = 1
+[triggers]
+push = ["main"]
+[[job]]
+name = "test"
+image = "rust:1.85"
+commands = ["true"]
+[job.matrix]
+os = ["linux"]
+[[job]]
+name = "test-0-os-linux"
+image = "rust:1.85"
+commands = ["true"]
+"#;
+        let err = err(text);
+        assert!(
+            err.contains("duplicate job name `test-0-os-linux`"),
+            "{err}"
         );
     }
 
