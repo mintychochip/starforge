@@ -5656,7 +5656,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "starforge-capture"
-version = "0.1.0"
+version = "0.1.0-pre.1"
 dependencies = [
  "rusqlite",
  "serde",
@@ -5671,7 +5671,7 @@ dependencies = [
 
 [[package]]
 name = "starforge-cli"
-version = "0.1.0"
+version = "0.1.0-pre.1"
 dependencies = [
  "axum",
  "clap",
@@ -5696,7 +5696,7 @@ dependencies = [
 
 [[package]]
 name = "starforge-format"
-version = "0.1.0"
+version = "0.1.0-pre.1"
 dependencies = [
  "blake3",
  "proptest",
@@ -5711,7 +5711,7 @@ dependencies = [
 
 [[package]]
 name = "starforge-redact"
-version = "0.1.0"
+version = "0.1.0-pre.1"
 dependencies = [
  "blake3",
  "proptest",
@@ -5726,7 +5726,7 @@ dependencies = [
 
 [[package]]
 name = "starforge-runner"
-version = "0.1.0"
+version = "0.1.0-pre.1"
 dependencies = [
  "clap",
  "hex",
@@ -5744,7 +5744,7 @@ dependencies = [
 
 [[package]]
 name = "starforge-sandbox-protocol"
-version = "0.1.0"
+version = "0.1.0-pre.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -5753,7 +5753,7 @@ dependencies = [
 
 [[package]]
 name = "starforge-sandboxd"
-version = "0.1.0"
+version = "0.1.0-pre.1"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -5774,7 +5774,7 @@ dependencies = [
 
 [[package]]
 name = "starforged"
-version = "0.1.0"
+version = "0.1.0-pre.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -5811,7 +5811,7 @@ dependencies = [
 
 [[package]]
 name = "starforged-api"
-version = "0.1.0"
+version = "0.1.0-pre.1"
 dependencies = [
  "axum",
  "serde",
@@ -5824,7 +5824,7 @@ dependencies = [
 
 [[package]]
 name = "starforged-blob"
-version = "0.1.0"
+version = "0.1.0-pre.1"
 dependencies = [
  "blake3",
  "tempfile",
@@ -5834,7 +5834,7 @@ dependencies = [
 
 [[package]]
 name = "starforged-core"
-version = "0.1.0"
+version = "0.1.0-pre.1"
 dependencies = [
  "argon2",
  "askama",
@@ -5871,7 +5871,7 @@ dependencies = [
 
 [[package]]
 name = "starforged-db"
-version = "0.1.0"
+version = "0.1.0-pre.1"
 dependencies = [
  "getrandom 0.4.3",
  "hex",
@@ -5884,7 +5884,7 @@ dependencies = [
 
 [[package]]
 name = "starforged-git"
-version = "0.1.0"
+version = "0.1.0-pre.1"
 dependencies = [
  "base64 0.23.1",
  "gix",
@@ -5899,7 +5899,7 @@ dependencies = [
 
 [[package]]
 name = "starforged-index"
-version = "0.1.0"
+version = "0.1.0-pre.1"
 dependencies = [
  "tantivy",
  "tempfile",
@@ -5908,7 +5908,7 @@ dependencies = [
 
 [[package]]
 name = "starforged-ssh"
-version = "0.1.0"
+version = "0.1.0-pre.1"
 dependencies = [
  "anyhow",
  "bytes",
@@ -5922,7 +5922,7 @@ dependencies = [
 
 [[package]]
 name = "starforged-web"
-version = "0.1.0"
+version = "0.1.0-pre.1"
 dependencies = [
  "ammonia",
  "askama",

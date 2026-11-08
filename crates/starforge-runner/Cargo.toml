@@ -23,7 +23,7 @@ reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-starforge-sandbox-protocol = { path = "../starforge-sandbox-protocol", version = "0.1.0" }
+starforge-sandbox-protocol = { path = "../starforge-sandbox-protocol", version = "0.1.0-pre.1" }
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
