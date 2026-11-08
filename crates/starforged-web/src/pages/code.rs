@@ -7,7 +7,7 @@ use axum::response::{IntoResponse, Redirect, Response};
 use starforged_core::CoreError;
 use starforged_core::repos::RepoAccess;
 use starforged_core::sessions::WebSession;
-use starforged_git::read::{Blob, EntryKind, TreeEntry, classify};
+use starforged_git::read::{ArchiveFormat, Blob, EntryKind, TreeEntry, classify};
 use tokio_util::io::ReaderStream;
 
 use crate::AppState;
@@ -46,6 +46,8 @@ pub struct TreePage {
     can_manage_import: bool,
     show_watch: bool,
     watch_mode: String,
+    archive_zip_href: String,
+    archive_tar_href: String,
 }
 
 #[derive(Template, WebTemplate)]
@@ -335,6 +337,41 @@ pub async fn raw(
     Ok(response)
 }
 
+/// A commit tree as a zip or tar.gz download, streamed without loading it
+/// into memory (spec §11.1): same sandbox as `raw`, never rendered as HTML.
+pub async fn archive(
+    State(state): State<AppState>,
+    MaybeUser(session): MaybeUser,
+    Path((owner, repo, rest)): Path<(String, String, String)>,
+) -> Result<Response, WebError> {
+    let Some((rev, format)) = ArchiveFormat::parse(&rest) else {
+        return Err(WebError::NotFound);
+    };
+    let access = state
+        .core
+        .repo_for(session.as_ref().map(|s| &s.user), &owner, &repo)
+        .await?;
+    let download = state.core.archive(&access, rev, format).await?;
+    let disposition =
+        HeaderValue::from_str(&format!("attachment; filename=\"{}\"", download.filename))
+            .map_err(|_| WebError::Internal("unrepresentable archive filename".to_owned()))?;
+    Ok((
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static(download.content_type),
+            ),
+            (header::CONTENT_DISPOSITION, disposition),
+            (
+                header::CONTENT_SECURITY_POLICY,
+                HeaderValue::from_static("sandbox"),
+            ),
+        ],
+        Body::from_stream(ReaderStream::new(download.stdout)),
+    )
+        .into_response())
+}
+
 async fn render_tree(
     state: &AppState,
     session: Option<&WebSession>,
@@ -437,6 +474,26 @@ async fn tree_page(
         can_manage_import: access.permission >= starforged_core::permission::Permission::Maintain,
         show_watch: session.is_some(),
         watch_mode: watch_mode.unwrap_or_else(|| "none".to_owned()),
+        archive_zip_href: ref_name
+            .map(|r| {
+                format!(
+                    "/{}/{}/archive/{}.zip",
+                    repo.owner,
+                    repo.name,
+                    encode_path(r)
+                )
+            })
+            .unwrap_or_default(),
+        archive_tar_href: ref_name
+            .map(|r| {
+                format!(
+                    "/{}/{}/archive/{}.tar.gz",
+                    repo.owner,
+                    repo.name,
+                    encode_path(r)
+                )
+            })
+            .unwrap_or_default(),
     })
 }
 

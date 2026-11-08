@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block title %}{% if is_new %}New release{% else %}Edit {{ tag }}{% endif %} · {{ head.owner }}/{{ head.name }}{% endblock %}
+{% block content %}
+{% include "repo_head.html" %}
+<h2>{% if is_new %}New release{% else %}Edit {{ tag }}{% endif %}</h2>
+{% if let Some(e) = error %}<p class="notice">{{ e }}</p>{% endif %}
+<form method="post" action="{{ action }}" class="stack">
+<input type="hidden" name="_csrf" value="{{ csrf }}">
+{% if is_new %}
+<label>Tag <input type="text" name="tag" value="{{ tag }}" required></label>
+<label>Target <input type="text" name="target" value="{{ target }}" placeholder="main"></label>
+{% else %}
+<p class="muted">Tag: {{ tag }}</p>
+{% endif %}
+<label>Title <input type="text" name="title" value="{{ title }}"></label>
+<label>Notes <textarea name="notes" rows="8">{{ notes }}</textarea></label>
+<p class="muted">Markdown is supported in the notes.</p>
+<label><input type="checkbox" name="draft" {% if draft %}checked{% endif %}> Draft</label>
+<label><input type="checkbox" name="prerelease" {% if prerelease %}checked{% endif %}> Pre-release</label>
+<button type="submit">{% if is_new %}Create release{% else %}Save release{% endif %}</button>
+</form>
+{% endblock %}

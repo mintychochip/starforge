@@ -51,6 +51,15 @@ search, webhooks, and mirrors, on SQLite or Postgres.
   `mail.url`, a verified address, and the per-user setting (on by default).
   The API has `/user/notifications` and repository and Trail subscription
   routes. Read notifications are deleted after 90 days, all after 365.
+- **Downloads and releases:** any branch, tag, or commit downloads as a zip
+  or tar.gz archive (`/{owner}/{repo}/archive/{ref}.zip`, links on the
+  repository home and the tags page, and the API). Releases attach a
+  title, Markdown notes, draft and prerelease flags, and uploaded asset
+  files (up to 1 GiB each) to a tag; creating a release for a missing tag
+  creates it at a branch or commit, protected tags need Maintain, drafts
+  are visible to writers only, and deleting a release keeps its tag. Web
+  pages under `/{owner}/{repo}/releases` and API routes under
+  `/repos/{owner}/{repo}/releases` and `release-assets`.
 - **Organizations and SSH (M3):** orgs, teams, and base permissions with
   repository transfer; git over SSH (`ssh://git@…`) with user and deploy
   keys and fingerprint registry.
@@ -163,6 +172,7 @@ before upgrading (see `docs/admin/backup-and-restore.md`).
 | 0039 | CI usage per job attempt and CI supplier links |
 | 0040 | Per-repository CI secret policy and secret host/header bindings |
 | 0041 | Notifications, repository watches, Trail subscriptions, per-user email setting |
+| 0042 | Releases and release assets |
 
 Note: migration numbers 0030–0033 do not exist; the series jumps from 0029
 to 0034.

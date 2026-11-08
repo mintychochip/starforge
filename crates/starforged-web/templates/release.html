@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block title %}{{ tag }} · {{ head.owner }}/{{ head.name }}{% endblock %}
+{% block content %}
+{% include "repo_head.html" %}
+<h2>{{ tag }}{% if !title.is_empty() %} — {{ title }}{% endif %}{% if draft %} <span class="badge">draft</span>{% endif %}{% if prerelease %} <span class="badge">pre-release</span>{% endif %}</h2>
+<p class="muted">Published {% if has_published %}{{ published }}{% else %}never{% endif %} · Created {{ created }}{% if !author.is_empty() %} · {{ author }}{% endif %}</p>
+<p><a href="{{ zip_href }}">Download zip</a> · <a href="{{ tar_gz_href }}">Download tar.gz</a></p>
+{% if has_notes %}<article class="readme">{{ notes_html|safe }}</article>{% endif %}
+{% if !assets.is_empty() %}
+<table class="list"><thead><tr><th>Assets</th><th>Size</th><th>Type</th><th></th></tr></thead><tbody>
+{% for a in assets %}
+<tr><td><a href="{{ a.download_href }}">{{ a.name }}</a></td>
+<td class="muted">{{ a.size }}</td>
+<td class="muted">{{ a.content_type }}</td>
+{% if can_write %}<td><form method="post" action="{{ a.delete_action }}" class="inline"><input type="hidden" name="_csrf" value="{{ csrf }}"><button type="submit">Delete</button></form></td>{% else %}<td></td>{% endif %}</tr>
+{% endfor %}
+</tbody></table>
+{% endif %}
+{% if can_write %}
+<p><a href="{{ edit_href }}">Edit release</a></p>
+<form method="post" action="{{ delete_action }}" class="inline"><input type="hidden" name="_csrf" value="{{ csrf }}"><button type="submit">Delete release</button></form>
+<form method="post" action="{{ upload_action }}" enctype="multipart/form-data" class="stack">
+<input type="hidden" name="_csrf" value="{{ csrf }}">
+<label>Asset <input type="file" name="asset" required></label>
+<button type="submit">Upload asset</button>
+</form>
+{% endif %}
+{% endblock %}

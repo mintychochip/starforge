@@ -29,6 +29,7 @@ pub mod oauth;
 pub mod orgs;
 pub mod protection;
 pub mod redirects;
+pub mod releases;
 pub mod remotes;
 pub mod repos;
 pub mod sandboxes;

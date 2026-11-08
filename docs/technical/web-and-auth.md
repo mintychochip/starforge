@@ -178,6 +178,8 @@ The router disables body limits for git routes. See [git hosting](git-hosting.md
 | Sessions | `/{owner}/{repo}/sessions`, `/{owner}/{repo}/sessions/{ulid}` | `sessions`, `session` |
 | Trails and changes | `/{owner}/{repo}/trails`, `/{owner}/{repo}/trails/{number}`, `/{owner}/{repo}/trails/{number}/changes/{k}` | `trails`, `changes` |
 | CI runs and usage | `/{owner}/{repo}/ci`, `/{owner}/{repo}/ci/usage`, `/{owner}/{repo}/ci/{id}`, `/{owner}/{repo}/ci/{id}/logs`, `POST /{owner}/{repo}/ci/{id}/cancel` | `ci` |
+| Archives | `/{owner}/{repo}/archive/{*rest}` | `releases` pages |
+| Releases | `/{owner}/{repo}/releases`, `/{owner}/{repo}/releases/new`, `/{owner}/{repo}/releases/tag/{*tag}`, `/{owner}/{repo}/releases/edit/{*tag}`, `/{owner}/{repo}/releases/delete/{*tag}`, `/{owner}/{repo}/releases/assets/{*tag}`, `/{owner}/{repo}/releases/asset-delete/{*rest}`, `/{owner}/{repo}/releases/download/{*rest}` | `releases` pages |
 | Owner profiles | `/{owner}` | `owner` |
 | Static and discovery | `/static/starforge.css`, `/.well-known/starforge.json` | `well_known` |
 
@@ -214,6 +216,13 @@ The runs page links to usage for at least Maintain.
 `/admin/sandboxes` lists every live and recently killed sandbox, newest first. The page needs `RequireAdmin`.
 Anonymous and non admin callers receive `404`. `POST /admin/sandboxes/{id}/kill` kills one sandbox.
 The kill action needs `RequireAdmin` and checks CSRF. Success redirects to `/admin/sandboxes`.
+### Archive and release pages
+
+`GET /{owner}/{repo}/archive/{*rest}` streams a zip or tar.gz snapshot. `ArchiveFormat::parse` splits the rest into revision and format. Core enforces read access.
+
+`/{owner}/{repo}/releases` lists releases newest first. Drafts appear only for write access or higher. `/{owner}/{repo}/releases/new` shows the create form and `POST` creates the release. `/{owner}/{repo}/releases/tag/{*tag}` shows one release with its assets. `/{owner}/{repo}/releases/edit/{*tag}` shows the edit form and `POST` saves it. `POST /{owner}/{repo}/releases/delete/{*tag}` deletes one release and keeps the git tag.
+
+`POST /{owner}/{repo}/releases/assets/{*tag}` uploads one asset from the multipart field `asset` with the field `_csrf`. `POST /{owner}/{repo}/releases/asset-delete/{*rest}` deletes one asset. `GET /{owner}/{repo}/releases/download/{*rest}` downloads one asset. The `{*rest}` split uses the last slash, because tags can contain a slash and asset names never can.
 
 ## Failure behavior
 

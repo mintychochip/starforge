@@ -21,6 +21,7 @@ pub mod owner;
 pub mod password;
 pub mod protection;
 pub mod refs;
+pub mod releases;
 pub mod remotes;
 pub mod repo_new;
 pub mod repo_settings;

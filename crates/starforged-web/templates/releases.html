@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block title %}Releases · {{ head.owner }}/{{ head.name }}{% endblock %}
+{% block content %}
+{% include "repo_head.html" %}
+{% if can_new %}<p><a href="/{{ head.owner }}/{{ head.name }}/releases/new">New release</a></p>{% endif %}
+{% if releases.is_empty() %}
+<p class="muted">No releases yet.</p>
+{% else %}
+<table class="list"><tbody>
+{% for r in releases %}
+<tr><td><a href="{{ r.href }}">{{ r.tag }}</a>{% if !r.title.is_empty() %} {{ r.title }}{% endif %}{% if r.draft %} <span class="badge">draft</span>{% endif %}{% if r.prerelease %} <span class="badge">pre-release</span>{% endif %}</td>
+<td class="muted">{% if r.has_published %}{{ r.published }}{% endif %}</td>
+<td><a href="{{ r.href }}">View</a></td></tr>
+{% endfor %}
+</tbody></table>
+{% endif %}
+{% endblock %}

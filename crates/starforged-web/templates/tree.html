@@ -29,6 +29,7 @@
 git push -u origin main</pre>
 {% else %}
 <p class="crumbs"><span class="badge">{{ ref_name }}</span>{% for c in crumbs %} / <a href="{{ c.href }}">{{ c.name }}</a>{% endfor %}{% if let Some(h) = history_href %} · <a href="{{ h }}">History</a>{% endif %}</p>
+<p><a href="{{ archive_zip_href }}">Download ZIP</a> · <a href="{{ archive_tar_href }}">Download tar.gz</a></p>
 <table class="list files"><tbody>
 {% for e in entries %}
 <tr><td class="{% if e.is_dir %}dir{% else %}file{% endif %}">{% if e.href.is_empty() %}{{ e.name }}{% else %}<a href="{{ e.href }}">{{ e.name }}</a>{% endif %}</td></tr>

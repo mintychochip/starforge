@@ -37,6 +37,7 @@ pub mod protection;
 pub mod quota;
 pub mod read;
 pub mod registration;
+pub mod releases;
 pub mod remotes;
 pub mod repolock;
 pub mod repos;

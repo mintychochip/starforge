@@ -193,6 +193,9 @@ A second test matches optional security with `reader` handlers.
 | Webhooks | `GET /repos/{owner}/{repo}/hooks`, `POST /repos/{owner}/{repo}/hooks`, `GET /repos/{owner}/{repo}/hooks/{id}/deliveries` | `repo:write` |
 | Gate rules | `GET /repos/{owner}/{repo}/gate-rules`, `POST /repos/{owner}/{repo}/gate-rules` | `repo:read` for reads, `repo:write` for writes |
 | Tag protections | `GET /repos/{owner}/{repo}/tag-protections`, `POST /repos/{owner}/{repo}/tag-protections` | `repo:read` for reads, `repo:write` for writes |
+| Archives | `GET /repos/{owner}/{repo}/archive/{*rest}` | `repo:read` |
+| Releases | `GET /repos/{owner}/{repo}/releases`, `POST /repos/{owner}/{repo}/releases`, `GET /repos/{owner}/{repo}/releases/{*tag}`, `PATCH /repos/{owner}/{repo}/releases/{*tag}`, `DELETE /repos/{owner}/{repo}/releases/{*tag}` | `repo:read` for reads, `repo:write` for writes |
+| Release assets | `PUT /repos/{owner}/{repo}/release-assets/{*rest}`, `GET /repos/{owner}/{repo}/release-assets/{*rest}`, `DELETE /repos/{owner}/{repo}/release-assets/{*rest}` | `repo:read` for reads, `repo:write` for writes |
 | SSH keys | `GET /user/keys`, `POST /user/keys`, `GET /repos/{owner}/{repo}/keys` | `repo:read` for user keys, `repo:write` for deploy keys and writes |
 | Admin audit | `GET /admin/audit` | `admin` plus site admin user |
 | OAuth | `POST /oauth/device/code`, `POST /oauth/token`, `POST /oauth/revoke` | None |
@@ -249,6 +252,13 @@ Secret values never enter the job environment. A `refs/for` run resolves no secr
 CI usage reads one report per supplier for the current calendar month. Starforge meters native usage and limits it.
 Starforge reads Depot usage from the Depot API and never enforces Depot limits.
 Quota refusals answer `422` with code `invalid`. Sandbox quota refusals answer `429`.
+### Archive and release routes
+
+`GET /repos/{owner}/{repo}/archive/{*rest}` needs `repo:read` and streams one zip or tar.gz snapshot. `ArchiveFormat::parse` splits the rest into revision and format.
+
+`GET /repos/{owner}/{repo}/releases` lists releases newest first. `POST /repos/{owner}/{repo}/releases` needs `repo:write` and answers `201`. The body carries tag, target, title, notes, draft, and prerelease. `GET /repos/{owner}/{repo}/releases/{*tag}` shows one release. `PATCH` edits title, notes, draft, and prerelease, and missing fields keep their values. `DELETE` answers `204` and keeps the git tag.
+
+`PUT /repos/{owner}/{repo}/release-assets/{*rest}` needs `repo:write` and uploads raw bytes. The handler stores the request `Content-Type` header. Oversize bodies answer `413`. Success answers `201` with the asset JSON. `GET` returns the bytes with `Content-Disposition: attachment`. `DELETE` answers `204`.
 
 Artifact upload takes raw bytes with a `X-Starforge-Sha256` header. Upload answers `201` and stores content in the blob store.
 Artifact download answers `200` with raw bytes and a `X-Starforge-Blake3` header. Both routes send `Cache-Control: no-store`.
