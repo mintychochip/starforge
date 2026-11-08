@@ -151,10 +151,27 @@ CI jobs use a separate queue from the internal `jobs` table. The internal `Job` 
 | `sessions.max_user_bytes` | 5 GiB | per user |
 | `sessions.max_hourly_bytes` | 500 MiB | per user per hour |
 
+| `limits.max_push_bytes` | 0, disabled | push input bytes per git receive pack |
+| `limits.max_repo_bytes` | 0, disabled | on disk bytes per repository |
+| `limits.git_per_ip_per_minute` | 0, disabled | git requests per address per 60 seconds |
+| `audit.retention_days` | 0, keep forever | days before audit rows expire |
+| `backup.dir` | empty, off | directory for scheduled backups |
+| `backup.interval_hours` | 0, off | hours between scheduled backups |
+| `backup.keep` | 7 | scheduled backups retained |
 | `sessions.max_decompressed_bytes` | 256 MiB | per decompressed segment |
 
 CI minutes come from `ci_usage` rows for native runner attempts. A full minutes quota refuses new runs at queue time. The refusal writes an `error` check, so a gate shows why the run did not start. The server reads Depot usage from the Depot API only. Starforge never enforces Depot limits.
 
+- `limits.max_push_bytes` caps push input. Git receive pack runs with `receive.maxInputSize` at this value.
+- The cap applies to HTTP pushes and SSH pushes alike.
+- `limits.max_repo_bytes` caps on disk size per repository. The pre receive hook measures size with `git count-objects -v`.
+- Size means pack size plus loose object size in KiB. The hook refuses each push at or above the cap.
+- The refusal text names current size and limit in MiB. A measurement error logs a warning and allows the push.
+- `limits.git_per_ip_per_minute` caps git requests per address per 60 seconds. The window covers smart HTTP and SSH public key attempts.
+- Smart HTTP covers `info/refs`, `git-upload-pack`, and `git-receive-pack`. An HTTP breach answers 429 with `Retry-After` and a plain text body.
+- The HTTP body reads `rate limit exceeded`. An SSH breach rejects the attempt before key lookup.
+- The daily prune deletes `audit_log` rows older than `audit.retention_days` days. The prune deletes rows in batches of 10000 rows.
+- A value of 0 keeps audit rows forever.
 - A value of 0 disables one of the four `limits.*` controls. A zero session quota rejects every upload.
 - API limit breaches answer 429 with an error envelope and `Retry-After`.
 - Token responses gain `X-RateLimit-Limit`, `X-RateLimit-Remaining`, and `X-RateLimit-Reset` headers.
@@ -208,6 +225,10 @@ Each line starts with `[OK]`, `[WARN]`, or `[FAIL]`.
 - Restore rejects symlink, FIFO, and socket entries inside a backup.
 - Restore writes files only after all checks pass.
 - Restore enqueues `RebuildIndex` after a successful write.
+- The server writes a scheduled backup every `backup.interval_hours` hours. The schedule runs only when an operator sets `backup.dir` and the interval is above 0.
+- Each backup directory name carries a UTC timestamp in `YYYYMMDD-HHMMSS` form. The backup code matches the `starforged backup` command and includes the configuration copy.
+- Rotation deletes oldest backup directories beyond `backup.keep`. Rotation counts only directories with a valid backup `manifest.json`.
+- A backup failure logs an error and never stops the server.
 
 > **Caution:** The backup contains `security.secret_key`.
 > Treat the backup directory like a secret after capture.

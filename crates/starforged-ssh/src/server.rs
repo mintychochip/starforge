@@ -84,11 +84,12 @@ impl ForgeServer {
 impl Server for ForgeServer {
     type Handler = Connection;
 
-    fn new_client(&mut self, _: Option<std::net::SocketAddr>) -> Connection {
+    fn new_client(&mut self, peer_addr: Option<std::net::SocketAddr>) -> Connection {
         starforged_core::metrics::SSH_CONNECTIONS
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Connection {
             shared: self.shared.clone(),
+            peer_addr,
             identity: None,
             counter_key: None,
             git_protocol: None,
@@ -100,6 +101,7 @@ impl Server for ForgeServer {
 
 pub(crate) struct Connection {
     shared: Arc<Shared>,
+    peer_addr: Option<std::net::SocketAddr>,
     identity: Option<KeyIdentity>,
     counter_key: Option<String>,
     git_protocol: Option<String>,
@@ -145,6 +147,16 @@ impl Handler for Connection {
         user: &str,
         key: VerifiedPublicKey<'_>,
     ) -> Result<Auth, Self::Error> {
+        if let Some(addr) = self.peer_addr
+            && !self
+                .shared
+                .core
+                .check_git_rate(&addr.ip().to_string())
+                .allowed
+        {
+            tracing::info!(peer = %addr, "git rate limit reached");
+            return Ok(Auth::reject());
+        }
         if user != "git" {
             return Ok(Auth::reject());
         }

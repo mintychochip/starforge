@@ -55,6 +55,14 @@ pub struct Config {
     /// (no token: `/metrics` answers 404).
     #[serde(default)]
     pub metrics: MetricsConfig,
+    /// Audit retention (plan P5). Missing section defaults cleanly (keep
+    /// everything).
+    #[serde(default)]
+    pub audit: AuditConfig,
+    /// Scheduled backups (plan P5). Missing section defaults cleanly
+    /// (scheduled backups off).
+    #[serde(default)]
+    pub backup: BackupConfig,
     /// Sandbox provider (plan M6b B1). Missing section defaults cleanly
     /// (`local`, 3600 s default TTL).
     #[serde(default)]
@@ -304,6 +312,18 @@ pub struct LimitsConfig {
     /// New `refs/for` changes per user per hour.
     #[serde(default = "default_refs_for_new_changes_per_hour")]
     pub refs_for_new_changes_per_hour: u64,
+    /// Maximum bytes accepted in one push (`receive.maxInputSize`); `0`
+    /// disables.
+    #[serde(default)]
+    pub max_push_bytes: u64,
+    /// Maximum on-disk bytes a repository may reach before pushes are
+    /// refused; `0` disables.
+    #[serde(default)]
+    pub max_repo_bytes: u64,
+    /// Git smart-HTTP and SSH public-key auth attempts per client IP per
+    /// minute; `0` disables.
+    #[serde(default)]
+    pub git_per_ip_per_minute: u64,
 }
 
 impl Default for LimitsConfig {
@@ -313,7 +333,61 @@ impl Default for LimitsConfig {
             login_per_account_per_hour: default_login_per_account_per_hour(),
             api_per_token_per_hour: default_api_per_token_per_hour(),
             refs_for_new_changes_per_hour: default_refs_for_new_changes_per_hour(),
+            max_push_bytes: 0,
+            max_repo_bytes: 0,
+            git_per_ip_per_minute: 0,
         }
+    }
+}
+
+/// The `[audit]` section (plan P5): audit-log retention. Missing section
+/// defaults cleanly (`0` keeps everything). Overridable by
+/// `STARFORGE__AUDIT__RETENTION_DAYS`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditConfig {
+    /// Deletes `audit_log` rows older than this many days; `0` keeps
+    /// everything.
+    #[serde(default)]
+    pub retention_days: u64,
+}
+
+fn default_backup_keep() -> u64 {
+    7
+}
+
+/// The `[backup]` section (plan P5): scheduled backups. Missing section
+/// defaults cleanly (scheduled backups off). Overridable by
+/// `STARFORGE__BACKUP__*`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupConfig {
+    /// Directory holding scheduled backup snapshots; empty disables
+    /// scheduled backups.
+    #[serde(default)]
+    pub dir: PathBuf,
+    /// Hours between scheduled backups; `0` disables scheduled backups.
+    #[serde(default)]
+    pub interval_hours: u64,
+    /// Backup snapshots to keep; must be at least `1` when scheduled
+    /// backups are enabled (default 7).
+    #[serde(default = "default_backup_keep")]
+    pub keep: u64,
+}
+
+impl Default for BackupConfig {
+    fn default() -> Self {
+        BackupConfig {
+            dir: PathBuf::new(),
+            interval_hours: 0,
+            keep: default_backup_keep(),
+        }
+    }
+}
+
+impl BackupConfig {
+    /// Scheduled backups run only when both `dir` is set and
+    /// `interval_hours > 0`.
+    pub fn enabled(&self) -> bool {
+        !self.dir.as_os_str().is_empty() && self.interval_hours > 0
     }
 }
 
@@ -628,6 +702,37 @@ impl Config {
                         .parse()
                         .map_err(|_| anyhow::anyhow!("{key} must be a non-negative count"))?;
                 }
+                "limits__max_push_bytes" => {
+                    self.limits.max_push_bytes = value
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("{key} must be a non-negative byte count"))?;
+                }
+                "limits__max_repo_bytes" => {
+                    self.limits.max_repo_bytes = value
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("{key} must be a non-negative byte count"))?;
+                }
+                "limits__git_per_ip_per_minute" => {
+                    self.limits.git_per_ip_per_minute = value
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("{key} must be a non-negative count"))?;
+                }
+                "audit__retention_days" => {
+                    self.audit.retention_days = value
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("{key} must be a non-negative count"))?;
+                }
+                "backup__dir" => self.backup.dir = PathBuf::from(value),
+                "backup__interval_hours" => {
+                    self.backup.interval_hours = value
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("{key} must be a non-negative count"))?;
+                }
+                "backup__keep" => {
+                    self.backup.keep = value
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("{key} must be a non-negative count"))?;
+                }
                 "oidc__enabled" => self.oidc.enabled = parse_bool(&key, &value)?,
                 "oidc__issuer" => self.oidc.issuer = value,
                 "oidc__client_id" => self.oidc.client_id = value,
@@ -780,6 +885,9 @@ impl Config {
             if self.oidc.client_id.trim().is_empty() {
                 bail!("oidc.enabled needs oidc.client_id");
             }
+        }
+        if self.backup.enabled() && self.backup.keep == 0 {
+            bail!("backup.keep must be at least 1 when scheduled backups are enabled");
         }
         Ok(())
     }
@@ -949,6 +1057,8 @@ mod tests {
             remotes: RemotesConfig::default(),
             github: GithubConfig::default(),
             limits: LimitsConfig::default(),
+            audit: AuditConfig::default(),
+            backup: BackupConfig::default(),
             oidc: OidcConfig::default(),
             ssh: SshConfig::default(),
             log: LogConfig::default(),
@@ -1463,5 +1573,104 @@ api_token = "sf-test-depot-token"
             )])
             .unwrap_err();
         assert!(err.to_string().contains("STARFORGE__SANDBOX__PROVIDER"));
+    }
+
+    #[test]
+    fn hardening_defaults_old_config_and_env_overrides() {
+        // New keys default to 0 = disabled, retention 0, backups off with keep 7.
+        let config = sample();
+        assert_eq!(config.limits.max_push_bytes, 0);
+        assert_eq!(config.limits.max_repo_bytes, 0);
+        assert_eq!(config.limits.git_per_ip_per_minute, 0);
+        assert_eq!(config.audit.retention_days, 0);
+        assert!(config.backup.dir.as_os_str().is_empty());
+        assert_eq!(config.backup.interval_hours, 0);
+        assert_eq!(config.backup.keep, 7);
+        assert!(!config.backup.enabled());
+        // An old config file without the new sections loads.
+        let bare =
+            "[server]\nhttp_addr = \"127.0.0.1:3000\"\nbase_url = \"http://127.0.0.1:3000\"\n\
+            [storage]\ndata_dir = \"/srv/starforge\"\n\
+            [security]\nsecret_key = \""
+                .to_owned()
+                + &"ab".repeat(32)
+                + "\"\n";
+        let without: Config = toml::from_str(&bare).unwrap();
+        assert_eq!(without.limits, LimitsConfig::default());
+        assert_eq!(without.audit, AuditConfig::default());
+        assert_eq!(without.backup, BackupConfig::default());
+        assert!(without.validate().is_ok());
+        // Explicit values parse and validate.
+        let explicit: Config = toml::from_str(&format!(
+            "{bare}[limits]\nmax_push_bytes = 1024\nmax_repo_bytes = 2048\ngit_per_ip_per_minute = 30\n\
+            [audit]\nretention_days = 90\n\
+            [backup]\ndir = \"/srv/backups\"\ninterval_hours = 24\nkeep = 3\n"
+        ))
+        .unwrap();
+        assert_eq!(explicit.limits.max_push_bytes, 1024);
+        assert_eq!(explicit.limits.max_repo_bytes, 2048);
+        assert_eq!(explicit.limits.git_per_ip_per_minute, 30);
+        assert_eq!(explicit.audit.retention_days, 90);
+        assert_eq!(explicit.backup.dir, PathBuf::from("/srv/backups"));
+        assert_eq!(explicit.backup.interval_hours, 24);
+        assert_eq!(explicit.backup.keep, 3);
+        assert!(explicit.backup.enabled());
+        assert!(explicit.validate().is_ok());
+        // Every new key applies from the environment.
+        let mut config = sample();
+        config
+            .apply_env([
+                (
+                    "STARFORGE__LIMITS__MAX_PUSH_BYTES".to_owned(),
+                    "4096".to_owned(),
+                ),
+                (
+                    "STARFORGE__LIMITS__MAX_REPO_BYTES".to_owned(),
+                    "8192".to_owned(),
+                ),
+                (
+                    "STARFORGE__LIMITS__GIT_PER_IP_PER_MINUTE".to_owned(),
+                    "60".to_owned(),
+                ),
+                (
+                    "STARFORGE__AUDIT__RETENTION_DAYS".to_owned(),
+                    "30".to_owned(),
+                ),
+                (
+                    "STARFORGE__BACKUP__DIR".to_owned(),
+                    "/var/backups".to_owned(),
+                ),
+                (
+                    "STARFORGE__BACKUP__INTERVAL_HOURS".to_owned(),
+                    "12".to_owned(),
+                ),
+                ("STARFORGE__BACKUP__KEEP".to_owned(), "14".to_owned()),
+            ])
+            .unwrap();
+        assert_eq!(config.limits.max_push_bytes, 4096);
+        assert_eq!(config.limits.max_repo_bytes, 8192);
+        assert_eq!(config.limits.git_per_ip_per_minute, 60);
+        assert_eq!(config.audit.retention_days, 30);
+        assert_eq!(config.backup.dir, PathBuf::from("/var/backups"));
+        assert_eq!(config.backup.interval_hours, 12);
+        assert_eq!(config.backup.keep, 14);
+        assert!(config.backup.enabled());
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn backup_keep_must_be_at_least_one_when_enabled() {
+        // Disabled backups accept keep 0 (the default off state).
+        let mut config = sample();
+        config.backup.keep = 0;
+        assert!(config.validate().is_ok());
+        // Enabled backups reject keep 0.
+        config.backup.dir = PathBuf::from("/srv/backups");
+        config.backup.interval_hours = 24;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("backup.keep"), "{err}");
+        // Keep 1 is the minimum accepted value when enabled.
+        config.backup.keep = 1;
+        assert!(config.validate().is_ok());
     }
 }

@@ -489,6 +489,8 @@ async fn backup_during_a_http_push_contains_pre_or_post_state() {
         github: starforged::config::GithubConfig::default(),
         oidc: starforged::config::OidcConfig::default(),
         limits: starforged::config::LimitsConfig::default(),
+        audit: starforged::config::AuditConfig::default(),
+        backup: starforged::config::BackupConfig::default(),
         ssh: starforged::config::SshConfig::default(),
         log: starforged::config::LogConfig::default(),
         metrics: starforged::config::MetricsConfig::default(),

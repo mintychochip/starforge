@@ -1,0 +1,73 @@
+# Starforge server. Install as /etc/systemd/system/starforged.service,
+# install the release binaries to /usr/local/bin, and keep the
+# configuration at /etc/starforge/starforged.toml (mode 0600,
+# owned by root or by the starforge user).
+
+[Unit]
+Description=Starforge git forge server
+Documentation=file:///usr/local/share/doc/starforge/install.md
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+# Run the server in the foreground so systemd tracks the process.
+ExecStart=/usr/local/bin/starforged --config /etc/starforge/starforged.toml serve
+# Run as the unprivileged starforge user, never as root.
+User=starforge
+Group=starforge
+# Restart after a failure so a crash no longer needs manual recovery.
+Restart=on-failure
+RestartSec=2
+# Give the process a stable working directory inside the data directory.
+WorkingDirectory=/var/lib/starforge
+# Limit output to the journal so logs stay searchable with journalctl.
+StandardOutput=journal
+StandardError=journal
+# Give the process a private temporary directory namespace.
+PrivateTmp=yes
+# Mount most of the filesystem read-only; the service only writes below.
+ProtectSystem=strict
+# Hide home directories from the process.
+ProtectHome=yes
+# Keep the user git configuration out of reach of helper git processes.
+Environment=GIT_CONFIG_GLOBAL=/dev/null
+Environment=GIT_CONFIG_SYSTEM=/dev/null
+# Refuse privilege gains through setuid and file capabilities.
+NoNewPrivileges=yes
+# Allow only the socket families the server needs.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# Hide kernel tunables from the process.
+ProtectKernelTunables=yes
+# Hide kernel modules from the process.
+ProtectKernelModules=yes
+# Hide kernel logs from the process.
+ProtectKernelLogs=yes
+# Hide the control groups of other processes from the process.
+ProtectControlGroups=yes
+# Stop the process from changing the system clock.
+ProtectClock=yes
+# Stop the process from changing the hostname.
+ProtectHostname=yes
+# Deny device access beyond the default container devices.
+PrivateDevices=yes
+# Protect the process tree from Unix socket escape through /proc.
+ProtectProc=invisible
+# Restrict syscalls to the system service profile.
+SystemCallFilter=@system-service
+# Restrict syscalls to the native architecture only.
+SystemCallArchitectures=native
+# Drop every Linux capability from the process.
+CapabilityBoundingSet=
+# Make the data directory writable while the rest of the tree stays read-only.
+ReadWritePaths=/var/lib/starforge
+# Create /var/lib/starforge owned by the service user on first start.
+# Mode 0750 keeps other local users from listing repositories, the
+# database, and sealed secrets; UMask=0027 keeps new files group-only.
+StateDirectory=starforge
+StateDirectoryMode=0750
+# Keep file creation private to the service group.
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

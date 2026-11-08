@@ -89,7 +89,7 @@ pub struct CoreConfig {
     /// Rejects segment bodies larger than this (spec §6.3).
     pub max_segment_bytes: u64,
     /// Rejects segment uploads past this per-repository stored total (spec §7.7).
-    pub max_repo_bytes: u64,
+    pub session_max_repo_bytes: u64,
     /// Rejects segment uploads past this per-uploader stored total (spec §7.7).
     pub max_user_bytes: u64,
     /// Rejects segment uploads past this per-uploader rolling-hour volume (spec §7.7).
@@ -155,6 +155,17 @@ pub struct CoreConfig {
     /// New `refs/for` changes per user per hour (`[limits]`, spec §11.6); `0`
     /// disables.
     pub refs_for_new_changes_per_hour: u64,
+    /// Git smart-HTTP and SSH public-key auth attempts per client IP per
+    /// minute (`[limits]`, plan P5); `0` disables.
+    pub git_per_ip_per_minute: u64,
+    /// Maximum bytes accepted in one push (`[limits]`, plan P5); `0`
+    /// disables.
+    pub max_push_bytes: u64,
+    /// Maximum on-disk bytes a repository may reach before pushes are
+    /// refused (`[limits]`, plan P5); `0` disables.
+    pub max_repo_bytes: u64,
+    /// Audit-log retention in days (`[audit]`, plan P5); `0` keeps everything.
+    pub audit_retention_days: u64,
     /// The `[sandbox]` section (plan M6b): provider selection, local
     /// daemon socket/token, E2B endpoint, quotas, default TTL.
     pub sandbox: sandboxes::SandboxConfig,
@@ -405,7 +416,7 @@ pub(crate) mod testing {
             blob_dir,
             index_dir: dir.path().join("index"),
             max_segment_bytes: DEFAULT_MAX_SEGMENT_BYTES,
-            max_repo_bytes: DEFAULT_MAX_REPO_BYTES,
+            session_max_repo_bytes: DEFAULT_MAX_REPO_BYTES,
             max_user_bytes: DEFAULT_MAX_USER_BYTES,
             max_hourly_bytes: DEFAULT_MAX_HOURLY_BYTES,
             max_decompressed_bytes: DEFAULT_MAX_DECOMPRESSED_BYTES,
@@ -426,6 +437,10 @@ pub(crate) mod testing {
             login_per_account_per_hour: 20,
             api_per_token_per_hour: 5000,
             refs_for_new_changes_per_hour: 30,
+            git_per_ip_per_minute: 0,
+            max_push_bytes: 0,
+            max_repo_bytes: 0,
+            audit_retention_days: 0,
             sandbox: crate::sandboxes::SandboxConfig::default(),
             ci: crate::ci_usage::CiConfig::default(),
         };

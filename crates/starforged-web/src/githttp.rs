@@ -1,8 +1,10 @@
 //! Git smart HTTP (spec §8.1). Fetching public repositories is anonymous; everything else uses HTTP Basic
 //! with a personal access token as the password.
 
+use std::net::SocketAddr;
+
 use axum::body::Body;
-use axum::extract::{Path, Query, State};
+use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use base64::Engine;
@@ -27,6 +29,7 @@ pub enum GitHttpError {
     Archived,
     NotFound,
     BadRequest(&'static str),
+    RateLimited { retry_after: i64 },
     Internal(String),
 }
 
@@ -54,6 +57,16 @@ impl IntoResponse for GitHttpError {
                 (StatusCode::NOT_FOUND, "repository not found\n").into_response()
             }
             GitHttpError::BadRequest(message) => (StatusCode::BAD_REQUEST, message).into_response(),
+            GitHttpError::RateLimited { retry_after } => (
+                StatusCode::TOO_MANY_REQUESTS,
+                [(
+                    header::RETRY_AFTER,
+                    HeaderValue::from_str(&retry_after.to_string())
+                        .unwrap_or_else(|_| HeaderValue::from_static("60")),
+                )],
+                "rate limit exceeded\n",
+            )
+                .into_response(),
             GitHttpError::Internal(message) => {
                 tracing::error!(%message, "git smart HTTP failure");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error\n").into_response()
@@ -160,12 +173,28 @@ async fn authorize(
     Ok((grant.access, grant.user, grant.write_path))
 }
 
+/// Counts one git request for the client IP against the per-IP fixed
+/// window (shared with SSH auth attempts); over the limit the request
+/// is refused before it reaches authorization or git.
+fn check_git_rate(state: &AppState, addr: SocketAddr) -> Result<(), GitHttpError> {
+    let decision = state.core.check_git_rate(&addr.ip().to_string());
+    if decision.allowed {
+        Ok(())
+    } else {
+        Err(GitHttpError::RateLimited {
+            retry_after: (decision.reset_at - starforged_core::limits::now_secs()).max(1),
+        })
+    }
+}
+
 pub async fn info_refs(
     State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Path((owner, repo)): Path<(String, String)>,
     Query(query): Query<InfoRefsQuery>,
     headers: HeaderMap,
 ) -> Result<Response, GitHttpError> {
+    check_git_rate(&state, addr)?;
     let service = query
         .service
         .as_deref()
@@ -199,19 +228,23 @@ pub async fn info_refs(
 
 pub async fn upload_pack(
     State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Path((owner, repo)): Path<(String, String)>,
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, GitHttpError> {
+    check_git_rate(&state, addr)?;
     rpc(state, &owner, &repo, headers, body, Service::UploadPack).await
 }
 
 pub async fn receive_pack(
     State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Path((owner, repo)): Path<(String, String)>,
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, GitHttpError> {
+    check_git_rate(&state, addr)?;
     rpc(state, &owner, &repo, headers, body, Service::ReceivePack).await
 }
 

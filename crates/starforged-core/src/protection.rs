@@ -86,6 +86,30 @@ fn default_true() -> bool {
     true
 }
 
+/// On-disk size of a repository in bytes: `git count-objects -v` reports
+/// `size` (loose) and `size-pack` (packed) in KiB.
+async fn repo_disk_size(path: &std::path::Path) -> Result<u64, String> {
+    let path = path.to_str().ok_or("repository path is not UTF-8")?;
+    let out = starforged_git::command::run(["-C", path, "count-objects", "-v"])
+        .await
+        .map_err(|err| err.to_string())?;
+    let text = String::from_utf8_lossy(&out);
+    let mut kib = 0u64;
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        if matches!(key.trim(), "size" | "size-pack") {
+            let count = value
+                .trim()
+                .parse::<u64>()
+                .map_err(|_| "bad count-objects output".to_owned())?;
+            kib = kib.saturating_add(count);
+        }
+    }
+    Ok(kib.saturating_mul(1024))
+}
+
 impl Core {
     /// The full environment for a git-RPC child: identity, permission, and
     /// nonce plus the protection snapshot for the pusher. Replaces the
@@ -171,6 +195,36 @@ impl Core {
             env.push(("STARFORGE_REFS_FOR_BUDGET", budget.to_string()));
             let topics = self.refs_for_topics(access.repo.id, user.id).await?;
             env.push(("STARFORGE_REFS_FOR_TOPICS", topics.join("\n")));
+        }
+        // Push-size limit (`receive.maxInputSize`): the RPC layer's
+        // `rpc_env` already set `GIT_CONFIG_COUNT=1` with
+        // `receive.advertisePushOptions`; this second pair overrides the
+        // count to 2 (later env wins) so the count stays consistent with
+        // every KEY/VALUE pair. This fn runs only for receive-pack on
+        // both transports, so upload-pack is unaffected.
+        if self.config().max_push_bytes > 0 {
+            env.push(("GIT_CONFIG_COUNT", "2".to_owned()));
+            env.push(("GIT_CONFIG_KEY_1", "receive.maxInputSize".to_owned()));
+            env.push((
+                "GIT_CONFIG_VALUE_1",
+                self.config().max_push_bytes.to_string(),
+            ));
+        }
+        // Repository-size limit: measure the on-disk size here and hand
+        // limit plus size to the hook, which refuses every push at or
+        // above the limit. A measurement error warns and allows the push
+        // (the hook sees no size and refuses nothing).
+        if self.config().max_repo_bytes > 0 {
+            env.push((
+                "STARFORGE_MAX_REPO_BYTES",
+                self.config().max_repo_bytes.to_string(),
+            ));
+            match repo_disk_size(&self.repo_path(access.repo.id)).await {
+                Ok(size) => env.push(("STARFORGE_REPO_SIZE_BYTES", size.to_string())),
+                Err(err) => {
+                    tracing::warn!(error = %err, "measuring repository size failed; allowing push")
+                }
+            }
         }
         Ok(env)
     }

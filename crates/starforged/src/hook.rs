@@ -43,6 +43,13 @@ pub struct HookCtx {
     /// push is refused ("this repository is a pull mirror"), while
     /// `refs/for` stays open for discussion.
     pub mirror: bool,
+    /// Repository-size limit in bytes (`STARFORGE_MAX_REPO_BYTES`); `0`
+    /// disables the limit.
+    pub max_repo_bytes: u64,
+    /// Current on-disk repository size in bytes
+    /// (`STARFORGE_REPO_SIZE_BYTES`); `0` when the RPC layer could not
+    /// measure it, which allows every push.
+    pub repo_size_bytes: u64,
 }
 
 fn env(name: &str) -> Option<String> {
@@ -99,6 +106,12 @@ impl HookCtx {
                 .unwrap_or_default(),
             import_in_progress: env("STARFORGE_IMPORT_IN_PROGRESS").is_some_and(|v| v == "1"),
             mirror: env("STARFORGE_MIRROR").is_some_and(|v| v == "1"),
+            max_repo_bytes: env("STARFORGE_MAX_REPO_BYTES")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+            repo_size_bytes: env("STARFORGE_REPO_SIZE_BYTES")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
         }
     }
 }
@@ -119,6 +132,17 @@ pub fn pre_receive_with(input: impl BufRead, mut err: impl Write, ctx: &HookCtx)
         let _ = writeln!(
             err,
             "starforge: repository import in progress; pushes are refused"
+        );
+        return 1;
+    }
+    // Repository-size limit: while the repository is at or above the
+    // limit, pushes are refused outright — no ref moves.
+    if ctx.max_repo_bytes > 0 && ctx.repo_size_bytes >= ctx.max_repo_bytes {
+        let _ = writeln!(
+            err,
+            "starforge: repository size limit reached ({} MiB of {} MiB); pushes are refused",
+            ctx.repo_size_bytes / (1024 * 1024),
+            ctx.max_repo_bytes / (1024 * 1024)
         );
         return 1;
     }
@@ -386,6 +410,8 @@ mod tests {
             refs_for_topics: Vec::new(),
             import_in_progress: false,
             mirror: false,
+            max_repo_bytes: 0,
+            repo_size_bytes: 0,
         }
     }
 
@@ -408,6 +434,26 @@ mod tests {
             run("0 1 refs/heads/main\n0 2 refs/tags/v1\n\n", &c),
             (0, String::new())
         );
+    }
+
+    #[test]
+    fn refuses_pushes_at_repository_size_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut c = ctx(tmp.path().to_owned());
+        c.permission = Some("write".to_owned());
+        // At the limit: refused with the size message.
+        c.max_repo_bytes = 2 * 1024 * 1024;
+        c.repo_size_bytes = 2 * 1024 * 1024;
+        let (code, err) = run("0 1 refs/heads/main\n", &c);
+        assert_eq!(code, 1);
+        assert!(err.contains("repository size limit reached"), "{err}");
+        // Below the limit: accepted.
+        c.repo_size_bytes = 1024 * 1024;
+        assert_eq!(run("0 1 refs/heads/main\n", &c), (0, String::new()));
+        // Disabled: any size accepted.
+        c.max_repo_bytes = 0;
+        c.repo_size_bytes = 100 * 1024 * 1024;
+        assert_eq!(run("0 1 refs/heads/main\n", &c), (0, String::new()));
     }
 
     #[test]

@@ -52,6 +52,8 @@ pub fn run(opts: &InitOptions<'_>) -> anyhow::Result<Config> {
         github: crate::config::GithubConfig::default(),
         oidc: crate::config::OidcConfig::default(),
         limits: crate::config::LimitsConfig::default(),
+        audit: crate::config::AuditConfig::default(),
+        backup: crate::config::BackupConfig::default(),
         ssh: crate::config::SshConfig::default(),
         log: crate::config::LogConfig::default(),
         metrics: crate::config::MetricsConfig::default(),

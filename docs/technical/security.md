@@ -164,6 +164,14 @@ It covers secrets at rest, audit reads, and known limits.
 - Protected branches apply the gate rules in [git-hosting.md](git-hosting.md).
 - Deploy keys push as `Write` without a user identity.
 - Archived repositories refuse pushes.
+- `limits.max_push_bytes` caps push input for HTTP and SSH pushes. Git receive pack runs with `receive.maxInputSize` at this value.
+- `limits.max_repo_bytes` caps on disk size per repository. The pre receive hook refuses each push at or above the cap.
+- The refusal text reads `starforge: repository size limit reached` with sizes in MiB. A measurement error logs a warning and allows the push.
+- `limits.git_per_ip_per_minute` caps git requests per address per 60 seconds. The cap covers smart HTTP and SSH public key attempts.
+- An HTTP breach answers 429 with `Retry-After` and a plain text body. The body reads `rate limit exceeded`.
+- An SSH breach rejects the attempt before key lookup. The cap reduces key lookup abuse from one address.
+- The daily prune deletes `audit_log` rows older than `audit.retention_days` days. A value of 0 keeps rows forever.
+- Scheduled backups write to `backup.dir` every `backup.interval_hours` hours. Rotation keeps `backup.keep` backups with a valid `manifest.json`.
 
 ### Secrets handling
 
