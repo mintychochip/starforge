@@ -100,6 +100,37 @@ pub enum Cmd {
         #[command(flatten)]
         args: starforge_runner::RunnerArgs,
     },
+    /// Run CI jobs locally in a sandbox (no server).
+    Ci {
+        #[command(subcommand)]
+        cmd: CiCmd,
+    },
+}
+
+/// `ci` subcommands.
+#[derive(Debug, Subcommand)]
+pub enum CiCmd {
+    /// Parse `.starforge/ci.toml` and run the jobs in a local sandbox.
+    Run {
+        /// Run one job by base name or exact expanded name.
+        #[arg(long)]
+        job: Option<String>,
+        /// Keep the sandbox after the job.
+        #[arg(long)]
+        keep: bool,
+        /// sandboxd Unix socket.
+        #[arg(long, default_value = "/run/starforge/sandboxd.sock")]
+        socket: PathBuf,
+        /// sandboxd bearer token file.
+        #[arg(long, default_value = "/run/starforge/sandboxd.token")]
+        token_file: PathBuf,
+        /// Host to allow egress to (repeatable).
+        #[arg(long = "allow-host")]
+        allow_host: Vec<String>,
+        /// Spec file to read.
+        #[arg(long, default_value = ".starforge/ci.toml")]
+        spec: PathBuf,
+    },
 }
 
 /// `spool` subcommands.
@@ -517,7 +548,8 @@ pub fn run(cli: Cli, paths: CliPaths) -> std::process::ExitCode {
     | Cmd::Export { .. }
     | Cmd::Import { .. }
     | Cmd::Sandbox { .. }
-    | Cmd::Runner { .. } = &cli.cmd
+    | Cmd::Runner { .. }
+    | Cmd::Ci { .. } = &cli.cmd
     {
         // fall through to async dispatch below
     } else {
@@ -556,6 +588,7 @@ fn sync_stub(cli: Cli, paths: CliPaths) -> std::process::ExitCode {
         Cmd::Trail { .. } => unreachable!("trail dispatches via run_async"),
         Cmd::Sandbox { .. } => unreachable!("sandbox dispatches via run_async"),
         Cmd::Runner { .. } => unreachable!("runner dispatches via run_async"),
+        Cmd::Ci { .. } => unreachable!("ci dispatches via run_async"),
     }
 }
 
@@ -718,6 +751,10 @@ pub async fn run_async(cli: Cli, paths: CliPaths) -> std::process::ExitCode {
         }
         Cmd::Runner { args } => {
             let code = crate::commands::runner::run(args, dry_run).await;
+            std::process::ExitCode::from(code)
+        }
+        Cmd::Ci { cmd } => {
+            let code = crate::commands::ci::run(cmd, dry_run).await;
             std::process::ExitCode::from(code)
         }
     }

@@ -3,6 +3,7 @@
 <!-- ste-sources
 Cargo.toml
 crates/starforge-capture
+crates/starforge-ci-spec
 crates/starforge-cli
 crates/starforge-format
 crates/starforge-redact
@@ -20,6 +21,7 @@ crates/starforged-web
 crates/starforged
 crates/starforged/src/lib.rs
 crates/starforged-core/src/lib.rs
+crates/starforge-ci-spec/src/lib.rs
 crates/starforge-runner/src/lib.rs
 crates/starforge-sandbox-protocol/src/lib.rs
 crates/starforge-sandboxd/src/lib.rs
@@ -119,6 +121,7 @@ Relevant build files live in each crate directory.
 | `starforged-blob` | Content addressed blob store | `BlobStore`, `FsBlobStore`, `BlobError` | `blake3`, `tokio`, `thiserror` | `tests/store.rs` |
 | `starforged-index` | Tantivy search index | `SearchIndex`, `TrailDoc`, `EventDoc` | `tantivy`, `thiserror` | `src/` unit tests |
 | `starforged` | Server binary and setup | `admin`, `backup`, `config`, `doctor`, `hook`, `index_cmd`, `init`, `restore`, `serve` | `starforged-api`, `starforged-web`, `starforged-ssh`, `starforged-core`, `clap`, `axum` | `tests/` integration |
+| `starforge-ci-spec` | CI job spec parser and validator | `CiSpec`, `CiJobSpec`, `CiCacheSpec`, `validate` | `serde`, `toml` | `src/` unit tests |
 | `starforge-runner` | CI runner binary and job executor | `Executor`, `Client`, `HttpSandboxProvider`, `FakeSandboxProvider` | `clap`, `reqwest`, `starforge-sandbox-protocol`, `tokio` | `src/` unit tests |
 | `starforge-sandbox-protocol` | Shared sandbox wire types | `CreateSandboxRequest`, `ExecRequest`, `FileOp`, `NetworkPolicy`, `ProviderError` | `serde`, `serde_json`, `thiserror` | `src/` unit tests |
 | `starforge-sandboxd` | Local sandbox daemon | `DaemonState`, `podman`, `proxy` | `axum`, `starforge-sandbox-protocol`, `tokio`, `nix` | `src/` unit tests |

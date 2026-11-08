@@ -86,6 +86,22 @@ impl LocalSandboxClient {
             .map_err(|e| RunnerError::Malformed(format!("file content: {e}")))
     }
 
+    /// Write one file into the sandbox workspace. The daemon accepts
+    /// base64 content up to 8 MiB per call.
+    pub async fn write_file(&self, id: &str, path: &str, bytes: &[u8]) -> Result<(), RunnerError> {
+        let content = base64::engine::general_purpose::STANDARD.encode(bytes);
+        let body = serde_json::json!({ "path": path, "content": content });
+        let body = serde_json::to_vec(&body)
+            .map_err(|e| RunnerError::Malformed(format!("file request: {e}")))?;
+        let (status, resp) = self
+            .request("PUT", &format!("/sandboxes/{id}/files"), Some(&body))
+            .await?;
+        if !(200..300).contains(&status) {
+            return Err(provider_error(status, &resp));
+        }
+        Ok(())
+    }
+
     /// List one directory in the sandbox workspace.
     pub async fn list_files(&self, id: &str, path: &str) -> Result<Vec<String>, RunnerError> {
         let query = url::form_urlencoded::byte_serialize(path.as_bytes()).collect::<String>();

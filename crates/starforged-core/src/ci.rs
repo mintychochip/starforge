@@ -1647,7 +1647,7 @@ impl Core {
         };
         let text = String::from_utf8(bytes)
             .map_err(|_| CoreError::Invalid("ci.toml is not UTF-8".into()))?;
-        match crate::ci_spec::CiSpec::parse(&text) {
+        match crate::ci_spec::parse(&text) {
             Ok(spec) => Ok(Some(spec)),
             Err(err) => {
                 if let Some(user_id) = creator {

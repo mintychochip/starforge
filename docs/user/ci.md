@@ -152,6 +152,25 @@ order. Paths are relative to the checkout root. An entry is at most
 entries (the least recently used entry is evicted first). A cache failure
 does not fail the job.
 
+## Run locally
+
+`starforge ci run` parses `.starforge/ci.toml` and runs the jobs in a
+local sandbox, without a server or a CI job. It needs a running
+`starforge-sandboxd` and a container image. The working tree is copied
+into the sandbox.
+
+```sh
+starforge ci run
+starforge ci run --job test
+starforge ci run --keep
+```
+
+`--job NAME` runs one job. An exact expanded name runs one combination.
+Without `--job`, every expanded job runs in order. The command stops at
+the first failure and exits with that job's code. The sandbox is killed
+after each job unless `--keep` is set. Secrets are not resolved locally.
+A job that lists `secrets` runs without them.
+
 ## Artifacts
 
 Files matching a job's `artifacts` globs are uploaded after a

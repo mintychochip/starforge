@@ -1,0 +1,18 @@
+[package]
+name = "starforge-ci-spec"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "MIT OR Apache-2.0"
+publish = true
+description = "Starforge CI job spec parser and validator for .starforge/ci.toml (CI format v1)"
+readme = "../../README.md"
+keywords = ["starforge", "ci", "spec"]
+categories = ["config"]
+
+[lints]
+workspace = true
+
+[dependencies]
+serde.workspace = true
+toml.workspace = true

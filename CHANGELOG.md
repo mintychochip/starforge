@@ -97,7 +97,8 @@ and opt-in CI runners with sandboxed jobs, on SQLite or Postgres.
   `starforge-sandboxd` (`podman`/gVisor) or the real E2B v2 API; a
   `matrix` table expands one job into one job per combination; a
   `[job.cache]` table restores and saves a dependency cache (256 MiB per
-  entry, 7-day retention, 50 entries per repository); E2B port URLs are
+  entry, 7-day retention, 50 entries per repository); `starforge ci run`
+  runs the spec in a local sandbox without a server; E2B port URLs are
   public (no traffic token, not signed) and bounded by the sandbox TTL;
   artifacts with BLAKE3 CAS and 30-day retention; sealed repo secrets
   injected only by the egress proxy; per-job agent sessions linked to the

@@ -5670,6 +5670,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "starforge-ci-spec"
+version = "0.1.0-rc.1"
+dependencies = [
+ "serde",
+ "toml",
+]
+
+[[package]]
 name = "starforge-cli"
 version = "0.1.0-rc.1"
 dependencies = [
@@ -5680,6 +5688,7 @@ dependencies = [
  "serde",
  "serde_json",
  "starforge-capture",
+ "starforge-ci-spec",
  "starforge-format",
  "starforge-redact",
  "starforge-runner",
@@ -5854,6 +5863,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.1",
  "sqlx",
+ "starforge-ci-spec",
  "starforge-format",
  "starforge-redact",
  "starforge-sandbox-protocol",
