@@ -499,13 +499,16 @@ pub(crate) mod testing {
             git(&["commit", "-q", "-m", &format!("on {branch}")]);
         }
         let bare = core.repo_path(repo_id);
+        // `+`: a second seed creates a fresh root commit for the same branch
+        // name, which is not a fast-forward. Without the force the fetch is
+        // rejected whenever the two commits land in different seconds.
         git(&[
             "--git-dir",
             bare.to_str().unwrap(),
             "fetch",
             "-q",
             work.path().to_str().unwrap(),
-            "refs/heads/*:refs/heads/*",
+            "+refs/heads/*:refs/heads/*",
         ]);
     }
 }
