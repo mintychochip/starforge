@@ -173,6 +173,7 @@ echo "==> sandboxd"
   --egress-ca-dir "$WORK/ca" \
   --egress-upstream-ca "$WORK/ca.pem" \
   --egress-https-port "$HTTPS_PORT" \
+  --egress-allow-cidr 127.0.0.1/32 \
   >"$WORK/sandboxd.log" 2>&1 &
 PIDS+=("$!")
 for _ in $(seq 1 100); do
