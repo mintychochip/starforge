@@ -6,6 +6,14 @@ use starforged_git::read::{self, BranchInfo, CommitInfo, Resolved, TagInfo, Tree
 
 use crate::repos::RepoAccess;
 use crate::{Core, CoreError, CoreResult};
+pub use starforged_git::read::ArchiveFormat;
+
+/// A commit tree archive, streamed to the client without loading it into memory.
+pub struct ArchiveDownload {
+    pub stdout: tokio::process::ChildStdout,
+    pub filename: String,
+    pub content_type: &'static str,
+}
 
 /// Largest file the web UI renders inline.
 pub const MAX_INLINE_BLOB_BYTES: usize = 1024 * 1024;
@@ -110,6 +118,31 @@ impl Core {
         id: &str,
     ) -> CoreResult<tokio::process::ChildStdout> {
         read::stream_blob(&self.repo_path(access.repo.id), id).map_err(CoreError::from)
+    }
+
+    /// A zip or tar.gz archive of the commit `rev` points at, streamed without
+    /// loading it into memory. `NotFound` when `rev` is unknown.
+    pub async fn archive(
+        &self,
+        access: &RepoAccess,
+        rev: &str,
+        format: ArchiveFormat,
+    ) -> CoreResult<ArchiveDownload> {
+        let resolved = self.resolve(access, rev).await?;
+        let prefix = format!("{}-{}", access.repo.name, rev.replace('/', "-"));
+        let filename = format!("{prefix}.{}", format.extension());
+        let stdout = read::stream_archive(
+            &self.repo_path(access.repo.id),
+            &resolved.commit_id,
+            format,
+            &prefix,
+        )
+        .map_err(CoreError::from)?;
+        Ok(ArchiveDownload {
+            stdout,
+            filename,
+            content_type: format.content_type(),
+        })
     }
 
     pub async fn log(

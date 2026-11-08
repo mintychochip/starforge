@@ -274,6 +274,18 @@ const ROUTES: &[(&str, &str)] = &[
         "delete",
         "/api/v1/repos/{owner}/{repo}/tag-protections/{id}",
     ),
+    ("get", "/api/v1/repos/{owner}/{repo}/archive/{*rest}"),
+    ("get", "/api/v1/repos/{owner}/{repo}/releases"),
+    ("post", "/api/v1/repos/{owner}/{repo}/releases"),
+    ("get", "/api/v1/repos/{owner}/{repo}/releases/{*tag}"),
+    ("patch", "/api/v1/repos/{owner}/{repo}/releases/{*tag}"),
+    ("delete", "/api/v1/repos/{owner}/{repo}/releases/{*tag}"),
+    ("put", "/api/v1/repos/{owner}/{repo}/release-assets/{*rest}"),
+    ("get", "/api/v1/repos/{owner}/{repo}/release-assets/{*rest}"),
+    (
+        "delete",
+        "/api/v1/repos/{owner}/{repo}/release-assets/{*rest}",
+    ),
     (
         "post",
         "/api/v1/repos/{owner}/{repo}/runners/registration-token",

@@ -262,6 +262,62 @@ pub async fn delete_ref(repo: &Path, name: &str) -> Result<(), GitError> {
     Ok(())
 }
 
+/// Creates a lightweight tag `refs/tags/<name>` pointing at `commit_id`.
+/// Argv-only (`update-ref <ref> <commit> ""`): the empty old value makes git
+/// refuse to overwrite a tag that already exists. The name must be a valid
+/// tag name and `commit_id` must pass [`crate::refpolicy::is_oid`], so
+/// caller input can never inject flags or escape the tags namespace.
+pub async fn create_tag(repo: &Path, name: &str, commit_id: &str) -> Result<(), GitError> {
+    if !valid_tag_name(name) {
+        return Err(GitError::Failed {
+            command: "update-ref".to_owned(),
+            stderr: format!("refusing to create invalid tag {name:?}"),
+        });
+    }
+    if !crate::refpolicy::is_oid(commit_id) {
+        return Err(GitError::Failed {
+            command: "update-ref".to_owned(),
+            stderr: format!("refusing to point tag {name:?} at non-oid {commit_id:?}"),
+        });
+    }
+    let target = format!("refs/tags/{name}");
+    run([
+        OsStr::new("--git-dir"),
+        repo.as_os_str(),
+        OsStr::new("update-ref"),
+        OsStr::new(&target),
+        OsStr::new(commit_id),
+        OsStr::new(""),
+    ])
+    .await?;
+    Ok(())
+}
+
+/// True for a tag name `git check-ref-format` accepts under `refs/tags/`:
+/// non-empty, no control chars, spaces, or `~^:?*[\`, no `..` or `@{`, no
+/// leading/trailing `/`, no `//`, no component starting with `.` or ending
+/// with `.lock`, and not ending in `.`.
+fn valid_tag_name(name: &str) -> bool {
+    if name.is_empty()
+        || name == "@"
+        || name.starts_with('/')
+        || name.ends_with('/')
+        || name.ends_with('.')
+        || name.contains("..")
+        || name.contains("@{")
+        || name.contains("//")
+    {
+        return false;
+    }
+    if name.bytes().any(|b| {
+        b < 0x20 || b == 0x7f || matches!(b, b' ' | b'~' | b'^' | b':' | b'?' | b'*' | b'[' | b'\\')
+    }) {
+        return false;
+    }
+    name.split('/')
+        .all(|part| !part.is_empty() && !part.starts_with('.') && !part.ends_with(".lock"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

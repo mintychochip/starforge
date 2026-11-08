@@ -13,6 +13,7 @@ mod notifications;
 mod oauth;
 pub mod openapi;
 mod orgs;
+mod releases;
 mod repos;
 mod sandboxes;
 mod search;
@@ -384,6 +385,32 @@ pub fn router(core: Core, base_url: String) -> Router {
         .route(
             "/repos/{owner}/{repo}/tag-protections/{id}",
             delete(tag_protections::delete_tag_protection),
+        )
+        .route(
+            "/repos/{owner}/{repo}/archive/{*rest}",
+            get(releases::download_archive),
+        )
+        .route(
+            "/repos/{owner}/{repo}/releases",
+            get(releases::list_releases).post(releases::create_release),
+        )
+        .route(
+            "/repos/{owner}/{repo}/releases/{*tag}",
+            get(releases::get_release)
+                .patch(releases::patch_release)
+                .delete(releases::delete_release),
+        )
+        .route(
+            "/repos/{owner}/{repo}/release-assets/{*rest}",
+            put(releases::put_release_asset)
+                .get(releases::get_release_asset)
+                .delete(releases::delete_release_asset)
+                .route_layer(axum::extract::DefaultBodyLimit::max(
+                    usize::try_from(
+                        starforged_core::releases::MAX_ASSET_BYTES.saturating_add(1024 * 1024),
+                    )
+                    .unwrap_or(usize::MAX),
+                )),
         )
         .route(
             "/repos/{owner}/{repo}/runners/registration-token",

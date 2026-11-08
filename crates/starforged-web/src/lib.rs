@@ -575,6 +575,38 @@ fn page_routes() -> Router<AppState> {
         )
         .route("/{owner}/{repo}/branches", get(pages::refs::branches))
         .route("/{owner}/{repo}/tags", get(pages::refs::tags))
+        .route("/{owner}/{repo}/archive/{*rest}", get(pages::code::archive))
+        .route("/{owner}/{repo}/releases", get(pages::releases::list))
+        .route(
+            "/{owner}/{repo}/releases/new",
+            get(pages::releases::new_form).post(pages::releases::create),
+        )
+        .route(
+            "/{owner}/{repo}/releases/tag/{*tag}",
+            get(pages::releases::show),
+        )
+        .route(
+            "/{owner}/{repo}/releases/edit/{*tag}",
+            get(pages::releases::edit_form).post(pages::releases::update),
+        )
+        .route(
+            "/{owner}/{repo}/releases/delete/{*tag}",
+            post(pages::releases::delete),
+        )
+        .route(
+            "/{owner}/{repo}/releases/assets/{*tag}",
+            post(pages::releases::upload_asset).route_layer(DefaultBodyLimit::max(
+                starforged_core::releases::MAX_ASSET_BYTES as usize + (1 << 20),
+            )),
+        )
+        .route(
+            "/{owner}/{repo}/releases/asset-delete/{*rest}",
+            post(pages::releases::delete_asset),
+        )
+        .route(
+            "/{owner}/{repo}/releases/download/{*rest}",
+            get(pages::releases::download_asset),
+        )
         .route("/static/starforge.css", get(stylesheet))
         .route("/static/highlight.css", get(highlight_stylesheet))
         .route("/static/session-viewer.js", get(session_viewer_js))

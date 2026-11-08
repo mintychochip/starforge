@@ -53,7 +53,7 @@ Reads inside open transactions use the writer pool. The engine enforces foreign 
 
 ### Migrations
 
-Embedded migrators live in `crates/starforged-db/migrations`. The SQLite and Postgres sets share filenames. Versions run from `0001` to `0041`, so `0030` to `0033` are absent. `Db::migrate` runs versions in order. Bookkeeping lives in `_sqlx_migrations`. Rerun of `migrate` is safe and idempotent.
+Embedded migrators live in `crates/starforged-db/migrations`. The SQLite and Postgres sets share filenames. Versions run from `0001` to `0042`, so `0030` to `0033` are absent. `Db::migrate` runs versions in order. Bookkeeping lives in `_sqlx_migrations`. Rerun of `migrate` is safe and idempotent.
 
 Migrations are forward only. A released migration must not change, because sqlx validates its checksum. `0034` rebuilds the SSH fingerprint table and drops orphan rows during the rebuild. `0035` adds the `jobs.rerun_at` column for rerun requests on deduplicated jobs. A request that arrives while a deduplicated job runs records its time in `rerun_at`, so the worker runs the job again after it finishes.
 
@@ -70,6 +70,10 @@ Migrations are forward only. A released migration must not change, because sqlx 
 `0040` drops queued rows of two removed job kinds. The two names are `resolve_commit_links` and `session_webhook_outbox`.
 
 `0041` adds `notifications`, `repo_watches`, and `trail_subscriptions`. It also adds `users.notify_email` with default `1`. `notifications` stores one row per recipient per event. `repo_watches` stores `watching` or `ignoring` per user and repository. `trail_subscriptions` stores a subscribed flag per user and Trail.
+
+`0042` adds `releases` and `release_assets`. `releases` stores tag, title, notes, draft flag, prerelease flag, author, and publish times per repository. The pair of repository and tag is unique. `release_assets` stores name, size, blob hash, and content type per release. The pair of release and name is unique. An index covers `release_assets` by release.
+
+Removal of a release cascades to its assets. Removal of a repository cascades to its releases.
 
 `auto_migrate` runs migrations at start. `starforged migrate` runs them manually. `doctor` compares latest and known versions. A difference reports a migrate action.
 
@@ -92,6 +96,7 @@ Migrations are forward only. A released migration must not change, because sqlx 
 | Sandboxes | `sandboxes`, `sandbox_usage` | Idempotency key unique per owner |
 | CI secrets | `ci_secrets`, `ci_job_secrets`, `ci_artifact_tokens` | Sealed values; secret name unique per repository |
 | CI usage | `ci_usage`, `ci_supplier_links` | One usage row per ended native attempt |
+| Releases | `releases`, `release_assets` | One release per tag; reference counted blobs |
 | Notifications | `notifications`, `repo_watches`, `trail_subscriptions` | One row per recipient per event; watch mode per repository |
 Users and organizations share the `owners` table. User rows cascade from owner rows. Segments cascade from session rows. Blobs track reference counts in rows. Trail numbers live in `trail_sequences`. Each group keeps its own data access module.
 
@@ -108,6 +113,8 @@ Expired artifacts stay out of downloads and out of the artifact quota. The hourl
 The temporary name carries the process identifier. The code writes the temporary file, then renames it. The code does not fsync the file, so a crash can lose the blob. Concurrent identical puts rename over each other. Readers rebuild the hash on every read. Hash mismatch returns a corrupt error.
 
 Missing files return a not-found error. Invalid hashes return a not-found error. The code rejects hashes with separators. `delete` accepts missing files. Deletion tries to remove empty shards. Refcounts live in the `blobs` table.
+
+Release assets use the same reference counted blobs. Upload increments the count. Delete decrements the count. The hourly zero reference sweep removes the files.
 
 Increment and decrement update the count. GC deletes rows with zero references. Deletion and GC never race with backup. `delete_session` returns segments for refcount drops.
 

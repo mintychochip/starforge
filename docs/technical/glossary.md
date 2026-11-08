@@ -46,6 +46,9 @@ The table defines words that appear in code, in the database schema, and in the 
 | watch | One repository watch row with mode watching or ignoring | `repo_watches`, `WatchMode` | [notifications](notifications.md) |
 | subscription | One Trail subscription row with a subscribed flag | `trail_subscriptions` | [notifications](notifications.md) |
 | mention | One `@handle` token that notifies the named user | `NotifyEvent.text` | [notifications](notifications.md) |
+| release | One tagged gift with notes and downloadable files | `releases`, `ReleaseView` | [releases](releases.md) |
+| release asset | One uploaded file in a release | `release_assets`, `AssetView` | [releases](releases.md) |
+| archive | One zip or tar.gz snapshot of a tree | `ArchiveFormat`, `stream_archive` | [releases](releases.md) |
 
 ### Sessions and traces
 

@@ -324,6 +324,83 @@ pub fn stream_blob(repo: &Path, id: &str) -> Result<tokio::process::ChildStdout,
     });
     Ok(stdout)
 }
+/// Archive container format for downloading a commit tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArchiveFormat {
+    Zip,
+    TarGz,
+}
+
+impl ArchiveFormat {
+    /// Splits `"{rev}.zip"` or `"{rev}.tar.gz"` into rev and format; `None`
+    /// when the suffix is missing or the rev is empty.
+    pub fn parse(rest: &str) -> Option<(&str, ArchiveFormat)> {
+        if let Some(rev) = rest.strip_suffix(".tar.gz") {
+            if rev.is_empty() {
+                return None;
+            }
+            return Some((rev, ArchiveFormat::TarGz));
+        }
+        let rev = rest.strip_suffix(".zip")?;
+        if rev.is_empty() {
+            return None;
+        }
+        Some((rev, ArchiveFormat::Zip))
+    }
+
+    pub fn extension(self) -> &'static str {
+        match self {
+            ArchiveFormat::Zip => "zip",
+            ArchiveFormat::TarGz => "tar.gz",
+        }
+    }
+
+    pub fn content_type(self) -> &'static str {
+        match self {
+            ArchiveFormat::Zip => "application/zip",
+            ArchiveFormat::TarGz => "application/gzip",
+        }
+    }
+}
+
+/// The stdout of `git archive --format=<fmt> --prefix=<prefix>/ <commit_id>`,
+/// streaming the archive's bytes. A reaped task collects the child and warns
+/// on a non-zero exit; dropping stdout makes git exit on EPIPE, so a
+/// disconnected client reaps cleanly.
+pub fn stream_archive(
+    repo: &Path,
+    commit_id: &str,
+    format: ArchiveFormat,
+    prefix: &str,
+) -> Result<tokio::process::ChildStdout, GitError> {
+    if !is_object_id(commit_id) {
+        return Err(GitError::Failed {
+            command: "archive".into(),
+            stderr: format!("not an object id: {commit_id}"),
+        });
+    }
+    let mut child = crate::command::git()
+        .arg("--git-dir")
+        .arg(repo)
+        .arg("archive")
+        .arg(format!("--format={}", format.extension()))
+        .arg(format!("--prefix={prefix}/"))
+        .arg(commit_id)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    let stdout = child.stdout.take().ok_or_else(|| GitError::Failed {
+        command: "archive".into(),
+        stderr: "git archive produced no stdout".into(),
+    })?;
+    tokio::spawn(async move {
+        let status = child.wait().await;
+        if !matches!(&status, Ok(status) if status.success()) {
+            tracing::warn!(?status, "git archive finished");
+        }
+    });
+    Ok(stdout)
+}
 
 /// Bytes of file `file` in `commit_id`; `None` when it is missing or not a file.
 pub fn blob_bytes(repo: &Path, commit_id: &str, file: &str) -> Result<Option<Vec<u8>>, GitError> {
@@ -1012,5 +1089,55 @@ mod tests {
             1,
             "the merge commit is listed once"
         );
+    }
+    #[test]
+    fn archive_format_parse_splits_rev_and_format() {
+        assert_eq!(
+            ArchiveFormat::parse("main.zip"),
+            Some(("main", ArchiveFormat::Zip))
+        );
+        assert_eq!(
+            ArchiveFormat::parse("release/1.0.tar.gz"),
+            Some(("release/1.0", ArchiveFormat::TarGz))
+        );
+        assert_eq!(ArchiveFormat::parse("x.tar"), None);
+        assert_eq!(ArchiveFormat::parse(".zip"), None);
+        assert_eq!(ArchiveFormat::parse("foo"), None);
+        assert_eq!(ArchiveFormat::Zip.extension(), "zip");
+        assert_eq!(ArchiveFormat::TarGz.extension(), "tar.gz");
+        assert_eq!(ArchiveFormat::Zip.content_type(), "application/zip");
+        assert_eq!(ArchiveFormat::TarGz.content_type(), "application/gzip");
+    }
+
+    #[tokio::test]
+    async fn stream_archive_zip_and_targz_carry_their_magic() {
+        use tokio::io::AsyncReadExt as _;
+
+        let f = fixture();
+        let p = f.path();
+        let gitdir = p.join(".git");
+        let main = resolve(p, "main").unwrap().unwrap().commit_id;
+        let mut zip = stream_archive(&gitdir, &main, ArchiveFormat::Zip, "repo-main").unwrap();
+        let mut zip_bytes = Vec::new();
+        zip.read_to_end(&mut zip_bytes).await.unwrap();
+        assert_eq!(&zip_bytes[..4], b"PK\x03\x04", "zip magic");
+        assert!(
+            zip_bytes
+                .windows(b"repo-main/README.md".len())
+                .any(|w| w == b"repo-main/README.md"),
+            "zip entries live under <prefix>/"
+        );
+        let mut tar = stream_archive(&gitdir, &main, ArchiveFormat::TarGz, "repo-main").unwrap();
+        let mut tar_bytes = Vec::new();
+        tar.read_to_end(&mut tar_bytes).await.unwrap();
+        assert_eq!(&tar_bytes[..2], &[0x1f, 0x8b], "gzip magic");
+    }
+
+    #[test]
+    fn stream_archive_rejects_non_hex_ids() {
+        let f = fixture();
+        assert!(stream_archive(f.path(), "--output=/tmp/x", ArchiveFormat::Zip, "x").is_err());
+        assert!(stream_archive(f.path(), "zz", ArchiveFormat::TarGz, "x").is_err());
+        assert!(stream_archive(f.path(), "", ArchiveFormat::Zip, "x").is_err());
     }
 }

@@ -97,6 +97,13 @@ One retry covers base movement. The retry re-resolves endpoints and re-evaluates
 
 `RepoLock` guards each repository directory. Writers hold the shared lock. Backup and purge hold the exclusive lock. Readers never take a lock. `LOCK_TIMEOUT` equals 120 seconds. A timeout returns `LockError::Timeout`.
 
+### Archives and release tags
+
+`stream_archive` in `crates/starforged-git/src/read.rs` runs `git archive` with the format, the prefix, and the commit id. `ArchiveFormat` splits the URL rest into revision and format. The command takes no shell. The code validates the object id before the spawn.
+
+`create_tag` in `crates/starforged-git/src/write.rs` creates one lightweight tag on the server. It validates the ref name first. It runs `update-ref` with an empty old value, so an existing ref stays untouched. Release creation uses this helper when the tag misses. Existing tags stay as the caller found them.
+
+Tag protection patterns from `starforged-db/src/protection.rs` gate release writes. `starforged-git/src/refpolicy.rs` matches the tag names against the patterns. A match raises the need from write to maintain. The pre-receive hook enforces the same patterns for pushes.
 ## Interfaces
 
 `Service::from_query` accepts `git-upload-pack` and `git-receive-pack`. Content types carry the `application/x-git-...` prefix. `GitHttpError::Internal` returns `500` with a generic body. Logs carry the detail.
