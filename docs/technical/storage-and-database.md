@@ -53,7 +53,7 @@ Reads inside open transactions use the writer pool. The engine enforces foreign 
 
 ### Migrations
 
-Embedded migrators live in `crates/starforged-db/migrations`. The SQLite and Postgres sets share filenames. Versions run from `0001` to `0039`, so `0030` to `0033` are absent. `Db::migrate` runs versions in order. Bookkeeping lives in `_sqlx_migrations`. Rerun of `migrate` is safe and idempotent.
+Embedded migrators live in `crates/starforged-db/migrations`. The SQLite and Postgres sets share filenames. Versions run from `0001` to `0040`, so `0030` to `0033` are absent. `Db::migrate` runs versions in order. Bookkeeping lives in `_sqlx_migrations`. Rerun of `migrate` is safe and idempotent.
 
 Migrations are forward only. A released migration must not change, because sqlx validates its checksum. `0034` rebuilds the SSH fingerprint table and drops orphan rows during the rebuild. `0035` adds the `jobs.rerun_at` column for rerun requests on deduplicated jobs. A request that arrives while a deduplicated job runs records its time in `rerun_at`, so the worker runs the job again after it finishes.
 
@@ -66,6 +66,8 @@ Migrations are forward only. A released migration must not change, because sqlx 
 `ci_secrets` stores sealed CI secret values. `ci_job_secrets` records which secrets one job resolved. `ci_artifact_tokens` stores hashed one-time artifact upload tokens.
 
 `0039` adds `ci_jobs.claimed_at`, `ci_usage`, and `ci_supplier_links`. `claimed_at` records when each claim happens. `ci_usage` records one row per ended attempt of a native runner job. `ci_supplier_links` links a repository to an external CI supplier. The supplier check allows `depot` only.
+
+`0040` drops queued rows of two removed job kinds. The two names are `resolve_commit_links` and `session_webhook_outbox`.
 
 `auto_migrate` runs migrations at start. `starforged migrate` runs them manually. `doctor` compares latest and known versions. A difference reports a migrate action.
 
@@ -98,7 +100,7 @@ Modules live under `crates/starforged-db/src`. Each module owns rows for one gro
 
 CI log chunks and CI artifacts use the same blob store. `put_log_chunk` writes log bytes through the blob store. Chunk rows record the blob BLAKE3 digest. `upload_ci_artifact` writes artifact bytes through the blob store. Artifact rows record the blob BLAKE3 digest.
 
-Expired artifacts stay out of downloads and out of the artifact quota. No scheduled job deletes expired artifacts. `gc_expired_artifacts` exists, but no caller runs it. Expired artifact rows and blobs stay in place. Read the [CI and sandboxes page](ci-and-sandboxes.md) for the full detail.
+Expired artifacts stay out of downloads and out of the artifact quota. The hourly cleanup runs `gc_expired_artifacts`. It deletes expired artifact rows. It deletes a blob when no unexpired artifact references it. Read the [CI and sandboxes page](ci-and-sandboxes.md) for the full detail.
 
 The temporary name carries the process identifier. The code writes the temporary file, then renames it. The code does not fsync the file, so a crash can lose the blob. Concurrent identical puts rename over each other. Readers rebuild the hash on every read. Hash mismatch returns a corrupt error.
 

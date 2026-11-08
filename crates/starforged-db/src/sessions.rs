@@ -344,6 +344,51 @@ pub async fn set_lifecycle(db: &Db, id: i64, lifecycle: &str) -> DbResult<()> {
     Ok(())
 }
 
+/// `receiving` sessions with no activity at or before `cutoff`, oldest
+/// first, at most `limit` rows. Last activity is the newest of the
+/// session's update time and its newest segment upload; the pair carries
+/// that time so the stalled-session finalizer can fill `ended_at` from it.
+pub async fn stalled_receiving_sessions(
+    db: &Db,
+    cutoff: i64,
+    limit: i64,
+) -> DbResult<Vec<(SessionRow, i64)>> {
+    let rows = sqlx::query(
+        "SELECT * FROM (\
+         SELECT sessions.*, \
+         CASE WHEN sessions.updated_at > COALESCE(seg.last_upload, 0) \
+         THEN sessions.updated_at ELSE COALESCE(seg.last_upload, 0) END AS last_activity \
+         FROM sessions \
+         LEFT JOIN (SELECT session_id, MAX(uploaded_at) AS last_upload FROM segments GROUP BY session_id) AS seg \
+         ON seg.session_id = sessions.id \
+         ) WHERE lifecycle = 'receiving' AND last_activity <= $1 ORDER BY id ASC LIMIT $2",
+    )
+    .bind(cutoff)
+    .bind(limit)
+    .fetch_all(db.read_pool())
+    .await?;
+    rows.iter()
+        .map(|row| Ok((session_from_row(row)?, row.try_get("last_activity")?)))
+        .collect()
+}
+
+/// Marks one stalled `receiving` session `complete`, filling a still-NULL
+/// `ended_at` with its last activity. Only a `receiving` row is touched,
+/// so a second call (or a session completed meanwhile) changes nothing;
+/// returns whether this call transitioned the session.
+pub async fn finalize_stalled_session(db: &Db, id: i64, last_activity: i64) -> DbResult<bool> {
+    let done = sqlx::query(
+        "UPDATE sessions SET lifecycle = 'complete', ended_at = COALESCE(ended_at, $1), updated_at = $2 \
+         WHERE id = $3 AND lifecycle = 'receiving'",
+    )
+    .bind(last_activity)
+    .bind(now())
+    .bind(id)
+    .execute(db.pool())
+    .await?;
+    Ok(done.rows_affected() > 0)
+}
+
 pub async fn set_quarantine(
     db: &Db,
     id: i64,

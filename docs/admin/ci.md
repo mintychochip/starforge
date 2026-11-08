@@ -100,14 +100,19 @@ Server-side configuration (`[sandbox]`, see
 | `sandbox.provider` | `local` (or `e2b`) |
 | `sandbox.local.socket` | `/run/starforge/sandboxd.sock` |
 | `sandbox.local.token_file` | `/run/starforge/sandboxd.token` |
-| `sandbox.local.egress.proxy_listen` | `127.0.0.1:8888` |
-| `sandbox.local.egress.ca_dir` | `/run/starforge/sandbox-ca` |
 | `sandbox.local.egress.allowlist` | `[]` |
 | `sandbox.e2b.api_url` | `https://api.e2b.dev` |
 | `sandbox.e2b.api_key` | (sealed; never logged or rendered) |
 | `sandbox.limits.max_concurrent_per_user` / `max_concurrent_per_repo` | `0` (disabled) |
 | `sandbox.limits.sandbox_seconds_per_hour` | `0` (disabled) |
 | `sandbox.default_ttl_secs` | `3600` |
+
+The egress proxy listen address and the CA directory are
+`starforge-sandboxd` flags, not server config: `--egress-listen`
+(default `127.0.0.1:0`) sets the proxy listen address, and
+`--egress-ca-dir` (default `/run/starforge/egress-ca`) sets the
+per-sandbox CA directory. The daemon reads only its own flags; the
+server only reads `sandbox.local.egress.allowlist`.
 
 ## E2B adapter
 
@@ -176,8 +181,9 @@ CI usage and its limits belong to whoever runs the compute:
 
 Per-item caps apply to every run: logs cap at 100 MiB per job;
 artifacts at 1 GiB each, with a 30-day expiry. An expired artifact can no
-longer be downloaded and stops counting toward `ci.limits.artifact_bytes`,
-but no scheduled job deletes it yet: its row and blob stay on disk.
+longer be downloaded and stops counting toward `ci.limits.artifact_bytes`;
+the hourly cleanup deletes its row, and its blob once no unexpired
+artifact shares it.
 
 ## Audit
 

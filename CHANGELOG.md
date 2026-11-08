@@ -31,7 +31,9 @@ search, webhooks, and mirrors, on SQLite or Postgres.
   bundles. Only sessions whose
   working directory lies inside the repository are captured; sessions with
   no known working directory are never attributed. Antigravity CLI sessions
-  are not captured (see README "Known gaps").
+  are not captured (see README "Known gaps"). The server completes a session
+  that stays `receiving` for 24 hours without activity, so an upload whose
+  client never sends `complete` still becomes searchable.
 - **Trails (M2):** per-repository numbered Trails with comments, labels,
   assignees, and review requests; changes via `refs/for/*` (agit) with
   revisions, reviews, threaded comments, and pending (draft) reviews;
@@ -39,7 +41,8 @@ search, webhooks, and mirrors, on SQLite or Postgres.
   merges; branch and tag protection; webhooks (`push`, `trail`, `review`,
   `check`, `session`; `ci` added in M6) with signed deliveries, a delivery
   log, and redelivery; dashboard sections and Trail/session/code search (Tantivy,
-  `git grep` over the default branch).
+  `git grep` over the default branch). The Branches page links each
+  branch's commits and opens a Trail from a branch, tracking it as a change.
 - **Organizations and SSH (M3):** orgs, teams, and base permissions with
   repository transfer; git over SSH (`ssh://git@…`) with user and deploy
   keys and fingerprint registry.
@@ -66,11 +69,17 @@ search, webhooks, and mirrors, on SQLite or Postgres.
   storage metered and limited by Starforge (`[ci.limits]`), and a linked
   Depot repository's usage read from Depot's API with its limits left to
   Depot (`GET /repos/{owner}/{repo}/ci/usage`). External CI statuses and
-  webhooks are unchanged, and the server never runs job code. Known
+  webhooks are unchanged, and the server never runs job code. The
+  repository nav has CI and Compare tabs; repository admins manage CI
+  secrets on a settings page as well as through the API; the hourly cleanup
+  deletes expired artifacts; the OCI image ships `starforge-runner` and
+  `starforge-sandboxd`. The never-read server keys
+  `sandbox.local.egress.proxy_listen` and `ca_dir` are removed (the daemon's
+  `--egress-listen` and `--egress-ca-dir` flags set them); an environment
+  override for either now fails startup as an unknown key. Known
   limitation: local sandboxes still run with `--network none`, so they
   cannot reach the egress proxy, and the runner's in-sandbox `git clone`
-  and session sync fail there; and expired artifacts stop downloading
-  and counting after 30 days but are not yet deleted from disk.
+  and session sync fail there.
 - **CLI:** `starforge` — `auth login` (device flow, scopes `repo:read
   trail:write session:upload`), `auth ssh-key add` (one-time `repo:write`
   device flow; both tokens are revoked and never stored), `enable`/`disable`
@@ -135,6 +144,7 @@ before upgrading (see `docs/admin/backup-and-restore.md`).
 | 0037 | Sandboxes and sandbox-second usage windows |
 | 0038 | CI secrets and one-time artifact tokens |
 | 0039 | CI usage per job attempt and CI supplier links |
+| 0040 | Drop queued rows of two removed no-op job kinds |
 
 Note: migration numbers 0030–0033 do not exist; the series jumps from 0029
 to 0034.

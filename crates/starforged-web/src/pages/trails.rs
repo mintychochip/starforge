@@ -326,20 +326,35 @@ pub struct TrailNewPage {
     csrf: String,
     title: String,
     intent: String,
+    head_branch: String,
+    base_branch: String,
     error: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct NewQuery {
+    head: Option<String>,
+    base: Option<String>,
 }
 
 /// `GET /{owner}/{repo}/trails/new`: signed-in readers only (anonymous
 /// requests redirect to sign-in via `RequireUser`; other non-readers 404).
+/// `?head=` and `?base=` prefill the branch fields; `base` defaults to the
+/// default branch.
 pub async fn new_form(
     State(state): State<AppState>,
     RequireUser(session): RequireUser,
     Path((owner, repo)): Path<(String, String)>,
+    Query(query): Query<NewQuery>,
 ) -> Result<impl IntoResponse, WebError> {
     let access = state
         .core
         .repo_for(Some(&session.user), &owner, &repo)
         .await?;
+    let base_branch = query
+        .base
+        .filter(|b| !b.trim().is_empty())
+        .unwrap_or_else(|| access.repo.default_branch.clone());
     Ok((
         detail_headers(),
         TrailNewPage {
@@ -348,6 +363,8 @@ pub async fn new_form(
             csrf: session.csrf_token.clone(),
             title: String::new(),
             intent: String::new(),
+            head_branch: query.head.unwrap_or_default(),
+            base_branch,
             error: None,
         },
     ))
@@ -361,10 +378,18 @@ pub struct NewForm {
     title: String,
     #[serde(default)]
     intent: String,
+    #[serde(default)]
+    head: String,
+    #[serde(default)]
+    base: String,
 }
 
 /// `POST /{owner}/{repo}/trails/new`: creates the trail and redirects to it.
-/// `Invalid` re-renders the form with 422 instead of dropping the input.
+/// A non-empty `head` first validates that `head` and `base` name existing,
+/// differing branches before anything is written, then tracks `head` into
+/// `base` as a change on the new trail; an empty `base` defaults to the
+/// default branch. `Invalid` re-renders the form with 422 instead of
+/// dropping the input.
 pub async fn create(
     State(state): State<AppState>,
     RequireUser(session): RequireUser,
@@ -376,16 +401,68 @@ pub async fn create(
         .repo_for(Some(&session.user), &owner, &repo)
         .await?;
     verify_csrf(&session.csrf_token, &form.csrf)?;
+    let head_branch = form.head.trim().to_owned();
+    let base_branch = match form.base.trim() {
+        "" => access.repo.default_branch.clone(),
+        base => base.to_owned(),
+    };
+    if !head_branch.is_empty() {
+        // Tracking a branch as a change needs `Triage` (the same minimum
+        // `create_branch_change` enforces); without it, refuse before the
+        // trail exists, with the same 403 the Trail pages answer.
+        let rejection = if access.permission < Permission::Triage {
+            Some((
+                StatusCode::FORBIDDEN,
+                "You do not have permission to do that.".to_owned(),
+            ))
+        } else {
+            validate_branches(&state, &access, &head_branch, &base_branch)
+                .await?
+                .map(|message| (StatusCode::UNPROCESSABLE_ENTITY, message))
+        };
+        if let Some((status, message)) = rejection {
+            return Ok((
+                status,
+                detail_headers(),
+                TrailNewPage {
+                    nav_user: Some(NavUser::from_session(&session)),
+                    head: RepoHead::new(&access, "trails", None),
+                    csrf: session.csrf_token.clone(),
+                    title: form.title.clone(),
+                    intent: form.intent.clone(),
+                    head_branch,
+                    base_branch,
+                    error: Some(message),
+                },
+            )
+                .into_response());
+        }
+    }
     match state
         .core
         .create_trail(&session.user, &owner, &repo, &form.title, &form.intent)
         .await
     {
-        Ok(view) => Ok(Redirect::to(&format!(
-            "/{}/{}/trails/{}",
-            access.repo.owner, access.repo.name, view.number
-        ))
-        .into_response()),
+        Ok(view) => {
+            if !head_branch.is_empty() {
+                state
+                    .core
+                    .create_branch_change(
+                        &session.user,
+                        &owner,
+                        &repo,
+                        view.number,
+                        &head_branch,
+                        &base_branch,
+                    )
+                    .await?;
+            }
+            Ok(Redirect::to(&format!(
+                "/{}/{}/trails/{}",
+                access.repo.owner, access.repo.name, view.number
+            ))
+            .into_response())
+        }
         Err(CoreError::Invalid(message)) => Ok((
             StatusCode::UNPROCESSABLE_ENTITY,
             detail_headers(),
@@ -395,12 +472,35 @@ pub async fn create(
                 csrf: session.csrf_token.clone(),
                 title: form.title.clone(),
                 intent: form.intent.clone(),
+                head_branch,
+                base_branch,
                 error: Some(message),
             },
         )
             .into_response()),
         Err(other) => Err(other.into()),
     }
+}
+
+/// `Some(message)` when `head`/`base` do not name existing, differing
+/// branches: nothing may be created on such input.
+async fn validate_branches(
+    state: &AppState,
+    access: &starforged_core::repos::RepoAccess,
+    head: &str,
+    base: &str,
+) -> Result<Option<String>, WebError> {
+    if head == base {
+        return Ok(Some("head and base branches must differ".to_owned()));
+    }
+    let branches = state.core.branches(access).await?;
+    if !branches.iter().any(|b| b == head) {
+        return Ok(Some(format!("unknown head branch '{head}'")));
+    }
+    if !branches.iter().any(|b| b == base) {
+        return Ok(Some(format!("unknown base branch '{base}'")));
+    }
+    Ok(None)
 }
 
 pub struct CommentItem {

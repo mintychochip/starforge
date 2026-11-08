@@ -53,6 +53,8 @@ It covers limits, the doctor command, backup, restore, and upgrade rules.
 - The hourly pass blanks failed mail bodies older than 7 days. It prunes webhook delivery rows older than 30 days. It reconciles mirror schedules.
 - The hourly pass garbage collects zero reference blobs under the blob garbage collection lock.
 - The hourly pass enqueues at most 100 unrecorded revision commits.
+- The hourly pass finalizes idle `receiving` sessions after 24 hours without activity.
+- The hourly pass runs `gc_expired_artifacts`. It deletes expired artifact rows. It deletes a blob when no unexpired artifact references it.
 
 Each job worker also runs the CI sweep. `run_ci_sweep_if_due` calls `sweep_ci_jobs` at most once every 30 seconds across all workers. A compare-exchange on the due time lets one worker sweep per interval. Sweep errors only log warnings. A sweep failure never stops job work.
 
@@ -75,9 +77,7 @@ CI jobs use a separate queue from the internal `jobs` table. The internal `Job` 
 | `index_repo` | `index_repo:<repo_id>` | on enqueue |
 | `drop_session_docs` | `drop_session_docs:<session_id>` | on enqueue |
 | `rebuild_index` | `rebuild_index` | on enqueue |
-| `resolve_commit_links` | none | on enqueue |
 | `update_session_stats` | none | on enqueue |
-| `session_webhook_outbox` | none | on enqueue |
 | `change_mergeability` | `change_mergeability:<change_id>` | on enqueue |
 | `record_revision_commits` | `record_revision_commits:<revision_id>` | on enqueue |
 | `import_repo` | `import_repo:<repo_id>` | on enqueue |

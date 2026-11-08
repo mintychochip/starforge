@@ -3047,7 +3047,11 @@ mod tests {
         let sealed = bx.seal(b"ci-secret-value");
         assert!(sealed.starts_with("c1:"), "{sealed}");
         assert_eq!(bx.open(&sealed).unwrap(), b"ci-secret-value");
-        assert!(bx.open(&sealed.replace(&sealed[3..4], "A")).is_err());
+        // Flip exactly one ciphertext character to a different value (the
+        // nonce is random, so a fixed replacement is a no-op 1 time in 64).
+        let flipped = if &sealed[3..4] == "A" { "B" } else { "A" };
+        let tampered = format!("{}{flipped}{}", &sealed[..3], &sealed[4..]);
+        assert!(bx.open(&tampered).is_err());
         assert_eq!(format!("{bx:?}"), "CiSecretBox(<redacted>)");
     }
 

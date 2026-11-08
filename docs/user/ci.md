@@ -113,13 +113,17 @@ run page.
 
 Files matching a job's `artifacts` globs are uploaded after a
 successful run (authorize-then-PUT, download authenticated). Artifacts
-expire after 30 days; an expired artifact can no longer be downloaded.
+expire after 30 days: an expired artifact can no longer be downloaded,
+and the hourly cleanup deletes it.
 Artifact names must be relative and stay inside the workspace.
 
 ## Secrets
 
-Repo secrets are created and rotated by repo admins (at least Admin):
-
+Repo secrets are created and rotated by repo admins (at least Admin).
+In the web UI, open the repository's **CI secrets** settings page
+(`/{owner}/{repo}/settings/ci-secrets`): it lists secret names and
+timestamps, adds or rotates a secret, and deletes one. Values stay
+write-only there, exactly as with the API below.
 ```shell
 curl -X POST "$SERVER/api/v1/repos/$OWNER/$REPO/ci/secrets" \
   -H "Authorization: Bearer $TOKEN" \

@@ -22,6 +22,9 @@ const HOUR: i64 = 3_600;
 const DAY: i64 = 86_400;
 /// Unrecorded revisions enqueued per hourly pass (D2 backfill bound).
 const BACKFILL_REVISIONS_PER_HOUR: i64 = 100;
+/// A `receiving` session with no activity (session update or segment
+/// upload) for this long is finalised by the hourly cleanup.
+const SESSION_STALL_SECS: i64 = DAY;
 
 /// Delay before the next attempt after `attempts` failed ones, or `None` when all [`MAX_ATTEMPTS`] are used.
 pub fn retry_delay(attempts: i64) -> Option<i64> {
@@ -62,13 +65,8 @@ pub enum Job {
     DropSessionDocs { session_id: i64, repo_id: i64 },
     /// Wipes and rebuilds the whole search index (startup recovery, admin action).
     RebuildIndex,
-    /// Links resolve synchronously at write time (trailer scan + CLI claims);
-    /// the M1d arm is a no-op marker for future layers (stub, documented).
-    ResolveCommitLinks { repo_id: i64, session_ulid: String },
     /// Recomputes the session's turn/tool counts and usage sums from its segment events.
     UpdateSessionStats { session_id: i64 },
-    /// M2/M5 own delivery: the M1d arm enqueues and succeeds (stub, documented).
-    SessionWebhookOutbox { session_id: i64, event: String },
     /// Recomputes one change's mergeability against its base tip (M2b G3).
     /// Deduplicated per change: rapid pushes collapse into one run over the
     /// latest revision.
@@ -119,9 +117,7 @@ impl Job {
             Job::IndexRepo { .. } => "index_repo",
             Job::DropSessionDocs { .. } => "drop_session_docs",
             Job::RebuildIndex => "rebuild_index",
-            Job::ResolveCommitLinks { .. } => "resolve_commit_links",
             Job::UpdateSessionStats { .. } => "update_session_stats",
-            Job::SessionWebhookOutbox { .. } => "session_webhook_outbox",
             Job::ChangeMergeability { .. } => "change_mergeability",
             Job::RecordRevisionCommits { .. } => "record_revision_commits",
             Job::WebhookDelivery { .. } => "webhook_delivery",
@@ -146,7 +142,6 @@ impl Job {
             Job::DropSessionDocs { .. } => None,
             Job::RebuildIndex => None,
             Job::IndexSessionEvents { .. } => None,
-            Job::ResolveCommitLinks { .. } => None,
             Job::UpdateSessionStats { .. } => None,
             Job::ChangeMergeability { .. } => None,
             Job::RecordRevisionCommits { .. } => None,
@@ -155,7 +150,6 @@ impl Job {
             Job::PullMirror { .. } => None,
             Job::PushMirror { .. } => None,
             Job::WebhookDelivery { .. } => None,
-            Job::SessionWebhookOutbox { .. } => None,
         }
     }
 
@@ -206,9 +200,7 @@ impl Job {
             | Job::GitMaintenance { .. }
             | Job::DropSessionDocs { .. }
             | Job::RebuildIndex
-            | Job::ResolveCommitLinks { .. }
             | Job::UpdateSessionStats { .. }
-            | Job::SessionWebhookOutbox { .. }
             | Job::RecordRevisionCommits { .. }
             | Job::WebhookDelivery { .. }
             | Job::ImportRepo { .. }
@@ -383,8 +375,6 @@ impl Core {
             Job::IndexRepo { repo_id } => self.index_repo_by_id(*repo_id).await,
             Job::DropSessionDocs { session_id, .. } => self.drop_session_docs(*session_id).await,
             Job::RebuildIndex => self.rebuild_search_index().await.map(|_| ()),
-            // Links resolve synchronously at write time; nothing left to do.
-            Job::ResolveCommitLinks { .. } => Ok(()),
             Job::UpdateSessionStats { session_id } => {
                 self.update_session_stats(*session_id).await.map(|_| ())
             }
@@ -405,8 +395,6 @@ impl Core {
                 self.deliver_webhook(id, *webhook_id, event, payload, *redelivery)
                     .await
             }
-            // M2/M5 own delivery; M1d only records the enqueue.
-            Job::SessionWebhookOutbox { .. } => Ok(()),
             Job::SendEmail { to, subject, body } => {
                 let mailer = self
                     .config()
@@ -434,6 +422,11 @@ impl Core {
         starforged_db::oauth::delete_expired(self.db(), ts).await?;
         // Expired sandboxes are killed and marked (M6b B5).
         self.gc_expired_sandboxes().await?;
+        // Stalled `receiving` sessions become `complete` so search can see
+        // them; expired CI artifacts lose their rows and, when the last
+        // live reference goes, their blobs.
+        self.finalize_stalled_sessions().await?;
+        self.gc_expired_artifacts().await?;
         // Delivery attempts older than 30 days fall out of the log (D5).
         starforged_db::checks::prune_deliveries_before(self.db(), ts - 30 * DAY).await?;
         // Every link in a message is dead 7 days after it was sent (invites live longest), so a failed
@@ -483,6 +476,32 @@ impl Core {
         {
             self.enqueue(&Job::RecordRevisionCommits { revision_id })
                 .await?;
+        }
+        Ok(())
+    }
+
+    /// Finalises `receiving` sessions idle at least [`SESSION_STALL_SECS`]
+    /// (no session update or segment upload): marks them `complete` with
+    /// `ended_at` filled from their last activity when still NULL, then
+    /// runs the same post-completion step as an explicit complete. Only
+    /// `receiving` rows are touched; a repeat pass finds none.
+    async fn finalize_stalled_sessions(&self) -> CoreResult<()> {
+        let cutoff = now() - SESSION_STALL_SECS;
+        loop {
+            let batch = db_sessions::stalled_receiving_sessions(self.db(), cutoff, 500).await?;
+            if batch.is_empty() {
+                break;
+            }
+            for (session, last_activity) in &batch {
+                if db_sessions::finalize_stalled_session(self.db(), session.id, *last_activity)
+                    .await?
+                {
+                    self.announce_session_completed(session).await;
+                }
+            }
+            if batch.len() < 500 {
+                break;
+            }
         }
         Ok(())
     }
@@ -890,7 +909,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn segment_store_enqueues_four_jobs_and_stats_recompute() {
+    async fn segment_store_enqueues_two_jobs_and_stats_recompute() {
         use crate::ingest::SegmentPut;
         let (core, _f, auth, _alice) = ingest_ctx().await;
         let ulid = "01ARZ3NDEKTSV4RRFFQ69G5FB0";
@@ -906,20 +925,12 @@ mod tests {
             SegmentPut::Stored(_) => {}
             other => panic!("unexpected put outcome: {other:?}"),
         }
-        // One segment store enqueues all four ingest jobs with the right payloads.
+        // One segment store enqueues both ingest jobs with the right payloads.
         let kinds: Vec<String> = sqlx::query_scalar("SELECT kind FROM jobs ORDER BY id")
             .fetch_all(core.db().pool())
             .await
             .unwrap();
-        assert_eq!(
-            kinds,
-            vec![
-                "index_session_events",
-                "resolve_commit_links",
-                "update_session_stats",
-                "session_webhook_outbox",
-            ]
-        );
+        assert_eq!(kinds, vec!["index_session_events", "update_session_stats"]);
         let payloads: Vec<String> = sqlx::query_scalar("SELECT payload FROM jobs ORDER BY id")
             .fetch_all(core.db().pool())
             .await
@@ -935,14 +946,10 @@ mod tests {
         );
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&payloads[1]).unwrap(),
-            serde_json::json!({"kind": "resolve_commit_links", "repo_id": auth.repo_id(), "session_ulid": ulid})
-        );
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&payloads[2]).unwrap(),
             serde_json::json!({"kind": "update_session_stats", "session_id": session_id})
         );
-        // `run_due_jobs` recomputes the session counts from the segment events;
-        // the three stub arms succeed and every job lands `done`.
+        // `run_due_jobs` recomputes the session counts from the segment events
+        // and every job lands `done`.
         core.run_due_jobs().await.unwrap();
         let row = starforged_db::sessions::session_by_ulid(core.db(), auth.repo_id(), ulid)
             .await
@@ -963,7 +970,7 @@ mod tests {
             .fetch_all(core.db().pool())
             .await
             .unwrap();
-        assert_eq!(states, vec!["done"; 4]);
+        assert_eq!(states, vec!["done"; 2]);
     }
 
     #[tokio::test]
@@ -1101,6 +1108,182 @@ mod tests {
             core.search_index().stats().unwrap().events,
             4,
             "the rerun indexes the completed session's events"
+        );
+    }
+
+    #[tokio::test]
+    async fn hourly_cleanup_finalizes_stalled_receiving_sessions() {
+        use crate::ingest::SegmentPut;
+        let (core, _f, auth, _alice) = ingest_ctx().await;
+        let repo_id = auth.repo_id();
+        let stalled = "01ARZ3NDEKTSV4RRFFQ69G5FB0";
+        let fresh = "01ARZ3NDEKTSV4RRFFQ69G5FB1";
+        let done = "01ARZ3NDEKTSV4RRFFQ69G5FB2";
+        let recent_segment = "01ARZ3NDEKTSV4RRFFQ69G5FB3";
+        for ulid in [stalled, fresh, done, recent_segment] {
+            core.upsert_session_meta(&auth, ulid, &session_meta(ulid))
+                .await
+                .unwrap();
+        }
+        // One session uploaded a segment just now, so its last activity is
+        // fresh even when its row time is backdated below.
+        let line =
+            r#"{"v":1,"seq":0,"ts":"2026-11-04T00:00:00Z","kind":"user_message","text":"hi"}"#
+                .to_owned();
+        let (bytes, hash) = segment_payload(&[line]);
+        match core
+            .put_segment(&auth, recent_segment, 0, &bytes, Some(hash))
+            .await
+            .unwrap()
+        {
+            SegmentPut::Stored(_) => {}
+            other => panic!("unexpected put outcome: {other:?}"),
+        }
+        core.complete_session(&auth, done).await.unwrap();
+        let stalled_at = now() - 25 * 3_600;
+        for (ulid, at) in [
+            (stalled, stalled_at),
+            (fresh, now() - 3_600),
+            (done, stalled_at),
+            (recent_segment, stalled_at),
+        ] {
+            sqlx::query("UPDATE sessions SET updated_at = $1 WHERE repo_id = $2 AND ulid = $3")
+                .bind(at)
+                .bind(repo_id)
+                .bind(ulid)
+                .execute(core.db().pool())
+                .await
+                .unwrap();
+        }
+        // Drain the ingest jobs so the cleanup's own index enqueue is the
+        // only index job the hourly pass creates.
+        core.run_due_jobs().await.unwrap();
+        let drained: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(id), 0) FROM jobs")
+            .fetch_one(core.db().pool())
+            .await
+            .unwrap();
+        core.enqueue(&Job::HourlyCleanup).await.unwrap();
+        core.run_due_jobs().await.unwrap();
+        async fn session_row(core: &Core, repo_id: i64, ulid: &str) -> db_sessions::SessionRow {
+            starforged_db::sessions::session_by_ulid(core.db(), repo_id, ulid)
+                .await
+                .unwrap()
+                .unwrap()
+        }
+        let stalled_row = session_row(&core, repo_id, stalled).await;
+        assert_eq!(stalled_row.lifecycle, "complete");
+        assert_eq!(stalled_row.ended_at, Some(stalled_at));
+        let fresh_row = session_row(&core, repo_id, fresh).await;
+        assert_eq!(fresh_row.lifecycle, "receiving");
+        assert_eq!(fresh_row.ended_at, None);
+        let done_row = session_row(&core, repo_id, done).await;
+        assert_eq!(done_row.lifecycle, "complete");
+        assert_eq!(done_row.ended_at, None);
+        let recent_row = session_row(&core, repo_id, recent_segment).await;
+        assert_eq!(recent_row.lifecycle, "receiving");
+        // The finalizer queued exactly one index job, for the stalled session.
+        let payloads: Vec<String> = sqlx::query_scalar(
+            "SELECT payload FROM jobs WHERE kind = 'index_session_events' AND state = 'done' AND id > $1",
+        )
+        .bind(drained)
+        .fetch_all(core.db().pool())
+        .await
+        .unwrap();
+        let indexed: Vec<i64> = payloads
+            .iter()
+            .filter_map(|payload| {
+                serde_json::from_str::<serde_json::Value>(payload)
+                    .ok()
+                    .and_then(|value| value.get("session_id")?.as_i64())
+            })
+            .collect();
+        assert_eq!(indexed, vec![stalled_row.id]);
+    }
+
+    #[tokio::test]
+    async fn hourly_cleanup_collects_expired_ci_artifacts() {
+        use starforged_db::ci::{NewArtifact, NewCiJob};
+        let (core, _f) = test_core().await;
+        let alice = user(&core, "alice").await;
+        let repo = core
+            .create_repo(
+                &alice,
+                "alice",
+                CreateRepo {
+                    name: "proj".into(),
+                    description: String::new(),
+                    visibility: Visibility::Private,
+                    readme: false,
+                },
+            )
+            .await
+            .unwrap();
+        let ts = now();
+        let job = starforged_db::ci::insert_ci_job(
+            core.db(),
+            &NewCiJob {
+                repo_id: repo.id,
+                trail_id: None,
+                change_id: None,
+                revision_id: None,
+                commit_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                base_sha: None,
+                job_name: "test",
+                spec: "{}",
+                run_at: ts,
+                deadline: ts + 3_600,
+                created_by: Some(alice.id),
+                now: ts,
+            },
+        )
+        .await
+        .unwrap();
+        let shared = core
+            .config()
+            .blob_store
+            .put(b"shared artifact bytes")
+            .await
+            .unwrap();
+        let alone = core
+            .config()
+            .blob_store
+            .put(b"expired only bytes")
+            .await
+            .unwrap();
+        for (name, blake3, expires_at) in [
+            ("expired-shared", &shared.hash, ts - 10),
+            ("live-shared", &shared.hash, ts + 3_600),
+            ("expired-alone", &alone.hash, ts - 10),
+        ] {
+            starforged_db::ci::insert_artifact(
+                core.db(),
+                &NewArtifact {
+                    job_id: job.id,
+                    name,
+                    size: 1,
+                    blake3,
+                    sha256: None,
+                    expires_at,
+                    now: ts,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        core.enqueue(&Job::HourlyCleanup).await.unwrap();
+        core.run_due_jobs().await.unwrap();
+        let names: Vec<String> = sqlx::query_scalar("SELECT name FROM ci_artifacts ORDER BY name")
+            .fetch_all(core.db().pool())
+            .await
+            .unwrap();
+        assert_eq!(names, vec!["live-shared".to_owned()]);
+        assert!(
+            starforged_blob::blob_file_path(&core.config().blob_dir, &shared.hash).exists(),
+            "a blob still referenced by a live artifact stays"
+        );
+        assert!(
+            !starforged_blob::blob_file_path(&core.config().blob_dir, &alone.hash).exists(),
+            "an expired artifact's unreferenced blob is collected"
         );
     }
 }

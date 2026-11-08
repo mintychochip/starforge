@@ -9,6 +9,8 @@
   <label>Title <input type="text" name="title" value="{{ title }}" maxlength="200" required></label>
   <label>Intent <textarea name="intent" rows="8">{{ intent }}</textarea></label>
   <p class="muted">Markdown is supported in the intent.</p>
+  <label>Head branch <input type="text" name="head" value="{{ head_branch }}"></label>
+  <label>Base branch <input type="text" name="base" value="{{ base_branch }}"></label>
   <button type="submit">Create trail</button>
 </form>
 {% endblock %}

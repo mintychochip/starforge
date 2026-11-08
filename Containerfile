@@ -42,6 +42,8 @@ COPY target/release-artifacts/starforged-*-${STARFORGE_TARGET}.tar.gz /tmp/artif
 RUN tar -xzf /tmp/artifacts.tar.gz -C /tmp \
   && install -m 0755 "/tmp/${STARFORGE_TARGET}/starforged" /usr/local/bin/starforged \
   && install -m 0755 "/tmp/${STARFORGE_TARGET}/starforge" /usr/local/bin/starforge \
+  && install -m 0755 "/tmp/${STARFORGE_TARGET}/starforge-runner" /usr/local/bin/starforge-runner \
+  && install -m 0755 "/tmp/${STARFORGE_TARGET}/starforge-sandboxd" /usr/local/bin/starforge-sandboxd \
   && rm -rf /tmp/artifacts.tar.gz "/tmp/${STARFORGE_TARGET}"
 
 COPY packaging/entrypoint.sh /usr/local/bin/starforge-entrypoint

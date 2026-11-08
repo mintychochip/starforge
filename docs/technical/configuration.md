@@ -100,8 +100,6 @@ The code rejects an unknown nested key as fatal.
 | `sandbox` | `default_ttl_secs` | number | 3600 | Default sandbox lifetime in seconds |
 | `sandbox.local` | `socket` | path | `/run/starforge/sandboxd.sock` | Sandbox daemon Unix socket |
 | `sandbox.local` | `token_file` | path | `/run/starforge/sandboxd.token` | Sandbox daemon token file |
-| `sandbox.local.egress` | `proxy_listen` | string | `127.0.0.1:8888` | Egress proxy listen address |
-| `sandbox.local.egress` | `ca_dir` | path | `/run/starforge/sandbox-ca` | Per-sandbox CA directory |
 | `sandbox.local.egress` | `allowlist` | list | empty | Hosts the sandbox can reach |
 | `sandbox.e2b` | `api_url` | string | `https://api.e2b.dev` | E2B API base URL |
 | `sandbox.e2b` | `api_key` | string | empty | E2B API key |

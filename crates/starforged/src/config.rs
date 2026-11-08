@@ -694,12 +694,6 @@ impl Config {
                 "sandbox__local__token_file" => {
                     self.sandbox.local.token_file = PathBuf::from(value);
                 }
-                "sandbox__local__egress__proxy_listen" => {
-                    self.sandbox.local.egress.proxy_listen = value;
-                }
-                "sandbox__local__egress__ca_dir" => {
-                    self.sandbox.local.egress.ca_dir = PathBuf::from(value);
-                }
                 "sandbox__local__egress__allowlist" => {
                     self.sandbox.local.egress.allowlist = value
                         .split(',')

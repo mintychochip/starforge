@@ -41,8 +41,6 @@
 | `sandbox.provider` | Sandbox provider: `local` (rootless containers via `starforge-sandboxd`, default) or `e2b` (remote cloud) |
 | `sandbox.local.socket` | Unix socket the local sandbox daemon listens on (default `/run/starforge/sandboxd.sock`) |
 | `sandbox.local.token_file` | Daemon auth token file, mode `0600`; rotates on restart (default `/run/starforge/sandboxd.token`) |
-| `sandbox.local.egress.proxy_listen` | Address the egress proxy listens on (default `127.0.0.1:8888`) |
-| `sandbox.local.egress.ca_dir` | Directory holding per-sandbox CA keys, destroyed with the sandbox (default `/run/starforge/sandbox-ca`) |
 | `sandbox.local.egress.allowlist` | Hosts the egress proxy (and therefore the sandbox) may reach (default `[]`) |
 | `sandbox.e2b.api_url` | Base URL of the E2B-shaped gateway (default `https://api.e2b.dev`; the adapter is not compatible with real E2B) |
 | `sandbox.e2b.api_key` | E2B API key (never logged or rendered) |

@@ -4,6 +4,7 @@ pub mod admin;
 pub mod blame;
 pub mod changes;
 pub mod ci;
+pub mod ci_secrets;
 pub mod code;
 pub mod collaborators;
 pub mod compare;

@@ -680,3 +680,128 @@ async fn ci_usage_page_is_for_maintainers() {
         .status();
     assert_ne!(status, 200);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ci_secrets_settings_page_crud_and_auth() {
+    let s = TestServer::start().await;
+    let alice = s.user("alice").await;
+    let _bob = s.user("bob").await;
+    s.repo(&alice, "proj", Visibility::Private).await;
+    s.core
+        .set_collaborator(&alice, "alice", "proj", "bob", Permission::Write)
+        .await
+        .unwrap();
+
+    let (alice_browser, alice_csrf) = s.login("alice").await;
+    let base = "/alice/proj/settings/ci-secrets";
+    let page_url = s.url(base);
+
+    let page = get_text(&alice_browser, &page_url).await;
+    assert!(page.contains("CI secrets"), "{page}");
+    assert!(
+        page.contains(base),
+        "settings nav links to the page: {page}"
+    );
+    assert!(
+        page.contains("input type=\"password\""),
+        "value input is a password field: {page}"
+    );
+
+    // Bad CSRF is refused and creates nothing.
+    let resp = alice_browser
+        .post(&page_url)
+        .form(&[
+            ("_csrf", "wrong"),
+            ("name", "MY_TOKEN"),
+            ("value", "v1-secret-value"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+    assert!(
+        !get_text(&alice_browser, &page_url)
+            .await
+            .contains("MY_TOKEN"),
+    );
+
+    // Create: 303 back to the list; the value never appears in any response.
+    let resp = alice_browser
+        .post(&page_url)
+        .form(&[
+            ("_csrf", alice_csrf.as_str()),
+            ("name", "MY_TOKEN"),
+            ("value", "v1-secret-value"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 303);
+    assert_eq!(resp.headers()["location"], base);
+    assert!(!resp.text().await.unwrap().contains("v1-secret-value"),);
+    let page = get_text(&alice_browser, &page_url).await;
+    assert!(page.contains("MY_TOKEN"), "{page}");
+    assert!(
+        !page.contains("v1-secret-value"),
+        "value is never rendered: {page}"
+    );
+
+    // Rotate: same name, new value; still 303, neither value leaks.
+    let resp = alice_browser
+        .post(&page_url)
+        .form(&[
+            ("_csrf", alice_csrf.as_str()),
+            ("name", "MY_TOKEN"),
+            ("value", "v2-rotated-value"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 303);
+    assert_eq!(resp.headers()["location"], base);
+    let page = get_text(&alice_browser, &page_url).await;
+    assert!(page.contains("MY_TOKEN"), "{page}");
+    assert!(!page.contains("v1-secret-value"), "{page}");
+    assert!(!page.contains("v2-rotated-value"), "{page}");
+
+    // Write-only collaborator: same refusal as the other Admin settings pages (403).
+    let (bob_browser, bob_csrf) = s.login("bob").await;
+    let status = bob_browser.get(&page_url).send().await.unwrap().status();
+    assert_eq!(status, 403, "Write-only GET: {status}");
+    let resp = bob_browser
+        .post(&page_url)
+        .form(&[
+            ("_csrf", bob_csrf.as_str()),
+            ("name", "BOB_SECRET"),
+            ("value", "bob-value"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "Write-only POST: {}", resp.status());
+    let resp = bob_browser
+        .post(s.url(&format!("{base}/MY_TOKEN/delete")))
+        .form(&[("_csrf", bob_csrf.as_str())])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "Write-only delete: {}", resp.status());
+    // The secret survives the refused delete.
+    assert!(
+        get_text(&alice_browser, &page_url)
+            .await
+            .contains("MY_TOKEN")
+    );
+
+    // Delete: 303, then the name is gone from the list.
+    let resp = alice_browser
+        .post(s.url(&format!("{base}/MY_TOKEN/delete")))
+        .form(&[("_csrf", alice_csrf.as_str())])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 303);
+    assert_eq!(resp.headers()["location"], base);
+    let page = get_text(&alice_browser, &page_url).await;
+    assert!(!page.contains("MY_TOKEN"), "{page}");
+}
