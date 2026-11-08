@@ -112,6 +112,9 @@ pub struct EgressPolicy {
     pub deny_out: Vec<String>,
     pub bindings: Vec<SecretBinding>,
     pub cidr_allow: Vec<IpNet>,
+    /// Ports the proxy treats as HTTPS and MITMs for allowlisted hosts.
+    /// `443` is the default; operators can add a private HTTPS port.
+    pub https_ports: Vec<u16>,
 }
 
 impl EgressPolicy {
@@ -583,27 +586,44 @@ async fn handle_connection(
     dns_override: Option<BTreeMap<String, SocketAddr>>,
     logs: Arc<ProxyLog>,
 ) {
-    // 1. CONNECT line.
-    let head = match read_until_header_end(&mut client, Duration::from_secs(10)).await {
-        Ok(head) => head,
-        Err(_) => return,
+    // 1. CONNECT line. A client may send an unauthenticated CONNECT,
+    // read the 407, and retry with `Proxy-Authorization` on the same
+    // connection (git/libcurl does this); keep the socket open and read
+    // the next head instead of closing after the challenge.
+    let head_text = {
+        let mut attempts = 0;
+        loop {
+            let head = match read_until_header_end(&mut client, Duration::from_secs(10)).await {
+                Ok(head) => head,
+                Err(_) => return,
+            };
+            let (head_bytes, _) = match split_head(&head) {
+                Ok(pair) => pair,
+                Err(_) => return,
+            };
+            let text = String::from_utf8_lossy(&head_bytes).into_owned();
+            if let Some(expected) = credential.as_deref()
+                && !proxy_authorized(&text, expected)
+            {
+                logs.record("auth 407".to_owned());
+                if client
+                    .write_all(
+                        b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"starforge\"\r\nContent-Length: 0\r\n\r\n",
+                    )
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                attempts += 1;
+                if attempts >= 3 {
+                    return;
+                }
+                continue;
+            }
+            break text;
+        }
     };
-    let (head_bytes, _) = match split_head(&head) {
-        Ok(pair) => pair,
-        Err(_) => return,
-    };
-    let head_text = String::from_utf8_lossy(&head_bytes);
-    if let Some(expected) = credential.as_deref()
-        && !proxy_authorized(&head_text, expected)
-    {
-        logs.record("auth 407".to_owned());
-        let _ = client
-            .write_all(
-                b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"starforge\"\r\nContent-Length: 0\r\n\r\n",
-            )
-            .await;
-        return;
-    }
     let Some(request_line) = head_text.lines().next() else {
         return;
     };
@@ -626,7 +646,7 @@ async fn handle_connection(
     let host = host.trim_matches(['[', ']']).to_owned();
 
     // 2. Policy gate — before any upstream contact.
-    let is_http_port = matches!(port, 80 | 443);
+    let is_http_port = port == 80 || policy.https_ports.contains(&port);
     // Resolve + pin (override map in tests, system DNS otherwise).
     let pinned: Vec<SocketAddr> = match dns_override.as_ref().and_then(|m| m.get(&host)) {
         Some(addr) => vec![*addr],
@@ -655,39 +675,62 @@ async fn handle_connection(
         return;
     }
     // Mint the MITM leaf only for allowed HTTPS destinations.
-    let leaf = if port == 443 {
+    let leaf = if policy.https_ports.contains(&port) {
         match ca.mint_leaf(&policy, &host) {
             Ok(leaf) => Some(leaf),
-            Err(_) => return,
+            Err(_) => {
+                logs.record(format!("CONNECT {host}:{port} -> 502 leaf"));
+                let _ = client
+                    .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+                    .await;
+                return;
+            }
         }
     } else {
         None
     };
 
-    // 3. Connect upstream to the pinned address (never re-resolved).
-    let upstream_addr = pinned[0];
-    let upstream = match tokio::net::TcpStream::connect(upstream_addr).await {
-        Ok(stream) => stream,
-        Err(_) => {
-            logs.record(format!("CONNECT {host}:{port} -> 502 upstream"));
-            let _ = client
-                .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
-                .await;
-            return;
+    // 3. Connect upstream to a pinned address (never re-resolved). Try
+    // every resolved address: `localhost` often resolves to `::1` first
+    // while the origin listens on IPv4 only.
+    let mut upstream = None;
+    for addr in &pinned {
+        if let Ok(stream) = tokio::net::TcpStream::connect(addr).await {
+            upstream = Some(stream);
+            break;
         }
+    }
+    let Some(upstream) = upstream else {
+        logs.record(format!("CONNECT {host}:{port} -> 502 upstream"));
+        let _ = client
+            .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+            .await;
+        return;
     };
 
     match (port, leaf) {
-        (443, Some(leaf)) => {
+        (_, Some(leaf)) => {
             // MITM: terminate TLS from the client, TLS to the origin. The
             // 200 must precede the TLS handshakes (CONNECT semantics).
             let server_config = match server_config_for_leaf(&leaf) {
                 Ok(config) => config,
-                Err(_) => return,
+                Err(_) => {
+                    logs.record(format!("CONNECT {host}:{port} -> 502 leaf config"));
+                    let _ = client
+                        .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+                        .await;
+                    return;
+                }
             };
             let server_name = match ServerName::try_from(host.clone()) {
                 Ok(name) => name,
-                Err(_) => return,
+                Err(_) => {
+                    logs.record(format!("CONNECT {host}:{port} -> 502 server name"));
+                    let _ = client
+                        .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+                        .await;
+                    return;
+                }
             };
             logs.record(format!("CONNECT {host}:{port} -> 200 mitm"));
             if client
@@ -709,7 +752,7 @@ async fn handle_connection(
             };
             relay_http(client_tls, upstream_tls, &policy, &host, logs).await;
         }
-        (_, _) => {
+        (_, None) => {
             // Plain HTTP (80) or CIDR-allowlisted raw TCP: inject into the
             // HTTP head for port 80, otherwise tunnel bytes untouched.
             logs.record(format!("CONNECT {host}:{port} -> 200 tcp"));
@@ -824,6 +867,7 @@ mod tests {
         params.subject_alt_names = vec![
             rcgen::SanType::DnsName("bound.test".to_owned().try_into().unwrap()),
             rcgen::SanType::DnsName("unbound.test".to_owned().try_into().unwrap()),
+            rcgen::SanType::DnsName("localhost".to_owned().try_into().unwrap()),
         ];
         let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
         let cert = params.self_signed(&key).unwrap();
@@ -886,6 +930,7 @@ mod tests {
                 value: secret.to_owned(),
             }],
             cidr_allow: Vec::new(),
+            https_ports: vec![443],
         }
     }
 
@@ -899,6 +944,7 @@ mod tests {
             ("bound.test", origin),
             ("unbound.test", origin),
             ("evil.test", origin),
+            ("localhost", origin),
         ]
         .into_iter()
         .map(|(h, a)| (h.to_owned(), a))
@@ -913,6 +959,17 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    async fn read_head(stream: &mut tokio::net::TcpStream) -> String {
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+            stream.read_exact(&mut byte).await.unwrap();
+            head.extend_from_slice(&byte);
+            assert!(head.len() < MAX_HEAD_BYTES, "CONNECT response too large");
+        }
+        String::from_utf8_lossy(&head).into_owned()
     }
 
     async fn connect_status(
@@ -982,6 +1039,30 @@ mod tests {
         let _ =
             tokio::time::timeout(Duration::from_secs(10), tls_read.read_to_end(&mut body)).await;
         String::from_utf8_lossy(&body).into_owned()
+    }
+
+    #[tokio::test]
+    async fn localhost_with_a_configured_https_port_is_mitm() {
+        let (origin, upstream_roots, _) = spawn_origin().await;
+        let ca = Arc::new(CaMaterial::generate(&["localhost".to_owned()]).unwrap());
+        let mut policy = test_policy("secret");
+        policy.allow_out.push("localhost".to_owned());
+        policy.https_ports = vec![443, 8443];
+        let proxy = start_test_proxy(policy, Arc::clone(&ca), origin, upstream_roots).await;
+        let body = fetch_via_proxy(proxy.addr(), &ca, "localhost", 8443).await;
+        assert!(body.contains("HEADERS>>>"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn mitm_on_a_configured_https_port() {
+        let (origin, upstream_roots, _) = spawn_origin().await;
+        let ca = Arc::new(CaMaterial::generate(&["bound.test".to_owned()]).unwrap());
+        let mut policy = test_policy("secret");
+        policy.https_ports = vec![443, 8443];
+        let proxy = start_test_proxy(policy, Arc::clone(&ca), origin, upstream_roots).await;
+        let body = fetch_via_proxy(proxy.addr(), &ca, "bound.test", 8443).await;
+        assert!(body.contains("HEADERS>>>"), "{body}");
+        assert!(body.contains("Authorization: secret"), "{body}");
     }
 
     #[tokio::test]
@@ -1131,6 +1212,48 @@ mod tests {
         destroy_ca_key(&path);
         assert!(!path.exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn proxy_accepts_an_auth_retry_on_the_same_connection() {
+        use base64::Engine as _;
+
+        let (origin, upstream_roots, _) = spawn_origin().await;
+        let ca = Arc::new(CaMaterial::generate(&["bound.test".to_owned()]).unwrap());
+        let overrides: BTreeMap<String, SocketAddr> =
+            [("bound.test".to_owned(), origin)].into_iter().collect();
+        let proxy = start_proxy(
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            Arc::clone(&ca),
+            Arc::new(test_policy("secret")),
+            Some("sbx:test-token".to_owned()),
+            Some(overrides),
+            Some(upstream_roots),
+        )
+        .await
+        .unwrap();
+        let mut stream = tokio::net::TcpStream::connect(proxy.addr()).await.unwrap();
+        stream
+            .write_all(b"CONNECT bound.test:443 HTTP/1.1\r\nHost: bound.test:443\r\n\r\n")
+            .await
+            .unwrap();
+        let first = read_head(&mut stream).await;
+        assert!(first.contains("407"), "{first}");
+        let auth = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode("sbx:test-token")
+        );
+        stream
+            .write_all(
+                format!(
+                    "CONNECT bound.test:443 HTTP/1.1\r\nHost: bound.test:443\r\nProxy-Authorization: {auth}\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let second = read_head(&mut stream).await;
+        assert!(second.contains("200"), "{second}");
     }
 
     #[tokio::test]

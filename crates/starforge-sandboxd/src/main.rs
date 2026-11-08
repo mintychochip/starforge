@@ -48,6 +48,14 @@ struct Args {
     /// with the sandbox).
     #[arg(long, default_value = "/run/starforge/egress-ca")]
     egress_ca_dir: PathBuf,
+    /// PEM CA bundle the proxy trusts for upstream TLS (private HTTPS
+    /// origins); the system roots are used when absent.
+    #[arg(long)]
+    egress_upstream_ca: Option<PathBuf>,
+    /// HTTPS port the proxy may MITM for allowlisted hosts (repeatable;
+    /// default 443). Add a private HTTPS port when needed.
+    #[arg(long = "egress-https-port")]
+    egress_https_ports: Vec<u16>,
     /// Secret binding `HOST=HEADER=VALUE` for egress header injection
     /// (repeatable). Values are never logged; prefer operator secret
     /// management over plaintext CLI use.
@@ -209,6 +217,12 @@ async fn run() -> io::Result<()> {
         max_sandboxes: args.max_sandboxes,
         egress_listen: Some(args.egress_listen),
         egress_ca_dir: args.egress_ca_dir,
+        egress_upstream_ca: args.egress_upstream_ca,
+        egress_https_ports: if args.egress_https_ports.is_empty() {
+            vec![443]
+        } else {
+            args.egress_https_ports
+        },
         secret_bindings,
         ..DaemonConfig::default()
     };

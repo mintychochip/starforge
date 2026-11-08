@@ -35,10 +35,19 @@ pub const MAX_WELL_KNOWN_BYTES: usize = 64 * 1024;
 /// followed, so a server cannot bounce a probe or a token-bearing request
 /// to another origin.
 pub fn forge_client(timeout: Duration) -> Result<reqwest::Client, reqwest::Error> {
-    reqwest::Client::builder()
+    let mut builder = reqwest::Client::builder()
         .timeout(timeout)
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
+        .redirect(reqwest::redirect::Policy::none());
+    // The sandbox installs its per-sandbox CA and points SSL_CERT_FILE at
+    // it; reqwest's rustls build uses webpki roots, so add the file
+    // explicitly. A malformed or multi-cert file is ignored.
+    if let Ok(path) = std::env::var("SSL_CERT_FILE")
+        && let Ok(pem) = std::fs::read(path)
+        && let Ok(cert) = reqwest::Certificate::from_pem(&pem)
+    {
+        builder = builder.add_root_certificate(cert);
+    }
+    builder.build()
 }
 
 /// Whether `host` is a loopback host: `localhost`, `127.0.0.0/8`, or `::1`.

@@ -281,6 +281,105 @@ mod tests {
         }
     }
 
+    /// An existing 0039 database upgrades to 0040 with the documented
+    /// defaults, not only a fresh database.
+    #[tokio::test]
+    async fn migration_0040_upgrades_existing_rows() {
+        let (url, _dir) = match std::env::var("STARFORGE_TEST_PG_URL") {
+            Ok(_) => (crate::testing::create_empty_pg_database().await, None),
+            Err(_) => {
+                let dir = tempfile::tempdir().unwrap();
+                (
+                    format!(
+                        "sqlite://{}?mode=rwc",
+                        dir.path().join("upgrade.db").display()
+                    ),
+                    Some(dir),
+                )
+            }
+        };
+        let postgres = url.starts_with("postgres");
+        let db = Db::connect(&url).await.unwrap();
+
+        // Apply 0001..0039 only, then write rows in the old shape.
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("migrations")
+            .join(if postgres { "postgres" } else { "sqlite" });
+        let partial_dir = tempfile::tempdir().unwrap();
+        for entry in std::fs::read_dir(&source).unwrap() {
+            let path = entry.unwrap().path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let Some(version) = name.get(..4).and_then(|v| v.parse::<u32>().ok()) else {
+                continue;
+            };
+            if version <= 39 {
+                std::fs::copy(&path, partial_dir.path().join(name)).unwrap();
+            }
+        }
+        let partial = sqlx::migrate::Migrator::new(partial_dir.path())
+            .await
+            .unwrap();
+        partial.run(db.pool()).await.unwrap();
+
+        sqlx::query("INSERT INTO owners (kind, handle, created_at) VALUES ('user', 'alice', 0)")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let owner_id: i64 = sqlx::query_scalar("SELECT id FROM owners WHERE handle = 'alice'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO repos (owner_id, name, lower_name, description, visibility, \
+             default_branch, created_at, updated_at) \
+             VALUES ($1, 'proj', 'proj', '', 'private', 'main', 0, 0)",
+        )
+        .bind(owner_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let repo_id: i64 = sqlx::query_scalar("SELECT id FROM repos WHERE lower_name = 'proj'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO ci_secrets (repo_id, name, sealed_value, redact_in_sessions, \
+             created_by, created_at, updated_at) \
+             VALUES ($1, 'TOKEN', 'c1:old', 1, NULL, 0, 0)",
+        )
+        .bind(repo_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        // The full migrator applies 0040 on top.
+        let full = if postgres {
+            &super::POSTGRES_MIGRATIONS
+        } else {
+            &super::SQLITE_MIGRATIONS
+        };
+        full.run(db.pool()).await.unwrap();
+
+        let (allow, env): (i64, i64) = sqlx::query_as(
+            "SELECT ci_allow_secrets_on_refs_for, ci_env_secrets FROM repos WHERE id = $1",
+        )
+        .bind(repo_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!((allow, env), (0, 0), "repo policy defaults off");
+        let (host, header): (String, String) =
+            sqlx::query_as("SELECT host, header FROM ci_secrets WHERE repo_id = $1")
+                .bind(repo_id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(host, "", "existing secret has no proxy binding");
+        assert_eq!(header, "Authorization", "default header");
+    }
+
     #[tokio::test]
     async fn foreign_keys_are_enforced() {
         let t = TestDb::new().await;

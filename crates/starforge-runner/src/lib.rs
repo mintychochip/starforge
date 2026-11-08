@@ -36,6 +36,10 @@ pub const HEARTBEAT_SECS: u64 = 30;
 pub struct RunnerConfig {
     /// Server base URL, e.g. `https://forge.example.com` (no trailing slash).
     pub server_url: String,
+    /// Server URL the sandbox uses for `starforge.server` and the network
+    /// allowlist. Defaults to `server_url`; set it when the runner reaches
+    /// the server internally but the sandbox reaches a public HTTPS URL.
+    pub sandbox_server_url: String,
     /// Runner auth token (`sfr_…`). Never logged.
     pub token: String,
     /// Runner labels offered on claim.
@@ -53,8 +57,10 @@ pub struct RunnerConfig {
 
 impl RunnerConfig {
     pub fn new(server_url: &str, token: impl Into<String>) -> Self {
+        let server_url = server_url.trim_end_matches('/').to_owned();
         Self {
-            server_url: server_url.trim_end_matches('/').to_owned(),
+            sandbox_server_url: server_url.clone(),
+            server_url,
             token: token.into(),
             labels: Vec::new(),
             runtime: "podman".to_owned(),
@@ -67,8 +73,9 @@ impl RunnerConfig {
     /// Human-readable plan used by `--dry-run`. Contains no secrets.
     pub fn plan_text(&self) -> String {
         format!(
-            "runner plan (dry run)\nserver: {}\nlabels: {}\nruntime: {}\nconcurrency: {}\npoll timeout: {}s\nsteps: claim -> git-credential -> create sandbox -> clone/checkout -> run commands -> trace logs -> starforge sync -> upload artifacts -> finish",
+            "runner plan (dry run)\nserver: {}\nsandbox server: {}\nlabels: {}\nruntime: {}\nconcurrency: {}\npoll timeout: {}s\nsteps: claim -> git-credential -> create sandbox -> clone/checkout -> run commands -> trace logs -> starforge sync -> upload artifacts -> finish",
             self.server_url,
+            self.sandbox_server_url,
             if self.labels.is_empty() {
                 "(none)".to_owned()
             } else {
@@ -87,6 +94,9 @@ pub struct RunnerArgs {
     /// Starforge server URL.
     #[arg(long, env = "STARFORGE_SERVER")]
     pub server: String,
+    /// Server URL the sandbox uses (defaults to `--server`).
+    #[arg(long, env = "STARFORGE_SANDBOX_SERVER", default_value = "")]
+    pub sandbox_server: String,
     /// Runner auth token (`sfr_…`).
     #[arg(long, env = "STARFORGE_RUNNER_TOKEN")]
     pub token: String,
@@ -109,8 +119,15 @@ pub struct RunnerArgs {
 
 impl From<&RunnerArgs> for RunnerConfig {
     fn from(a: &RunnerArgs) -> Self {
+        let server_url = a.server.trim_end_matches('/').to_owned();
+        let sandbox_server_url = if a.sandbox_server.is_empty() {
+            server_url.clone()
+        } else {
+            a.sandbox_server.trim_end_matches('/').to_owned()
+        };
         Self {
-            server_url: a.server.trim_end_matches('/').to_owned(),
+            server_url,
+            sandbox_server_url,
             token: a.token.clone(),
             labels: a.label.clone(),
             runtime: a.runtime.clone(),
@@ -773,6 +790,19 @@ fn repo_full_name(repo_url: &str) -> Option<String> {
     Some(format!("{owner}/{repo}"))
 }
 
+/// Put the short-lived git credential in the clone URL as the Basic
+/// password (`x-access-token:<token>`), the form the git HTTP handler
+/// reads. Supports both HTTP and HTTPS clone URLs.
+fn authenticated_repo_url(repo_url: &str, token: &str) -> String {
+    if let Some(rest) = repo_url.strip_prefix("https://") {
+        format!("https://x-access-token:{token}@{rest}")
+    } else if let Some(rest) = repo_url.strip_prefix("http://") {
+        format!("http://x-access-token:{token}@{rest}")
+    } else {
+        repo_url.to_owned()
+    }
+}
+
 /// Single-quote a shell argument.
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
@@ -856,7 +886,11 @@ impl<P: SandboxProvider> Executor<P> {
             mem_mb: 0,
             disk_gb: 0,
             envs,
-            network: network_policy(&self.config.server_url, &self.config.repo_url, resolved),
+            network: network_policy(
+                &self.config.sandbox_server_url,
+                &self.config.repo_url,
+                resolved,
+            ),
             metadata: BTreeMap::from([
                 ("job_id".to_owned(), job.job_id.to_string()),
                 ("commit_sha".to_owned(), job.commit_sha.clone()),
@@ -1004,13 +1038,13 @@ impl<P: SandboxProvider> Executor<P> {
 
         // 3. Clone / checkout.
         if !self.config.repo_url.is_empty() {
-            let url = self.config.repo_url.replace(
-                "https://",
-                &format!("https://{}@x-access-token:", git_token),
-            );
+            let url = authenticated_repo_url(&self.config.repo_url, &git_token);
+            // `/workspace` already holds the per-sandbox CA directory, so
+            // `git clone` (which needs an empty destination) cannot be used.
+            // Initialize in place and fetch the job's commit instead.
             let cmd = format!(
-                "git clone --depth 1 {url} /workspace && cd /workspace && git fetch --depth 1 origin {} && git checkout {}",
-                job.commit_sha, job.commit_sha
+                "cd /workspace && git init -q && (git remote remove origin 2>/dev/null || true) && git remote add origin {url} && git fetch --depth 1 origin {} && git checkout -q FETCH_HEAD",
+                job.commit_sha
             );
             match self
                 .run_cmd(job, &sandbox_id, &cmd, &mut offset, &secrets)
@@ -1032,7 +1066,7 @@ impl<P: SandboxProvider> Executor<P> {
         // worktree may be pre-populated (no clone), so this is best effort.
         let mut config_cmd = format!(
             "git config starforge.server {}",
-            shell_quote(&self.config.server_url)
+            shell_quote(&self.config.sandbox_server_url)
         );
         if let Some(repo) = repo_full_name(&self.config.repo_url) {
             config_cmd.push_str(&format!(
@@ -1172,7 +1206,9 @@ impl<P: SandboxProvider> Executor<P> {
     ) -> Result<i64, JobOutcome> {
         let req = ExecRequest {
             command: vec!["sh".to_owned(), "-c".to_owned(), cmd.to_owned()],
-            cwd: Some("/workspace".to_owned()),
+            // The container's workdir is already `/workspace`; the daemon
+            // validates `cwd` as a relative path and rejects absolute ones.
+            cwd: None,
             envs: BTreeMap::new(),
             timeout_s: job
                 .spec
@@ -1270,7 +1306,8 @@ impl<P: SandboxProvider> Executor<P> {
             }
             match self.client.request_job(&self.config.labels).await? {
                 Some(job) => {
-                    let _ = self.execute_job(job).await;
+                    let outcome = self.execute_job(job).await;
+                    tracing::info!(?outcome, "runner job finished");
                     done += 1;
                 }
                 None => break,
@@ -1515,6 +1552,22 @@ mod tests {
         assert!(req.network.deny_out.is_empty());
         assert!(req.secret_bindings.is_empty());
         assert!(!req.network_enabled);
+    }
+
+    #[test]
+    fn authenticated_repo_url_puts_the_token_in_the_password() {
+        assert_eq!(
+            authenticated_repo_url("https://git.example.com/o/r", "sfp_t"),
+            "https://x-access-token:sfp_t@git.example.com/o/r"
+        );
+        assert_eq!(
+            authenticated_repo_url("http://127.0.0.1:3000/o/r", "sfp_t"),
+            "http://x-access-token:sfp_t@127.0.0.1:3000/o/r"
+        );
+        assert_eq!(
+            authenticated_repo_url("ssh://git@host/o/r", "sfp_t"),
+            "ssh://git@host/o/r"
+        );
     }
 
     #[test]

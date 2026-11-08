@@ -277,6 +277,19 @@ pub async fn insert_session(db: &Db, s: &NewSession<'_>) -> DbResult<i64> {
     Ok(id)
 }
 
+/// The ULIDs of sessions uploaded under one CI job
+/// (`sessions.ci_job_id`), oldest first. Used to link the job's sessions
+/// even when the runner did not report them.
+pub async fn ulids_for_ci_job(db: &Db, job_id: i64) -> DbResult<Vec<String>> {
+    let rows: Vec<String> = sqlx::query_scalar(
+        "SELECT ulid FROM sessions WHERE ci_job_id = $1 ORDER BY created_at ASC",
+    )
+    .bind(job_id)
+    .fetch_all(db.read_pool())
+    .await?;
+    Ok(rows)
+}
+
 pub async fn session_by_ulid(db: &Db, repo_id: i64, ulid: &str) -> DbResult<Option<SessionRow>> {
     let row = sqlx::query(select_session!("WHERE repo_id = $1 AND ulid = $2"))
         .bind(repo_id)

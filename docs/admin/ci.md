@@ -141,8 +141,12 @@ When egress is provisioned, the daemon starts the container with
 The proxy listens on host loopback and the container reaches it at
 `10.0.2.2:<port>`; the sandbox gets `HTTP_PROXY`/`HTTPS_PROXY` with
 that address. The proxy forwards HTTPS `CONNECT` to allowlisted hosts
-on ports 80 and 443. A plain `http://` request or another port is not
-forwarded, so a local job needs an `https://` server and repo URL.
+on ports 80 and 443; `--egress-https-port` adds a private HTTPS port.
+A plain `http://` request or another port is not forwarded, so a local
+job needs an `https://` server and repo URL. The daemon sets
+`SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`, and `GIT_SSL_CAINFO` to the
+per-sandbox CA, and `--egress-upstream-ca` trusts a private upstream
+CA.
 Pasta maps host loopback to `10.0.2.2`, so a sandbox can also reach
 host loopback ports directly; the proxy is not the only reachable
 host service. Do not expose untrusted services on host loopback. Each

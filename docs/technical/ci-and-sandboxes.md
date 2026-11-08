@@ -80,6 +80,8 @@ A runner harvests files that match the job artifact globs. A file name stays rel
 
 `upload_ci_artifact` checks the bytes against the bound SHA-256. The token is one-time use. A replay answers `Conflict`. Each artifact caps at 1 GiB. Each artifact expires after 30 days. The hourly cleanup deletes expired artifact rows and zero-ref blobs.
 
+The runner initializes the checkout in place with `git init` and `fetch` because `/workspace` already holds the per-sandbox CA directory.
+
 The runner fetches one short-lived git credential per job. `git_credential_for_runner` mints one `sfp_` token. The token scope holds `repo:read` and `repo:write`. The token expires at the earlier of the deadline and now plus 1 hour. The server revokes the token at finish or cancel.
 
 ### Session capture inside jobs
@@ -88,7 +90,7 @@ A job runs agent commands in the sandbox. The runner puts the per-job token in `
 
 The runner runs `starforge sync` in the sandbox. The sync uses the per-job token from the environment. The sync uses the `starforge.server` and `starforge.repo` git settings. No interactive sign in occurs. No long-lived token enters the sandbox.
 
-`finish_ci_job` links each uploaded session to the job. The run page lists those sessions.
+`finish_ci_job` links each uploaded session to the job. It also links every session whose `ci_job_id` matches the job, so a missed sync-output ULID does not hide a session. The run page lists those sessions.
 
 `redact_ci_secrets` replaces secret values with `[redacted]`. It covers base64 forms, URL forms, hex forms, and JSON escaped forms. `redact_ci_secrets_with_history` covers values split across a segment seam. No stored segment, page, preview, or index entry keeps the value.
 
@@ -124,9 +126,13 @@ The proxy refuses a non-allowlisted host. The CA keys carry mode `0600`. The dae
 
 When the daemon provisions egress, it starts the container with `--network pasta:--map-host-loopback=10.0.2.2`. The daemon uses `slirp4netns:allow_host_loopback=true` when pasta is unavailable.
 
-The proxy listens on host loopback. The container reaches the proxy at `10.0.2.2:<port>`. The daemon sets `HTTP_PROXY` and `HTTPS_PROXY` to that address. The proxy forwards HTTPS `CONNECT` to allowlisted hosts on ports 80 and 443. The proxy refuses a plain `http://` request and any other port, so a local job needs an `https://` server and repository URL.
+The proxy listens on host loopback. The container reaches the proxy at `10.0.2.2:<port>`. The daemon sets `HTTP_PROXY` and `HTTPS_PROXY` to that address. The proxy forwards HTTPS `CONNECT` to allowlisted hosts on ports 80 and 443. The daemon can add a private HTTPS port with `--egress-https-port`.
 
-Pasta maps host loopback to `10.0.2.2`, so a sandbox can also reach host loopback ports directly. The proxy is not the only reachable host service. The proxy requires a per-sandbox Basic credential from the proxy URL, so a sibling sandbox cannot borrow it. Do not expose untrusted services on host loopback. Secret values never enter the sandbox. With egress disabled, the container stays with `--network none`.
+The proxy refuses a plain `http://` request and any other port. A local job needs an `https://` server and repository URL. A client that sends an unauthenticated `CONNECT` gets a 407. The client can retry with `Proxy-Authorization` on the same connection. The proxy keeps the socket open for that retry.
+
+Pasta maps host loopback to `10.0.2.2`, so a sandbox can also reach host loopback ports directly. The proxy is not the only reachable host service. The proxy requires a per-sandbox Basic credential from the proxy URL, so a sibling sandbox cannot borrow it. Do not expose untrusted services on host loopback.
+
+The daemon sets `SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`, and `GIT_SSL_CAINFO` to the per-sandbox CA. The daemon trusts a private upstream CA with `--egress-upstream-ca`. Secret values never enter the sandbox. With egress disabled, the container stays with `--network none`.
 
 Sandbox limits answer 429 for a limit breach. `max_concurrent_per_user` caps concurrent sandboxes per user. `max_concurrent_per_repo` caps concurrent sandboxes per repository. `sandbox_seconds_per_hour` caps seconds per user per hour. `default_ttl_secs` records the default lifetime at 3600 seconds. A request can set its own `timeout_s`.
 

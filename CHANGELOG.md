@@ -79,6 +79,13 @@ search, webhooks, and mirrors, on SQLite or Postgres.
   plain HTTP and non-443 ports are not proxied, and pasta exposes host
   loopback directly. The proxy requires a per-sandbox credential. The
   hourly cleanup deletes expired artifacts and collects zero-ref blobs.
+- **CI end-to-end:** `scripts/ci-e2e.sh` runs a real server, runner,
+  sandboxd, and rootless podman through a fixture job. It proves the
+  HTTPS clone and sync through the per-sandbox proxy, the artifact, and
+  the linked session. The proxy keeps the socket open for a client's
+  authenticated CONNECT retry; the daemon sets `GIT_SSL_CAINFO`; the
+  runner initializes the checkout in place because `/workspace` holds the
+  CA directory; a job finish links every session bound by `ci_job_id`.
 - **CLI:** `starforge` — `auth login` (device flow, scopes `repo:read
   trail:write session:upload`), `auth ssh-key add` (one-time `repo:write`
   device flow; both tokens are revoked and never stored), `enable`/`disable`

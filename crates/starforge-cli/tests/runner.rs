@@ -332,6 +332,7 @@ async fn runner_dry_run_prints_plan_without_network() {
     // No server is started: dry-run must not touch the network.
     let args = starforge_runner::RunnerArgs {
         server: "http://127.0.0.1:1".to_owned(),
+        sandbox_server: String::new(),
         token: RUNNER_TOKEN.to_owned(),
         label: vec![],
         runtime: "podman".to_owned(),

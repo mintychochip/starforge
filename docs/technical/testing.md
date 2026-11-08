@@ -17,6 +17,8 @@ crates/starforged/tests/web_ci.rs
 scripts/browser-tests.sh
 scripts/docs-smoke.sh
 scripts/build-release.sh
+scripts/ci-e2e.sh
+scripts/https_proxy.py
 tests/browser/playwright.config.ts
 -->
 
@@ -51,6 +53,8 @@ Integration tests exercise the full server in process. The server crate holds ab
 M6 adds `api_ci_jobs.rs`, `api_ci_runners.rs`, `api_ci_runs.rs`, `api_ci_usage.rs`, and `api_sandboxes.rs`. M6 also adds `ci_e2e.rs`, `ci_security.rs`, and `web_ci.rs` for CI and sandbox behavior. Unit tests in `crates/starforged-core/src/ci.rs` and `crates/starforged-core/src/ci_spec.rs` cover job specs and usage metering.
 
 Binary end-to-end tests spawn real binaries. The server test file is `crates/starforged/tests/e2e_binary.rs`. The CLI test file is `crates/starforge-cli/tests/e2e_binary.rs`. They prove the process boundary, not just the library boundary.
+
+The real CI end-to-end test is `scripts/ci-e2e.sh`. It starts a server, the runner, `starforge-sandboxd`, and rootless podman. It runs a fixture `.starforge/ci.toml`, clones and syncs through the per-sandbox egress proxy over HTTPS, and checks the artifact and the linked session. `scripts/https_proxy.py` is the local HTTPS origin it uses. The script runs only when `STARFORGE_TEST_SANDBOX` equals `1`.
 
 Golden adapter tests prove per-agent parsing. Each adapter has one test file in `crates/starforge-capture/tests/`. The adapters are `claude`, `codex`, `gemini`, `opencode`, and `pi`. The `fixtures/` directory holds one directory per agent and version. Each fixture holds `transcript.*`, `expected.jsonl`, and `meta.json`.
 

@@ -62,6 +62,12 @@ pub struct DaemonConfig {
     pub egress_listen: Option<std::net::SocketAddr>,
     /// Directory holding per-sandbox CA certs/keys (keys are `0600`).
     pub egress_ca_dir: std::path::PathBuf,
+    /// Optional PEM CA bundle the proxy trusts for upstream TLS. Use it
+    /// for a private HTTPS origin; the system roots are used otherwise.
+    pub egress_upstream_ca: Option<std::path::PathBuf>,
+    /// Ports the proxy treats as HTTPS and MITMs for allowlisted hosts.
+    /// `443` is the default; add a private HTTPS port when needed.
+    pub egress_https_ports: Vec<u16>,
     /// Operator-configured secret bindings for header injection. Values
     /// never enter the sandbox env/filesystem and are never logged.
     pub secret_bindings: Vec<proxy::SecretBinding>,
@@ -76,6 +82,8 @@ impl Default for DaemonConfig {
             exec_timeout_s: 300,
             egress_listen: None,
             egress_ca_dir: std::path::PathBuf::from("/run/starforge/egress-ca"),
+            egress_upstream_ca: None,
+            egress_https_ports: vec![443],
             secret_bindings: Vec::new(),
         }
     }
@@ -281,12 +289,14 @@ pub fn egress_policy(
     network: &starforge_sandbox_protocol::NetworkPolicy,
     daemon_bindings: &[proxy::SecretBinding],
     request_bindings: &[starforge_sandbox_protocol::SecretBindingWire],
+    https_ports: &[u16],
 ) -> proxy::EgressPolicy {
     let mut policy = proxy::EgressPolicy {
         allow_out: network.allow_out.clone(),
         deny_out: network.deny_out.clone(),
         bindings: Vec::new(),
         cidr_allow: Vec::new(),
+        https_ports: https_ports.to_vec(),
     };
     // Request bindings (server-resolved secrets): honor only when
     // `secret_headers` names the exact header for the host and the host is
@@ -319,6 +329,41 @@ pub fn egress_policy(
     policy
 }
 
+/// Load one or more PEM certificates into a rustls root store for the
+/// proxy's upstream TLS. Returns an error when the file has no certificate.
+fn load_upstream_ca(path: &std::path::Path) -> Result<rustls::RootCertStore, ProviderError> {
+    use base64::Engine as _;
+
+    let text = std::fs::read_to_string(path).map_err(|e| {
+        ProviderError::new(
+            "internal",
+            format!("reading egress upstream CA {}: {e}", path.display()),
+        )
+    })?;
+    let mut roots = rustls::RootCertStore::empty();
+    let mut added = 0;
+    for block in text.split("-----BEGIN CERTIFICATE-----").skip(1) {
+        let Some((body, _)) = block.split_once("-----END CERTIFICATE-----") else {
+            continue;
+        };
+        let body: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+        let der = base64::engine::general_purpose::STANDARD
+            .decode(body)
+            .map_err(|e| ProviderError::new("internal", format!("decoding upstream CA: {e}")))?;
+        roots
+            .add(rustls::pki_types::CertificateDer::from(der))
+            .map_err(|e| ProviderError::new("internal", format!("adding upstream CA: {e}")))?;
+        added += 1;
+    }
+    if added == 0 {
+        return Err(ProviderError::new(
+            "internal",
+            format!("egress upstream CA {} has no certificate", path.display()),
+        ));
+    }
+    Ok(roots)
+}
+
 /// Start egress for a sandbox (CA + proxy). No container contact: must run
 /// BEFORE `runtime.create` so the proxy env can be injected at create time.
 pub async fn start_egress(
@@ -346,13 +391,17 @@ pub async fn start_egress(
         random_hex(16)
             .map_err(|e| ProviderError::new("internal", format!("proxy credential: {e}")))?
     );
+    let upstream_roots = match &state.config.egress_upstream_ca {
+        Some(path) => Some(load_upstream_ca(path)?),
+        None => None,
+    };
     let proxy_inst = proxy::start_proxy(
         listen,
         Arc::new(ca),
         Arc::new(policy.clone()),
         Some(credential.clone()),
         None,
-        None,
+        upstream_roots,
     )
     .await
     .map_err(|e| ProviderError::new("internal", format!("egress proxy: {e}")))?;
@@ -453,6 +502,10 @@ pub fn proxy_env(state: &DaemonState, id: &str) -> Vec<(String, String)> {
                     "NODE_EXTRA_CA_CERTS".to_owned(),
                     format!("/workspace/{PROXY_CA_PATH}"),
                 ),
+                (
+                    "GIT_SSL_CAINFO".to_owned(),
+                    format!("/workspace/{PROXY_CA_PATH}"),
+                ),
             ]
         }
         _ => Vec::new(),
@@ -542,6 +595,7 @@ async fn create_sandbox(
         &req.network,
         &state.config.secret_bindings,
         &req.secret_bindings,
+        &state.config.egress_https_ports,
     );
     if let Err(err) = start_egress(&state, &id, &policy).await {
         return Err(ApiError(err));
@@ -1310,6 +1364,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
     #[test]
+    fn upstream_ca_pem_loads() {
+        let dir =
+            std::env::temp_dir().join(format!("starforge-upstream-ca-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ca = proxy::CaMaterial::generate(&["localhost".to_owned()]).unwrap();
+        let path = dir.join("upstream.pem");
+        std::fs::write(&path, &ca.cert_pem).unwrap();
+        load_upstream_ca(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn request_secret_bindings_honored_only_when_bound_and_allowlisted() {
         use std::collections::BTreeMap;
 
@@ -1325,13 +1391,18 @@ mod tests {
             value: "wire-secret-123".to_owned(),
         };
         // Bound + allowlisted: honored.
-        let policy = egress_policy(&network, &[], &[wire("bound.test", "Authorization")]);
+        let policy = egress_policy(
+            &network,
+            &[],
+            &[wire("bound.test", "Authorization")],
+            &[443],
+        );
         assert_eq!(policy.bindings.len(), 1);
         assert_eq!(policy.bindings[0].host, "bound.test");
         assert_eq!(policy.bindings[0].header, "Authorization");
         assert_eq!(policy.bindings[0].value, "wire-secret-123");
         // Header disagrees with secret_headers: ignored.
-        let policy = egress_policy(&network, &[], &[wire("bound.test", "X-Other")]);
+        let policy = egress_policy(&network, &[], &[wire("bound.test", "X-Other")], &[443]);
         assert!(policy.bindings.is_empty());
         // Host not allowlisted (secret_headers names it, allow_out doesn't):
         // ignored.
@@ -1339,7 +1410,12 @@ mod tests {
         expanded
             .secret_headers
             .insert("other.test".to_owned(), "Authorization".to_owned());
-        let policy = egress_policy(&expanded, &[], &[wire("other.test", "Authorization")]);
+        let policy = egress_policy(
+            &expanded,
+            &[],
+            &[wire("other.test", "Authorization")],
+            &[443],
+        );
         assert!(policy.bindings.is_empty());
     }
 

@@ -1191,6 +1191,11 @@ impl Core {
                 db_ci::set_session_ci_job(self.db(), session.id, job.id).await?;
             }
         }
+        // The session upload already binds `sessions.ci_job_id`; link every
+        // such session even if the runner's sync-output ULID parse missed it.
+        for ulid in db_sessions::ulids_for_ci_job(self.db(), job.id).await? {
+            db_ci::insert_job_session(self.db(), job.id, &ulid, now()).await?;
+        }
         if !db_ci::finish_ci_job(
             self.db(),
             job.id,

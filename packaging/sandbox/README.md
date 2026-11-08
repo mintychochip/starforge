@@ -47,7 +47,7 @@ tools that consume it.
 | `starforge.repo` | `git config` in the checkout | `owner/repo` the uploads are scoped to |
 | Writable spool | `<git-common-dir>/starforge/sessions/` | Where `starforge sync` spools and records uploads before the sandbox is destroyed |
 | Proxy env | `HTTPS_PROXY` / `https_proxy` / `HTTP_PROXY` / `http_proxy` | Points outbound traffic at the per-sandbox egress proxy (default-deny except allowlisted hosts) |
-| CA trust | `SSL_CERT_FILE` and `NODE_EXTRA_CA_CERTS` → `/workspace/.starforge-proxy/ca.pem`, plus the system bundle | The per-sandbox CA, installed by sandboxd into the trust store so TLS verifies inside the sandbox. CA keys live on the daemon host (`0600`) and are destroyed with the sandbox |
+| CA trust | `SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`, and `GIT_SSL_CAINFO` → `/workspace/.starforge-proxy/ca.pem`, plus the system bundle | The per-sandbox CA, installed by sandboxd into the trust store so TLS verifies inside the sandbox. CA keys live on the daemon host (`0600`) and are destroyed with the sandbox |
 
 `starforge sync` in the sandbox needs no interactive login: the token
 comes from the environment, the server and repo from git config, and
