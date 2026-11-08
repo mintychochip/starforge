@@ -31,6 +31,9 @@ const MAX_SECRET_NAME_LEN: usize = 128;
 const MAX_ARTIFACTS: usize = 32;
 const MAX_ARTIFACT_LEN: usize = 256;
 const MAX_RUNS_ON: usize = 16;
+const MAX_MATRIX_KEYS: usize = 8;
+const MAX_MATRIX_VALUES: usize = 16;
+const MAX_MATRIX_JOBS: usize = 64;
 const MAX_LABEL_LEN: usize = 64;
 const MAX_TRIGGERS: usize = 100;
 const MAX_PATTERN_LEN: usize = 256;
@@ -79,6 +82,12 @@ pub struct CiJobSpec {
     /// Runner labels that may claim this job.
     #[serde(default)]
     pub runs_on: Vec<String>,
+    /// Matrix variables: each key expands the job into one job per value
+    /// combination. Matrix values are added to `env` and override a
+    /// same-named `env` entry. The expanded name is
+    /// `<name>-<index>-<key>-<value>...` (sanitized, unique).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub matrix: BTreeMap<String, Vec<String>>,
 }
 
 impl CiJobSpec {
@@ -89,6 +98,65 @@ impl CiJobSpec {
             .as_deref()
             .and_then(|text| parse_timeout(text).ok())
     }
+
+    /// Expand this job into one job per matrix combination. A job without a
+    /// matrix expands to itself.
+    pub fn expanded(&self) -> Vec<CiJobSpec> {
+        if self.matrix.is_empty() {
+            return vec![self.clone()];
+        }
+        let mut combos: Vec<Vec<(String, String)>> = vec![Vec::new()];
+        for (key, values) in &self.matrix {
+            let mut next = Vec::new();
+            for combo in &combos {
+                for value in values {
+                    let mut c = combo.clone();
+                    c.push((key.clone(), value.clone()));
+                    next.push(c);
+                }
+            }
+            combos = next;
+        }
+        combos
+            .into_iter()
+            .enumerate()
+            .map(|(index, combo)| {
+                let mut job = self.clone();
+                job.matrix.clear();
+                job.name = expanded_name(&self.name, index, &combo);
+                for (key, value) in combo {
+                    job.env.insert(key, value);
+                }
+                job
+            })
+            .collect()
+    }
+}
+
+/// A unique, `[A-Za-z0-9_-]`-only expanded job name. The index keeps two
+/// sanitized combinations from colliding.
+fn expanded_name(base: &str, index: usize, combo: &[(String, String)]) -> String {
+    let mut suffix = format!("-{index}");
+    for (key, value) in combo {
+        suffix.push('-');
+        suffix.push_str(&sanitize_name_part(key));
+        suffix.push('-');
+        suffix.push_str(&sanitize_name_part(value));
+    }
+    let mut name = format!("{base}{suffix}");
+    if name.len() > MAX_JOB_NAME_LEN {
+        name.truncate(MAX_JOB_NAME_LEN);
+        while name.ends_with('-') {
+            name.pop();
+        }
+    }
+    name
+}
+
+fn sanitize_name_part(part: &str) -> String {
+    part.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
 }
 
 /// A parsed and validated `.starforge/ci.toml`.
@@ -148,8 +216,14 @@ impl CiSpec {
                 )));
             }
             validate_job(job)?;
+            validate_matrix(job)?;
         }
         Ok(())
+    }
+
+    /// Every job after matrix expansion. The trigger paths enqueue these.
+    pub fn expanded_jobs(&self) -> Vec<CiJobSpec> {
+        self.jobs.iter().flat_map(CiJobSpec::expanded).collect()
     }
 }
 
@@ -253,6 +327,71 @@ fn validate_job_name(name: &str) -> CoreResult<()> {
         return Err(invalid(format!(
             "ci.toml: job name `{name}` may only contain [A-Za-z0-9_-]"
         )));
+    }
+    Ok(())
+}
+
+fn validate_matrix(job: &CiJobSpec) -> CoreResult<()> {
+    if job.matrix.is_empty() {
+        return Ok(());
+    }
+    let bad = |message: String| invalid(format!("ci.toml: job `{}`: {message}", job.name));
+    if job.matrix.len() > MAX_MATRIX_KEYS {
+        return Err(bad(format!(
+            "{} matrix keys, over the {MAX_MATRIX_KEYS}-key limit",
+            job.matrix.len()
+        )));
+    }
+    let mut combos = 1usize;
+    for (key, values) in &job.matrix {
+        if key.is_empty() || key.len() > MAX_ENV_KEY_LEN {
+            return Err(bad(format!(
+                "matrix key `{key}` must be 1-{MAX_ENV_KEY_LEN} characters"
+            )));
+        }
+        let mut bytes = key.bytes();
+        let first_ok = bytes
+            .next()
+            .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_');
+        if !first_ok || !bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+            return Err(bad(format!(
+                "matrix key `{key}` must match [A-Za-z_][A-Za-z0-9_]*"
+            )));
+        }
+        if values.is_empty() {
+            return Err(bad(format!("matrix key `{key}` has no values")));
+        }
+        if values.len() > MAX_MATRIX_VALUES {
+            return Err(bad(format!(
+                "matrix key `{key}` has {} values, over the {MAX_MATRIX_VALUES}-value limit",
+                values.len()
+            )));
+        }
+        for value in values {
+            if value.is_empty() || value.len() > MAX_ENV_VALUE_LEN {
+                return Err(bad(format!(
+                    "matrix value for `{key}` must be 1-{MAX_ENV_VALUE_LEN} characters"
+                )));
+            }
+            if value.chars().any(char::is_control) {
+                return Err(bad(format!(
+                    "matrix value for `{key}` has a control character"
+                )));
+            }
+        }
+        combos = combos.saturating_mul(values.len());
+        if combos > MAX_MATRIX_JOBS {
+            return Err(bad(format!(
+                "matrix expands to more than {MAX_MATRIX_JOBS} jobs"
+            )));
+        }
+    }
+    let mut names = HashSet::new();
+    for expanded in job.expanded() {
+        validate_job_name(&expanded.name)?;
+        if !names.insert(expanded.name.clone()) {
+            return Err(bad("matrix expansion produced a duplicate name".to_owned()));
+        }
     }
     Ok(())
 }
@@ -764,8 +903,69 @@ commands = ["cargo clippy"]
                 secrets: Vec::new(),
                 artifacts: Vec::new(),
                 runs_on: Vec::new(),
+                matrix: BTreeMap::new(),
             }],
         };
         assert!(spec.validate().is_err());
+    }
+
+    #[test]
+    fn matrix_expands_to_one_job_per_combination() {
+        let spec = CiSpec::parse(
+            r#"
+version = 1
+[triggers]
+push = ["main"]
+[[job]]
+name = "test"
+image = "rust:1.85"
+commands = ["true"]
+[job.matrix]
+os = ["linux", "mac"]
+rust = ["1.85", "1.90"]
+"#,
+        )
+        .unwrap();
+        let expanded = spec.expanded_jobs();
+        assert_eq!(expanded.len(), 4);
+        let names: HashSet<_> = expanded.iter().map(|j| j.name.clone()).collect();
+        assert_eq!(names.len(), 4);
+        for job in &expanded {
+            assert!(job.name.starts_with("test-"));
+            assert!(
+                job.name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            );
+            assert!(!job.env.is_empty());
+            assert!(job.matrix.is_empty());
+        }
+        let os_values: HashSet<_> = expanded.iter().map(|j| j.env["os"].clone()).collect();
+        assert_eq!(
+            os_values,
+            HashSet::from(["linux".to_owned(), "mac".to_owned()])
+        );
+    }
+
+    #[test]
+    fn matrix_limits_are_enforced() {
+        let bad = |matrix: &str| {
+            let text = format!(
+                "version = 1\n[triggers]\npush = [\"main\"]\n[[job]]\nname = \"t\"\nimage = \"rust:1.85\"\ncommands = [\"true\"]\n[job.matrix]\n{matrix}\n"
+            );
+            err(&text)
+        };
+        assert!(bad("os = []").contains("has no values"));
+        let seventeen = (0..17)
+            .map(|i| format!("\"v{i}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert!(bad(&format!("os = [{seventeen}]")).contains("over the 16-value limit"));
+        let nine = (0..9)
+            .map(|i| format!("\"v{i}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert!(bad(&format!("a = [{nine}]\nb = [{nine}]")).contains("more than 64 jobs"));
+        assert!(bad("1bad = [\"x\"]").contains("matrix key"));
     }
 }

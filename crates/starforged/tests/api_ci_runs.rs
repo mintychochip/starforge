@@ -1434,3 +1434,66 @@ async fn job_sandbox_sends_secret_bindings_to_the_local_daemon() {
         "PAT create gets no secret env: {pat_create}"
     );
 }
+
+/// A matrix job expands into one job per combination on a push, each with
+/// its own expanded name and matrix environment.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn matrix_spec_enqueues_one_job_per_combination() {
+    let s = TestServer::start().await;
+    let alice = s.user("alice").await;
+    let repo = s.repo(&alice, "proj", Visibility::Private).await;
+    let pat = s.token(&alice, &[Scope::RepoWrite]).await;
+    let spec = r#"
+version = 1
+[triggers]
+push = ["main"]
+[[job]]
+name = "test"
+image = "example.test/image:1"
+commands = ["true"]
+[job.matrix]
+os = ["linux", "mac"]
+"#;
+    let tmp = tempfile::tempdir().unwrap();
+    let work = work_repo(
+        tmp.path(),
+        "work",
+        &[(".starforge/ci.toml", spec), ("README.md", "# proj\n")],
+    )
+    .await;
+    git_ok(
+        &work,
+        &[
+            "push",
+            "-q",
+            &s.git_url("alice", "proj", Some(&pat)),
+            "main",
+        ],
+    )
+    .await;
+    let start = Instant::now();
+    let jobs = loop {
+        let jobs = starforged_db::ci::list_ci_jobs_for_repo(s.db(), repo.id, 100)
+            .await
+            .unwrap();
+        if jobs.len() >= 2 {
+            break jobs;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "timed out waiting for the matrix jobs"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let names: Vec<&str> = jobs.iter().map(|job| job.job_name.as_str()).collect();
+    assert!(names.iter().any(|n| n.starts_with("test-0-")), "{names:?}");
+    assert!(names.iter().any(|n| n.starts_with("test-1-")), "{names:?}");
+    for job in &jobs {
+        let spec: serde_json::Value = serde_json::from_str(&job.spec).unwrap();
+        assert!(spec.get("matrix").is_none(), "{spec}");
+        assert!(
+            matches!(spec["env"]["os"].as_str(), Some("linux" | "mac")),
+            "{spec}"
+        );
+    }
+}

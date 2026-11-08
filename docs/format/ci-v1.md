@@ -45,6 +45,7 @@ runs_on = ["linux"]
 | `jobs[].secrets` | array of names | At most 32 names, 128 chars each. Secret **names**, never values; the trust rule is applied at resolution. The optional `host`/`header` binding is set on the secret, not in the spec. |
 | `jobs[].artifacts` | array of globs | At most 32; relative, non-empty, no `..`, 256 chars; each artifact at most 1 GiB, retained 30 days. |
 | `jobs[].runs_on` | array of labels | At most 16 labels, 64 chars each; empty means any runner for the repo. |
+| `jobs[].matrix` | table of arrays | At most 8 keys, 16 values per key, 64 expanded jobs; keys match `[A-Za-z_][A-Za-z0-9_]*`, values 1–4096 chars. Matrix values are added to the job `env` (a matrix value overrides a same-named `env` entry). The expanded name is `<name>-<index>-<key>-<value>...`, sanitized to `[A-Za-z0-9_-]` and at most 64 chars. |
 
 A malformed or invalid spec fails the run with a `ci/spec` check in state
 `error` and a description naming the first validation failure.

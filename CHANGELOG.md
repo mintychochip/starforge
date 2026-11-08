@@ -94,7 +94,8 @@ and opt-in CI runners with sandboxed jobs, on SQLite or Postgres.
 - **CI runners and sandboxes (M6):** opt-in `.starforge/ci.toml` jobs
   triggered by pushes, Trail changes, or manually; self-hosted runners
   with lease fences and per-job tokens; sandboxed execution through
-  `starforge-sandboxd` (`podman`/gVisor) or the real E2B v2 API;
+  `starforge-sandboxd` (`podman`/gVisor) or the real E2B v2 API; a
+  `matrix` table expands one job into one job per combination;
   artifacts with BLAKE3 CAS and 30-day retention; sealed repo secrets
   injected only by the egress proxy; per-job agent sessions linked to the
   run; the `ci` webhook event (`queued`/`started`/`finished`/

@@ -58,9 +58,32 @@ runs_on = ["linux"]
   relative paths only, no `..`; each artifact upload is capped at 1 GiB.
 - `runs_on` lists runner labels that may claim the job (empty means any
   runner for the repo).
+- `matrix` expands one job into one job per combination of its values
+  (see [Matrix](#matrix)).
 
 No host mounts, privileged containers, or arbitrary devices are
 expressible — a job only ever runs inside its sandbox.
+
+### Matrix
+
+A job can expand into several jobs with `[job.matrix]`:
+
+```toml
+[[job]]
+name = "test"
+image = "docker.io/library/rust:1.85"
+commands = ["cargo test"]
+[job.matrix]
+os = ["linux", "mac"]
+rust = ["1.85", "1.90"]
+```
+
+This enqueues four jobs. Each expanded job has `os` and `rust` in its
+environment and a name like `test-0-os-linux-rust-1-85`. The check
+context is `ci/<expanded-name>`. A gate can require one combination or
+the base job's combinations. A manual run with `--job test` enqueues
+every combination of `test`. The spec allows at most 8 keys, 16 values
+per key, and 64 expanded jobs.
 
 ## Triggers
 

@@ -1759,9 +1759,9 @@ impl Core {
             return Ok(Vec::new());
         }
         let mut ids = Vec::new();
-        for job in &spec.jobs {
+        for job in spec.expanded_jobs() {
             if let Some(id) = self
-                .enqueue_ci_job(repo_id, None, None, None, commit_sha, None, job, pusher)
+                .enqueue_ci_job(repo_id, None, None, None, commit_sha, None, &job, pusher)
                 .await?
             {
                 ids.push(id);
@@ -1812,7 +1812,7 @@ impl Core {
                 }
             }
             let created_by = change.creator_id.or(actor);
-            for job in &spec.jobs {
+            for job in spec.expanded_jobs() {
                 if let Some(id) = self
                     .enqueue_ci_job(
                         repo_id,
@@ -1821,7 +1821,7 @@ impl Core {
                         change.current_revision_id,
                         commit_sha,
                         None,
-                        job,
+                        &job,
                         created_by,
                     )
                     .await?
@@ -1864,20 +1864,25 @@ impl Core {
                 "no .starforge/ci.toml at the requested ref".into(),
             ));
         };
-        let jobs: Vec<&crate::ci_spec::CiJobSpec> = match job_name {
+        let expanded = spec.expanded_jobs();
+        let jobs: Vec<crate::ci_spec::CiJobSpec> = match job_name {
             Some(name) => {
-                let Some(job) = spec.jobs.iter().find(|job| job.name == name) else {
+                let selected: Vec<_> = expanded
+                    .into_iter()
+                    .filter(|job| job.name == name || job.name.starts_with(&format!("{name}-")))
+                    .collect();
+                if selected.is_empty() {
                     return Err(CoreError::Invalid(format!("unknown CI job `{name}`")));
-                };
-                vec![job]
+                }
+                selected
             }
-            None => spec.jobs.iter().collect(),
+            None => expanded,
         };
         if let Some(message) = self.ci_minutes_quota_exhausted(access.repo.id).await? {
             return Err(CoreError::Invalid(message));
         }
         let mut ids = Vec::new();
-        for job in jobs {
+        for job in &jobs {
             if let Some(id) = self
                 .enqueue_ci_job(
                     access.repo.id,
