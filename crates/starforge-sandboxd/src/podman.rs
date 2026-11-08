@@ -337,6 +337,61 @@ pub fn create_args(id: &str, req: &CreateSandboxRequest) -> Vec<String> {
     args
 }
 
+/// Build the `podman exec` argv. `podman exec` stops option parsing at the
+/// container name, so the command follows it directly (no `--`).
+fn exec_args(id: &str, req: &ExecRequest) -> Result<Vec<String>, ProviderError> {
+    if req.command.is_empty() {
+        return Err(err_invalid("command must not be empty"));
+    }
+    validate_env(&req.envs)?;
+    let mut args: Vec<String> = vec!["exec".into()];
+    if let Some(cwd) = &req.cwd {
+        let cwd = validate_relative_path(cwd)?;
+        args.push("--workdir".into());
+        args.push(workspace_path(&cwd));
+    }
+    for (key, value) in &req.envs {
+        args.push("--env".into());
+        args.push(format!("{key}={value}"));
+    }
+    args.push(id.into());
+    for part in &req.command {
+        if part.contains('\0') {
+            return Err(err_invalid("command argument contains NUL"));
+        }
+        args.push(part.clone());
+    }
+    Ok(args)
+}
+
+/// Build the `podman exec` argv that reads one file to stdout. `podman cp
+/// container:file -` emits a tar archive, not the file bytes, so use `cat`.
+fn read_args(id: &str, resolved: &str) -> Vec<String> {
+    vec![
+        "exec".into(),
+        id.into(),
+        "cat".into(),
+        "--".into(),
+        resolved.into(),
+    ]
+}
+
+/// Build the `podman exec -i` argv that streams stdin into one file.
+/// `podman cp -` only accepts a directory destination, so the bytes go
+/// through `sh -c 'cat > "$1"'` instead.
+fn write_args(id: &str, resolved: &str) -> Vec<String> {
+    vec![
+        "exec".into(),
+        "-i".into(),
+        id.into(),
+        "sh".into(),
+        "-c".into(),
+        "cat > \"$1\"".into(),
+        "sh".into(),
+        resolved.into(),
+    ]
+}
+
 impl Runtime for PodmanRuntime {
     fn create<'a>(&'a self, id: &'a str, req: &'a CreateSandboxRequest) -> Fute<'a, ()> {
         Box::pin(async move {
@@ -429,28 +484,7 @@ impl Runtime for PodmanRuntime {
 
     fn exec<'a>(&'a self, id: &'a str, req: &'a ExecRequest) -> Fute<'a, Vec<ExecChunk>> {
         Box::pin(async move {
-            if req.command.is_empty() {
-                return Err(err_invalid("command must not be empty"));
-            }
-            validate_env(&req.envs)?;
-            let mut args: Vec<String> = vec!["exec".into()];
-            if let Some(cwd) = &req.cwd {
-                let cwd = validate_relative_path(cwd)?;
-                args.push("--workdir".into());
-                args.push(workspace_path(&cwd));
-            }
-            for (key, value) in &req.envs {
-                args.push("--env".into());
-                args.push(format!("{key}={value}"));
-            }
-            args.push(id.into());
-            args.push("--".into());
-            for part in &req.command {
-                if part.contains('\0') {
-                    return Err(err_invalid("command argument contains NUL"));
-                }
-                args.push(part.clone());
-            }
+            let args = exec_args(id, req)?;
             let refs: Vec<&str> = args.iter().map(String::as_str).collect();
             let (code, stdout, stderr) = self.run(&refs, None).await?;
             if stdout.len() > MAX_EXEC_BYTES || stderr.len() > MAX_EXEC_BYTES {
@@ -476,9 +510,15 @@ impl Runtime for PodmanRuntime {
     fn file_read<'a>(&'a self, id: &'a str, rel_path: &'a str) -> Fute<'a, Vec<u8>> {
         Box::pin(async move {
             let resolved = self.resolve_in_container(id, rel_path).await?;
-            let out = self
-                .run_ok(&["cp", &format!("{id}:{resolved}"), "-"], None)
-                .await?;
+            let args = read_args(id, &resolved);
+            let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            let out = self.run_ok(&refs, None).await.map_err(|e| {
+                if e.message.contains("No such file") || e.message.contains("not found") {
+                    err_not_found(rel_path)
+                } else {
+                    e
+                }
+            })?;
             if out.len() > MAX_FILE_BYTES {
                 return Err(ProviderError::new(
                     "too_large",
@@ -504,8 +544,9 @@ impl Runtime for PodmanRuntime {
                 .unwrap_or(WORKSPACE_ROOT);
             self.run_ok(&["exec", id, "mkdir", "-p", "--", parent], None)
                 .await?;
-            self.run_ok(&["cp", "-", &format!("{id}:{resolved}")], Some(bytes))
-                .await?;
+            let args = write_args(id, &resolved);
+            let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            self.run_ok(&refs, Some(bytes)).await?;
             Ok(())
         })
     }
@@ -940,6 +981,36 @@ mod tests {
         args.windows(2)
             .find(|pair| pair[0] == flag)
             .map(|pair| pair[1].clone())
+    }
+
+    #[test]
+    fn exec_args_put_the_command_after_the_container() {
+        let req = ExecRequest {
+            command: vec!["sh".into(), "-c".into(), "true".into()],
+            ..Default::default()
+        };
+        let args = exec_args("sbx-1", &req).unwrap();
+        let pos = args.iter().position(|a| a == "sbx-1").unwrap();
+        assert_eq!(args[pos + 1], "sh");
+        assert!(!args.iter().any(|a| a == "--"), "args: {args:?}");
+    }
+
+    #[test]
+    fn read_args_use_cat_not_cp() {
+        let args = read_args("sbx-1", "/workspace/a/b");
+        assert_eq!(args[0], "exec");
+        assert!(args.contains(&"cat".to_owned()), "args: {args:?}");
+        assert!(!args.contains(&"cp".to_owned()), "args: {args:?}");
+        assert_eq!(args.last().unwrap(), "/workspace/a/b");
+    }
+
+    #[test]
+    fn write_args_stream_into_the_file() {
+        let args = write_args("sbx-1", "/workspace/a/b");
+        assert_eq!(args[0], "exec");
+        assert_eq!(args[1], "-i");
+        assert!(args.contains(&"cat > \"$1\"".to_owned()), "args: {args:?}");
+        assert_eq!(args.last().unwrap(), "/workspace/a/b");
     }
 
     #[test]
