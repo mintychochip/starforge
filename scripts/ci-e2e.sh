@@ -120,6 +120,9 @@ echo "==> server"
 TOKEN="$(cat "$WORK/token")"
 (
   cd "$WORK"
+  # The e2e uses HTTP only; keep the default SSH port free for a live
+  # instance that may already hold 0.0.0.0:2222.
+  export STARFORGE__SSH__ENABLED=false
   export STARFORGE__SANDBOX__LOCAL__SOCKET="$WORK/sandboxd.sock"
   export STARFORGE__SANDBOX__LOCAL__TOKEN_FILE="$WORK/sandboxd.token"
   exec "$SERVER_BIN" serve >"$WORK/server.log" 2>&1
@@ -166,21 +169,30 @@ git -C "$WORK/work" commit -q -m "e2e fixture"
 git -C "$WORK/work" push -q "http://git:$TOKEN@127.0.0.1:$SERVER_PORT/me/proj.git" main
 
 echo "==> sandboxd"
-"$SANDBOXD_BIN" \
-  --socket "$WORK/sandboxd.sock" --token-file "$WORK/sandboxd.token" \
-  --image localhost/sf-ci-e2e \
-  --egress-listen 127.0.0.1:0 \
-  --egress-ca-dir "$WORK/ca" \
-  --egress-upstream-ca "$WORK/ca.pem" \
-  --egress-https-port "$HTTPS_PORT" \
-  --egress-allow-cidr 127.0.0.1/32 \
-  >"$WORK/sandboxd.log" 2>&1 &
-PIDS+=("$!")
-for _ in $(seq 1 100); do
-  [[ -S "$WORK/sandboxd.sock" && -f "$WORK/sandboxd.token" ]] && break
-  sleep 0.1
-done
-[[ -S "$WORK/sandboxd.sock" && -f "$WORK/sandboxd.token" ]]
+# Two phases. The proxy smoke is a user sandbox: the public API cannot set
+# the server-only `forge` field, so the daemon needs the operator CIDR for
+# its loopback origin. The job phase restarts the daemon WITHOUT the CIDR,
+# so the job's clone, sync, and artifact upload can only pass through the
+# server-set `forge` exact entry (the SSRF gate refuses loopback otherwise).
+start_sandboxd() {
+  rm -f "$WORK/sandboxd.sock"
+  "$SANDBOXD_BIN" \
+    --socket "$WORK/sandboxd.sock" --token-file "$WORK/sandboxd.token" \
+    --image localhost/sf-ci-e2e \
+    --egress-listen 127.0.0.1:0 \
+    --egress-ca-dir "$WORK/ca" \
+    --egress-upstream-ca "$WORK/ca.pem" \
+    --egress-https-port "$HTTPS_PORT" \
+    "$@" \
+    >>"$WORK/sandboxd.log" 2>&1 &
+  PIDS+=("$!")
+  for _ in $(seq 1 100); do
+    [[ -S "$WORK/sandboxd.sock" && -f "$WORK/sandboxd.token" ]] && break
+    sleep 0.1
+  done
+  [[ -S "$WORK/sandboxd.sock" && -f "$WORK/sandboxd.token" ]]
+}
+start_sandboxd --egress-allow-cidr 127.0.0.1/32
 
 echo "==> proxy smoke"
 SANDBOX="$(curl -fsS -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
@@ -199,6 +211,18 @@ assert out.strip() == "200", (out, err)
 print("proxy smoke: 200")
 '
 curl -fsS -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/sandboxes/$SANDBOX_ID" >/dev/null
+
+echo "==> sandboxd (job phase, no egress CIDR)"
+# Stop the smoke daemon and start a clean one with no special-use allowance.
+SMOKE_PID="${PIDS[${#PIDS[@]}-1]}"
+kill "$SMOKE_PID" 2>/dev/null || true
+wait "$SMOKE_PID" 2>/dev/null || true
+start_sandboxd
+# The job's egress must be the server-set forge entry, not a CIDR.
+if grep -q -- "--egress-allow-cidr" <(printf '%s' "$(ps -o args= -p "${PIDS[${#PIDS[@]}-1]}" 2>/dev/null)"); then
+  echo "ci-e2e: job-phase sandboxd must not carry --egress-allow-cidr" >&2
+  exit 1
+fi
 
 echo "==> runner"
 REG_TOKEN="$(curl -fsS -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \

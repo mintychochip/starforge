@@ -42,7 +42,7 @@ impl Modify for SecurityAddon {
 
 #[derive(OpenApi)]
 #[openapi(
-    info(title = "Starforge API", version = "0.1.0", description = "Starforge JSON REST API (spec \u{00a7}10.4)."),
+    info(title = "Starforge API", version = env!("CARGO_PKG_VERSION"), description = "Starforge JSON REST API (spec \u{00a7}10.4)."),
     paths(
         crate::admin::audit,
         crate::user::show,

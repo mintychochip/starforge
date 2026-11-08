@@ -1010,7 +1010,7 @@ async fn handle_connection(
                 Ok(stream) => stream,
                 Err(_) => return,
             };
-            relay_http(client_tls, upstream_tls, &policy, &host, 443, logs).await;
+            relay_http(client_tls, upstream_tls, &policy, &host, port, logs).await;
         }
         (_, None) => {
             // Plain HTTP (80) or CIDR-allowlisted raw TCP: inject into the
@@ -1082,7 +1082,9 @@ async fn relay_http<C, U>(
     // I1 (tunneled): when a binding applies, the inner Host (and
     // absolute-form authority) must equal the outer CONNECT host.
     if policy.binding_for(host).is_some() {
-        let default_port = if port == 443 { 443 } else { 80 };
+        // Plain HTTP defaults to 80; every MITM call is HTTPS (443 or a
+        // private `--egress-https-port`), whose scheme default is 443.
+        let default_port = if port == 80 { 80 } else { 443 };
         if !injection_host_ok(&head_bytes, host, port, default_port) {
             logs.record(format!("{method} {host}:{port} -> 403 host mismatch"));
             let _ = client_write
@@ -1312,9 +1314,17 @@ mod tests {
             .await
             .unwrap();
         let (mut tls_read, mut tls_write) = tokio::io::split(tls);
+        // A non-default port must appear in the inner Host, as real clients
+        // send it; the proxy compares the inner authority to the CONNECT port.
+        let host_header = if port == 443 {
+            host.to_owned()
+        } else {
+            format!("{host}:{port}")
+        };
         tls_write
             .write_all(
-                format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n").as_bytes(),
+                format!("GET / HTTP/1.1\r\nHost: {host_header}\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
             )
             .await
             .unwrap();

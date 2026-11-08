@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use common::*;
 use reqwest::{Client, StatusCode};
 use serde_json::{Value, json};
+use starforged_core::ci::CiSecretInput;
 use starforged_core::permission::{Permission, Visibility};
 use starforged_core::tokens::Scope;
 
@@ -804,4 +805,61 @@ async fn ci_secrets_settings_page_crud_and_auth() {
     assert_eq!(resp.headers()["location"], base);
     let page = get_text(&alice_browser, &page_url).await;
     assert!(!page.contains("MY_TOKEN"), "{page}");
+}
+
+/// Rotating a secret from the web page must not drop an API-set proxy
+/// binding. The list shows host and header; a blank form keeps them.
+#[tokio::test]
+async fn ci_secret_rotation_keeps_an_api_set_binding() {
+    let s = TestServer::start().await;
+    let alice = s.user("alice").await;
+    s.repo(&alice, "proj", Visibility::Private).await;
+    s.core
+        .create_ci_secret(
+            &alice,
+            "alice",
+            "proj",
+            CiSecretInput {
+                name: "BOUND",
+                value: "v1-secret-value",
+                host: "api.example.com",
+                header: "X-Api-Key",
+                redact_in_sessions: true,
+            },
+        )
+        .await
+        .unwrap();
+    let (browser, csrf) = s.login("alice").await;
+    let base = "/alice/proj/settings/ci-secrets";
+    let page = get_text(&browser, &s.url(base)).await;
+    assert!(page.contains("api.example.com"), "host shown: {page}");
+    assert!(page.contains("X-Api-Key"), "header shown: {page}");
+
+    // Rotate with blank binding fields: the existing binding survives.
+    let resp = browser
+        .post(s.url(base))
+        .form(&[
+            ("_csrf", csrf.as_str()),
+            ("name", "BOUND"),
+            ("value", "v2-rotated-value"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 303);
+    let page = get_text(&browser, &s.url(base)).await;
+    assert!(page.contains("api.example.com"), "binding kept: {page}");
+    assert!(page.contains("X-Api-Key"), "header kept: {page}");
+    assert!(
+        !page.contains("v2-rotated-value"),
+        "value not rendered: {page}"
+    );
+    let secrets = s
+        .core
+        .list_ci_secrets(&alice, "alice", "proj")
+        .await
+        .unwrap();
+    let row = secrets.iter().find(|s| s.name == "BOUND").unwrap();
+    assert_eq!(row.host, "api.example.com");
+    assert_eq!(row.header, "X-Api-Key");
 }

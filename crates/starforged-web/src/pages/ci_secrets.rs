@@ -38,6 +38,15 @@ pub struct SecretForm {
     name: String,
     #[serde(default)]
     value: String,
+    /// Proxy binding host; empty keeps an existing binding on rotate.
+    #[serde(default)]
+    host: String,
+    /// Proxy binding header; empty keeps an existing binding on rotate.
+    #[serde(default)]
+    header: String,
+    /// `1` (default) or `0`; a select always submits one.
+    #[serde(default)]
+    redact: Option<String>,
 }
 
 fn settings_url(owner: &str, repo: &str) -> String {
@@ -64,6 +73,23 @@ pub async fn create_or_rotate(
     Form(form): Form<SecretForm>,
 ) -> Result<Response, WebError> {
     verify_csrf(&session.csrf_token, &form.csrf)?;
+    // Rotating a secret must not silently drop its proxy binding. When the
+    // form leaves both binding fields blank, keep the existing row's host
+    // and header (a new secret gets the core defaults: no host, Authorization).
+    let existing = if form.host.trim().is_empty() && form.header.trim().is_empty() {
+        state
+            .core
+            .list_ci_secrets(&session.user, &owner, &repo)
+            .await?
+            .into_iter()
+            .find(|secret| secret.name == form.name)
+    } else {
+        None
+    };
+    let (host, header) = match existing {
+        Some(secret) => (secret.host, secret.header),
+        None => (form.host.trim().to_owned(), form.header.trim().to_owned()),
+    };
     match state
         .core
         .create_ci_secret(
@@ -73,11 +99,9 @@ pub async fn create_or_rotate(
             CiSecretInput {
                 name: &form.name,
                 value: &form.value,
-                // The settings form sets the value only; the proxy binding
-                // is set through the API (empty host = no proxy injection).
-                host: "",
-                header: "Authorization",
-                redact_in_sessions: true,
+                host: &host,
+                header: &header,
+                redact_in_sessions: form.redact.as_deref() != Some("0"),
             },
         )
         .await
