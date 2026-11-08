@@ -1,6 +1,6 @@
 # Starforge M1a (Trace Format v1 + Redaction) Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** Implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Freeze the cross-milestone contract every later M1 plan builds on: the Trace Format v1 written spec under `docs/format/` (session + events + JSON Schema), the `starforge-format` crate (v1 types, version handling, segmentation, agent-output delimiters), and the `starforge-redact` crate (detectors, declarative rules, JSON-aware redaction, rule-set fingerprinting). No database, no server, no CLI in this plan.
 

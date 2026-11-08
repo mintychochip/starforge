@@ -1,6 +1,6 @@
 # Starforge M2d (CLI Trail commands) Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** Implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Ship the spec §10.3 `starforge trail` command family so a human or an agent can drive a Trail end to end from a terminal. The commands are `list`, `show`, `create`, `comment`, `checkout`, `push`, `review`, and `merge`. The plan also makes the server changes those commands need:
 - explicit fetch of change heads (§8.3);

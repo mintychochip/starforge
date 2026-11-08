@@ -1,6 +1,6 @@
 # Starforge M1c (Developer CLI) Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** Implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build the `starforge` developer CLI that implements the client half of spec §7: device-flow login and credential storage (§7.6), server discovery via `GET /.well-known/starforge.json` or `.git/config` keys, `enable`/`disable` installing chaining git hooks plus agent hooks from `starforge-capture`, session discovery → client redaction → local spool (§7.3 layout exactly), segment split + BLAKE3, the upload protocol (§7.5: PUT metadata, PUT segments, POST complete, POST links; idempotent 409 semantics, 16 MiB cap, exponential backoff, push never fails because of upload), `sync`, and the `sessions list/show/link/unlink` + `status`/`doctor` commands from §10.3.
 

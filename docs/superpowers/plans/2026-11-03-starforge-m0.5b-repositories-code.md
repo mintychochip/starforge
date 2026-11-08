@@ -1,6 +1,6 @@
 # Starforge M0.5 Plan B (Repositories and Code Views) Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** Implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Let repository owners and maintainers manage repositories from the browser (settings, an initial README, renames that keep old links working, archiving, deletion with a 7-day restore window), let users delete their accounts, and add branches, tags, compare, and syntax highlighting to the code views.
 

@@ -1,6 +1,6 @@
 # Starforge M1b (Capture Adapters) Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** Implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build the `starforge-capture` library that normalizes the five agents' native transcripts (Claude Code, Codex CLI, Pi/omp, OpenCode, Gemini CLI/Antigravity) into Trace Format v1 `Event`s plus `SessionMeta` headers, with incremental cursors, unknown-version `unverified` marking, and golden-fixture tests per agent version.
 

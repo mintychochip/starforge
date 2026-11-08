@@ -1,6 +1,6 @@
 # Starforge M2a (Trail Core) Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** Implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build the Trail-as-issue foundation of spec §6.2: dual-engine schema (`trails`, `trail_labels`, `trail_assignees`, `trail_comments`, `timeline_events`) via migration `0010_trails.sql`, per-repo numbering starting at 1, a `starforged-core` service layer (create/get/list/filter/update/state/ready/comment/labels/assignees, one timeline row per mutation), triage-aware permissions (§6.1) with 404-for-non-readers, REST JSON under `/api/v1/repos/{owner}/{repo}/trails`, and the web list/new/detail pages with sanitized Markdown. No changes/revisions, no `refs/for`, no reviews/checks/gates/merge, no webhooks, no CLI `trail` commands — those are M2b–M2d.
 

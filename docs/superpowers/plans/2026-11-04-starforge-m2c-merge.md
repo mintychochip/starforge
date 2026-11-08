@@ -1,6 +1,6 @@
 # Starforge M2c (Commit statuses, gates, merge, webhooks) Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** Implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build the merge layer of spec §6.2 on top of the M2b change/review core: dual-engine schema (`checks`, `gate_rules`, `webhooks`, `webhook_deliveries`) via migration `0013_checks_gates.sql`; a commit-status API with combined status; pure-ish gate evaluation over approvals, required contexts, up-to-date, resolved threads, session evidence, and allowed methods; server-side merge execution (`merge-tree --write-tree` + `commit-tree` + `update-ref` CAS, all three methods) with trail-state transitions and recompute triggers; and HMAC-signed webhook delivery with retries. Plus web: gate panel, merge form, statuses docs, hooks settings page.
 

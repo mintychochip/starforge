@@ -1,6 +1,6 @@
 # Starforge M0 (Hosting Skeleton) Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** Implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** A single `starforged` binary that hosts git repositories over smart HTTP with local accounts, personal access tokens, user-owned repositories with collaborators, a minimal REST API, and server-rendered code, history, and diff browsing — on SQLite by default or Postgres.
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Format check, lints, and tests. STARFORGE_TEST_PG=1 also runs the suite against a throwaway
+# Format check, lints, tests, and the technical-docs check. STARFORGE_TEST_PG=1 also runs the suite against a throwaway
 # Postgres 17 container (podman or docker).
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -7,6 +7,10 @@ cd "$(dirname "$0")/.."
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+
+# Technical documents use ASD-STE100; the checker enforces the mechanical rules.
+python3 scripts/ste_check.py --strict
+python3 -m unittest discover -s scripts/tests
 
 if [[ "${STARFORGE_TEST_PG:-0}" == "1" ]]; then
   engine="$(command -v podman || command -v docker)"

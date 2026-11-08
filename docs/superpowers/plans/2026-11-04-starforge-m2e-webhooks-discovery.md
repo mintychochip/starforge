@@ -1,6 +1,6 @@
 # Starforge M2e (Webhooks to spec, Trail discovery) Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** Implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Bring webhooks to spec §10.4 and give users ways to find the Trails that need them (§10.1).
 - **Webhook events:** the five event types `push`, `trail` (opened, updated, ready, merged, closed), `review`, `check`, and `session` (uploaded, quarantined, published), delivered in one documented envelope and signed in `X-Starforge-Signature-256`.

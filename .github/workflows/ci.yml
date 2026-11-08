@@ -72,6 +72,16 @@ jobs:
           STARFORGE_TEST_PG_URL: postgres://postgres:starforge@127.0.0.1:5432/postgres
         run: cargo test --workspace
 
+  docs:
+    name: technical docs
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5.0.0
+      - name: Check technical documents
+        run: python3 scripts/ste_check.py --strict
+      - name: Test the documentation checker
+        run: python3 -m unittest discover -s scripts/tests
+
   browser:
     name: browser tests
     runs-on: ubuntu-24.04

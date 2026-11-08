@@ -1,6 +1,6 @@
 # Starforge M0.5 Plan C (Site Administration) Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** Implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build the `/admin` site-administration area: overview, user management, invites, repository oversight (restore/purge-now), and job queue management, all hidden behind a 404 for non-admins.
 

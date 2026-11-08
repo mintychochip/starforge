@@ -1,6 +1,6 @@
 # Starforge M1d (Server Session Ingest) Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** Implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build the server half of spec §7: session upload endpoints with the exact wire contract the `starforge` CLI (M1c) already speaks, validation (format version, numbering, BLAKE3, 16 MiB cap, idempotency, `complete` semantics), device-flow OAuth (`POST /api/v1/oauth/device/code` + `/token` plus a web approval page) so `starforge auth login` works against a real server, server-side re-scan with `starforge-redact` plus quarantine + audit + an in-app admin quarantine queue, the content-addressed blob store, commit-link resolution from both ends (push trailers and CLI claims, either arriving first), and the ingest follow-up jobs on the existing queue. No session viewer UI, no blame integration, no search indexing, no webhook delivery, no S3 backend (all later milestones).
 

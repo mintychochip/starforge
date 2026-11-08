@@ -1,6 +1,6 @@
 # Starforge M0.5 Plan A (Foundations and Accounts) Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** Implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Give `starforged` a durable background-jobs queue, optional email, email verification, registration modes with invites, password reset, and account settings, so people can join and manage their own accounts without shell access.
 

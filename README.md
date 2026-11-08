@@ -72,6 +72,10 @@ podman run --rm -p 3000:3000 -p 2222:2222 -v starforge-data:/data starforge:0.1.
   and [CI](docs/user/ci.md).
 - CI administration: [docs/admin/ci.md](docs/admin/ci.md) — runner
   registration, `starforge-sandboxd`, E2B, quotas, and audit.
+- Technical documentation: [docs/technical/](docs/technical/) — architecture,
+  crates, storage, git hosting, Trails, web and API, sessions, search,
+  webhooks, import, CLI, operations, security, and tests. These pages use
+  ASD-STE100 Simplified Technical English.
 - Trace format: [docs/format/README.md](docs/format/README.md).
 
 ## Development

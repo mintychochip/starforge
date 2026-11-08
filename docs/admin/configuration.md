@@ -9,7 +9,7 @@
 | `database.url` | Empty for SQLite in the data directory, or a `postgres://` URL |
 | `database.auto_migrate` | Migrate the schema at startup (default `true`) |
 | `storage.data_dir` | Repositories, SQLite database, and runtime files |
-| `security.secret_key` | 64 hex characters; losing it logs everyone out |
+| `security.secret_key` | 64 hex characters; losing it makes sealed webhook secrets and mirror credentials unreadable |
 | `registration.mode` | Who can sign up: `invite` (default; invite links only), `open`, `domains`, or `sso` (no sign-up forms; accounts arrive only through single sign-on) |
 | `registration.allowed_domains` | Email domains that `domains` mode accepts, e.g. `["example.com"]` |
 | `oidc.enabled` | Whether single sign-on is offered on the sign-in page (default `false`) |

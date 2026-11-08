@@ -1,6 +1,6 @@
 # Starforge M1e (Session Viewer + Read Rules) Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** Implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Close milestone M1 (§14) on the read side: one reusable §6.4 session read-rule helper enforced identically by the session web page, the session JSON API, and (by contract) future search results; a server-rendered session viewer at the repo page convention with safe rendering of every Trace Format v1 kind; a Commit Sessions panel on commit/history pages backed by a new links-by-SHA query; a blame page whose blocks link line → commit → linked sessions; publish/unpublish endpoints + UI for public repos; the two recorded M1d gaps (admin `POST …/sessions/{ulid}/rescan` over HTTP and the links-by-SHA lookup); and uploader/admin session delete with blob decref. No search indexing, no webhooks delivery, no export/import CLI, no raw-transcript upload, no S3 backend, no SSH, no orgs (all out of scope below).
 

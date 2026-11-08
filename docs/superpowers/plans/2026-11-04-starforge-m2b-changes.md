@@ -1,6 +1,6 @@
 # Starforge M2b (Changes, Revisions, refs/for, Reviews) Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** Implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build the change-and-review layer of spec §6.2 on top of the M2a Trail core: dual-engine schema (`changes`, `revisions`, `reviews`, `review_threads`, `review_comments`, `repos.refs_for_access`) via migration `0012_changes.sql`; ref policy accepting `refs/for/<base>[/<topic>]` with `-o trail=<n>` / `-o title=<text>` push options while rejecting `refs/trails/*` from clients; a post-receive scan that creates/updates `agit` changes and revisions, maintains `refs/trails/<n>/changes/<k>/head` + `rev/<r>`, computes mergeability with `git merge-tree --write-tree`, records timeline events, and enqueues a recompute job; a `starforged-core` service plus REST JSON for branch-change creation, change/revision reads, reviews, threads, and close/reopen; and web Trail-changes sections plus a change page with revision picker, diff, review form, outdated threads, and a merge button disabled with the literal M2c reason. No checks, gate rules, merge execution, webhooks, CLI commands, notifications, mirrors/import.
 
