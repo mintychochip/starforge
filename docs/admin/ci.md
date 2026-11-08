@@ -153,6 +153,11 @@ socket the container creates. The sandbox gets `HTTP_PROXY`,
 static binary because it runs inside the sandbox; the release musl
 binary is.
 
+The image must provide `/bin/sh`, `mkdir`, `chmod`, and `realpath -m`
+(the daemon runs them inside the container), and a writable and
+executable `/workspace`. The sandbox image README lists the full
+contract.
+
 The proxy forwards HTTPS `CONNECT` and absolute-form plain HTTP to
 allowlisted hosts. A bare `host` allowlist entry permits ports 80 and
 443 only; a `host:port` entry permits exactly that port.

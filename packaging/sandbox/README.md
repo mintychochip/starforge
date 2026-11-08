@@ -29,6 +29,23 @@ podman build --build-arg STARFORGE_TARGET=x86_64-unknown-linux-musl \
   -t starforge-sandbox:0.1.0-rc.1 -f packaging/sandbox/Containerfile .
 ```
 
+## Requirements on the image
+
+The daemon runs these commands inside the container, so the image must
+provide them:
+
+- `/bin/sh`, `mkdir`, and `chmod` (the forwarder install).
+- `realpath -m` (the file API). Busybox's `realpath` has no `-m`; install
+  `coreutils` on Alpine, as the reference image does.
+- A writable and executable `/workspace` for the sandbox user: the daemon
+  copies its static binary to `/workspace/.starforge-proxy/sandboxd` and
+  runs it.
+- A writable `/run/starforge/egress` mount for the sandbox user: the
+  forwarder creates its Unix socket there.
+- The daemon binary itself must be static, because it copies itself into
+  the sandbox; a dynamically linked daemon cannot run in a musl or
+  distroless image.
+
 ## Runtime contract
 
 Everything below is set by the runner / `starforge-sandboxd` at sandbox

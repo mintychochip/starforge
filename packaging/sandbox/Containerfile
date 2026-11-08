@@ -35,7 +35,7 @@ ARG STARFORGE_TARGET=x86_64-unknown-linux-musl
 # (TLS through the egress proxy; the per-sandbox CA is added on top at
 # run time by sandboxd), and bash/zstd so agent CLIs and `starforge`
 # spool handling have the usual Unix toolkit.
-RUN apk add --no-cache git ca-certificates bash zstd \
+RUN apk add --no-cache git ca-certificates bash zstd coreutils \
   && adduser -D -s /bin/sh sandbox \
   && mkdir -p /workspace /home/sandbox \
   && chown sandbox:sandbox /workspace /home/sandbox
