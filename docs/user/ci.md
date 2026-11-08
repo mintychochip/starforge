@@ -82,8 +82,9 @@ This enqueues four jobs. Each expanded job has `os` and `rust` in its
 environment and a name like `test-0-os-linux-rust-1-85`. The check
 context is `ci/<expanded-name>`. A gate can require one combination or
 the base job's combinations. A manual run with `--job test` enqueues
-every combination of `test`. The spec allows at most 8 keys, 16 values
-per key, and 64 expanded jobs.
+every combination of `test` (never a different job such as
+`test-fast`). The spec allows at most 8 keys, 16 values per key, 64
+expanded jobs per job, and 256 jobs after expansion in the whole file.
 
 ## Triggers
 

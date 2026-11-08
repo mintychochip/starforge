@@ -34,6 +34,7 @@ const MAX_RUNS_ON: usize = 16;
 const MAX_MATRIX_KEYS: usize = 8;
 const MAX_MATRIX_VALUES: usize = 16;
 const MAX_MATRIX_JOBS: usize = 64;
+const MAX_EXPANDED_JOBS: usize = 256;
 const MAX_LABEL_LEN: usize = 64;
 const MAX_TRIGGERS: usize = 100;
 const MAX_PATTERN_LEN: usize = 256;
@@ -217,6 +218,12 @@ impl CiSpec {
             }
             validate_job(job)?;
             validate_matrix(job)?;
+        }
+        let expanded = self.expanded_jobs().len();
+        if expanded > MAX_EXPANDED_JOBS {
+            return Err(invalid(format!(
+                "ci.toml: {expanded} jobs after matrix expansion, over the {MAX_EXPANDED_JOBS}-job limit"
+            )));
         }
         Ok(())
     }
@@ -945,6 +952,42 @@ rust = ["1.85", "1.90"]
             os_values,
             HashSet::from(["linux".to_owned(), "mac".to_owned()])
         );
+    }
+
+    #[test]
+    fn total_expanded_jobs_are_capped() {
+        let job = |name: &str| CiJobSpec {
+            name: name.to_owned(),
+            image: Some("rust:1.85".to_owned()),
+            template: None,
+            commands: vec!["true".to_owned()],
+            timeout: None,
+            env: BTreeMap::new(),
+            secrets: Vec::new(),
+            artifacts: Vec::new(),
+            runs_on: Vec::new(),
+            matrix: BTreeMap::from([
+                (
+                    "a".to_owned(),
+                    (0..4).map(|i| i.to_string()).collect::<Vec<_>>(),
+                ),
+                (
+                    "b".to_owned(),
+                    (0..4).map(|i| i.to_string()).collect::<Vec<_>>(),
+                ),
+                (
+                    "c".to_owned(),
+                    (0..4).map(|i| i.to_string()).collect::<Vec<_>>(),
+                ),
+            ]),
+        };
+        let spec = CiSpec {
+            version: 1,
+            triggers: CiTriggers::default(),
+            jobs: (0..5).map(|i| job(&format!("j{i}"))).collect(),
+        };
+        let err = spec.validate().unwrap_err().to_string();
+        assert!(err.contains("over the 256-job limit"), "{err}");
     }
 
     #[test]

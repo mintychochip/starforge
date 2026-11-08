@@ -1497,3 +1497,91 @@ os = ["linux", "mac"]
         );
     }
 }
+
+/// A manual `--job NAME` selects the base job's combinations, never a
+/// different job whose name starts with `NAME-`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_run_selects_the_base_job_not_a_prefixed_one() {
+    let s = TestServer::start().await;
+    let alice = s.user("alice").await;
+    let repo = s.repo(&alice, "proj", Visibility::Private).await;
+    let pat = s.token(&alice, &[Scope::RepoWrite]).await;
+    let spec = r#"
+version = 1
+[triggers]
+push = []
+[[job]]
+name = "test"
+image = "example.test/image:1"
+commands = ["true"]
+[job.matrix]
+os = ["linux", "mac"]
+[[job]]
+name = "test-fast"
+image = "example.test/image:1"
+commands = ["true"]
+"#;
+    let tmp = tempfile::tempdir().unwrap();
+    let work = work_repo(
+        tmp.path(),
+        "work",
+        &[(".starforge/ci.toml", spec), ("README.md", "# proj\n")],
+    )
+    .await;
+    git_ok(
+        &work,
+        &[
+            "push",
+            "-q",
+            &s.git_url("alice", "proj", Some(&pat)),
+            "main",
+        ],
+    )
+    .await;
+    let jobs = starforged_db::ci::list_ci_jobs_for_repo(s.db(), repo.id, 100)
+        .await
+        .unwrap();
+    assert!(
+        jobs.is_empty(),
+        "manual-only spec enqueues nothing: {jobs:?}"
+    );
+
+    let (status, value) = api(
+        &s.browser(),
+        "POST",
+        &s.url("/api/v1/repos/alice/proj/ci/runs"),
+        &pat,
+        Some(json!({"ref": "main", "job": "test"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{value}");
+    let names: Vec<&str> = value["runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|run| run["job_name"].as_str())
+        .collect();
+    assert_eq!(names.len(), 2, "{names:?}");
+    assert!(
+        names.iter().all(|name| name.starts_with("test-")),
+        "{names:?}"
+    );
+    assert!(!names.contains(&"test-fast"), "{names:?}");
+
+    let (status, value) = api(
+        &s.browser(),
+        "POST",
+        &s.url("/api/v1/repos/alice/proj/ci/runs"),
+        &pat,
+        Some(json!({"ref": "main", "job": "test-fast"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{value}");
+    let names: Vec<&str> = value["runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|run| run["job_name"].as_str())
+        .collect();
+    assert_eq!(names, vec!["test-fast"], "{names:?}");
+}

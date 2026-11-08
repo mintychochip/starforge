@@ -1867,14 +1867,23 @@ impl Core {
         let expanded = spec.expanded_jobs();
         let jobs: Vec<crate::ci_spec::CiJobSpec> = match job_name {
             Some(name) => {
-                let selected: Vec<_> = expanded
-                    .into_iter()
-                    .filter(|job| job.name == name || job.name.starts_with(&format!("{name}-")))
-                    .collect();
-                if selected.is_empty() {
-                    return Err(CoreError::Invalid(format!("unknown CI job `{name}`")));
+                // An exact expanded name selects one combination.
+                if let Some(job) = expanded.iter().find(|job| job.name == name) {
+                    vec![job.clone()]
+                } else {
+                    // A base name selects every combination of that job, and
+                    // never a different job whose name starts with it.
+                    let selected: Vec<_> = spec
+                        .jobs
+                        .iter()
+                        .filter(|job| job.name == name)
+                        .flat_map(crate::ci_spec::CiJobSpec::expanded)
+                        .collect();
+                    if selected.is_empty() {
+                        return Err(CoreError::Invalid(format!("unknown CI job `{name}`")));
+                    }
+                    selected
                 }
-                selected
             }
             None => expanded,
         };
