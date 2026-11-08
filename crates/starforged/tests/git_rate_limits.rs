@@ -7,6 +7,16 @@ mod common;
 use common::*;
 use starforged_core::permission::Visibility;
 
+/// The limiter uses a fixed one-minute window; starting the attempts just
+/// before a boundary would split them across windows and make the test
+/// flaky. Wait for a fresh window when close to one.
+async fn wait_for_fresh_window() {
+    let now = starforged_db::now();
+    if now % 60 > 50 {
+        tokio::time::sleep(std::time::Duration::from_secs((60 - now % 60) as u64 + 1)).await;
+    }
+}
+
 /// With a budget of 3, three `info/refs` requests succeed and the fourth
 /// answers 429 with `Retry-After` and a plain-text body.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -42,6 +52,7 @@ async fn git_http_rate_limit_disabled_allows_burst() {
     .await;
     let alice = s.user("alice").await;
     s.repo(&alice, "proj", Visibility::Public).await;
+    wait_for_fresh_window().await;
     let client = reqwest::Client::new();
     let url = s.url("/alice/proj.git/info/refs?service=git-upload-pack");
     for _ in 0..5 {
@@ -60,6 +71,7 @@ async fn ssh_auth_rate_limit_rejects_attempts_past_the_budget() {
     .await;
     let alice = s.user("alice").await;
     s.repo(&alice, "proj", Visibility::Public).await;
+    wait_for_fresh_window().await;
     let tmp = tempfile::tempdir().unwrap();
     let (priv_key, publine) = gen_key(tmp.path(), "id", "ed25519", None);
     s.add_key(&alice, &publine).await;

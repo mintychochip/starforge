@@ -68,8 +68,8 @@ podman run --rm -p 3000:3000 -p 2222:2222 -v starforge-data:/data starforge:0.1.
   backup and restore, upgrades and migrations, doctor, monitoring, abuse
   controls, site administration.
 - User guide: [docs/user/](docs/user/) — getting started, repositories and
-  SSH keys, Trails, sessions, search, orgs and teams, API and webhooks,
-  and [CI](docs/user/ci.md).
+  SSH keys, Trails, sessions, search, orgs and teams, notifications,
+  releases, API and webhooks, and [CI](docs/user/ci.md).
 - CI administration: [docs/admin/ci.md](docs/admin/ci.md) — runner
   registration, `starforge-sandboxd`, E2B, quotas, and audit.
 - Technical documentation: [docs/technical/](docs/technical/) — architecture,
