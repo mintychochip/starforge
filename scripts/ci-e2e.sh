@@ -219,6 +219,32 @@ err = "".join(c.get("data", "") for c in chunks if c.get("stream") == "stderr")
 assert out.strip() == "200", (out, err)
 print("proxy smoke: 200")
 '
+# The sandbox has `--network none`: neither its own loopback (except the
+# forwarder) nor the old pasta gateway may reach a host service.
+echo "==> host-loopback probe (must be blocked)"
+PROBE_PORT="$(free_port)"
+python3 -m http.server "$PROBE_PORT" --bind 127.0.0.1 >/dev/null 2>&1 &
+PIDS+=("$!")
+for _ in $(seq 1 50); do
+  python3 - "$PROBE_PORT" <<'PY' && break
+import socket, sys
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=0.2)
+s.close()
+PY
+  sleep 0.1
+done
+for target in "http://127.0.0.1:$PROBE_PORT/" "http://10.0.2.2:$PROBE_PORT/"; do
+  EXEC="$(curl -fsS -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+    -d "{\"command\":[\"sh\",\"-c\",\"curl --noproxy '*' -m 3 -sS -o /dev/null -w '%{http_code}' $target || echo BLOCKED\"]}" \
+    "$BASE/api/v1/sandboxes/$SANDBOX_ID/exec")"
+  printf '%s' "$EXEC" | python3 -c '
+import json, sys
+chunks = json.load(sys.stdin)
+out = "".join(c.get("data", "") for c in chunks if c.get("stream") == "stdout").strip()
+assert out != "200", ("host loopback reachable:", out)
+print("blocked:", out)
+'
+done
 curl -fsS -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/sandboxes/$SANDBOX_ID" >/dev/null
 
 echo "==> sandboxd (job phase, no egress CIDR)"
