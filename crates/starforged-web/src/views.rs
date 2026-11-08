@@ -17,10 +17,11 @@ use starforged_core::sessions::WebSession;
 /// (`or_insert` keeps ours).
 pub const STRICT_CSP: &str = "default-src 'none'; img-src 'self'; style-src 'self'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
 
-/// What the page header needs: the signed-in handle and the CSRF token for its sign-out form.
+/// What the page header needs: the signed-in handle, the CSRF token for its sign-out form, and the unread notification count.
 pub struct NavUser {
     pub handle: String,
     pub csrf: String,
+    pub unread_notifications: i64,
 }
 
 impl NavUser {
@@ -28,6 +29,7 @@ impl NavUser {
         NavUser {
             handle: session.user.handle.clone(),
             csrf: session.csrf_token.clone(),
+            unread_notifications: session.unread_notifications,
         }
     }
 }

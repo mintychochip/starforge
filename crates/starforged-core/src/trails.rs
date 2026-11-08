@@ -481,6 +481,15 @@ impl Core {
         .await;
         self.enqueue_index(&crate::jobs::Job::IndexTrail { trail_id: row.id })
             .await;
+        self.notify(crate::notifications::NotifyEvent {
+            repo_id: access.repo.id,
+            trail_id: row.id,
+            kind: crate::notifications::NotifyKind::TrailOpened,
+            actor_id: Some(user.id),
+            targets: &[],
+            text: Some(intent),
+        })
+        .await;
         self.trail_view(&row).await
     }
     pub async fn trail_by_number(
@@ -872,6 +881,19 @@ impl Core {
         }
         self.enqueue_index(&crate::jobs::Job::IndexTrail { trail_id: row.id })
             .await;
+        self.notify(crate::notifications::NotifyEvent {
+            repo_id: access.repo.id,
+            trail_id: row.id,
+            kind: if state == "closed" {
+                crate::notifications::NotifyKind::Closed
+            } else {
+                crate::notifications::NotifyKind::Reopened
+            },
+            actor_id: Some(user.id),
+            targets: &[],
+            text: None,
+        })
+        .await;
         self.trail_view(&self.trail_row(access.repo.id, number).await?)
             .await
     }
@@ -901,6 +923,15 @@ impl Core {
         .await?;
         self.enqueue_index(&crate::jobs::Job::IndexTrail { trail_id: row.id })
             .await;
+        self.notify(crate::notifications::NotifyEvent {
+            repo_id: access.repo.id,
+            trail_id: row.id,
+            kind: crate::notifications::NotifyKind::Commented,
+            actor_id: Some(user.id),
+            targets: &[],
+            text: Some(body),
+        })
+        .await;
         self.comment_view(&saved).await
     }
 
@@ -1079,6 +1110,15 @@ impl Core {
             None,
         )
         .await;
+        self.notify(crate::notifications::NotifyEvent {
+            repo_id: access.repo.id,
+            trail_id: row.id,
+            kind: crate::notifications::NotifyKind::Assigned,
+            actor_id: Some(user.id),
+            targets: &[target.id],
+            text: None,
+        })
+        .await;
         self.trail_view(&self.trail_row(access.repo.id, number).await?)
             .await
     }
@@ -1183,6 +1223,15 @@ impl Core {
             number,
             None,
         )
+        .await;
+        self.notify(crate::notifications::NotifyEvent {
+            repo_id: access.repo.id,
+            trail_id: row.id,
+            kind: crate::notifications::NotifyKind::ReviewRequested,
+            actor_id: Some(user.id),
+            targets: &[target.id],
+            text: None,
+        })
         .await;
         self.trail_view(&self.trail_row(access.repo.id, number).await?)
             .await

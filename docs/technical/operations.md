@@ -53,6 +53,8 @@ It covers limits, the doctor command, backup, restore, and upgrade rules.
 - The hourly pass blanks failed mail bodies older than 7 days. It prunes webhook delivery rows older than 30 days. It reconciles mirror schedules.
 - The hourly pass garbage collects zero reference blobs under the blob garbage collection lock. The hourly pass deletes expired CI artifact rows and collects zero-ref artifact blobs.
 - The hourly pass enqueues at most 100 unrecorded revision commits.
+- The hourly pass finalizes idle `receiving` sessions after 24 hours without activity.
+- The hourly pass runs `prune_notifications`. It deletes read rows older than 90 days. It deletes every row older than 365 days.
 
 Each job worker also runs the CI sweep. `run_ci_sweep_if_due` calls `sweep_ci_jobs` at most once every 30 seconds across all workers. A compare-exchange on the due time lets one worker sweep per interval. Sweep errors only log warnings. A sweep failure never stops job work.
 

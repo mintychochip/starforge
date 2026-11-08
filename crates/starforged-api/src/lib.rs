@@ -9,6 +9,7 @@ pub mod error;
 mod gate_rules;
 mod github_import;
 mod moved;
+mod notifications;
 mod oauth;
 pub mod openapi;
 mod orgs;
@@ -61,6 +62,30 @@ pub fn router(core: Core, base_url: String) -> Router {
         .route("/openapi.json", get(openapi::openapi_json))
         .route("/admin/audit", get(admin::audit))
         .route("/user", get(user::show))
+        .route(
+            "/user/notifications",
+            get(notifications::list_notifications),
+        )
+        .route(
+            "/user/notifications/{id}/read",
+            post(notifications::mark_notification_read),
+        )
+        .route(
+            "/user/notifications/read-all",
+            post(notifications::mark_all_read),
+        )
+        .route(
+            "/repos/{owner}/{repo}/subscription",
+            get(notifications::get_repo_subscription)
+                .put(notifications::put_repo_subscription)
+                .delete(notifications::delete_repo_subscription),
+        )
+        .route(
+            "/repos/{owner}/{repo}/trails/{number}/subscription",
+            get(notifications::get_trail_subscription)
+                .put(notifications::put_trail_subscription)
+                .delete(notifications::delete_trail_subscription),
+        )
         .route("/user/repos", post(repos::create))
         .route(
             "/user/keys",

@@ -27,6 +27,7 @@ pub mod limits;
 pub mod mail;
 pub mod merge;
 pub mod metrics;
+pub mod notifications;
 pub mod oauth;
 pub mod oidc;
 pub mod orgs;

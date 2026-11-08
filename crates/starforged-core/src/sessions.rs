@@ -22,6 +22,8 @@ pub struct WebSession {
     pub csrf_token: String,
     /// The `web_sessions` row, for the sessions page.
     pub session_id: i64,
+    /// Unread notifications for the nav badge; 0 when the count could not be read.
+    pub unread_notifications: i64,
 }
 
 /// A session opened by [`Core::login`]. `cookie_value` goes to the browser and is never stored.
@@ -254,10 +256,18 @@ impl Core {
         if ts - row.last_seen_at >= TOUCH_INTERVAL_SECS {
             web_sessions::touch(self.db(), row.id, ts).await?;
         }
+        let unread_notifications = match self.unread_notification_count(&user).await {
+            Ok(count) => count,
+            Err(err) => {
+                tracing::warn!(user_id = user.id, error = %err, "unread notification count failed");
+                0
+            }
+        };
         Ok(Some(WebSession {
             user,
             csrf_token: row.csrf_token,
             session_id: row.id,
+            unread_notifications,
         }))
     }
 

@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block title %}Notifications · Settings · Starforge{% endblock %}
+{% block content %}
+{% include "settings_nav.html" %}
+<h1>Notifications</h1>
+<form method="post" action="/settings/notifications" class="stack">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <label><input type="checkbox" name="notify_email"{% if email_enabled %} checked{% endif %}> Email me about notifications</label>
+  <button type="submit">Save</button>
+</form>
+<h2>Watched repositories</h2>
+{% if watched.is_empty() %}
+<p>You are not watching any repositories.</p>
+{% else %}
+<table class="list"><tbody>
+{% for w in watched %}
+<tr>
+  <td><a href="/{{ w.owner }}/{{ w.repo }}">{{ w.owner }}/{{ w.repo }}</a></td>
+  <td>{{ w.mode }}</td>
+  <td><form method="post" action="/{{ w.owner }}/{{ w.repo }}/watch" class="inline"><input type="hidden" name="_csrf" value="{{ csrf }}"><input type="hidden" name="mode" value="none"><button type="submit">Unwatch</button></form></td>
+</tr>
+{% endfor %}
+</tbody></table>
+{% endif %}
+{% endblock %}

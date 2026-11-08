@@ -15,6 +15,7 @@ pub mod identities;
 pub mod join;
 pub mod login;
 pub mod message;
+pub mod notifications;
 pub mod orgs;
 pub mod owner;
 pub mod password;

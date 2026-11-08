@@ -3,6 +3,13 @@
 <p><span class="badge">{{ header.state }}</span>{% if header.ready %} <span class="badge">ready</span>{% endif %}
 opened by {% if let Some(a) = header.imported_author %}{{ a }} (imported){% else if header.author_handle == "deleted user" %}deleted user{% else %}<a href="/{{ header.author_handle }}">{{ header.author_handle }}</a>{% endif %} · <span class="muted">{{ header.created }}</span></p>
 {% if let Some(e) = error %}<p class="notice">{{ e }}</p>{% endif %}
+{% if header.can_subscribe %}
+<form method="post" action="/{{ head.owner }}/{{ head.name }}/trails/{{ header.number }}/subscription" class="inline" id="trail-subscription">
+  <input type="hidden" name="_csrf" value="{{ header.csrf }}">
+  <input type="hidden" name="subscribed" value="{% if header.subscribed %}0{% else %}1{% endif %}">
+  <button type="submit">{% if header.subscribed %}Unsubscribe{% else %}Subscribe{% endif %}</button>
+</form>
+{% endif %}
 <div class="labels">
 {% for l in header.labels %}<span class="badge">{{ l }}</span>{% if header.can_triage %}
   <form method="post" action="/{{ head.owner }}/{{ head.name }}/trails/{{ header.number }}/labels" class="inline">

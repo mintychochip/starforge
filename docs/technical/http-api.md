@@ -184,6 +184,9 @@ A second test matches optional security with `reader` handlers.
 | Trails | `GET /repos/{owner}/{repo}/trails`, `POST /repos/{owner}/{repo}/trails`, `PATCH /repos/{owner}/{repo}/trails/{n}` | `repo:read` for reads, `trail:write` for writes |
 | Changes | `GET /repos/{owner}/{repo}/trails/{n}/changes`, `POST /repos/{owner}/{repo}/trails/{n}/changes/{k}/state` | `repo:read` for reads, `trail:write` for writes |
 | Reviews | `GET /repos/{owner}/{repo}/trails/{n}/changes/{k}/reviews`, `POST /repos/{owner}/{repo}/trails/{n}/changes/{k}/reviews` | `repo:read` for reads, `trail:write` for writes |
+| Notifications | `GET /user/notifications`, `POST /user/notifications/{id}/read`, `POST /user/notifications/read-all` | `repo:read` |
+| Repository subscription | `GET /repos/{owner}/{repo}/subscription`, `PUT /repos/{owner}/{repo}/subscription`, `DELETE /repos/{owner}/{repo}/subscription` | `repo:read` |
+| Trail subscription | `GET /repos/{owner}/{repo}/trails/{n}/subscription`, `PUT /repos/{owner}/{repo}/trails/{n}/subscription`, `DELETE /repos/{owner}/{repo}/trails/{n}/subscription` | `repo:read` |
 | Statuses | `POST /repos/{owner}/{repo}/statuses/{sha}`, `GET /repos/{owner}/{repo}/statuses/{sha}` | `repo:read` for reads, `repo:write` for writes |
 | Sessions | `PUT /repos/{owner}/{repo}/sessions/{ulid}`, `PUT /repos/{owner}/{repo}/sessions/{ulid}/segments/{n}`, `GET /repos/{owner}/{repo}/sessions/{ulid}/events` | `session:upload` for ingest, `repo:read` for reads, raw segment reads need the uploader or a site admin |
 | Search | `GET /search/trails`, `GET /search/sessions`, `GET /repos/{owner}/{repo}/search/code` | `repo:read` |
@@ -210,6 +213,14 @@ A second test matches optional security with `reader` handlers.
 Organization member lists need a non-anonymous reader and answer `404` otherwise.
 User SSH key reads need `repo:read`. Deploy key reads need `repo:write`. Success statuses include `200`, `201`, and `202`.
 Deletes answer `204` without a body.
+
+### Notification routes
+
+The notification list honors `all` and `limit` query keys. The response stores one `notifications` array. Each object carries id, repository, Trail number, title, kind, reason, actor, absolute URL, creation time, and read flag. Creation time uses the trails API format.
+
+`POST /user/notifications/{id}/read` marks one row read and returns the object. `POST /user/notifications/read-all` returns `marked` with the count. The repository subscription returns `mode` as `watching`, `ignoring`, or null. `DELETE` on the repository subscription answers `204`.
+
+The Trail subscription returns `subscribed` as a boolean. `DELETE` on the Trail subscription resets to the participation default and answers `204`. Read [notifications](notifications.md) for recipient rules.
 
 ### CI and sandbox routes
 
@@ -285,6 +296,7 @@ Core unit tests cover scope parsing and grants. Core unit tests cover fixed wind
 <!-- ste-sources
 crates/starforged-api/src/lib.rs
 crates/starforged-api/src/auth.rs
+crates/starforged-api/src/notifications.rs
 crates/starforged-api/src/error.rs
 crates/starforged-api/src/openapi.rs
 crates/starforged-api/src/sessions.rs

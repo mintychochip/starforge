@@ -283,6 +283,19 @@ impl Core {
             )
             .await;
         }
+        self.notify(crate::notifications::NotifyEvent {
+            repo_id,
+            trail_id,
+            kind: if is_new {
+                crate::notifications::NotifyKind::ChangeOpened
+            } else {
+                crate::notifications::NotifyKind::RevisionPushed
+            },
+            actor_id: Some(user_id),
+            targets: &[],
+            text: None,
+        })
+        .await;
         Ok(Some((change.number, revision.number)))
     }
     /// Push fan-out (spec §10.4 D2): emits one `push` event per heads/tags
@@ -453,6 +466,15 @@ impl Core {
                 trail.number,
                 Some(serde_json::json!({"k": change.number, "revision": revision.number})),
             )
+            .await;
+            self.notify(crate::notifications::NotifyEvent {
+                repo_id,
+                trail_id: trail.id,
+                kind: crate::notifications::NotifyKind::RevisionPushed,
+                actor_id: pusher_id,
+                targets: &[],
+                text: None,
+            })
             .await;
         }
         Ok(())
@@ -1686,6 +1708,15 @@ impl Core {
             Some(serde_json::json!({"k": row.number, "revision": revision.number})),
         )
         .await;
+        self.notify(crate::notifications::NotifyEvent {
+            repo_id: access.repo.id,
+            trail_id: trail.id,
+            kind: crate::notifications::NotifyKind::ChangeOpened,
+            actor_id: Some(user.id),
+            targets: &[],
+            text: None,
+        })
+        .await;
         self.change_view(
             &db_changes::change_by_id(self.db(), row.id)
                 .await?
@@ -2152,6 +2183,16 @@ impl Core {
                 );
             }
         }
+        let mut text_parts = vec![body.clone()];
+        for (_, _, _, _, comment_body) in &checked {
+            text_parts.push(comment_body.clone());
+        }
+        if let Some(id) = draft_id {
+            for row in db_changes::comments_of_review(self.db(), id).await? {
+                text_parts.push(row.body);
+            }
+        }
+        let text = text_parts.join("\n");
         for (path, side, start_line, end_line, comment_body) in checked {
             let thread = db_changes::insert_thread(
                 self.db(),
@@ -2195,6 +2236,15 @@ impl Core {
                     .ok_or_else(|| CoreError::Internal("own thread hidden".into()))?,
             );
         }
+        self.notify(crate::notifications::NotifyEvent {
+            repo_id: access.repo.id,
+            trail_id: trail.id,
+            kind: crate::notifications::NotifyKind::ReviewSubmitted,
+            actor_id: Some(user.id),
+            targets: &[],
+            text: Some(&text),
+        })
+        .await;
         Ok((review, threads))
     }
 
@@ -2476,6 +2526,17 @@ impl Core {
                 }),
             )
             .await?;
+        }
+        if !pending {
+            self.notify(crate::notifications::NotifyEvent {
+                repo_id: access.repo.id,
+                trail_id: trail.id,
+                kind: crate::notifications::NotifyKind::ThreadComment,
+                actor_id: Some(user.id),
+                targets: &[],
+                text: Some(&body),
+            })
+            .await;
         }
         let reviews = self.reviews_by_id(change.id).await?;
         self.thread_view(Some(user), &access, &change, &thread, &reviews)
@@ -2807,6 +2868,15 @@ impl Core {
             }),
         )
         .await?;
+        self.notify(crate::notifications::NotifyEvent {
+            repo_id: access.repo.id,
+            trail_id: trail.id,
+            kind: crate::notifications::NotifyKind::ThreadComment,
+            actor_id: Some(user.id),
+            targets: &[],
+            text: Some(&body),
+        })
+        .await;
         self.thread_comment_view(&row).await
     }
 

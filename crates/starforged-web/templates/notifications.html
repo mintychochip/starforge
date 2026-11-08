@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block title %}Notifications · Starforge{% endblock %}
+{% block content %}
+<h1>Notifications</h1>
+<p>{% if show_all %}<a href="/notifications">Unread only</a>{% else %}<a href="/notifications?all=1">Show all</a>{% endif %}</p>
+<form method="post" action="/notifications/read-all" class="inline">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <button type="submit">Mark all read</button>
+</form>
+{% if rows.is_empty() %}
+<p>No notifications.</p>
+{% else %}
+<table class="list notifications"><tbody>
+{% for r in rows %}
+<tr{% if !r.read %} class="unread"{% endif %}>
+  <td>{{ r.repository }}</td>
+  <td><a href="{{ r.open_href }}">{{ r.label }}</a></td>
+  <td>{{ r.reason }}</td>
+  <td>{{ r.actor }}</td>
+  <td>{{ r.age }}</td>
+  <td>{% if !r.read %}<form method="post" action="/notifications/{{ r.id }}/read" class="inline"><input type="hidden" name="_csrf" value="{{ csrf }}"><button type="submit">Mark read</button></form>{% endif %}</td>
+</tr>
+{% endfor %}
+</tbody></table>
+{% endif %}
+{% endblock %}

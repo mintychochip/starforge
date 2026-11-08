@@ -318,6 +318,24 @@ const ROUTES: &[(&str, &str)] = &[
     ("put", "/api/v1/sandboxes/{id}/files"),
     ("delete", "/api/v1/sandboxes/{id}/files"),
     ("get", "/api/v1/sandboxes/{id}/ports/{port}/url"),
+    ("get", "/api/v1/user/notifications"),
+    ("post", "/api/v1/user/notifications/{id}/read"),
+    ("post", "/api/v1/user/notifications/read-all"),
+    ("get", "/api/v1/repos/{owner}/{repo}/subscription"),
+    ("put", "/api/v1/repos/{owner}/{repo}/subscription"),
+    ("delete", "/api/v1/repos/{owner}/{repo}/subscription"),
+    (
+        "get",
+        "/api/v1/repos/{owner}/{repo}/trails/{number}/subscription",
+    ),
+    (
+        "put",
+        "/api/v1/repos/{owner}/{repo}/trails/{number}/subscription",
+    ),
+    (
+        "delete",
+        "/api/v1/repos/{owner}/{repo}/trails/{number}/subscription",
+    ),
 ];
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

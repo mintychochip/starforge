@@ -24,6 +24,7 @@ pub mod email_tokens;
 pub mod github_imports;
 pub mod invites;
 pub mod jobs;
+pub mod notifications;
 pub mod oauth;
 pub mod orgs;
 pub mod protection;
