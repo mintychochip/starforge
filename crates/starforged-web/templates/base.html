@@ -18,6 +18,7 @@
   {% if let Some(u) = nav_user %}
     <a href="/new">New repository</a>
     <a href="/orgs/new">New organization</a>
+    <a href="/notifications">Notifications{% if u.unread_notifications > 0 %} ({{ u.unread_notifications }}){% endif %}</a>
     <a href="/settings/profile">Settings</a>
     <a href="/{{ u.handle }}">{{ u.handle }}</a>
     <form method="post" action="/logout" class="inline">

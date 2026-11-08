@@ -257,6 +257,45 @@ pub(crate) fn confirm_email(to: &str, handle: &str, link: &str) -> CoreResult<Em
     })
 }
 
+#[derive(Template)]
+#[template(path = "mail/notification.txt")]
+struct NotificationText<'a> {
+    actor: &'a str,
+    event: &'a str,
+    link: &'a str,
+    reason: &'a str,
+    settings_link: &'a str,
+}
+
+/// One Trail notification. The subject carries the repository, Trail
+/// title and number; the body names the actor and the event, the
+/// absolute Trail link, the notification reason and the settings page.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn notification_email(
+    to: &str,
+    owner: &str,
+    repo: &str,
+    title: &str,
+    number: i64,
+    actor: &str,
+    event: &str,
+    link: &str,
+    reason: &str,
+    settings_link: &str,
+) -> CoreResult<Email> {
+    Ok(Email {
+        to: to.to_owned(),
+        subject: format!("[{owner}/{repo}] {title} (#{number})"),
+        body: render(&NotificationText {
+            actor,
+            event,
+            link,
+            reason,
+            settings_link,
+        })?,
+    })
+}
+
 impl Core {
     /// Whether this instance sends email (`[mail] url` is set).
     pub fn mail_enabled(&self) -> bool {

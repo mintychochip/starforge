@@ -570,6 +570,8 @@ pub struct TrailHeader {
     can_create_change: bool,
     can_link: bool,
     is_open: bool,
+    can_subscribe: bool,
+    subscribed: bool,
 }
 
 #[derive(Template, WebTemplate)]
@@ -743,6 +745,16 @@ pub(crate) async fn header_data(
         can_link: detail.can_triage
             || session.is_some_and(|s| detail.trail.author_id == Some(s.user.id)),
         is_open: trail.state == "open",
+        can_subscribe: session.is_some(),
+        subscribed: match session {
+            Some(s) => {
+                state
+                    .core
+                    .trail_subscription(&s.user, owner, repo, number)
+                    .await?
+            }
+            None => false,
+        },
     };
     Ok((head, header, sessions))
 }

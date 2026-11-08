@@ -429,6 +429,7 @@ impl Core {
         self.gc_expired_artifacts().await?;
         // Delivery attempts older than 30 days fall out of the log (D5).
         starforged_db::checks::prune_deliveries_before(self.db(), ts - 30 * DAY).await?;
+        self.prune_notifications(ts).await?;
         // Every link in a message is dead 7 days after it was sent (invites live longest), so a failed
         // message's body is kept no longer than that.
         for row in jobs::failed_of_kind_before(self.db(), "send_email", ts - 7 * DAY).await? {

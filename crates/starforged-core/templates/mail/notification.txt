@@ -1,0 +1,7 @@
+{{ actor }} {{ event }}
+
+{{ link }}
+
+You received this notification because: {{ reason }}.
+
+Manage notification emails: {{ settings_link }}

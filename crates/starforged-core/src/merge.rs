@@ -769,6 +769,17 @@ impl Core {
             self.enqueue_index(&crate::jobs::Job::IndexTrail { trail_id: trail.id })
                 .await;
         }
+        if flipped {
+            self.notify(crate::notifications::NotifyEvent {
+                repo_id: trail.repo_id,
+                trail_id: trail.id,
+                kind: crate::notifications::NotifyKind::Merged,
+                actor_id: Some(user.id),
+                targets: &[],
+                text: None,
+            })
+            .await;
+        }
         let revision = match change.current_revision_id {
             Some(id) => db_changes::revision_by_id(self.db(), id)
                 .await?

@@ -42,6 +42,10 @@ The table defines words that appear in code, in the database schema, and in the 
 | status | The API name for a commit status record. Prose uses check | `StatusDto`, `combined_status` | [trails](trails.md) |
 | import | Copy data into Starforge one time | `import_state`, `Job::ImportRepo` | [import and mirrors](import-and-mirrors.md) |
 | mirror | A repository that copies refs from another repository | `repo_remotes`, `repos.mirror` | [import and mirrors](import-and-mirrors.md) |
+| notification | One inbox row for one recipient per event | `notifications`, `NotificationView` | [notifications](notifications.md) |
+| watch | One repository watch row with mode watching or ignoring | `repo_watches`, `WatchMode` | [notifications](notifications.md) |
+| subscription | One Trail subscription row with a subscribed flag | `trail_subscriptions` | [notifications](notifications.md) |
+| mention | One `@handle` token that notifies the named user | `NotifyEvent.text` | [notifications](notifications.md) |
 
 ### Sessions and traces
 

@@ -88,6 +88,13 @@ fn page_routes() -> Router<AppState> {
             get(pages::orgs::new_form).post(pages::orgs::create),
         )
         .route("/settings", get(pages::settings::index))
+        .route("/notifications", get(pages::notifications::show))
+        .route("/notifications/{id}/open", get(pages::notifications::open))
+        .route("/notifications/{id}/read", post(pages::notifications::read))
+        .route(
+            "/notifications/read-all",
+            post(pages::notifications::read_all),
+        )
         .route(
             "/settings/profile",
             get(pages::settings::profile).post(pages::settings::save_profile),
@@ -123,6 +130,10 @@ fn page_routes() -> Router<AppState> {
             post(pages::sshkeys::user_remove),
         )
         .route("/settings/repositories", get(pages::settings::repositories))
+        .route(
+            "/settings/notifications",
+            get(pages::notifications::settings_show).post(pages::notifications::settings_save),
+        )
         .route(
             "/settings/repositories/{id}/restore",
             post(pages::settings::restore_repository),
@@ -410,6 +421,7 @@ fn page_routes() -> Router<AppState> {
             post(pages::repo_new::import_delete),
         )
         .route("/{owner}/{repo}", get(pages::code::repo_home))
+        .route("/{owner}/{repo}/watch", post(pages::notifications::watch))
         .route("/{owner}/{repo}/search", get(pages::search::code_search))
         .route("/{owner}/{repo}/tree/{*rest}", get(pages::code::tree))
         .route("/{owner}/{repo}/blob/{*rest}", get(pages::code::blob))
@@ -467,6 +479,10 @@ fn page_routes() -> Router<AppState> {
         .route(
             "/{owner}/{repo}/trails/{number}",
             get(pages::trails::detail),
+        )
+        .route(
+            "/{owner}/{repo}/trails/{number}/subscription",
+            post(pages::notifications::subscription),
         )
         .route(
             "/{owner}/{repo}/trails/{number}/changes",

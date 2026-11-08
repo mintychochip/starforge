@@ -44,6 +44,8 @@ pub struct TreePage {
     ssh_public_key: Option<String>,
     csrf: String,
     can_manage_import: bool,
+    show_watch: bool,
+    watch_mode: String,
 }
 
 #[derive(Template, WebTemplate)]
@@ -97,7 +99,7 @@ pub async fn repo_home(
             Vec::new(),
             None,
         )
-        .await
+        .await?
         .into_response());
     };
     let resolved = state.core.resolve(&access, &default).await?;
@@ -375,7 +377,7 @@ async fn render_tree(
         rows,
         readme_html,
     )
-    .await
+    .await?
     .into_response())
 }
 
@@ -387,11 +389,19 @@ async fn tree_page(
     dir: &str,
     entries: Vec<EntryRow>,
     readme_html: Option<String>,
-) -> TreePage {
+) -> Result<TreePage, WebError> {
     let repo = &access.repo;
     let import = state.core.import_for(repo.id).await.ok().flatten();
     let current = ref_name.unwrap_or_default();
-    TreePage {
+    let watch_mode = match session {
+        Some(s) => state
+            .core
+            .repo_watch(&s.user, &repo.owner, &repo.name)
+            .await?
+            .map(|mode| mode.as_str().to_owned()),
+        None => None,
+    };
+    Ok(TreePage {
         nav_user: nav(session),
         head: RepoHead::new(access, "code", ref_name),
         clone_url: format!(
@@ -425,7 +435,9 @@ async fn tree_page(
         ssh_public_key: import.and_then(|v| v.ssh_public_key),
         csrf: session.map(|s| s.csrf_token.clone()).unwrap_or_default(),
         can_manage_import: access.permission >= starforged_core::permission::Permission::Maintain,
-    }
+        show_watch: session.is_some(),
+        watch_mode: watch_mode.unwrap_or_else(|| "none".to_owned()),
+    })
 }
 
 /// Rendered README of `dir`, if it has one that is text and fits the inline limit.

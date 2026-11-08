@@ -43,6 +43,16 @@ search, webhooks, and mirrors, on SQLite or Postgres.
   log, and redelivery; dashboard sections and Trail/session/code search (Tantivy,
   `git grep` over the default branch). The Branches page links each
   branch's commits and opens a Trail from a branch, tracking it as a change.
+- **Notifications:** an inbox (`/notifications`, unread badge in the nav)
+  and optional email for Trail activity: comments, reviews and inline
+  threads, merges, closes and reopens, and @mentions reach participants;
+  assignments and review requests reach their target; new changes and
+  revisions reach watchers. Users watch or ignore repositories and
+  subscribe to or unsubscribe from Trails; nobody is notified about a
+  repository they cannot read, nor about their own actions. Email needs
+  `mail.url`, a verified address, and the per-user setting (on by default).
+  The API has `/user/notifications` and repository and Trail subscription
+  routes. Read notifications are deleted after 90 days, all after 365.
 - **Organizations and SSH (M3):** orgs, teams, and base permissions with
   repository transfer; git over SSH (`ssh://git@…`) with user and deploy
   keys and fingerprint registry.
@@ -145,6 +155,7 @@ before upgrading (see `docs/admin/backup-and-restore.md`).
 | 0038 | CI secrets and one-time artifact tokens |
 | 0039 | CI usage per job attempt and CI supplier links |
 | 0040 | Drop queued rows of two removed no-op job kinds |
+| 0041 | Notifications, repository watches, Trail subscriptions, per-user email setting |
 
 Note: migration numbers 0030–0033 do not exist; the series jumps from 0029
 to 0034.

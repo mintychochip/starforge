@@ -31,6 +31,7 @@ confirms that the paths exist and that the text follows the mechanical rules.
 | [repositories.md](repositories.md) | Repository model, creation, rename, transfer, archive, delete |
 | [git-hosting.md](git-hosting.md) | Smart HTTP, SSH, ref policy, push hooks, merge |
 | [trails.md](trails.md) | Trail model, changes, revisions, reviews, gates |
+| [notifications.md](notifications.md) | Notifications, watches, subscriptions, and mentions |
 | [web-and-auth.md](web-and-auth.md) | Web routes, templates, web sessions, CSRF, sign-in |
 | [http-api.md](http-api.md) | REST API conventions, scopes, errors, pagination |
 | [sessions.md](sessions.md) | Capture, spool, sync, ingest, quotas, viewer |

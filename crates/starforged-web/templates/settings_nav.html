@@ -1,6 +1,7 @@
 <nav class="tabs" aria-label="Settings">
   <a href="/settings/profile"{% if settings_tab == "profile" %} aria-current="page"{% endif %}>Profile</a>
   <a href="/settings/email"{% if settings_tab == "email" %} aria-current="page"{% endif %}>Email</a>
+  <a href="/settings/notifications"{% if settings_tab == "notifications" %} aria-current="page"{% endif %}>Notifications</a>
   <a href="/settings/password"{% if settings_tab == "password" %} aria-current="page"{% endif %}>Password</a>
   <a href="/settings/two-factor"{% if settings_tab == "two-factor" %} aria-current="page"{% endif %}>Two-factor</a>
   <a href="/settings/identities"{% if settings_tab == "identities" %} aria-current="page"{% endif %}>Linked sign-ins</a>

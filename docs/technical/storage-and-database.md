@@ -53,7 +53,7 @@ Reads inside open transactions use the writer pool. The engine enforces foreign 
 
 ### Migrations
 
-Embedded migrators live in `crates/starforged-db/migrations`. The SQLite and Postgres sets share filenames. Versions run from `0001` to `0040`, so `0030` to `0033` are absent. `Db::migrate` runs versions in order. Bookkeeping lives in `_sqlx_migrations`. Rerun of `migrate` is safe and idempotent.
+Embedded migrators live in `crates/starforged-db/migrations`. The SQLite and Postgres sets share filenames. Versions run from `0001` to `0041`, so `0030` to `0033` are absent. `Db::migrate` runs versions in order. Bookkeeping lives in `_sqlx_migrations`. Rerun of `migrate` is safe and idempotent.
 
 Migrations are forward only. A released migration must not change, because sqlx validates its checksum. `0034` rebuilds the SSH fingerprint table and drops orphan rows during the rebuild. `0035` adds the `jobs.rerun_at` column for rerun requests on deduplicated jobs. A request that arrives while a deduplicated job runs records its time in `rerun_at`, so the worker runs the job again after it finishes.
 
@@ -68,6 +68,8 @@ Migrations are forward only. A released migration must not change, because sqlx 
 `0039` adds `ci_jobs.claimed_at`, `ci_usage`, and `ci_supplier_links`. `claimed_at` records when each claim happens. `ci_usage` records one row per ended attempt of a native runner job. `ci_supplier_links` links a repository to an external CI supplier. The supplier check allows `depot` only.
 
 `0040` drops queued rows of two removed job kinds. The two names are `resolve_commit_links` and `session_webhook_outbox`.
+
+`0041` adds `notifications`, `repo_watches`, and `trail_subscriptions`. It also adds `users.notify_email` with default `1`. `notifications` stores one row per recipient per event. `repo_watches` stores `watching` or `ignoring` per user and repository. `trail_subscriptions` stores a subscribed flag per user and Trail.
 
 `auto_migrate` runs migrations at start. `starforged migrate` runs them manually. `doctor` compares latest and known versions. A difference reports a migrate action.
 
@@ -90,6 +92,7 @@ Migrations are forward only. A released migration must not change, because sqlx 
 | Sandboxes | `sandboxes`, `sandbox_usage` | Idempotency key unique per owner |
 | CI secrets | `ci_secrets`, `ci_job_secrets`, `ci_artifact_tokens` | Sealed values; secret name unique per repository |
 | CI usage | `ci_usage`, `ci_supplier_links` | One usage row per ended native attempt |
+| Notifications | `notifications`, `repo_watches`, `trail_subscriptions` | One row per recipient per event; watch mode per repository |
 Users and organizations share the `owners` table. User rows cascade from owner rows. Segments cascade from session rows. Blobs track reference counts in rows. Trail numbers live in `trail_sequences`. Each group keeps its own data access module.
 
 Modules live under `crates/starforged-db/src`. Each module owns rows for one group. Business rules live above this layer. The core crate enforces permissions.

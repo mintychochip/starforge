@@ -168,6 +168,8 @@ The router disables body limits for git routes. See [git hosting](git-hosting.md
 | Accounts | `/login`, `/login/two-factor`, `/login/oidc`, `/join`, `/logout`, `/forgot`, `/reset/{token}`, `/verify/{token}` | `login`, `device`, `join`, `verify`, `password` |
 | Personal settings | `/settings/profile`, `/settings/tokens`, `/settings/keys`, `/settings/identities` | `settings`, `settings_2fa`, `tokens`, `sshkeys`, `identities` |
 | Site administration | `/admin/users`, `/admin/audit`, `/admin/quarantine`, `/admin/jobs`, `/admin/sandboxes`, `/admin/sandboxes/{id}/kill` | `admin` |
+| Notifications | `/notifications`, `/notifications/{id}/open`, `/notifications/{id}/read`, `/notifications/read-all`, `/settings/notifications` | `notifications` |
+
 | Organizations and teams | `/orgs/new`, `/orgs/{org}/members`, `/orgs/{org}/teams/{team}` | `orgs` |
 | Repository creation | `/new`, `/{owner}/{repo}/import/start` | `repo_new` |
 | Repository settings | `/{owner}/{repo}/settings`, `/{owner}/{repo}/settings/hooks`, `/{owner}/{repo}/settings/collaborators` | `repo_settings`, `webhooks`, `collaborators`, `protection`, `remotes`, `github_import` |
@@ -181,6 +183,14 @@ The router disables body limits for git routes. See [git hosting](git-hosting.md
 
 The list groups about 150 routes. Representative paths hide the full route count.
 A `message` module owns generic message pages.
+
+### Notifications
+
+`GET /notifications` lists unread rows. The query `?all=1` lists every row. `GET /notifications/{id}/open` marks one row read and answers `303` toward its URL. `POST /notifications/{id}/read` marks one row read. `POST /notifications/read-all` marks every row read.
+
+`GET /settings/notifications` shows the email toggle and watched repositories. `POST /settings/notifications` stores the toggle. Each watched repository carries an unwatch control. `POST /{owner}/{repo}/watch` reads the form field `mode`. `POST /{owner}/{repo}/trails/{number}/subscription` reads the form field `subscribed`.
+
+The navigation template shows a Notifications link with the unread count for signed in users. Read [notifications](notifications.md) for recipient rules and email.
 ### CI and sandbox pages
 
 `/{owner}/{repo}/ci` lists CI runs, newest first. The runs page uses `MaybeUser`.
@@ -258,4 +268,5 @@ crates/starforged-web/src/views.rs
 crates/starforged-web/src/pages/mod.rs
 crates/starforged-web/src/pages/ci.rs
 crates/starforged-web/src/pages/admin.rs
+crates/starforged-web/src/pages/notifications.rs
 -->

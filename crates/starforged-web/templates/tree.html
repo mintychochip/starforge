@@ -4,6 +4,19 @@
 {% include "repo_head.html" %}
 <p>Clone with <code>git clone {{ clone_url }}</code></p>
 {% if let Some(ssh_url) = ssh_clone_url %}<p>Clone with <code>git clone {{ ssh_url }}</code></p>{% endif %}
+{% if show_watch %}
+<form method="post" action="/{{ head.owner }}/{{ head.name }}/watch" class="inline" id="watch-repo">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <label>Watch
+    <select name="mode">
+      <option value="none"{% if watch_mode == "none" %} selected{% endif %}>Not watching</option>
+      <option value="watching"{% if watch_mode == "watching" %} selected{% endif %}>Watching</option>
+      <option value="ignoring"{% if watch_mode == "ignoring" %} selected{% endif %}>Ignoring</option>
+    </select>
+  </label>
+  <button type="submit">Save</button>
+</form>
+{% endif %}
 {% if import_state == "pending" %}<p class="notice">Import pending. Pushes are refused until the import finishes.</p>{% endif %}
 {% if import_state == "running" %}<p class="notice">Import in progress. Pushes are refused until the import finishes.</p>{% endif %}
 {% if import_state == "failed" %}<p class="error">Import failed.{% if let Some(e) = import_error %} {{ e }}{% endif %}</p>{% endif %}
