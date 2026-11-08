@@ -77,6 +77,16 @@ search, webhooks, and mirrors, on SQLite or Postgres.
   the OCI image (`Containerfile`, Alpine, non-root, `/data` volume),
   cargo-dist installers for `starforge`, and Playwright browser tests
   (`tests/browser/`).
+- **Public-instance hardening:** `[limits]` gains `max_push_bytes` (git's
+  `receive.maxInputSize` for HTTP and SSH pushes), `max_repo_bytes` (the
+  pre-receive hook refuses pushes once the repository's packed and loose
+  objects reach the limit), and `git_per_ip_per_minute` (one per-IP window
+  for git smart HTTP, which answers `429` with `Retry-After`, and SSH
+  public-key auth attempts); `[audit] retention_days` deletes older audit
+  rows in the daily prune; `[backup] dir`, `interval_hours`, and `keep`
+  run scheduled backups while serving and rotate the oldest valid ones; a
+  systemd unit (`packaging/systemd/starforged.service`) ships in the
+  release tarballs. Every new setting defaults to off.
 - **CI runners and sandboxes (M6):** opt-in `.starforge/ci.toml` jobs
   triggered by pushes, Trail changes, or manually; self-hosted runners
   with lease fences and per-job tokens; sandboxed execution through

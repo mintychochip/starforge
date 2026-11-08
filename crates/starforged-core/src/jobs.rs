@@ -4,6 +4,7 @@
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use starforged_db::audit;
 use starforged_db::jobs::{self, NewJob};
 use starforged_db::sessions as db_sessions;
 use starforged_db::{now, web_sessions};
@@ -366,6 +367,12 @@ impl Core {
             Job::DailyPrune => {
                 let ts = now();
                 jobs::prune(self.db(), ts - 7 * DAY, ts - 30 * DAY).await?;
+                let retention = self.config().audit_retention_days;
+                if retention > 0 {
+                    let days = i64::try_from(retention).unwrap_or(i64::MAX);
+                    let cutoff = ts.saturating_sub(days.saturating_mul(DAY));
+                    audit::prune_before(self.db(), cutoff, 10_000).await?;
+                }
                 Ok(())
             }
             Job::PurgeDeletedRepos => self.purge_deleted_repos().await.map(|_| ()),

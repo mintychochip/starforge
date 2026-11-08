@@ -29,3 +29,37 @@ uses the backup's config with `storage.data_dir` taken from `--data-dir`.
 Stop the server before restoring, and start it again afterwards.
 
 
+
+## Scheduled backups and rotation
+
+The server takes scheduled backups while it serves when both
+`backup.dir` is set and `backup.interval_hours` is greater than 0:
+
+```toml
+[backup]
+dir = "/var/backups/starforge"
+interval_hours = 24
+keep = 7
+```
+
+Set `backup.dir` to an empty or absent directory, `backup.interval_hours`
+to the interval in hours, and `backup.keep` to the number of backups
+to retain. `backup.keep` defaults to 7 and the minimum value is 1 when
+scheduled backups run. Set `backup.dir` to an empty value or
+`backup.interval_hours` to 0 to turn scheduled backups off.
+Environment overrides use `STARFORGE__BACKUP__DIR`,
+`STARFORGE__BACKUP__INTERVAL_HOURS`, and `STARFORGE__BACKUP__KEEP`.
+
+Every interval the server writes one backup to
+`<dir>/starforge-backup-<UTC YYYYMMDD-HHMMSS>` with the same code as
+`starforged backup`, and the backup includes the configuration copy.
+After each backup the server deletes the oldest backup directories
+beyond `keep`. Rotation considers only directories that hold a valid
+backup `manifest.json`, so it never deletes unrelated directories.
+Backup failures log an error and never stop the server. The backup
+directory holds secrets, so keep it encrypted at rest and
+access-limited like every other backup.
+
+Under systemd, give the service write access to the backup directory
+with an extra `ReadWritePaths=` entry in the unit, then reload and
+restart the service to apply the change.

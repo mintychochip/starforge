@@ -37,6 +37,7 @@ for target in "${TARGETS[@]}"; do
   rm -rf "$stage"
   mkdir -p "$stage"
   cp "$TARGET_DIR/$target/release/starforged" "$TARGET_DIR/$target/release/starforge" "$TARGET_DIR/$target/release/starforge-runner" "$TARGET_DIR/$target/release/starforge-sandboxd" "$stage/"
+  cp packaging/systemd/starforged.service "$stage/"
   tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner -cf - -C "$OUT_DIR" "$target" | gzip -n > "$OUT_DIR/starforged-$VERSION-$target.tar.gz"
   rm -rf "$stage"
 done

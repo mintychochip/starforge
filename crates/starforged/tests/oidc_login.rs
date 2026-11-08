@@ -195,7 +195,12 @@ fn oidc_config_validation() {
             login_per_account_per_hour: 0,
             api_per_token_per_hour: 0,
             refs_for_new_changes_per_hour: 0,
+            max_push_bytes: 0,
+            max_repo_bytes: 0,
+            git_per_ip_per_minute: 0,
         },
+        audit: starforged::config::AuditConfig::default(),
+        backup: starforged::config::BackupConfig::default(),
         ssh: starforged::config::SshConfig {
             listen: "127.0.0.1:0".to_owned(),
             host_key_path: std::path::PathBuf::from("ssh_host_ed25519_key"),

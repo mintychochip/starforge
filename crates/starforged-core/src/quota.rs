@@ -18,11 +18,11 @@ pub async fn check_storage_quotas(
 ) -> CoreResult<()> {
     let incoming = i64::try_from(incoming_bytes).unwrap_or(i64::MAX);
     let repo_used = db_sessions::repo_storage_bytes(core.db(), repo_id).await?;
-    if repo_used.saturating_add(incoming) > core.config().max_repo_bytes as i64 {
+    if repo_used.saturating_add(incoming) > core.config().session_max_repo_bytes as i64 {
         return Err(CoreError::Invalid(format!(
             "repository storage quota exceeded ({} of {} bytes used)",
             repo_used,
-            core.config().max_repo_bytes
+            core.config().session_max_repo_bytes
         )));
     }
     let user_used = db_sessions::user_storage_bytes(core.db(), user_id).await?;

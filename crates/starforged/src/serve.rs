@@ -252,11 +252,46 @@ pub async fn serve_on(
     .await
 }
 
+/// Runs one scheduled backup through the shared [`crate::backup`] code and
+/// rotates old backups; the returned path is the new backup directory.
+pub async fn run_scheduled_backup(
+    config: &Config,
+    config_path: Option<&std::path::Path>,
+) -> anyhow::Result<PathBuf> {
+    crate::backup::run_scheduled(config, config_path).await
+}
+
+/// Writes a backup every `interval_hours` hours. Failures are logged as
+/// errors and never stop the loop or the server; the task ends when the
+/// server drops it.
+async fn backup_schedule_loop(config: Config, config_path: Option<PathBuf>) {
+    let interval = Duration::from_secs(config.backup.interval_hours.saturating_mul(3_600));
+    if interval.is_zero() {
+        return;
+    }
+    loop {
+        tokio::time::sleep(interval).await;
+        match crate::backup::run_scheduled(&config, config_path.as_deref()).await {
+            Ok(target) => tracing::info!(target = %target.display(), "scheduled backup complete"),
+            Err(err) => tracing::error!(error = %err, "scheduled backup failed"),
+        }
+    }
+}
+
 pub async fn run(config: Config) -> anyhow::Result<()> {
     let (major, minor) = starforged_git::command::check_version().await?;
     let app = build(&config, std::env::current_exe()?).await?;
     recover_search_index(&app.core).await?;
     starforged_core::jobs::start_workers(&app.core, JOB_WORKERS).await?;
+    let backup_task = config.backup.enabled().then(|| {
+        tracing::info!(
+            dir = %config.backup.dir.display(),
+            interval_hours = config.backup.interval_hours,
+            keep = config.backup.keep,
+            "scheduled backups enabled"
+        );
+        tokio::spawn(backup_schedule_loop(config.clone(), None))
+    });
     let listener = TcpListener::bind(&config.server.http_addr)
         .await
         .with_context(|| format!("binding {}", config.server.http_addr))?;
@@ -280,15 +315,19 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     } else {
         None
     };
-    match ssh {
+    let result = match ssh {
         Some(ssh) => {
             tokio::select! {
-                result = serve_on(listener, app.router, shutdown_signal()) => result?,
-                result = ssh.wait() => result?,
+                result = serve_on(listener, app.router, shutdown_signal()) => result,
+                result = ssh.wait() => result,
             }
         }
-        None => serve_on(listener, app.router, shutdown_signal()).await?,
+        None => serve_on(listener, app.router, shutdown_signal()).await,
+    };
+    if let Some(task) = backup_task {
+        task.abort();
     }
+    result?;
     Ok(())
 }
 

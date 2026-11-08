@@ -140,6 +140,10 @@ pub fn spawn_rpc(
 /// API can fetch it by SHA. Protocol v2 accepts wants for any object already,
 /// so the flag only brings v0/v1 clients to parity; `ls-remote` and default
 /// clones still never see the trail refs.
+/// `Core::git_rpc_env` (receive-pack only, both transports) may append a
+/// second config pair (`receive.maxInputSize`) and override
+/// `GIT_CONFIG_COUNT` to 2, so the count stays consistent with every
+/// KEY/VALUE pair after merging.
 /// Passed through the existing `spawn_rpc` / `advertisement` `env` seam.
 pub fn rpc_env(service: Service) -> Vec<(&'static str, String)> {
     match service {

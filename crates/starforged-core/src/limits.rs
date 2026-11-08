@@ -91,13 +91,15 @@ impl FixedWindows {
 }
 
 /// The in-memory counters: per-IP login attempts (1-minute window),
-/// per-token API requests (1-hour window), and unauthenticated runner
-/// registration attempts per IP (1-minute window).
+/// per-token API requests (1-hour window), unauthenticated runner
+/// registration attempts per IP (1-minute window), and git smart-HTTP
+/// requests plus SSH public-key auth attempts per IP (1-minute window).
 #[derive(Debug, Default)]
 pub struct Limiters {
     pub login_ip: FixedWindows,
     pub register_ip: FixedWindows,
     pub api_token: FixedWindows,
+    pub git_ip: FixedWindows,
 }
 
 impl Core {
@@ -122,6 +124,18 @@ impl Core {
             ip,
             60,
             self.config().login_per_ip_per_minute,
+            starforged_db::now(),
+        )
+    }
+
+    /// Counts one git smart-HTTP request or SSH public-key auth attempt
+    /// for `ip` against the per-IP fixed window (1 minute), reporting the
+    /// decision (allowed, limit, remaining, reset). `0` disables the limit.
+    pub fn check_git_rate(&self, ip: &str) -> RateDecision {
+        self.inner.limits.git_ip.check(
+            ip,
+            60,
+            self.config().git_per_ip_per_minute,
             starforged_db::now(),
         )
     }

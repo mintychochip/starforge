@@ -32,7 +32,7 @@ use std::process::Command as ShellCommand;
 use std::time::SystemTime;
 
 use anyhow::{Context, bail};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use starforged_core::repolock::{BlobGcLock, RepoLock};
 use starforged_db::{Backend, Db};
 
@@ -41,12 +41,12 @@ use crate::config::Config;
 /// Manifest format version written by this backup.
 pub const MANIFEST_FORMAT_VERSION: u32 = 1;
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
 struct Manifest {
     format_version: u32,
-    starforged_version: &'static str,
+    starforged_version: String,
     created_at: i64,
-    engine: &'static str,
+    engine: String,
     latest_migration: Option<i64>,
     repositories: u64,
     blobs: u64,
@@ -54,10 +54,22 @@ struct Manifest {
 
 /// Runs the backup into `target` and prints a one-line summary.
 pub async fn run(config_path: &Path, target: &Path, include_config: bool) -> anyhow::Result<()> {
-    prepare_target(target)?;
-
     let config =
         Config::load(config_path).with_context(|| format!("loading {}", config_path.display()))?;
+    run_with_config(&config, Some(config_path), target, include_config).await
+}
+
+/// Shared backup implementation for the CLI and the scheduled-backup task.
+/// `config_path` supplies the config-file bytes for the copy when present;
+/// without it the copy is the serialized effective config.
+pub async fn run_with_config(
+    config: &Config,
+    config_path: Option<&Path>,
+    target: &Path,
+    include_config: bool,
+) -> anyhow::Result<()> {
+    prepare_target(target)?;
+
     let db = Db::connect(&config.database_url())
         .await
         .context("connecting to the database")?;
@@ -121,20 +133,26 @@ pub async fn run(config_path: &Path, target: &Path, include_config: bool) -> any
     if include_config {
         let config_dir = target.join("config");
         make_dir(&config_dir)?;
-        let text = std::fs::read(config_path)
-            .with_context(|| format!("reading {}", config_path.display()))?;
+        let text = match config_path {
+            Some(path) => {
+                std::fs::read(path).with_context(|| format!("reading {}", path.display()))?
+            }
+            None => toml::to_string_pretty(config)
+                .context("serializing the config for the backup copy")?
+                .into_bytes(),
+        };
         let dest = config_dir.join("starforged.toml");
         write_file(&dest, &text, 0o600)?;
     }
 
     let manifest = Manifest {
         format_version: MANIFEST_FORMAT_VERSION,
-        starforged_version: env!("CARGO_PKG_VERSION"),
+        starforged_version: env!("CARGO_PKG_VERSION").to_owned(),
         created_at: SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0),
-        engine,
+        engine: engine.to_owned(),
         latest_migration,
         repositories,
         blobs,
@@ -148,6 +166,100 @@ pub async fn run(config_path: &Path, target: &Path, include_config: bool) -> any
         "backed up {repositories} repositories and {blobs} blobs to {} (engine {engine})",
         target.display()
     );
+    Ok(())
+}
+
+/// Writes one scheduled backup into `<backup.dir>/starforge-backup-<UTC YYYYMMDD-HHMMSS>`,
+/// rotates old backups, and returns the new backup directory. The call
+/// includes the config copy, like `starforged backup`.
+pub async fn run_scheduled(config: &Config, config_path: Option<&Path>) -> anyhow::Result<PathBuf> {
+    let dir = &config.backup.dir;
+    if !config.backup.enabled() {
+        bail!("scheduled backups are disabled");
+    }
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    set_mode(dir, 0o700)?;
+    let secs = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let target = scheduled_target(dir, secs);
+    run_with_config(config, config_path, &target, true).await?;
+    rotate(dir, config.backup.keep)?;
+    Ok(target)
+}
+
+/// The `<dir>/starforge-backup-<UTC YYYYMMDD-HHMMSS>` path for `secs`. If
+/// that name already exists, `-2`, `-3`, … disambiguate it so a second
+/// backup within the same second never refuses a non-empty target.
+pub fn scheduled_target(dir: &Path, secs: i64) -> PathBuf {
+    let base = format!("starforge-backup-{}", utc_stamp(secs));
+    let mut candidate = dir.join(&base);
+    let mut n = 2_u64;
+    while candidate.exists() {
+        candidate = dir.join(format!("{base}-{n}"));
+        n += 1;
+    }
+    candidate
+}
+
+/// UTC `YYYYMMDD-HHMMSS` for unix seconds `secs`.
+pub fn utc_stamp(secs: i64) -> String {
+    let days = secs.div_euclid(86_400);
+    let sod = secs.rem_euclid(86_400);
+    let hour = sod / 3_600;
+    let minute = (sod % 3_600) / 60;
+    let second = sod % 60;
+    // Civil date from days (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+    format!("{year:04}{m:02}{d:02}-{hour:02}{minute:02}{second:02}")
+}
+
+/// Reads `<dir>/manifest.json` and checks its format version.
+fn read_manifest(dir: &Path) -> anyhow::Result<Manifest> {
+    let text = std::fs::read_to_string(dir.join("manifest.json"))
+        .with_context(|| format!("reading {}", dir.join("manifest.json").display()))?;
+    let manifest: Manifest = serde_json::from_str(&text).context("parsing the backup manifest")?;
+    if manifest.format_version != MANIFEST_FORMAT_VERSION {
+        bail!(
+            "backup manifest format version {} is not supported",
+            manifest.format_version
+        );
+    }
+    Ok(manifest)
+}
+
+/// Keeps the newest `keep` backups in `dir` and removes the older ones.
+/// Only directories holding a valid manifest count; a directory without
+/// one is left alone. The newest backup always survives: `keep` is at
+/// least 1.
+pub fn rotate(dir: &Path, keep: u64) -> anyhow::Result<()> {
+    let keep = usize::try_from(keep.max(1)).unwrap_or(usize::MAX);
+    let mut valid: Vec<(i64, PathBuf)> = Vec::new();
+    let entries = std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))?;
+    for entry in entries {
+        let entry = entry.with_context(|| format!("reading {}", dir.display()))?;
+        let path = entry.path();
+        if path.is_dir()
+            && let Ok(manifest) = read_manifest(&path)
+        {
+            valid.push((manifest.created_at, path));
+        }
+    }
+    // Newest first; the path breaks ties so the result is deterministic.
+    valid.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+    for (_, path) in valid.into_iter().skip(keep) {
+        std::fs::remove_dir_all(&path).with_context(|| format!("removing {}", path.display()))?;
+    }
     Ok(())
 }
 

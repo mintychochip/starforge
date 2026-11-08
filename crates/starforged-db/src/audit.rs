@@ -191,3 +191,28 @@ pub async fn count_action_target_since(
     .await?;
     Ok(count)
 }
+
+/// Deletes audit rows created before `cutoff` in batches of `batch` rows and
+/// returns the total deleted. Each batch deletes the oldest matching rows so
+/// a crash mid-prune resumes where it stopped. A non-positive `batch`
+/// deletes nothing.
+pub async fn prune_before(db: &Db, cutoff: i64, batch: i64) -> DbResult<u64> {
+    if batch <= 0 {
+        return Ok(0);
+    }
+    let mut total = 0_u64;
+    loop {
+        let deleted = sqlx::query(
+            "DELETE FROM audit_log WHERE id IN (SELECT id FROM audit_log WHERE created_at < $1 ORDER BY id LIMIT $2)",
+        )
+        .bind(cutoff)
+        .bind(batch)
+        .execute(db.pool())
+        .await?
+        .rows_affected();
+        total += deleted;
+        if deleted == 0 || deleted < u64::try_from(batch).unwrap_or(u64::MAX) {
+            return Ok(total);
+        }
+    }
+}

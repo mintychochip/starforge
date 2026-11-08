@@ -37,6 +37,13 @@
 | `limits.login_per_account_per_hour` | Failed sign-ins per normalized login name per hour (default `20`; `0` disables) |
 | `limits.api_per_token_per_hour` | API requests per token per hour (default `5000`; `0` disables) |
 | `limits.refs_for_new_changes_per_hour` | New `refs/for` changes per user per hour (default `30`; `0` disables) |
+| `limits.max_push_bytes` | Maximum bytes accepted in one push (default `0`; `0` disables) |
+| `limits.max_repo_bytes` | Maximum on-disk bytes a repository may reach before pushes are refused (default `0`; `0` disables) |
+| `limits.git_per_ip_per_minute` | Git smart-HTTP and SSH public-key auth attempts per client IP per minute (default `0`; `0` disables) |
+| `audit.retention_days` | Days to keep `audit_log` rows before the daily prune deletes them (default `0`; `0` keeps everything) |
+| `backup.dir` | Directory holding scheduled backups; empty disables scheduled backups (default empty) |
+| `backup.interval_hours` | Hours between scheduled backups (default `0`; `0` disables) |
+| `backup.keep` | Backup snapshots to keep; must be at least `1` when scheduled backups are enabled (default `7`) |
 | `remotes.allow_file_urls` | Test-only: admit `file://`/local-path remotes and loopback hosts for the import/mirror URL policy (default `false`; never set in production) |
 | `sandbox.provider` | Sandbox provider: `local` (rootless containers via `starforge-sandboxd`, default) or `e2b` (remote cloud) |
 | `sandbox.local.socket` | Unix socket the local sandbox daemon listens on (default `/run/starforge/sandboxd.sock`) |
@@ -91,6 +98,9 @@ segment) and their existing errors.
 | Failed sign-ins | `limits.login_per_account_per_hour` | `20` | `auth.login_failed` rows for the normalized login name in the last hour (database) |
 | API requests | `limits.api_per_token_per_hour` | `5000` | Requests per token per fixed 1-hour window (in-memory) |
 | New `refs/for` changes | `limits.refs_for_new_changes_per_hour` | `30` | `agit` changes created by the user in all repositories in the last hour (database) |
+| Push size | `limits.max_push_bytes` | `0` | Bytes in one push, enforced by `receive.maxInputSize` on HTTP and SSH (git) |
+| Repository size | `limits.max_repo_bytes` | `0` | On-disk repository bytes at push time, from `git count-objects -v` (git) |
+| Git requests | `limits.git_per_ip_per_minute` | `0` | Git smart-HTTP requests and SSH public-key auth attempts per client IP per fixed 1-minute window (in-memory) |
 
 **Client IP.** The login limiter, the login page, and the audit writer all use
 the same address: the TCP peer (`ConnectInfo`) of the HTTP connection. An
