@@ -693,6 +693,25 @@ pub fn update_checkpoint_ref(repo: &Path, name: &str, sha: &str) -> Result<(), G
     Ok(())
 }
 
+/// Deletes one checkpoint ref (`refs/starforge/checkpoints/<ulid>/<n>`).
+pub fn delete_checkpoint_ref(repo: &Path, ulid: &str, n: u64) -> Result<(), GitError> {
+    if n == 0 || ulid.is_empty() || ulid.contains('/') {
+        return Err(GitError::Failed(format!(
+            "refusing to delete invalid checkpoint {ulid}/{n}"
+        )));
+    }
+    let name = format!("refs/starforge/checkpoints/{ulid}/{n}");
+    let output = git_output(repo, &["update-ref", "-d", &name])?;
+    if !output.status.success() {
+        return Err(GitError::Failed(format!(
+            "git update-ref -d failed in {}: {}",
+            repo.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(())
+}
+
 /// `git rev-parse --verify <rev>`: the object id, or an error.
 pub fn rev_parse(repo: &Path, rev: &str) -> Result<String, GitError> {
     let output = git_output(repo, &["rev-parse", "--verify", rev])?;

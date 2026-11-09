@@ -156,6 +156,27 @@ impl Ctx {
         res.json::<Value>().await.unwrap()
     }
 
+    /// Waits for the push scan to publish revision `expected` on the change.
+    async fn wait_for_revision(&self, n: i64, k: i64, expected: i64) {
+        let client = reqwest::Client::new();
+        for _ in 0..200 {
+            let detail: Value = client
+                .get(self.change(n, k))
+                .bearer_auth(&self.alice_rw)
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            if detail["change"]["current_revision"].as_i64() == Some(expected) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("change {n}/{k} did not reach revision {expected}");
+    }
+
     async fn post_merge(&self, n: i64, k: i64, token: &str, method: &str) -> (u16, Value) {
         let client = reqwest::Client::new();
         let res = client
@@ -1084,6 +1105,9 @@ async fn rebase_refuses_conflicts_and_non_linear_histories() {
     )
     .await;
     git_ok(&work2, &["push", "-q", &url2, "feature/x"]).await;
+    // The push scan publishes the new revision asynchronously; merge only
+    // after it is current, or the merge would rebase the previous head.
+    c2.wait_for_revision(n2, 1, 2).await;
     let (status, body) = c2.post_merge(n2, 1, &c2.alice_repo, "rebase").await;
     assert_eq!(status, 422, "{body}");
     let text = serde_json::to_string(&body).unwrap();

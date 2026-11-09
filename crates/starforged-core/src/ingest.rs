@@ -44,6 +44,10 @@ pub struct CheckpointInput {
 /// Checkpoint sources the server accepts.
 const CHECKPOINT_SOURCES: [&str; 3] = ["commit", "session_end", "manual"];
 
+/// How many checkpoints one session keeps. Older rows and refs are removed
+/// when a newer checkpoint arrives.
+const CHECKPOINT_KEEP: i64 = 200;
+
 /// Proof that an authenticated caller may upload sessions to a repository:
 /// a PAT caller ([`IngestAuth::Pat`], gated on `session:upload` + `write`
 /// as before) or a CI job execution ([`IngestAuth::CiJob`], capped to the
@@ -706,7 +710,7 @@ impl Core {
         }
         let created_at = input.created_at.unwrap_or_else(starforged_db::now);
         let created_at = created_at.min(starforged_db::now() + 300);
-        Ok(db_sessions::upsert_checkpoint(
+        let row = db_sessions::upsert_checkpoint(
             self.db(),
             repo_id,
             session.id,
@@ -718,7 +722,25 @@ impl Core {
             source,
             created_at,
         )
-        .await?)
+        .await?;
+        // Keep the newest checkpoints; the DB rows cascade with the session,
+        // but the git refs need an explicit delete.
+        let removed =
+            db_sessions::prune_checkpoints(self.db(), session.id, CHECKPOINT_KEEP).await?;
+        for old in removed {
+            if let Err(err) =
+                write::delete_checkpoint_ref(&self.repo_path(repo_id), ulid, old.n).await
+            {
+                tracing::warn!(
+                    repo_id,
+                    session = %ulid,
+                    checkpoint = old.n,
+                    error = %err,
+                    "checkpoint prune: ref delete failed"
+                );
+            }
+        }
+        Ok(row)
     }
 
     /// Lists a session's checkpoints, §6.4-filtered for the viewer.
@@ -1094,6 +1116,17 @@ impl Core {
         let removed = db_sessions::delete_session(self.db(), session.id).await?;
         for seg in &removed {
             db_sessions::blob_decref(self.db(), &seg.blob_hash).await?;
+        }
+        // The rows cascade with the session; the checkpoint refs do not.
+        if let Err(err) =
+            write::delete_checkpoint_refs(&self.repo_path(repo_id), &session.ulid).await
+        {
+            tracing::warn!(
+                repo_id,
+                session = %session.ulid,
+                error = %err,
+                "session delete: checkpoint refs not removed"
+            );
         }
         self.audit(
             actor_id,

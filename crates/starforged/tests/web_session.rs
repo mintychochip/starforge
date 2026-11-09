@@ -701,6 +701,8 @@ async fn api_meta_events_and_download() {
     // The download is exactly the stored segment JSONL for clean sessions.
     let download_url = viewer_url(&s, "alice", "apiproj", ULID_API) + "/download";
     let (alice_client, _) = s.login("alice").await;
+    let page = get_text(&alice_client, &viewer_url(&s, "alice", "apiproj", ULID_API)).await;
+    assert!(page.contains("Commits (1)"), "{page}");
     let download = alice_client.get(&download_url).send().await.unwrap();
     assert_eq!(download.status(), 200);
     let mut expected = lines.join("\n");

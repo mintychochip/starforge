@@ -71,6 +71,16 @@
 </ul>
 </section>
 {% endif %}
+{% if !commits.is_empty() %}
+<section class="session-commits" aria-label="Linked commits">
+<h3>Commits ({{ commits.len() }})</h3>
+<ul>
+{% for c in commits %}
+<li><a href="/{{ head.owner }}/{{ head.name }}/commit/{{ c.sha }}">{{ c.short }}</a> · <a href="/{{ head.owner }}/{{ head.name }}/sessions/{{ ulid }}?split={{ c.sha }}">split view</a> · turn {{ c.seq }}</li>
+{% endfor %}
+</ul>
+</section>
+{% endif %}
 {% if !checkpoints.is_empty() %}
 <section class="checkpoints" aria-label="Checkpoints">
 <h3>Checkpoints ({{ checkpoints.len() }})</h3>

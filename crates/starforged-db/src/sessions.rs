@@ -1585,6 +1585,38 @@ mod tests {
         assert_eq!(capped.len(), 1);
         assert_eq!(capped[0].ulid, "01LISTA");
     }
+
+    #[tokio::test]
+    async fn prune_checkpoints_keeps_the_newest() {
+        let (t, alice, repo_id) = setup().await;
+        let sid = insert_session(&t.db, &session(repo_id, alice, "01PRUNE"))
+            .await
+            .unwrap();
+        for n in 1..=4 {
+            upsert_checkpoint(
+                &t.db,
+                repo_id,
+                sid,
+                n,
+                &format!("{n:040x}"),
+                &format!("{:040x}", n + 100),
+                None,
+                "",
+                "manual",
+                1,
+            )
+            .await
+            .unwrap();
+        }
+        let mut removed = prune_checkpoints(&t.db, sid, 2).await.unwrap();
+        removed.sort_by_key(|row| row.n);
+        assert_eq!(
+            removed.iter().map(|row| row.n).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        let left = checkpoints_of_session(&t.db, sid).await.unwrap();
+        assert_eq!(left.iter().map(|row| row.n).collect::<Vec<_>>(), vec![3, 4]);
+    }
 }
 
 /// One session checkpoint: a git commit under
@@ -1687,4 +1719,30 @@ pub async fn checkpoint_by_n(
     .fetch_optional(db.read_pool())
     .await?;
     row.as_ref().map(checkpoint_from_row).transpose()
+}
+
+/// Deletes all but the newest `keep` checkpoints of a session and returns
+/// the removed rows. `keep` must be at least 1; fewer rows than `keep` delete
+/// nothing.
+pub async fn prune_checkpoints(
+    db: &Db,
+    session_id: i64,
+    keep: i64,
+) -> DbResult<Vec<SessionCheckpointRow>> {
+    if keep < 1 {
+        return Ok(Vec::new());
+    }
+    let rows = sqlx::query(
+        "DELETE FROM session_checkpoints \
+         WHERE session_id = $1 AND n < ( \
+           SELECT n FROM session_checkpoints WHERE session_id = $1 \
+           ORDER BY n DESC LIMIT 1 OFFSET $2 \
+         ) \
+         RETURNING id, repo_id, session_id, n, commit_sha, tree_sha, parent_sha, label, source, created_at",
+    )
+    .bind(session_id)
+    .bind(keep - 1)
+    .fetch_all(db.pool())
+    .await?;
+    rows.iter().map(checkpoint_from_row).collect()
 }

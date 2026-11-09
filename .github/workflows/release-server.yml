@@ -1,0 +1,38 @@
+# Build the server tarballs after the cargo-dist release workflow finishes.
+# cargo-dist publishes the CLI; this workflow adds the static server, CLI,
+# runner, and sandboxd tarballs plus SHA-256 sums to the same release.
+name: Release server
+
+on:
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
+
+permissions:
+  contents: write
+
+jobs:
+  server:
+    if: >-
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5.0.0
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+      - name: Install pinned toolchain
+        run: rustup show
+      - name: Install zig and cargo-zigbuild
+        run: |
+          python3 -m pip install --user ziglang==0.13.0
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          cargo install cargo-zigbuild --locked
+      - name: Build static tarballs
+        run: scripts/build-release.sh
+      - name: Upload server artifacts to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.workflow_run.head_branch }}
+          files: target/release-artifacts/*
+          fail_on_unmatched_files: true

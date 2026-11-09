@@ -192,3 +192,38 @@ fn checkpoint_excludes_unlisted_and_secret_untracked_files() {
         "ignored file must stay out of the checkpoint"
     );
 }
+
+#[test]
+fn spool_prune_keeps_the_newest_checkpoints() {
+    let tmp = TempDir::new().unwrap();
+    let repo = init_repo(tmp.path());
+    let spool = open_spool(&repo);
+    let ulid = new_session(&spool);
+    for n in 1..=3u64 {
+        spool
+            .append_checkpoint(
+                &ulid,
+                starforge_cli::spool::CheckpointEntry {
+                    n,
+                    commit: format!("{n:040x}"),
+                    tree: format!("{:040x}", n + 100),
+                    parent: None,
+                    label: format!("cp {n}"),
+                    source: "manual".into(),
+                    created_at: n as i64,
+                    uploaded: false,
+                },
+            )
+            .unwrap();
+    }
+    let removed = spool.prune_checkpoints(&ulid, 2).unwrap();
+    assert_eq!(
+        removed.iter().map(|entry| entry.n).collect::<Vec<_>>(),
+        vec![1]
+    );
+    let left = spool.read_checkpoints(&ulid).unwrap();
+    assert_eq!(
+        left.iter().map(|entry| entry.n).collect::<Vec<_>>(),
+        vec![2, 3]
+    );
+}

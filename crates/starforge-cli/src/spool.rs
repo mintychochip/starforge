@@ -437,6 +437,27 @@ impl Spool {
         Ok(())
     }
 
+    /// Deletes all but the newest `keep` checkpoints and returns the removed
+    /// entries (oldest first). The caller deletes their git refs.
+    pub fn prune_checkpoints(
+        &self,
+        ulid: &str,
+        keep: usize,
+    ) -> Result<Vec<CheckpointEntry>, SpoolError> {
+        let path = self.session_dir(ulid)?.join("checkpoints.json");
+        let mut entries = self.read_checkpoints(ulid)?;
+        if entries.len() <= keep {
+            return Ok(Vec::new());
+        }
+        let removed = entries.drain(..entries.len() - keep).collect::<Vec<_>>();
+        atomic_write(
+            &path,
+            &serde_json::to_vec_pretty(&CheckpointsFile { entries })?,
+        )?;
+        tighten_file(&path);
+        Ok(removed)
+    }
+
     /// The newest checkpoint, if any.
     pub fn last_checkpoint(&self, ulid: &str) -> Result<Option<CheckpointEntry>, SpoolError> {
         Ok(self.read_checkpoints(ulid)?.pop())
@@ -1018,7 +1039,10 @@ impl Spool {
             Err(_) => return Ok(Vec::new()),
         };
         let cursors = self.cursor_records()?;
-        let threshold = time::Duration::days(older_than_days as i64);
+        // Cap the threshold so an absurd `--older-than` cannot overflow the
+        // duration; the command already rejects values it considers absurd.
+        let days = older_than_days.min(365_000) as i64;
+        let threshold = time::Duration::days(days);
         let mut out = Vec::new();
         for ulid in self.session_ulids()? {
             if self.is_pruned(&ulid) {

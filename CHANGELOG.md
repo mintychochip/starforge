@@ -9,9 +9,9 @@
   and refuses merge commits, conflicts, and ranges over 1024 commits.
 - Cross-repository changes: a Trail change can track a branch in another
   repository. The server fetches the source objects into the target
-  repository, so diffs, gates, and merges use the existing paths. A private
-  source is allowed only for the same owner or a source admin. The API and
-  CLI can refresh the source branch.
+  repository, so diffs, gates, and merges use the existing paths. A source
+  is allowed only when it is public or the target is no more visible than the
+  source. The API and CLI can refresh the source branch.
 
 ### Sessions
 
@@ -21,6 +21,23 @@
   The session page lists checkpoints. `starforge rewind` restores a
   checkpoint; `starforge resume` also writes `.starforge/resume.md` with the
   last turns.
+
+### Hardening
+
+- Per-file history stops after 10,000 commits instead of walking the whole
+  repository.
+- The session page lists linked commits with commit and split-view links.
+- Checkpoints keep the newest 200 per session; older rows and refs are
+  removed. Deleting a session removes its checkpoint refs.
+- `spool prune` caps its day threshold instead of casting an unbounded
+  `u64`, and the dead CLI `Unimplemented` error is gone.
+
+### Release
+
+- `SECURITY.md`, `CONTRIBUTING.md`, and issue templates.
+- CI runs `cargo-audit` and the real sandbox e2e.
+- A server release workflow adds the static tarballs and SHA-256 sums to the
+  cargo-dist release.
 
 ### Migrations
 

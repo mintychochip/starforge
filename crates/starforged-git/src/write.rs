@@ -180,7 +180,69 @@ pub async fn rev_parse_ref(repo: &Path, name: &str) -> Result<String, GitError> 
         })?
 }
 
-/// Tree object id of commit `sha` (`rev-parse <sha>^{tree}`, argv-only; `sha`
+/// Deletes one checkpoint ref (`refs/starforge/checkpoints/<ulid>/<n>`).
+/// The ULID shape and the positive number are checked before git runs.
+pub async fn delete_checkpoint_ref(repo: &Path, ulid: &str, n: i64) -> Result<(), GitError> {
+    if !valid_checkpoint_ulid(ulid) || n <= 0 {
+        return Err(GitError::Failed {
+            command: "update-ref".to_owned(),
+            stderr: format!("refusing to delete invalid checkpoint {ulid}/{n}"),
+        });
+    }
+    let name = format!("refs/starforge/checkpoints/{ulid}/{n}");
+    run([
+        OsStr::new("--git-dir"),
+        repo.as_os_str(),
+        OsStr::new("update-ref"),
+        OsStr::new("-d"),
+        OsStr::new(&name),
+    ])
+    .await?;
+    Ok(())
+}
+
+/// Deletes every checkpoint ref of one session. Best-effort per ref: a
+/// missing ref is ignored, and the count of deleted refs is returned.
+pub async fn delete_checkpoint_refs(repo: &Path, ulid: &str) -> Result<usize, GitError> {
+    if !valid_checkpoint_ulid(ulid) {
+        return Err(GitError::Failed {
+            command: "for-each-ref".to_owned(),
+            stderr: format!("refusing to delete invalid session {ulid}"),
+        });
+    }
+    let prefix = format!("refs/starforge/checkpoints/{ulid}/");
+    let out = run([
+        OsStr::new("--git-dir"),
+        repo.as_os_str(),
+        OsStr::new("for-each-ref"),
+        OsStr::new("--format=%(refname)"),
+        OsStr::new(&prefix),
+    ])
+    .await?;
+    let text = String::from_utf8_lossy(&out);
+    let mut removed = 0;
+    for name in text.lines().map(str::trim).filter(|name| !name.is_empty()) {
+        if !name.starts_with(&prefix) {
+            continue;
+        }
+        run([
+            OsStr::new("--git-dir"),
+            repo.as_os_str(),
+            OsStr::new("update-ref"),
+            OsStr::new("-d"),
+            OsStr::new(name),
+        ])
+        .await?;
+        removed += 1;
+    }
+    Ok(removed)
+}
+
+fn valid_checkpoint_ulid(ulid: &str) -> bool {
+    ulid.len() == 26 && ulid.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
+/// Tree object id of commit `sha` (`rev-parse <sha>^{tree}`, argv-only; `sha`/// Tree object id of commit `sha` (`rev-parse <sha>^{tree}`, argv-only; `sha`
 /// must pass [`crate::refpolicy::is_oid`], so the `^{tree}` suffix cannot be
 /// attacker-controlled).
 pub async fn rev_parse_tree(repo: &Path, sha: &str) -> Result<String, GitError> {

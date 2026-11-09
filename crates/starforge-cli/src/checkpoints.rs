@@ -46,7 +46,7 @@ pub fn create(
     let n = last.map(|entry| entry.n + 1).unwrap_or(1);
     let ref_name = format!("refs/starforge/checkpoints/{ulid}/{n}");
     git::update_checkpoint_ref(repo, &ref_name, &commit).map_err(|err| err.to_string())?;
-    spool
+    let entry = spool
         .append_checkpoint(
             ulid,
             CheckpointEntry {
@@ -60,7 +60,14 @@ pub fn create(
                 uploaded: false,
             },
         )
-        .map_err(|err| err.to_string())
+        .map_err(|err| err.to_string())?;
+    // Keep the newest 200 checkpoints; the caller has no other GC hook.
+    if let Ok(removed) = spool.prune_checkpoints(ulid, 200) {
+        for old in removed {
+            let _ = git::delete_checkpoint_ref(repo, ulid, old.n);
+        }
+    }
+    Ok(entry)
 }
 
 /// Session-touched untracked files that are safe to include in a checkpoint.

@@ -471,17 +471,35 @@ pub fn path_exists(repo: &Path, commit_id: &str, path: &str) -> Result<bool, Git
     Ok(entry_id(&r, commit_id, path).is_some())
 }
 
+/// Cap on the commits [`log_path`] walks. A file untouched for longer than
+/// this returns a short (possibly empty) history instead of walking the whole
+/// repository.
+pub const MAX_LOG_PATH_SCAN: usize = 10_000;
+
 /// Up to `limit` commits reachable from `commit_id` that touched `path` (a file or a
 /// directory), newest first (by commit time), after skipping `skip` matches. A commit
 /// touches `path` when the entry at `path` differs from its first parent's (a root
 /// commit touches every path it contains), matching `git log -- <path>`: a deletion
-/// (or the old side of a rename) is listed. Renames are not followed.
+/// (or the old side of a rename) is listed. Renames are not followed. The walk
+/// stops after [`MAX_LOG_PATH_SCAN`] commits.
 pub fn log_path(
     repo: &Path,
     commit_id: &str,
     path: &str,
     skip: usize,
     limit: usize,
+) -> Result<Vec<CommitInfo>, GitError> {
+    log_path_capped(repo, commit_id, path, skip, limit, MAX_LOG_PATH_SCAN)
+}
+
+/// [`log_path`] with an explicit walk cap (tests use a small cap).
+pub fn log_path_capped(
+    repo: &Path,
+    commit_id: &str,
+    path: &str,
+    skip: usize,
+    limit: usize,
+    max_scan: usize,
 ) -> Result<Vec<CommitInfo>, GitError> {
     let r = open(repo)?;
     let start = r.rev_parse_single(commit_id).map_err(gix_err)?.detach();
@@ -494,7 +512,10 @@ pub fn log_path(
         .map_err(gix_err)?;
     let mut commits = Vec::new();
     let mut matched = 0_usize;
-    for info in walk {
+    for (scanned, info) in walk.enumerate() {
+        if scanned >= max_scan {
+            break;
+        }
         let commit = info.map_err(gix_err)?.object().map_err(gix_err)?;
         let info = commit_info(&commit)?;
         let entry = entry_id(&r, &info.id, path);
@@ -909,6 +930,23 @@ mod tests {
                 .is_empty()
         );
     }
+    #[test]
+    fn path_history_walk_is_capped() {
+        let f = fixture();
+        let p = f.path();
+        let feature = resolve(p, "feature/x").unwrap().unwrap().commit_id;
+        // The newest commit does not touch src/lib.rs; a one-commit scan finds
+        // nothing, while the full scan finds the oldest commit.
+        assert!(
+            log_path_capped(p, &feature, "src/lib.rs", 0, 10, 1)
+                .unwrap()
+                .is_empty()
+        );
+        let found = log_path_capped(p, &feature, "src/lib.rs", 0, 10, 3).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].summary, "first");
+    }
+
     #[test]
     fn range_logs_list_what_head_adds_to_base() {
         let f = fixture();

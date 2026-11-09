@@ -601,28 +601,7 @@ pub enum CheckpointCmd {
     },
 }
 
-/// CLI errors. Every non-root cause maps to an exit code (0/1/2).
-#[derive(Debug, thiserror::Error)]
-pub enum CliError {
-    /// Handler not implemented yet (C3–C7 replace these stubs).
-    #[error("{0} is not yet implemented")]
-    Unimplemented(&'static str),
-    /// Auth failure.
-    #[error(transparent)]
-    Auth(#[from] crate::auth::AuthError),
-}
-
-impl CliError {
-    /// Exit code: 0 success; 1 operational error; 2 items still queued.
-    pub fn exit_code(&self) -> u8 {
-        match self {
-            CliError::Unimplemented(_) | CliError::Auth(_) => 1,
-        }
-    }
-}
-
-/// Dispatch `cli` to its handler. Auth handlers are real (C2); the rest are
-/// stubs until C3–C7.
+/// Dispatch `cli` to its handler.
 ///
 /// Must not be called from inside a Tokio runtime (it blocks on one for the
 /// async device flow); async contexts use [`run_async`] instead.
@@ -646,7 +625,7 @@ pub fn run(cli: Cli, paths: CliPaths) -> std::process::ExitCode {
     {
         // fall through to async dispatch below
     } else {
-        return sync_stub(cli, paths);
+        return run_sync_commands(cli, paths);
     }
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -661,7 +640,7 @@ pub fn run(cli: Cli, paths: CliPaths) -> std::process::ExitCode {
     runtime.block_on(run_async(cli, paths))
 }
 
-fn sync_stub(cli: Cli, paths: CliPaths) -> std::process::ExitCode {
+fn run_sync_commands(cli: Cli, paths: CliPaths) -> std::process::ExitCode {
     let dry_run = cli.dry_run;
     match cli.cmd {
         Cmd::Auth { .. } => unreachable!("auth dispatches via run_async"),
@@ -825,8 +804,8 @@ fn run_spool(cmd: SpoolCmd, dry_run: bool) -> std::process::ExitCode {
     std::process::ExitCode::from(code)
 }
 
-/// Async dispatch (auth/status/sync/doctor/pre-push live here; the rest are
-/// sync or stubs).
+/// Async dispatch (auth/status/sync/doctor/pre-push live here; the rest run
+/// on the sync path).
 pub async fn run_async(cli: Cli, paths: CliPaths) -> std::process::ExitCode {
     let dry_run = cli.dry_run;
     match cli.cmd {

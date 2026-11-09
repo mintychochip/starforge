@@ -316,3 +316,63 @@ async fn quarantined_session_refuses_checkpoint_metadata() {
     let text = res.text().await.unwrap();
     assert!(text.contains("quarantined"), "{text}");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deleting_a_session_removes_its_checkpoint_refs() {
+    let s = TestServer::start().await;
+    let alice = s.user("alice").await;
+    let repo = s.repo(&alice, "proj", Visibility::Private).await;
+    let upload = s
+        .token(&alice, &[Scope::RepoRead, Scope::SessionUpload])
+        .await;
+    create_session(&s, "alice", "proj", &upload, ULID).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let work = work_repo(tmp.path(), "work", &[("a.txt", "one\n")]).await;
+    let head = git_ok(&work, &["rev-parse", "HEAD"])
+        .await
+        .trim()
+        .to_owned();
+    let tree = git_ok(&work, &["rev-parse", "HEAD^{tree}"])
+        .await
+        .trim()
+        .to_owned();
+    let url = s.git_url("alice", "proj", Some(&upload));
+    git_ok(
+        &work,
+        &[
+            "push",
+            "-q",
+            &url,
+            &format!("{head}:refs/starforge/checkpoints/{ULID}/1"),
+        ],
+    )
+    .await;
+    let res = reqwest::Client::new()
+        .put(s.url(&format!(
+            "/api/v1/repos/alice/proj/sessions/{ULID}/checkpoints/1"
+        )))
+        .bearer_auth(&upload)
+        .json(&json!({"commit": head, "tree": tree}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200, "{}", res.text().await.unwrap());
+
+    let res = reqwest::Client::new()
+        .delete(s.url(&format!("/api/v1/repos/alice/proj/sessions/{ULID}")))
+        .bearer_auth(&upload)
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success(), "{}", res.text().await.unwrap());
+
+    let server = s.core.repo_path(repo.id);
+    let gd = format!("--git-dir={}", server.display());
+    let ref_name = format!("refs/starforge/checkpoints/{ULID}/1");
+    let out = git(&work, &[&gd, "rev-parse", "--verify", &ref_name]).await;
+    assert!(
+        !out.status.success(),
+        "checkpoint ref survived session delete"
+    );
+}

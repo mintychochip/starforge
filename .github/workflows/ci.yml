@@ -101,3 +101,36 @@ jobs:
         run: npm ci && npx playwright install --with-deps chromium
       - name: Browser tests
         run: scripts/browser-tests.sh
+
+  audit:
+    name: dependency audit
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5.0.0
+      - name: Install pinned toolchain
+        run: rustup show
+      - name: Audit dependencies
+        uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  sandbox-e2e:
+    name: real sandbox e2e
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5.0.0
+      - name: Install pinned toolchain
+        run: rustup show
+      - name: Install zig and cargo-zigbuild
+        run: |
+          python3 -m pip install --user ziglang==0.13.0
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          cargo install cargo-zigbuild --locked
+      - name: Build static artifacts
+        run: scripts/build-release.sh
+      - name: Install podman
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y podman
+      - name: Run the real sandbox e2e
+        run: STARFORGE_TEST_SANDBOX=1 scripts/ci-e2e.sh

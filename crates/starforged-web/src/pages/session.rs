@@ -67,6 +67,13 @@ fn related_view(
     }
 }
 
+/// One linked commit in the session's commit list.
+pub struct CommitItem {
+    sha: String,
+    short: String,
+    seq: i64,
+}
+
 /// One checkpoint row on the session page.
 pub struct CheckpointItem {
     n: i64,
@@ -132,6 +139,8 @@ pub struct SessionPageView {
     child_truncated: bool,
     /// Checkpoints of this session, ascending.
     checkpoints: Vec<CheckpointItem>,
+    /// Linked commits, ascending by event sequence.
+    commits: Vec<CommitItem>,
 }
 
 /// `GET /{owner}/{repo}/sessions/{ulid}?page=N&focus=seq&q=needle&split=<sha>`:
@@ -163,6 +172,14 @@ pub async fn show(
     // Commit markers (D3): group by `seq_end`; each renders immediately
     // after the event at that seq, linking to the commit page and split view.
     let markers = state.core.commit_markers(session_row.id).await?;
+    let commits = markers
+        .iter()
+        .map(|marker| CommitItem {
+            sha: marker.sha.clone(),
+            short: marker.short_sha.clone(),
+            seq: marker.seq_end,
+        })
+        .collect::<Vec<_>>();
     let mut markers_by_seq: std::collections::HashMap<
         i64,
         Vec<&starforged_core::read::CommitMarker>,
@@ -354,6 +371,7 @@ pub async fn show(
         children,
         child_truncated,
         checkpoints,
+        commits,
     };
     // Sessions never reach search indexes (spec §11.1). The transcript is
     // attacker-influenced, so the viewer also carries the strict CSP (it
