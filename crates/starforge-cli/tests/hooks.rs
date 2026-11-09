@@ -575,7 +575,7 @@ fn fileless_active_session_gets_heuristic_trailer() {
     assert_eq!(links[0].confidence, LinkConfidence::Heuristic);
 }
 
-fn commit_with_msg(repo: &Path, msg: &Path, date: &str) {
+fn commit_with_msg(repo: &Path, msg: &Path, date: &str, home: &Path) {
     let out = Command::new("git")
         .arg("-C")
         .arg(repo)
@@ -583,6 +583,10 @@ fn commit_with_msg(repo: &Path, msg: &Path, date: &str) {
         .arg(msg)
         .env("GIT_COMMITTER_DATE", date)
         .env("GIT_AUTHOR_DATE", date)
+        // `prepare-commit-msg` still runs with `--no-verify`; point it at the
+        // test home so its ingest does not scan the real one.
+        .env("STARFORGE_HOME", home)
+        .env("HOME", home)
         .output()
         .expect("git runs");
     assert!(
@@ -631,7 +635,7 @@ fn real_ingest_fileless_session_trailer_lifecycle() {
         1,
         "commit 1 trailer; body:\n{body}"
     );
-    commit_with_msg(&repo, &msg, "2026-07-01T00:00:00+00:00");
+    commit_with_msg(&repo, &msg, "2026-07-01T00:00:00+00:00", home.path());
     assert_eq!(hook_post_commit(&repo, &paths), 0);
     let links = spool.links().unwrap();
     assert_eq!(links.len(), 1);
@@ -647,7 +651,7 @@ fn real_ingest_fileless_session_trailer_lifecycle() {
         !body.contains("Starforge-Session:"),
         "commit 2 must have no trailer; body:\n{body}"
     );
-    commit_with_msg(&repo, &msg, "2026-08-01T00:00:00+00:00");
+    commit_with_msg(&repo, &msg, "2026-08-01T00:00:00+00:00", home.path());
     assert_eq!(hook_post_commit(&repo, &paths), 0);
     assert_eq!(spool.links().unwrap().len(), 1);
 
@@ -670,7 +674,7 @@ fn real_ingest_fileless_session_trailer_lifecycle() {
         1,
         "commit 3 trailer; body:\n{body}"
     );
-    commit_with_msg(&repo, &msg, "2026-10-01T00:00:00+00:00");
+    commit_with_msg(&repo, &msg, "2026-10-01T00:00:00+00:00", home.path());
     assert_eq!(hook_post_commit(&repo, &paths), 0);
     assert_eq!(spool.links().unwrap().len(), 2);
 }
