@@ -453,9 +453,27 @@ async fn sync_checkpoints(spool: &Spool, client: &UploadClient, owner_repo: &str
         }
         let refspec =
             format!("refs/starforge/checkpoints/{ulid}/*:refs/starforge/checkpoints/{ulid}/*");
-        if let Err(err) = push_checkpoint_refs(common, &remote, &refspec) {
-            tracing::warn!("sync: checkpoint ref push failed for `{ulid}`: {err}");
-            continue;
+        // `git push` waits on the network: run it on the blocking pool so a
+        // stalled push can never block the runtime's other tasks (the CLI
+        // builds a current-thread runtime, and an in-process server sharing
+        // it would otherwise stop accepting).
+        let pushed = tokio::task::spawn_blocking({
+            let common = common.to_path_buf();
+            let remote = remote.clone();
+            let refspec = refspec.clone();
+            move || push_checkpoint_refs(&common, &remote, &refspec)
+        })
+        .await;
+        match pushed {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                tracing::warn!("sync: checkpoint ref push failed for `{ulid}`: {err}");
+                continue;
+            }
+            Err(err) => {
+                tracing::warn!("sync: checkpoint ref push task failed for `{ulid}`: {err}");
+                continue;
+            }
         }
         for entry in pending {
             match client

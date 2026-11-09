@@ -6,7 +6,8 @@
 # The runner clones and syncs through the per-sandbox egress proxy over
 # HTTPS; the job uploads an artifact and a Pi session.
 #
-# Gated by STARFORGE_TEST_SANDBOX=1 (podman + the sf-ci-test image).
+# Gated by STARFORGE_TEST_SANDBOX=1 (podman). Builds its own sandbox image
+# from the public Alpine base; nothing is pre-built on the host.
 # Uses the local x86_64 musl release tarball for the in-sandbox CLI.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -82,9 +83,19 @@ if ! podman image exists localhost/sf-ci-e2e:latest; then
   mkdir -p "$WORK/image"
   cp "$TARBALL" "$WORK/image/starforge.tar.gz"
   cp crates/starforge-cli/tests/fixtures/pi-session.jsonl "$WORK/image/pi-session.jsonl"
+  # The image is built from the public Alpine base, so a clean checkout can
+  # build it anywhere; it must provide everything the daemon and the job
+  # commands run inside it (see packaging/sandbox/README.md): git and
+  # ca-certificates for the egress proxy, bash/zstd for agent CLIs,
+  # coreutils for `realpath -m`, curl for the proxy smoke, plus the non-root
+  # `sandbox` user and a writable `/workspace`.
   cat >"$WORK/image/Containerfile" <<'EOF'
-FROM localhost/sf-ci-test:latest
+FROM docker.io/library/alpine:3
 USER root
+RUN apk add --no-cache git ca-certificates bash zstd coreutils curl \
+  && adduser -D -s /bin/sh sandbox \
+  && mkdir -p /workspace /home/sandbox \
+  && chown sandbox:sandbox /workspace /home/sandbox
 COPY starforge.tar.gz /tmp/starforge.tar.gz
 RUN mkdir -p /tmp/starforge && tar -xzf /tmp/starforge.tar.gz -C /tmp/starforge \
   && cp /tmp/starforge/x86_64-unknown-linux-musl/starforge /usr/local/bin/starforge \
@@ -92,6 +103,7 @@ RUN mkdir -p /tmp/starforge && tar -xzf /tmp/starforge.tar.gz -C /tmp/starforge 
   && rm -rf /tmp/starforge /tmp/starforge.tar.gz
 COPY pi-session.jsonl /opt/starforge/pi-session.jsonl
 USER sandbox
+WORKDIR /workspace
 EOF
   podman build -t localhost/sf-ci-e2e:latest -f "$WORK/image/Containerfile" "$WORK/image"
 fi
