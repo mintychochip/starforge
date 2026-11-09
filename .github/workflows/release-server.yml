@@ -25,6 +25,7 @@ jobs:
         run: rustup show
       - name: Install zig and cargo-zigbuild
         run: |
+          rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
           # The ziglang wheel ships `ziglang/zig` with no console script, so
           # pip --user installs no ~/.local/bin/zig. Shim it through the
           # package's own entry point.
