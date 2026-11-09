@@ -25,8 +25,15 @@ jobs:
         run: rustup show
       - name: Install zig and cargo-zigbuild
         run: |
+          # The ziglang wheel ships `ziglang/zig` with no console script, so
+          # pip --user installs no ~/.local/bin/zig. Shim it through the
+          # package's own entry point.
           python3 -m pip install --user ziglang==0.13.0
+          install -d "$HOME/.local/bin"
+          printf '#!/bin/sh\nexec python3 -m ziglang "$@"\n' > "$HOME/.local/bin/zig"
+          chmod +x "$HOME/.local/bin/zig"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/zig" version
           cargo install cargo-zigbuild --locked
       - name: Build static tarballs
         run: scripts/build-release.sh

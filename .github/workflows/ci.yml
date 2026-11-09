@@ -107,6 +107,11 @@ jobs:
     runs-on: ubuntu-24.04
     # Non-blocking until the dependency set has a clean `cargo audit` run.
     continue-on-error: true
+    # audit-check reports results by creating a check run; `contents: read`
+    # alone yields "Resource not accessible by integration".
+    permissions:
+      contents: read
+      checks: write
     steps:
       - uses: actions/checkout@v5.0.0
       - name: Install pinned toolchain
@@ -115,6 +120,11 @@ jobs:
         uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          # rsa 0.10.0-rc.18 is the RustCrypto fix for RUSTSEC-2023-0071, but
+          # the advisory lists the patch as `>= 0.10.0` and semver orders the
+          # release candidate below it. russh pulls the pre-release in, so
+          # ignore the advisory until a stable rsa 0.10 is released.
+          ignore: RUSTSEC-2023-0071
 
   sandbox-e2e:
     name: real sandbox e2e
@@ -125,8 +135,15 @@ jobs:
         run: rustup show
       - name: Install zig and cargo-zigbuild
         run: |
+          # The ziglang wheel ships `ziglang/zig` with no console script, so
+          # pip --user installs no ~/.local/bin/zig. Shim it through the
+          # package's own entry point.
           python3 -m pip install --user ziglang==0.13.0
+          install -d "$HOME/.local/bin"
+          printf '#!/bin/sh\nexec python3 -m ziglang "$@"\n' > "$HOME/.local/bin/zig"
+          chmod +x "$HOME/.local/bin/zig"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/zig" version
           cargo install cargo-zigbuild --locked
       - name: Build static artifacts
         run: scripts/build-release.sh
