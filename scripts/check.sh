@@ -20,7 +20,8 @@ if [[ "${STARFORGE_TEST_PG:-0}" == "1" ]]; then
   # The suite creates hundreds of databases with concurrent migrations; the
   # container default of 64 MiB /dev/shm runs out of dynamic shared memory.
   "$engine" run -d --rm --name "$name" -e POSTGRES_PASSWORD=starforge \
-    --shm-size=1g -p 127.0.0.1:55439:5432 docker.io/library/postgres:17 >/dev/null
+    --shm-size=1g -p 127.0.0.1:55439:5432 docker.io/library/postgres:17 \
+    -c max_connections=500 >/dev/null
   trap '"$engine" stop -t 2 "$name" >/dev/null' EXIT
   for _ in $(seq 1 60); do
     "$engine" exec "$name" pg_isready -U postgres -h 127.0.0.1 >/dev/null 2>&1 && break
