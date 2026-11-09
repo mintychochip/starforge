@@ -280,9 +280,9 @@ The server fetches the source branch's objects into the target repository, so
 diffs, gates, and merges work as for a same-repository change. The change page
 shows the source as `owner/repo:branch`.
 
-The source repository must be public, share the target's owner, or grant the
-actor admin permission. This rule stops a reader of a private source from
-copying its code into a target with a wider audience. A source branch that
+The source repository must be public, or the target must not be more visible
+than the source. This rule stops a reader of a private source from copying
+its code into a target with a wider audience. A source branch that
 moved is re-fetched with `POST .../changes/{k}/refresh` or
 `starforge trail change refresh --trail <n> --change <k>`. Merging also needs
 read access on the source repository.

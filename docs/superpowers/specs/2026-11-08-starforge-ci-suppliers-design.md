@@ -36,11 +36,20 @@ remains the only supplier Starforge enforces.
 4. **Config sections.** `[ci.github]`, `[ci.buildkite]`, `[ci.blacksmith]`,
    and `[ci.namespace]`, each with `api_url`, `token`, and (where needed)
    `org` and `cli_path`. Empty token disables the supplier.
-5. **Blacksmith uses the CLI.** The server executes `blacksmith usage
+5. **Migration 0048 relaxes the supplier link constraint.** Migration 0039
+   created `ci_supplier_links.supplier` with `CHECK (supplier IN ('depot'))`.
+   Migration 0048 rebuilds the table on SQLite (as 0045 did) and drops and
+   re-adds the check on Postgres, allowing `depot`, `github`, `buildkite`,
+   `blacksmith`, and `namespace`.
+6. **Per-supplier `external_ref` rules.** `depot` takes `owner/name`;
+   `github` takes `org` or `org/repo`; `buildkite`, `blacksmith`, and
+   `namespace` take an organization slug. `validate_external_ref` takes the
+   supplier and applies the matching rule.
+7. **Blacksmith uses the CLI.** The server executes `blacksmith usage
    --format json` with a bounded timeout and parses the JSON. The operator
    installs the CLI; a missing binary reports an error on the usage page, not
    a server failure.
-6. **Namespace waits for a confirmed proto.** Do not guess the Connect
+8. **Namespace waits for a confirmed proto.** Do not guess the Connect
    message shape. Add the client only after the proto and a real response are
    available.
 

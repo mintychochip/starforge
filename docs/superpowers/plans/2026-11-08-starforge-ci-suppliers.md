@@ -3,6 +3,17 @@
 - **Design:** `docs/superpowers/specs/2026-11-08-starforge-ci-suppliers-design.md`
 - **Status:** proposed.
 
+## Task 0 — Supplier link constraint [FR-5]
+
+- [ ] Migration 0048 (SQLite + Postgres): allow `depot`, `github`,
+      `buildkite`, `blacksmith`, and `namespace` in
+      `ci_supplier_links.supplier`. SQLite rebuilds the table; Postgres drops
+      `ci_supplier_links_supplier_check` and adds the new CHECK.
+- [ ] `validate_external_ref(supplier, external_ref)`: `depot` is
+      `owner/name`; `github` is `org` or `org/repo`; the others are an org
+      slug.
+- [ ] Postgres run of the link CRUD tests.
+
 ## Task 1 — GitHub Actions client [FR-1]
 
 - [ ] `crates/starforged-core/src/ci_usage_github.rs`:

@@ -522,6 +522,31 @@ impl Core {
             .await?
             .ok_or_else(|| CoreError::Internal("change has no current revision".into()))?;
         let head = revision.head_sha.clone();
+        // A branch change's live tip can move before the post-push scan
+        // appends the new revision. Merging the stale revision would merge
+        // the previous head; refuse until the scan catches up.
+        // Cross-repository changes use the imported head and refresh on
+        // demand, so they are exempt.
+        if change.kind == "branch"
+            && db_changes::change_source(self.db(), change.id)
+                .await?
+                .is_none()
+            && let Some(branch) = &change.head_branch
+        {
+            match self.branch_tip(access.repo.id, branch).await? {
+                Some(live) if live != head => {
+                    return Err(CoreError::Conflict(format!(
+                        "branch '{branch}' moved to {live}; the new revision is not ready yet"
+                    )));
+                }
+                None => {
+                    return Err(CoreError::Conflict(format!(
+                        "head branch '{branch}' is missing"
+                    )));
+                }
+                Some(_) => {}
+            }
+        }
         let base_branch = change.base_branch.clone();
         let base_ref = format!("refs/heads/{base_branch}");
         if base_branch.contains('\0') || base_branch.contains('\n') {

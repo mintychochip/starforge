@@ -35,10 +35,11 @@ server support.
   repository shall open a change on a target Trail whose head is a branch in
   the source repository. The server shall fetch the source branch's objects
   into the target repository before recording the revision.
-- **FR-002:** The server shall refuse a cross-repository change when the source
-  repository is private and the source is not owned by the same user or
-  organization and the actor is not a source admin. This prevents copying
-  private code into a target repository with a wider audience.
+- **FR-002:** The server shall refuse a cross-repository change when the
+  source repository is not public and the target repository is more visible
+  than the source. This prevents copying private code into a target
+  repository with a wider audience. Source admin permission does not bypass
+  the rule.
 - **FR-003:** A cross-repository change shall store its source repository and
   source branch in a `change_sources` row; the `changes` row keeps its
   existing shape.
@@ -98,8 +99,9 @@ server support.
    SELECT lists stay untouched; a change without a source row is same-repo.
 3. **Cross-repo changes use `kind = 'branch'`.** They are branch changes with
    a source; no new kind value is needed.
-4. **Leak rule:** private source + different owner + non-admin actor is
-   refused. Public sources and same-owner sources are allowed.
+4. **Leak rule:** a public source may go anywhere. Otherwise the target must
+   not be more visible than the source. Source admin permission does not
+   bypass the rule.
 5. **Rebase uses plumbing, not a worktree.** Each commit is replayed with
    `git merge-tree --write-tree --merge-base=<original-parent>` and
    `git commit-tree`; the server never checks out a worktree.

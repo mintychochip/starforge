@@ -702,7 +702,11 @@ impl Core {
     }
 
     /// Tip of `branch`, or `None` when the branch does not exist.
-    async fn branch_tip(&self, repo_id: i64, branch: &str) -> CoreResult<Option<String>> {
+    pub(crate) async fn branch_tip(
+        &self,
+        repo_id: i64,
+        branch: &str,
+    ) -> CoreResult<Option<String>> {
         let repo = self.repo_path(repo_id);
         let name = branch.to_owned();
         tokio::task::spawn_blocking(move || {

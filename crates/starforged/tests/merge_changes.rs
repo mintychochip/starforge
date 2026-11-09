@@ -1113,3 +1113,31 @@ async fn rebase_refuses_conflicts_and_non_linear_histories() {
     let text = serde_json::to_string(&body).unwrap();
     assert!(text.contains("linear history"), "{text}");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn merge_refuses_a_branch_that_moved_before_the_scan() {
+    let c = Ctx::start().await;
+    let (work, _url) = c.push_basic().await;
+    let server = c.server().await;
+    let n = c.trail().await;
+    c.create_branch_change(n, "feature/x", "main").await;
+
+    // Move the branch directly in the server repository, without the
+    // post-push scan that would append a revision.
+    let gd = git_dir_arg(&server);
+    let tip = server_rev(&work, &server, "refs/heads/feature/x").await;
+    let tree = git_ok(&work, &[&gd, "rev-parse", &format!("{tip}^{{tree}}")]).await;
+    let tree = tree.trim();
+    let new = git_ok(
+        &work,
+        &[&gd, "commit-tree", tree, "-p", &tip, "-m", "unscanned"],
+    )
+    .await;
+    let new = new.trim();
+    git_ok(&work, &[&gd, "update-ref", "refs/heads/feature/x", new]).await;
+
+    let (status, body) = c.post_merge(n, 1, &c.alice_repo, "merge").await;
+    assert_eq!(status, 409, "{body}");
+    let text = serde_json::to_string(&body).unwrap();
+    assert!(text.contains("moved"), "{text}");
+}

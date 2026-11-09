@@ -111,7 +111,7 @@ The function refuses a merge commit, a conflict, or more than 1024 commits. The 
 
 A cross-repository change has a `change_sources` row. The row stores the source repository and branch. `create_cross_repo_change` fetches the source branch with `write::fetch_branch` into a temporary import ref, verifies the object, records the change and revision, then deletes the temporary ref. The trail head ref keeps the objects reachable.
 
-`refresh_cross_repo_change` repeats the fetch and appends a revision when the head moved. The leak rule allows a public source, a same-owner source, or a source admin. `merge_change` also requires read access on the source.
+`refresh_cross_repo_change` repeats the fetch and appends a revision when the head moved. The leak rule allows a public source, or a target that is no more visible than the source. `merge_change` also requires read access on the source.
 
 Gate-rule push rules act in branch protection at push time. The fields are `block_direct_push`, `block_force_push`, and `block_deletion`. `merge_change` does not re-check them.
 
