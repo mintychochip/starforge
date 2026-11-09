@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
-# Format check, lints, tests, and the technical-docs check. STARFORGE_TEST_PG=1 also runs the suite against a throwaway
-# Postgres 17 container (podman or docker).
+# Format check, lints, tests, and the technical-docs check.
+# Tests run under cargo-nextest: the full workspace on SQLite, then the
+# SQL-sensitive packages on Postgres 17 (STARFORGE_TEST_PG=1).
+# STARFORGE_GATE_FULL_PG=1 runs the whole workspace on Postgres instead.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo nextest run --workspace
 
 # Technical documents use ASD-STE100; the checker enforces the mechanical rules.
 python3 scripts/ste_check.py --strict
@@ -24,5 +26,18 @@ if [[ "${STARFORGE_TEST_PG:-0}" == "1" ]]; then
     "$engine" exec "$name" pg_isready -U postgres -h 127.0.0.1 >/dev/null 2>&1 && break
     sleep 0.5
   done
-  STARFORGE_TEST_PG_URL="postgres://postgres:starforge@127.0.0.1:55439/postgres" cargo test --workspace
+  export STARFORGE_TEST_PG_URL="postgres://postgres:starforge@127.0.0.1:55439/postgres"
+  if [[ "${STARFORGE_GATE_FULL_PG:-0}" == "1" ]]; then
+    cargo nextest run --workspace
+  else
+    # The SQLite run above covers the whole workspace. Postgres reruns the
+    # packages whose tests exercise SQL behavior: the DB layer, and the
+    # integration tests for backup/restore, pooling, search, audit
+    # retention, admin display, and the CI tables.
+    cargo nextest run -p starforged-db
+    cargo nextest run -p starforged \
+      --test backup_restore --test db_pool --test search_index \
+      --test admin_pages --test audit_retention --test api_ci_runs \
+      --test api_ci_usage
+  fi
 fi

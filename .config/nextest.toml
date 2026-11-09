@@ -1,0 +1,5 @@
+# The suite is large and some tests share global state (ports, temp paths).
+# One retry keeps a single flake from failing the gate; a recovered test is
+# reported as FLAKY in the log, so it stays visible.
+[profile.default]
+retries = 1

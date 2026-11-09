@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+### CI
+
+- Real E2B v2 API adapter: control plane on `api.e2b.app`, the envd data
+  plane for exec and files, and token rehydration across restarts. E2B
+  port URLs are public (no traffic token, not signed) and bounded by the
+  sandbox TTL.
+- Matrix jobs: `[job.matrix]` expands one job into one job per
+  combination. A manual `--job NAME` selects the base job's
+  combinations, never a prefixed job. The whole file caps at 256 jobs
+  after expansion.
+- Dependency cache: `[job.cache]` restores before the commands and saves
+  after a successful job. An entry caps at 256 MiB, is retained 7 days,
+  and a repository keeps 50 live entries (LRU). `ci.limits.cache_bytes`
+  bounds a repository's live cache.
+- `starforge ci run` runs the spec in a local sandbox without a server.
+  The spec parser moved to the permissive `starforge-ci-spec` crate.
+- `starforge sandbox run/exec/cp/kill` local developer loop.
+
 ## 0.1.0-rc.1
 
 First release candidate of the 0.1.0 line: git over HTTP and SSH with Trails,
@@ -94,13 +114,8 @@ and opt-in CI runners with sandboxed jobs, on SQLite or Postgres.
 - **CI runners and sandboxes (M6):** opt-in `.starforge/ci.toml` jobs
   triggered by pushes, Trail changes, or manually; self-hosted runners
   with lease fences and per-job tokens; sandboxed execution through
-  `starforge-sandboxd` (`podman`/gVisor) or the real E2B v2 API; a
-  `matrix` table expands one job into one job per combination; a
-  `[job.cache]` table restores and saves a dependency cache (256 MiB per
-  entry, 7-day retention, 50 entries per repository); `starforge ci run`
-  runs the spec in a local sandbox without a server; E2B port URLs are
-  public (no traffic token, not signed) and bounded by the sandbox TTL;
-  artifacts with BLAKE3 CAS and 30-day retention; sealed repo secrets
+  `starforge-sandboxd` (`podman`/gVisor) or E2B; artifacts with BLAKE3
+  CAS and 30-day retention; sealed repo secrets
   injected only by the egress proxy; per-job agent sessions linked to the
   run; the `ci` webhook event (`queued`/`started`/`finished`/
   `canceled`); and usage by supplier — native runner minutes and artifact
