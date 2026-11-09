@@ -46,8 +46,8 @@ The [storage and database page](storage-and-database.md) describes stored state.
 Server code and client code have different licenses.
 The workspace package license is AGPL-3.0-or-later.
 `publish` is false for every server crate.
-The seven client crates publish separately.
-Those seven crates use MIT OR Apache-2.0.
+The eight client crates publish separately.
+Those eight crates use MIT OR Apache-2.0.
 The split keeps the server under copyleft.
 
 The client format stays reusable by other tools.
@@ -93,10 +93,12 @@ flowchart BT
     starforged-core --> starforge-format
     starforged-core --> starforge-redact
     starforged-core --> starforge-sandbox-protocol
+    starforged-core --> starforge-ci-spec
     starforge-cli --> starforge-capture
     starforge-cli --> starforge-format
     starforge-capture --> starforge-format
     starforge-cli --> starforge-redact
+    starforge-cli --> starforge-ci-spec
     starforge-runner --> starforge-sandbox-protocol
     starforge-sandboxd --> starforge-sandbox-protocol
 ```

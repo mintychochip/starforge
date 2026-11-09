@@ -6,7 +6,10 @@ Milestone M6 adds opt-in continuous integration. A repository opts in with one f
 
 ## Scope
 
-The code in `starforged-core/src/ci_spec.rs` parses the spec. The code in `starforged-core/src/ci.rs` owns runners, jobs, artifacts, secrets, and session capture. The code in `starforged-core/src/ci_usage.rs` and `ci_usage_depot.rs` builds the usage report. The code in `starforged-core/src/sandboxes.rs` and `sandboxes_e2b.rs` owns sandbox providers. The code in `starforge-sandboxd/src/podman.rs` and `proxy.rs` owns the local daemon. The code in `starforge-runner/src/lib.rs` owns the runner.
+The code in `starforge-ci-spec/src/lib.rs` parses the spec.
+The code in `starforged-core/src/ci_spec.rs` re-exports it.
+
+The code in `starforged-core/src/ci.rs` owns runners, jobs, artifacts, secrets, and session capture. The code in `starforged-core/src/ci_usage.rs` and `ci_usage_depot.rs` builds the usage report. The code in `starforged-core/src/sandboxes.rs` and `sandboxes_e2b.rs` owns sandbox providers. The code in `starforge-sandboxd/src/podman.rs` and `proxy.rs` owns the local daemon. The code in `starforge-runner/src/lib.rs` owns the runner.
 
 ## How it works
 
@@ -85,6 +88,12 @@ The runner initializes the checkout in place with `git init` and `fetch` because
 The hourly cleanup runs `gc_expired_artifacts`. It deletes expired artifact rows. It deletes a blob when no unexpired artifact references it.
 
 The blob store keeps the bytes under a BLAKE3 address. Downloads need an artifact token or the job token.
+
+### Dependency cache
+
+A job can declare `[job.cache]` with an exact key, up to 8 relative paths, and up to 4 restore prefixes. The runner restores the entry before the commands and saves it after a successful job. `put_ci_cache` stores the archive in the same blob store and upserts one `ci_cache_entries` row per `(repository, key)`. An entry caps at 256 MiB and expires after 7 days.
+
+A repository keeps at most 50 live entries. A save evicts the least recently used entries first and then checks `cache_bytes`. `gc_expired_caches` runs in the hourly cleanup.
 
 The runner fetches one short-lived git credential per job. `git_credential_for_runner` mints one `sfp_` token. The token scope holds `repo:read` and `repo:write`. The token expires at the earlier of the deadline and now plus 1 hour. The server revokes the token at finish or cancel.
 
@@ -168,7 +177,7 @@ Two suppliers report for one repository. The `native` supplier reports Starforge
 
 A reaped attempt ends at its lease end. An overdue attempt ends at sweep time. The row records `claimed_at` as the start. The row records the end time as the end. Seconds equal end minus start.
 
-`[ci.limits]` caps native use. `minutes_per_month` caps runner minutes per repository per UTC calendar month. `artifact_bytes` caps unexpired artifact bytes per repository. A zero value disables the cap. The server checks the minutes cap at queue time.
+`[ci.limits]` caps native use. `minutes_per_month` caps runner minutes per repository per UTC calendar month. `artifact_bytes` caps unexpired artifact bytes per repository. `cache_bytes` caps live cache bytes per repository. A zero value disables the cap. The server checks the minutes cap at queue time.
 
 A refused run skips job creation and skips the `ci` event. A refused run writes an `error` check unless the commit already holds that check. The description names the reset date. A manual trigger answers `Invalid`, and the API maps `Invalid` to 422.
 
@@ -182,7 +191,7 @@ The API returns no limits. Each Depot metric so reports `limit` as null. The rep
 
 ### Report endpoints and page
 
-`ci_usage` serves the native report. `GET /api/v1/repos/{owner}/{repo}/ci/usage` serves every supplier report. Each report lists `used` for every metric. Each report lists `limit` only when Starforge can see one. Native metrics are `runner_minutes`, `attempts`, and `artifact_bytes`.
+`ci_usage` serves the native report. `GET /api/v1/repos/{owner}/{repo}/ci/usage` serves every supplier report. Each report lists `used` for every metric. Each report lists `limit` only when Starforge can see one. Native metrics are `runner_minutes`, `attempts`, `artifact_bytes`, and `cache_bytes`.
 
 Depot metrics are `depot_ci_vcpu_minutes`, `depot_ci_minutes`, `depot_ci_attempts`, `github_actions_minutes`, and `github_actions_jobs`. The page `/{owner}/{repo}/ci/usage` shows the same reports. The page needs at least Maintain. The runs page also links to the usage page.
 

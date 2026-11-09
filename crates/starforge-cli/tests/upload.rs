@@ -338,8 +338,10 @@ async fn start_stub(config: StubConfig) -> Stub {
 
 /// A port on localhost that is (almost surely) closed, for the down-stub case.
 fn closed_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap().port()
+    // Port 1 is reserved and never bound by the suite. Binding an ephemeral
+    // port and dropping it races with parallel tests that can rebind it,
+    // which turns "server down" into a live stub.
+    1
 }
 
 async fn run_sync(
