@@ -38,6 +38,10 @@ use starforge_cli::queue::{QueueEntry, QueueOp, Sleeper, enqueue, read_queue};
 use starforge_cli::spool::Spool;
 use tempfile::TempDir;
 
+mod common;
+
+use common::hermetic_command;
+
 const TOKEN: &str = "test-token";
 const PAST: &str = "2026-01-01T00:00:00Z";
 const NOW: &str = "2026-11-04T00:00:00Z";
@@ -397,9 +401,18 @@ async fn enable_commit_sync_end_to_end() {
         vec![format!("Starforge-Session: {ulid}")],
         "body: {body:?}"
     );
-    git_ok(
-        &repo,
-        &["commit", "--no-verify", "-F", msg.to_str().unwrap()],
+    // `--no-verify` still runs `prepare-commit-msg`; keep its ingest on the
+    // test home instead of the real one.
+    let out = hermetic_command("git", home.path())
+        .arg("-C")
+        .arg(&repo)
+        .args(["commit", "--no-verify", "-F", msg.to_str().unwrap()])
+        .output()
+        .expect("git runs");
+    assert!(
+        out.status.success(),
+        "commit failed: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
     let sha = git_ok(&repo, &["rev-parse", "HEAD"]);
     let sha = sha.trim().to_string();
