@@ -30,7 +30,7 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
-starforge-ci-spec = { path = "../starforge-ci-spec" }
+starforge-ci-spec = { path = "../starforge-ci-spec", version = "0.1.0-rc.1" }
 clap.workspace = true
 reqwest = { workspace = true, features = ["rustls"] }
 serde.workspace = true

@@ -20,6 +20,13 @@
   The spec parser moved to the permissive `starforge-ci-spec` crate.
 - `starforge sandbox run/exec/cp/kill` local developer loop.
 
+### Migrations
+
+| Migration | Purpose |
+|---|---|
+| 0044 | CI cache entries (`ci_cache_entries`) |
+| 0045 | Cache branch scope (`ci_cache_entries.scope`, `ci_jobs.branch`; table rebuild) |
+
 ## 0.1.0-rc.1
 
 First release candidate of the 0.1.0 line: git over HTTP and SSH with Trails,

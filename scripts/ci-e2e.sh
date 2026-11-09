@@ -165,12 +165,17 @@ push = ["main"]
 name = "test"
 image = "localhost/sf-ci-e2e:latest"
 commands = [
+  "if [ -f out/result.bin ]; then echo cache-restored; else echo cache-miss; fi",
   "mkdir -p out && echo artifact > out/result.bin",
   "mkdir -p \"$HOME/.pi/agent/sessions/--x--\" \"$STARFORGE_HOME/.pi/agent/sessions/--x--\" && sed 's|/work/repo|/workspace|g' /opt/starforge/pi-session.jsonl > \"$HOME/.pi/agent/sessions/--x--/01ARZ3NDEKTSV4RRFFQ69G5FAV.jsonl\" && cp \"$HOME/.pi/agent/sessions/--x--/01ARZ3NDEKTSV4RRFFQ69G5FAV.jsonl\" \"$STARFORGE_HOME/.pi/agent/sessions/--x--/01ARZ3NDEKTSV4RRFFQ69G5FAV.jsonl\"",
 ]
 timeout = "10m"
 artifacts = ["out/**"]
 env = { HOME = "/tmp", STARFORGE_HOME = "/tmp/.starforge" }
+
+[job.cache]
+key = "e2e-cache"
+paths = ["out"]
 TOML
 echo "# e2e" >"$WORK/work/README.md"
 git -C "$WORK/work" add -A
@@ -337,4 +342,43 @@ assert "out/result.bin" in names, names
 assert d["sessions"], "no session linked to the job"
 print("ci-e2e: job", d["job_id"], "succeeded; artifacts", names, "sessions", d["sessions"])
 '
+echo "==> second push (cache restore)"
+echo "second" >>"$WORK/work/README.md"
+git -C "$WORK/work" add -A
+git -C "$WORK/work" commit -q -m "e2e second"
+git -C "$WORK/work" push -q "http://git:$TOKEN@127.0.0.1:$SERVER_PORT/me/proj.git" main
+
+JOB_ID=""
+STATE=""
+for _ in $(seq 1 240); do
+  RUNS="$(curl -fsS -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/repos/me/proj/ci/runs?limit=10")"
+  read -r JOB_ID STATE < <(printf '%s' "$RUNS" | python3 -c '
+import json, sys
+runs = [r for r in json.load(sys.stdin)["runs"] if r["job_name"] == "test"]
+if runs:
+    print(runs[0]["job_id"], runs[0]["state"])
+')
+  case "$STATE" in
+    succeeded) break ;;
+    failed|error|canceled)
+      echo "ci-e2e: second job $JOB_ID ended $STATE" >&2
+      print_job_log >&2
+      exit 1
+      ;;
+  esac
+  sleep 1
+done
+[[ "$STATE" == "succeeded" ]] || {
+  echo "ci-e2e: timed out waiting for the second job (last state: ${STATE:-none})" >&2
+  print_job_log >&2
+  exit 1
+}
+SECOND_LOG="$(print_job_log)"
+printf '%s' "$SECOND_LOG" | grep -q "cache-restored" || {
+  echo "ci-e2e: second job did not restore the cache" >&2
+  printf '%s\n' "$SECOND_LOG" >&2
+  exit 1
+}
+echo "ci-e2e: cache restored"
+
 echo "ci-e2e: ok"
