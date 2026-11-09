@@ -46,7 +46,7 @@ async fn call(
 /// A stateful fake E2B server: routes the adapter's paths, stores file
 /// content, and tracks one sandbox's state (running/paused).
 async fn spawn_fake_e2b() -> String {
-    let files: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
+    let files: Arc<Mutex<HashMap<String, Vec<u8>>>> = Arc::new(Mutex::new(HashMap::new()));
     let state: Arc<Mutex<String>> = Arc::new(Mutex::new("running".to_owned()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
@@ -90,7 +90,15 @@ async fn spawn_fake_e2b() -> String {
                 let method = parts.next().unwrap_or_default().to_owned();
                 let target = parts.next().unwrap_or_default().to_owned();
                 let path = target.split('?').next().unwrap_or_default().to_owned();
-                // Extract JSON body (after the blank line) when present.
+                // Extract the body (after the blank line) when present. The
+                // bytes stay raw for the binary file route; JSON handlers
+                // use the lossy text.
+                let body_start = buf
+                    .windows(4)
+                    .position(|w| w == b"\r\n\r\n")
+                    .map(|end| end + 4)
+                    .unwrap_or(buf.len());
+                let body_bytes = buf[body_start..].to_vec();
                 let body = text
                     .split_once("\r\n\r\n")
                     .map(|(_, b)| b.to_owned())
@@ -157,15 +165,15 @@ async fn spawn_fake_e2b() -> String {
                             .unwrap()
                             .get(&path_q)
                             .cloned()
-                            .unwrap_or_else(|| "hello".into());
-                        (200, content.into_bytes())
+                            .unwrap_or_else(|| b"hello".to_vec());
+                        (200, content)
                     } else if method == "PUT" && path == "/files" {
                         let query = target.split('?').nth(1).unwrap_or_default();
                         let path_q: String = query
                             .split('&')
                             .find_map(|kv| kv.strip_prefix("path=").map(percent_decode))
                             .unwrap_or_default();
-                        files.lock().unwrap().insert(path_q, body.clone());
+                        files.lock().unwrap().insert(path_q, body_bytes.clone());
                         (200, b"{}".to_vec())
                     } else if method == "POST" && path == "/filesystem.Filesystem/ListDir" {
                         (200, br#"{"entries":[{"name":"a.txt"}]}"#.to_vec())
@@ -498,6 +506,27 @@ async fn idempotency_and_file_traversal() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["entries"][0], "a.txt");
+
+    // Raw binary write/read (cache archives, binary artifacts).
+    let raw = vec![0u8, 159, 146, 150, 255, 0];
+    let resp = s
+        .browser()
+        .put(s.url(&format!("/api/v1/sandboxes/{id}/files/raw?path=blob.bin")))
+        .bearer_auth(&token)
+        .body(raw.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let resp = s
+        .browser()
+        .get(s.url(&format!("/api/v1/sandboxes/{id}/files/raw?path=blob.bin")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.bytes().await.unwrap().to_vec(), raw);
     let (status, body) = call(
         &s.browser(),
         "DELETE",

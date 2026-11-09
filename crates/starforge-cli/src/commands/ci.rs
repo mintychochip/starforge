@@ -113,6 +113,12 @@ async fn run_job(
     allow_host: &[String],
     keep: bool,
 ) -> u8 {
+    if !job.secrets.is_empty() {
+        eprintln!(
+            "warning: job {} lists secrets; local runs do not resolve them",
+            job.name
+        );
+    }
     let image = job
         .image
         .as_deref()
@@ -208,7 +214,15 @@ async fn exec(client: &LocalSandboxClient, id: &str, command: &str, timeout_s: u
 /// sandbox workspace root).
 fn working_tree_tar() -> Result<Vec<u8>, String> {
     let out = Command::new("tar")
-        .args(["czf", "-", "--exclude=.starforge-ci", "-C", ".", "."])
+        .args([
+            "czf",
+            "-",
+            "--exclude=.starforge-ci",
+            "--exclude=target",
+            "-C",
+            ".",
+            ".",
+        ])
         .output()
         .map_err(|err| format!("running tar: {err}"))?;
     if !out.status.success() {

@@ -2,8 +2,8 @@
 
 Normative specification of `.starforge/ci.toml` (version 1), the run
 lifecycle, and the `ci`/`check` webhook payloads. The Rust implementation
-is `starforged-core::ci_spec::{CiSpec, CiJobSpec}` and
-`starforged-core::ci`; the authoring guide is [CI](../user/ci.md) and the
+is `starforge-ci-spec::{CiSpec, CiJobSpec}` (parsing and validation)
+and `starforged-core::ci` (lifecycle); the authoring guide is [CI](../user/ci.md) and the
 operator guide is [Admin: CI](../admin/ci.md). The webhook envelope
 itself is specified in [Events v1](events-v1.md).
 
