@@ -2,7 +2,8 @@
 //! sandbox, without a server or a CI job. A developer loop.
 
 use std::collections::BTreeMap;
-use std::process::Command;
+use std::io::Write as _;
+use std::process::{Command, Stdio};
 
 use starforge_ci_spec::{CiJobSpec, CiSpec};
 use starforge_runner::local::LocalSandboxClient;
@@ -13,6 +14,8 @@ use crate::cli::CiCmd;
 /// Chunk size for copying the working tree into the sandbox (the daemon's
 /// per-file cap is 8 MiB).
 const COPY_CHUNK_BYTES: usize = 8 * 1024 * 1024;
+/// Refuse a working tree larger than this; the archive is built in memory.
+const MAX_TREE_BYTES: usize = 512 * 1024 * 1024;
 
 /// Run one `ci` subcommand; returns the process exit code.
 pub async fn run(cmd: CiCmd, dry_run: bool) -> u8 {
@@ -210,25 +213,53 @@ async fn exec(client: &LocalSandboxClient, id: &str, command: &str, timeout_s: u
     }
 }
 
-/// The working tree as a gzipped tar (members are `./...`, extracted at the
-/// sandbox workspace root).
+/// The working tree as a gzipped tar, extracted at the sandbox workspace
+/// root. `git ls-files` respects `.gitignore` and skips deleted tracked
+/// files; `.git` is included so jobs can run git commands.
 fn working_tree_tar() -> Result<Vec<u8>, String> {
-    let out = Command::new("tar")
+    let list = Command::new("git")
         .args([
-            "czf",
-            "-",
-            "--exclude=.starforge-ci",
-            "--exclude=target",
-            "-C",
-            ".",
-            ".",
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
         ])
         .output()
+        .map_err(|err| format!("running git ls-files: {err}"))?;
+    if !list.status.success() {
+        return Err(format!(
+            "git ls-files failed: {}",
+            String::from_utf8_lossy(&list.stderr).trim()
+        ));
+    }
+    let mut names = list.stdout;
+    names.extend_from_slice(b".git\0");
+    let mut child = Command::new("tar")
+        .args(["czf", "-", "--null", "-T", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|err| format!("running tar: {err}"))?;
+    if let Some(stdin) = child.stdin.as_mut() {
+        stdin
+            .write_all(&names)
+            .map_err(|err| format!("feeding tar: {err}"))?;
+    }
+    let out = child
+        .wait_with_output()
+        .map_err(|err| format!("waiting for tar: {err}"))?;
     if !out.status.success() {
         return Err(format!(
             "tar failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    if out.stdout.len() > MAX_TREE_BYTES {
+        return Err(format!(
+            "the working tree archive is {} bytes, over the {MAX_TREE_BYTES}-byte cap; add build output to .gitignore",
+            out.stdout.len()
         ));
     }
     Ok(out.stdout)

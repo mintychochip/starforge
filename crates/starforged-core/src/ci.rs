@@ -1683,6 +1683,7 @@ impl Core {
         revision_id: Option<i64>,
         commit_sha: &str,
         base_sha: Option<&str>,
+        branch: &str,
         job: &crate::ci_spec::CiJobSpec,
         created_by: Option<i64>,
     ) -> CoreResult<Option<i64>> {
@@ -1705,6 +1706,7 @@ impl Core {
                 revision_id,
                 commit_sha,
                 base_sha,
+                branch,
                 job_name: &job.name,
                 spec: &spec_json,
                 run_at: now_ts,
@@ -1769,7 +1771,9 @@ impl Core {
         let mut ids = Vec::new();
         for job in spec.expanded_jobs() {
             if let Some(id) = self
-                .enqueue_ci_job(repo_id, None, None, None, commit_sha, None, &job, pusher)
+                .enqueue_ci_job(
+                    repo_id, None, None, None, commit_sha, None, branch, &job, pusher,
+                )
                 .await?
             {
                 ids.push(id);
@@ -1829,6 +1833,10 @@ impl Core {
                         change.current_revision_id,
                         commit_sha,
                         None,
+                        change
+                            .head_branch
+                            .as_deref()
+                            .unwrap_or(&format!("trail-{}", change.id)),
                         &job,
                         created_by,
                     )
@@ -1908,6 +1916,7 @@ impl Core {
                     None,
                     &resolved.commit_id,
                     None,
+                    &reference,
                     job,
                     Some(user.id),
                 )
@@ -2501,27 +2510,37 @@ impl Core {
         let expired = db_ci::expired_artifacts(self.db(), now(), 1000).await?;
         let mut ids = Vec::new();
         for row in expired {
-            if db_ci::delete_artifact(self.db(), row.id).await?
-                && db_ci::artifact_refcount(self.db(), &row.blake3).await? == 0
-                && db_ci::ci_log_refcount(self.db(), &row.blake3).await? == 0
-                && db_ci::cache_refcount(self.db(), &row.blake3).await? == 0
-                && !db_sessions::blob_by_hash(self.db(), &row.blake3)
-                    .await?
-                    .is_some_and(|blob| blob.refcount > 0)
-            {
-                let _ = self
-                    .config()
-                    .blob_store
-                    .delete(&starforged_blob::BlobRef {
-                        hash: row.blake3.clone(),
-                        size: row.size as u64,
-                        key: row.blake3.clone(),
-                    })
-                    .await;
+            if db_ci::delete_artifact(self.db(), row.id).await? {
+                self.delete_blob_if_unreferenced(&row.blake3, row.size)
+                    .await?;
             }
             ids.push(row.id);
         }
         Ok(ids)
+    }
+
+    /// Deletes one CAS blob when no live artifact, log chunk, cache entry,
+    /// or session blob references it. The CAS is shared, so every delete
+    /// path goes through this guard.
+    async fn delete_blob_if_unreferenced(&self, hash: &str, size: i64) -> CoreResult<()> {
+        if db_ci::artifact_refcount(self.db(), hash).await? == 0
+            && db_ci::ci_log_refcount(self.db(), hash).await? == 0
+            && db_ci::cache_refcount(self.db(), hash).await? == 0
+            && !db_sessions::blob_by_hash(self.db(), hash)
+                .await?
+                .is_some_and(|blob| blob.refcount > 0)
+        {
+            let _ = self
+                .config()
+                .blob_store
+                .delete(&starforged_blob::BlobRef {
+                    hash: hash.to_owned(),
+                    size: size as u64,
+                    key: hash.to_owned(),
+                })
+                .await;
+        }
+        Ok(())
     }
 
     /// Saves one cache entry for the executing job. The key must equal the
@@ -2547,6 +2566,15 @@ impl Core {
         if !cache.save || cache.key != key {
             return Err(CoreError::Forbidden);
         }
+        let repo_row = db_repos::by_id(self.db(), job.repo_id)
+            .await?
+            .ok_or(CoreError::NotFound)?;
+        let default_branch = repo_row.default_branch;
+        let scope = if job.branch.is_empty() {
+            default_branch.as_str()
+        } else {
+            job.branch.as_str()
+        };
         if bytes.len() as i64 > MAX_CACHE_ENTRY_BYTES {
             return Err(CoreError::Invalid(format!(
                 "cache entry exceeds the {MAX_CACHE_ENTRY_BYTES}-byte cap"
@@ -2556,6 +2584,7 @@ impl Core {
             .await?;
         self.check_cache_quota(job.repo_id, bytes.len() as i64)
             .await?;
+        let previous = db_ci::cache_entry_any(self.db(), job.repo_id, scope, key).await?;
         let blob = self
             .config()
             .blob_store
@@ -2566,6 +2595,7 @@ impl Core {
             self.db(),
             &db_ci::NewCacheEntry {
                 repo_id: job.repo_id,
+                scope,
                 key,
                 size: bytes.len() as i64,
                 blake3: &blob.hash,
@@ -2574,6 +2604,12 @@ impl Core {
             },
         )
         .await?;
+        if let Some(previous) = previous
+            && previous.blake3 != row.blake3
+        {
+            self.delete_blob_if_unreferenced(&previous.blake3, previous.size)
+                .await?;
+        }
         Ok(CacheView {
             key: row.key,
             size: row.size,
@@ -2600,6 +2636,15 @@ impl Core {
         let spec: CiJobSpec = serde_json::from_str(&job.spec)
             .map_err(|_| CoreError::Invalid("job spec is not parseable".into()))?;
         let cache = spec.cache.as_ref().ok_or(CoreError::Forbidden)?;
+        let repo_row = db_repos::by_id(self.db(), job.repo_id)
+            .await?
+            .ok_or(CoreError::NotFound)?;
+        let default_branch = repo_row.default_branch;
+        let scope = if job.branch.is_empty() {
+            default_branch.as_str()
+        } else {
+            job.branch.as_str()
+        };
         let exact_allowed = key == cache.key;
         let prefix_allowed = cache
             .restore_keys
@@ -2609,10 +2654,13 @@ impl Core {
             return Err(CoreError::Forbidden);
         }
         let mut row = if exact_allowed {
-            db_ci::cache_entry(self.db(), job.repo_id, key).await?
+            db_ci::cache_entry(self.db(), job.repo_id, scope, key).await?
         } else {
             None
         };
+        if row.is_none() && scope != default_branch {
+            row = db_ci::cache_entry(self.db(), job.repo_id, &default_branch, key).await?;
+        }
         if row.is_none() {
             for prefix in restore_keys {
                 if !cache
@@ -2623,7 +2671,20 @@ impl Core {
                     continue;
                 }
                 if let Some(found) =
-                    db_ci::restore_cache_entry(self.db(), job.repo_id, prefix, now()).await?
+                    db_ci::restore_cache_entry(self.db(), job.repo_id, scope, prefix, now()).await?
+                {
+                    row = Some(found);
+                    break;
+                }
+                if scope != default_branch
+                    && let Some(found) = db_ci::restore_cache_entry(
+                        self.db(),
+                        job.repo_id,
+                        &default_branch,
+                        prefix,
+                        now(),
+                    )
+                    .await?
                 {
                     row = Some(found);
                     break;
@@ -2668,23 +2729,9 @@ impl Core {
     /// Deletes one cache row and its blob when no other live reference
     /// remains.
     async fn delete_cache_entry_row(&self, row: &db_ci::CiCacheRow) -> CoreResult<()> {
-        if db_ci::delete_cache_entry(self.db(), row.id).await?
-            && db_ci::artifact_refcount(self.db(), &row.blake3).await? == 0
-            && db_ci::ci_log_refcount(self.db(), &row.blake3).await? == 0
-            && db_ci::cache_refcount(self.db(), &row.blake3).await? == 0
-            && !db_sessions::blob_by_hash(self.db(), &row.blake3)
-                .await?
-                .is_some_and(|blob| blob.refcount > 0)
-        {
-            let _ = self
-                .config()
-                .blob_store
-                .delete(&starforged_blob::BlobRef {
-                    hash: row.blake3.clone(),
-                    size: row.size as u64,
-                    key: row.blake3.clone(),
-                })
-                .await;
+        if db_ci::delete_cache_entry(self.db(), row.id).await? {
+            self.delete_blob_if_unreferenced(&row.blake3, row.size)
+                .await?;
         }
         Ok(())
     }
@@ -3085,6 +3132,7 @@ mod tests {
                 revision_id: None,
                 commit_sha: sha,
                 base_sha: None,
+                branch: "",
                 job_name: "test",
                 spec: "{}",
                 run_at: now_ts,
@@ -3584,6 +3632,7 @@ mod tests {
                 // (repo, sha, name) and `seed` already has a "test" job at SHA.
                 commit_sha: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
                 base_sha: None,
+                branch: "",
                 job_name: "test",
                 spec: &spec,
                 run_at: now(),
@@ -3631,6 +3680,7 @@ mod tests {
                 // As real revisions do: its own commit SHA (uniqueness (repo, sha, name)).
                 commit_sha: "ffffffffffffffffffffffffffffffffffffffff",
                 base_sha: None,
+                branch: "",
                 job_name: "test",
                 spec: &job_no_revision.spec,
                 run_at: now(),

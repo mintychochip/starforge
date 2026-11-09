@@ -1240,6 +1240,7 @@ mod tests {
                 revision_id: None,
                 commit_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 base_sha: None,
+                branch: "",
                 job_name: "test",
                 spec: "{}",
                 run_at: ts,

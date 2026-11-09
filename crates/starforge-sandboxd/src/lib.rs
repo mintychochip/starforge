@@ -1005,7 +1005,12 @@ pub fn router(state: DaemonState) -> Router {
             "/sandboxes/{id}/files",
             axum::routing::get(get_files)
                 .put(put_file)
-                .delete(delete_file),
+                .delete(delete_file)
+                // The write body is base64 JSON; axum's default 2 MiB limit
+                // is below the daemon's own 8 MiB file cap.
+                .route_layer(axum::extract::DefaultBodyLimit::max(
+                    MAX_FILE_B64_CHARS + 1024,
+                )),
         )
         .route(
             "/sandboxes/{id}/ports/{port}/url",

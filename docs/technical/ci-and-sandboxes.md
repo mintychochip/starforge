@@ -89,9 +89,11 @@ The hourly cleanup runs `gc_expired_artifacts`. It deletes expired artifact rows
 
 The blob store keeps the bytes under a BLAKE3 address. Downloads need an artifact token or the job token.
 
+The sandbox file API has a text route and a binary route at `/sandboxes/{id}/files/raw`. The runner reads and writes cache archives through the raw route in 8 MiB chunks, which matches the daemon's per-file cap.
+
 ### Dependency cache
 
-A job can declare `[job.cache]` with an exact key, up to 8 relative paths, and up to 4 restore prefixes. The runner restores the entry before the commands and saves it after a successful job. `put_ci_cache` stores the archive in the same blob store and upserts one `ci_cache_entries` row per `(repository, key)`. An entry caps at 256 MiB and expires after 7 days.
+A job can declare `[job.cache]` with an exact key, up to 8 relative paths, and up to 4 restore prefixes. The server keys entries by `(repository, branch scope, key)`. A job reads its own scope, then the default branch's, and writes only its own. The runner restores the entry before the commands and saves it after a successful job. `put_ci_cache` stores the archive in the same blob store and upserts one `ci_cache_entries` row per `(repository, key)`. An entry caps at 256 MiB and expires after 7 days.
 
 A repository keeps at most 50 live entries. A save evicts the least recently used entries first and then checks `cache_bytes`. `gc_expired_caches` runs in the hourly cleanup.
 

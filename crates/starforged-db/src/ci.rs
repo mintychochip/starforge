@@ -77,6 +77,8 @@ pub struct CiJobRow {
     pub revision_id: Option<i64>,
     pub commit_sha: String,
     pub base_sha: Option<String>,
+    /// Branch (or isolated Trail scope) the job runs for; cache scope.
+    pub branch: String,
     pub job_name: String,
     pub spec: String,
     pub state: String,
@@ -107,6 +109,7 @@ pub struct NewCiJob<'a> {
     pub revision_id: Option<i64>,
     pub commit_sha: &'a str,
     pub base_sha: Option<&'a str>,
+    pub branch: &'a str,
     pub job_name: &'a str,
     pub spec: &'a str,
     pub run_at: i64,
@@ -197,7 +200,7 @@ macro_rules! select_ci_job {
     ($tail:literal) => {
         concat!(
             "SELECT id, repo_id, trail_id, change_id, revision_id, commit_sha, base_sha, ",
-            "job_name, spec, state, runner_id, attempts, run_at, lease_until, lease_token, ",
+            "branch, job_name, spec, state, runner_id, attempts, run_at, lease_until, lease_token, ",
             "deadline, exit_code, checksum, cancel_requested, created_by, git_token_id, ",
             "last_error, created_at, started_at, finished_at, claimed_at FROM ci_jobs ",
             $tail
@@ -283,6 +286,7 @@ fn ci_job_from_row(row: &AnyRow) -> DbResult<CiJobRow> {
         revision_id: row.try_get("revision_id")?,
         commit_sha: row.try_get("commit_sha")?,
         base_sha: row.try_get("base_sha")?,
+        branch: row.try_get("branch")?,
         job_name: row.try_get("job_name")?,
         spec: row.try_get("spec")?,
         state: row.try_get("state")?,
@@ -476,9 +480,9 @@ pub async fn consume_registration_token(
 /// `(repo_id, commit_sha, job_name)` violates the partial unique index.
 pub async fn insert_ci_job(db: &Db, n: &NewCiJob<'_>) -> DbResult<CiJobRow> {
     let row = sqlx::query(
-        "INSERT INTO ci_jobs (repo_id, trail_id, change_id, revision_id, commit_sha, base_sha, job_name, spec, run_at, deadline, created_by, created_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
-         RETURNING id, repo_id, trail_id, change_id, revision_id, commit_sha, base_sha, job_name, spec, state, runner_id, attempts, run_at, lease_until, lease_token, deadline, exit_code, checksum, cancel_requested, created_by, git_token_id, last_error, created_at, started_at, finished_at, claimed_at",
+        "INSERT INTO ci_jobs (repo_id, trail_id, change_id, revision_id, commit_sha, base_sha, branch, job_name, spec, run_at, deadline, created_by, created_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
+         RETURNING id, repo_id, trail_id, change_id, revision_id, commit_sha, base_sha, branch, job_name, spec, state, runner_id, attempts, run_at, lease_until, lease_token, deadline, exit_code, checksum, cancel_requested, created_by, git_token_id, last_error, created_at, started_at, finished_at, claimed_at",
     )
     .bind(n.repo_id)
     .bind(n.trail_id)
@@ -486,6 +490,7 @@ pub async fn insert_ci_job(db: &Db, n: &NewCiJob<'_>) -> DbResult<CiJobRow> {
     .bind(n.revision_id)
     .bind(n.commit_sha)
     .bind(n.base_sha)
+    .bind(n.branch)
     .bind(n.job_name)
     .bind(n.spec)
     .bind(n.run_at)
@@ -1398,6 +1403,7 @@ pub async fn delete_artifact(db: &Db, id: i64) -> DbResult<bool> {
 pub struct CiCacheRow {
     pub id: i64,
     pub repo_id: i64,
+    pub scope: String,
     pub key: String,
     pub size: i64,
     pub blake3: String,
@@ -1409,6 +1415,7 @@ pub struct CiCacheRow {
 #[derive(Debug, Clone)]
 pub struct NewCacheEntry<'a> {
     pub repo_id: i64,
+    pub scope: &'a str,
     pub key: &'a str,
     pub size: i64,
     pub blake3: &'a str,
@@ -1421,6 +1428,7 @@ fn cache_from_row(row: &sqlx::any::AnyRow) -> DbResult<CiCacheRow> {
     Ok(CiCacheRow {
         id: row.try_get("id")?,
         repo_id: row.try_get("repo_id")?,
+        scope: row.try_get("scope")?,
         key: row.try_get("key")?,
         size: row.try_get("size")?,
         blake3: row.try_get("blake3")?,
@@ -1430,13 +1438,38 @@ fn cache_from_row(row: &sqlx::any::AnyRow) -> DbResult<CiCacheRow> {
     })
 }
 
-/// One unexpired cache entry by exact key.
-pub async fn cache_entry(db: &Db, repo_id: i64, key: &str) -> DbResult<Option<CiCacheRow>> {
+/// One cache entry by exact key, including expired rows (overwrite cleanup).
+pub async fn cache_entry_any(
+    db: &Db,
+    repo_id: i64,
+    scope: &str,
+    key: &str,
+) -> DbResult<Option<CiCacheRow>> {
     let row = sqlx::query(
-        "SELECT id, repo_id, key, size, blake3, created_at, last_used_at, expires_at FROM ci_cache_entries \
-         WHERE repo_id = $1 AND key = $2 AND expires_at > $3",
+        "SELECT id, repo_id, scope, key, size, blake3, created_at, last_used_at, expires_at \
+         FROM ci_cache_entries WHERE repo_id = $1 AND scope = $2 AND key = $3",
     )
     .bind(repo_id)
+    .bind(scope)
+    .bind(key)
+    .fetch_optional(db.read_pool())
+    .await?;
+    row.as_ref().map(cache_from_row).transpose()
+}
+
+/// One unexpired cache entry by exact key.
+pub async fn cache_entry(
+    db: &Db,
+    repo_id: i64,
+    scope: &str,
+    key: &str,
+) -> DbResult<Option<CiCacheRow>> {
+    let row = sqlx::query(
+        "SELECT id, repo_id, scope, key, size, blake3, created_at, last_used_at, expires_at FROM ci_cache_entries \
+         WHERE repo_id = $1 AND scope = $2 AND key = $3 AND expires_at > $4",
+    )
+    .bind(repo_id)
+    .bind(scope)
     .bind(key)
     .bind(now())
     .fetch_optional(db.read_pool())
@@ -1449,15 +1482,17 @@ pub async fn cache_entry(db: &Db, repo_id: i64, key: &str) -> DbResult<Option<Ci
 pub async fn restore_cache_entry(
     db: &Db,
     repo_id: i64,
+    scope: &str,
     prefix: &str,
     now_ts: i64,
 ) -> DbResult<Option<CiCacheRow>> {
     let row = sqlx::query(
-        "SELECT id, repo_id, key, size, blake3, created_at, last_used_at, expires_at FROM ci_cache_entries \
-         WHERE repo_id = $1 AND substr(key, 1, length($2)) = $2 AND expires_at > $3 \
+        "SELECT id, repo_id, scope, key, size, blake3, created_at, last_used_at, expires_at FROM ci_cache_entries \
+         WHERE repo_id = $1 AND scope = $2 AND substr(key, 1, length($3)) = $3 AND expires_at > $4 \
          ORDER BY created_at DESC, id DESC LIMIT 1",
     )
     .bind(repo_id)
+    .bind(scope)
     .bind(prefix)
     .bind(now_ts)
     .fetch_optional(db.read_pool())
@@ -1469,15 +1504,16 @@ pub async fn restore_cache_entry(
 pub async fn upsert_cache_entry(db: &Db, n: &NewCacheEntry<'_>) -> DbResult<CiCacheRow> {
     let row = sqlx::query(
         "INSERT INTO ci_cache_entries \
-         (repo_id, key, size, blake3, created_at, last_used_at, expires_at) \
-         VALUES ($1, $2, $3, $4, $5, $5, $6) \
-         ON CONFLICT (repo_id, key) DO UPDATE SET \
+         (repo_id, scope, key, size, blake3, created_at, last_used_at, expires_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $6, $7) \
+         ON CONFLICT (repo_id, scope, key) DO UPDATE SET \
            size = excluded.size, blake3 = excluded.blake3, \
            created_at = excluded.created_at, last_used_at = excluded.last_used_at, \
            expires_at = excluded.expires_at \
-         RETURNING id, repo_id, key, size, blake3, created_at, last_used_at, expires_at",
+         RETURNING id, repo_id, scope, key, size, blake3, created_at, last_used_at, expires_at",
     )
     .bind(n.repo_id)
+    .bind(n.scope)
     .bind(n.key)
     .bind(n.size)
     .bind(n.blake3)
@@ -1730,6 +1766,7 @@ mod tests {
             revision_id: None,
             commit_sha: "abc123",
             base_sha: None,
+            branch: "",
             job_name: name,
             spec: r#"{"commands":["cargo test"]}"#,
             run_at,

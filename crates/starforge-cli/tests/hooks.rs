@@ -576,17 +576,15 @@ fn fileless_active_session_gets_heuristic_trailer() {
 }
 
 fn commit_with_msg(repo: &Path, msg: &Path, date: &str, home: &Path) {
-    let out = Command::new("git")
+    // `prepare-commit-msg` still runs with `--no-verify`; the hermetic env
+    // keeps its ingest on the test home instead of the real one.
+    let out = hermetic_command("git", home)
         .arg("-C")
         .arg(repo)
         .args(["commit", "--no-verify", "-F"])
         .arg(msg)
         .env("GIT_COMMITTER_DATE", date)
         .env("GIT_AUTHOR_DATE", date)
-        // `prepare-commit-msg` still runs with `--no-verify`; point it at the
-        // test home so its ingest does not scan the real one.
-        .env("STARFORGE_HOME", home)
-        .env("HOME", home)
         .output()
         .expect("git runs");
     assert!(

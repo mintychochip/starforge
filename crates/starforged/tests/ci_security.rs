@@ -111,6 +111,7 @@ async fn queue_job(s: &TestServer, repo_id: i64, user_id: i64, name: &str) -> i6
             revision_id: None,
             commit_sha: SHA,
             base_sha: None,
+            branch: "",
             job_name: name,
             spec: &spec,
             run_at: 0,

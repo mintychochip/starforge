@@ -6,10 +6,10 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
-use axum::routing::{patch, post, put};
+use axum::routing::{get, patch, post, put};
 use axum::{Json, Router};
 use serde_json::{Value, json};
 use starforge_runner::{
@@ -27,12 +27,20 @@ struct Record {
     artifacts: Vec<(String, Vec<u8>)>,
 }
 
+type CacheUploads = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
+
 #[derive(Clone, Default)]
 struct FakeState {
     record: Arc<Mutex<Record>>,
     cancel_on_trace: bool,
     stale_on_finish: bool,
     secret: Option<Value>,
+    /// Cache spec injected into the claimed job when set.
+    cache_job: Option<Value>,
+    /// Cache archive served by the download route; `None` answers 404.
+    cache_blob: Option<Vec<u8>>,
+    /// Cache saves observed by the upload route.
+    cache_uploads: CacheUploads,
 }
 
 fn job_json() -> Value {
@@ -57,8 +65,44 @@ fn job_json() -> Value {
     })
 }
 
-async fn request_job() -> impl IntoResponse {
-    (StatusCode::CREATED, Json(job_json()))
+async fn request_job(State(s): State<FakeState>) -> impl IntoResponse {
+    let mut job = job_json();
+    if let Some(cache) = &s.cache_job {
+        job["spec"]["cache"] = cache.clone();
+    }
+    (StatusCode::CREATED, Json(job))
+}
+
+async fn download_cache(
+    State(s): State<FakeState>,
+    Query(query): Query<std::collections::BTreeMap<String, String>>,
+) -> impl IntoResponse {
+    match &s.cache_blob {
+        Some(bytes) => {
+            let mut response = axum::response::Response::new(axum::body::Body::from(bytes.clone()));
+            response.headers_mut().insert(
+                "x-starforge-cache-key",
+                query
+                    .get("key")
+                    .cloned()
+                    .unwrap_or_default()
+                    .parse()
+                    .unwrap(),
+            );
+            response
+        }
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+async fn upload_cache(
+    State(s): State<FakeState>,
+    Query(query): Query<std::collections::BTreeMap<String, String>>,
+    body: Bytes,
+) -> impl IntoResponse {
+    let key = query.get("key").cloned().unwrap_or_default();
+    s.cache_uploads.lock().unwrap().push((key, body.to_vec()));
+    (StatusCode::CREATED, Json(json!({ "key": "k", "size": 0 })))
 }
 
 async fn git_credential() -> impl IntoResponse {
@@ -146,6 +190,10 @@ fn app(state: FakeState) -> Router {
             post(authorize),
         )
         .route("/api/v1/runners/jobs/{id}/artifacts/{*name}", put(upload))
+        .route(
+            "/api/v1/runners/jobs/{id}/cache",
+            get(download_cache).put(upload_cache),
+        )
         .with_state(state)
 }
 
@@ -160,6 +208,17 @@ async fn serve(state: FakeState) -> String {
 
 fn claimed() -> ClaimedJob {
     serde_json::from_value(job_json()).unwrap()
+}
+
+fn claimed_cached() -> ClaimedJob {
+    let mut job = job_json();
+    job["spec"]["cache"] = json!({
+        "key": "k",
+        "paths": ["target"],
+        "restore_keys": ["k-"],
+        "save": true
+    });
+    serde_json::from_value(job).unwrap()
 }
 
 fn config(server: &str) -> RunnerConfig {
@@ -369,4 +428,40 @@ fn spec() -> CiJobSpec {
         runs_on: vec![],
         cache: None,
     }
+}
+
+/// Restore writes the archive in 8 MiB chunks; save concatenates the split
+/// parts and uploads them.
+#[tokio::test]
+async fn cache_restore_and_save_use_the_raw_file_api() {
+    let blob: Vec<u8> = (0..(20 * 1024 * 1024 + 7))
+        .map(|i| (i % 251) as u8)
+        .collect();
+    let state = FakeState {
+        cache_job: Some(json!({
+            "key": "k",
+            "paths": ["target"],
+            "restore_keys": ["k-"],
+            "save": true
+        })),
+        cache_blob: Some(blob.clone()),
+        ..Default::default()
+    };
+    let server = serve(state.clone()).await;
+    let provider = FakeSandboxProvider::new()
+        .with_script("cargo test", "ok\n", 0)
+        .with_script("starforge sync", "ok\n", 0)
+        .with_file(".starforge-cache.part-aa", b"save-a")
+        .with_file(".starforge-cache.part-ab", b"save-b");
+    let exec = Executor::new(config(&server), provider);
+    let outcome = exec.execute_job(claimed_cached()).await;
+    assert!(
+        matches!(outcome, JobOutcome::Succeeded { .. }),
+        "{outcome:?}"
+    );
+
+    let uploads = state.cache_uploads.lock().unwrap().clone();
+    assert_eq!(uploads.len(), 1, "{uploads:?}");
+    assert_eq!(uploads[0].0, "k");
+    assert_eq!(uploads[0].1, b"save-asave-b");
 }

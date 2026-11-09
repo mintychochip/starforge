@@ -147,7 +147,9 @@ restore_keys = ["cargo-"]
 
 The runner restores the entry before the commands and saves it after a
 successful job. The exact key wins; `restore_keys` are prefixes tried in
-order. Paths are relative to the checkout root. An entry is at most
+order. Entries are scoped to the job's branch: a job reads its own
+branch's entry, then the default branch's, and writes only its own.
+Paths are relative to the checkout root. An entry is at most
 256 MiB, is retained 7 days, and the repository keeps at most 50 live
 entries (the least recently used entry is evicted first). A cache failure
 does not fail the job.
@@ -169,7 +171,10 @@ starforge ci run --keep
 Without `--job`, every expanded job runs in order. The command stops at
 the first failure and exits with that job's code. The sandbox is killed
 after each job unless `--keep` is set. Secrets are not resolved locally.
-A job that lists `secrets` runs without them.
+A job that lists `secrets` runs without them. The copy respects
+`.gitignore` and includes `.git`. The archive caps at 512 MiB. Local runs
+ignore `[job.cache]` and `artifacts`. Network is off unless `--allow-host`
+names a host.
 
 ## Artifacts
 

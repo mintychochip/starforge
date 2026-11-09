@@ -1,5 +1,6 @@
 # CI: format, lints, tests on SQLite and Postgres 17, and browser tests.
-# The crate set to test and the Postgres URL mirror scripts/check.sh.
+# CI deliberately runs the full suite on both engines. The local gate
+# (scripts/check.sh) uses nextest and a Postgres subset for speed.
 name: ci
 
 "on":

@@ -16,3 +16,14 @@ use crate::{CoreError, CoreResult};
 pub fn parse(text: &str) -> CoreResult<CiSpec> {
     CiSpec::parse(text).map_err(|err| CoreError::Invalid(err.to_string()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_errors_map_to_invalid() {
+        let err = parse("version = 2\n").unwrap_err();
+        assert!(matches!(err, CoreError::Invalid(_)), "{err:?}");
+    }
+}

@@ -8,7 +8,17 @@ cd "$(dirname "$0")/.."
 
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo nextest run --workspace
+
+# nextest runs the tests in parallel across binaries. Fall back to cargo
+# test for contributors without it.
+if cargo nextest --version >/dev/null 2>&1; then
+  cargo nextest run --workspace
+else
+  echo "cargo-nextest not found; falling back to cargo test --workspace" >&2
+  cargo test --workspace
+fi
+# nextest skips doctests; keep them in the gate.
+cargo test --workspace --doc
 
 # Technical documents use ASD-STE100; the checker enforces the mechanical rules.
 python3 scripts/ste_check.py --strict
@@ -29,16 +39,29 @@ if [[ "${STARFORGE_TEST_PG:-0}" == "1" ]]; then
   done
   export STARFORGE_TEST_PG_URL="postgres://postgres:starforge@127.0.0.1:55439/postgres"
   if [[ "${STARFORGE_GATE_FULL_PG:-0}" == "1" ]]; then
-    cargo nextest run --workspace
+    if cargo nextest --version >/dev/null 2>&1; then
+      cargo nextest run --workspace
+    else
+      cargo test --workspace
+    fi
   else
     # The SQLite run above covers the whole workspace. Postgres reruns the
     # packages whose tests exercise SQL behavior: the DB layer, and the
     # integration tests for backup/restore, pooling, search, audit
-    # retention, admin display, and the CI tables.
-    cargo nextest run -p starforged-db
-    cargo nextest run -p starforged \
-      --test backup_restore --test db_pool --test search_index \
-      --test admin_pages --test audit_retention --test api_ci_runs \
-      --test api_ci_usage
+    # retention, admin display, and the CI tables (the cache SQL runs
+    # through api_ci_runs and api_ci_usage).
+    if cargo nextest --version >/dev/null 2>&1; then
+      cargo nextest run -p starforged-db
+      cargo nextest run -p starforged \
+        --test backup_restore --test db_pool --test search_index \
+        --test admin_pages --test audit_retention --test api_ci_runs \
+        --test api_ci_usage
+    else
+      cargo test -p starforged-db
+      cargo test -p starforged \
+        --test backup_restore --test db_pool --test search_index \
+        --test admin_pages --test audit_retention --test api_ci_runs \
+        --test api_ci_usage
+    fi
   fi
 fi

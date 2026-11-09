@@ -1656,7 +1656,7 @@ restore_keys = ["cargo-"]
     let runner = register_runner(&s, &pat).await;
     let (first, _fence, first_token) = claim(&s, &runner).await;
     let payload = b"\x1f\x8b\x08 cache-bytes";
-    let (status, _) = api_bytes(
+    let (status, body) = api_bytes(
         &s.browser(),
         "PUT",
         &s.url(&format!(
@@ -1666,7 +1666,12 @@ restore_keys = ["cargo-"]
         Some(payload.to_vec()),
     )
     .await;
-    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
 
     let (status, body) = api_bytes(
         &s.browser(),
@@ -1717,4 +1722,104 @@ restore_keys = ["cargo-"]
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, payload);
+}
+
+/// Caches are scoped to the job's branch: a feature-branch save is not
+/// visible to a default-branch job, and the feature job reads its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cache_entries_are_scoped_to_the_job_branch() {
+    let s = TestServer::start().await;
+    let alice = s.user("alice").await;
+    let _repo = s.repo(&alice, "proj", Visibility::Private).await;
+    let pat = s.token(&alice, &[Scope::RepoWrite]).await;
+    let spec = r#"
+version = 1
+[triggers]
+push = ["main", "feature"]
+[[job]]
+name = "a"
+image = "example.test/image:1"
+commands = ["true"]
+[job.cache]
+key = "ka"
+paths = ["target"]
+[[job]]
+name = "b"
+image = "example.test/image:1"
+commands = ["true"]
+[job.cache]
+key = "kb"
+paths = ["target"]
+"#;
+    let tmp = tempfile::tempdir().unwrap();
+    let work = work_repo(
+        tmp.path(),
+        "work",
+        &[(".starforge/ci.toml", spec), ("README.md", "# proj\n")],
+    )
+    .await;
+    let url = s.git_url("alice", "proj", Some(&pat));
+
+    // Feature branch saves both keys.
+    git_ok(&work, &["checkout", "-q", "-b", "feature"]).await;
+    git_ok(&work, &["push", "-q", &url, "feature"]).await;
+    let runner = register_runner(&s, &pat).await;
+    let (a_feature, _fence, a_feature_token) = claim(&s, &runner).await;
+    let (b_feature, _fence, b_feature_token) = claim(&s, &runner).await;
+    let ka = b"feature-ka";
+    let kb = b"feature-kb";
+    for (job, token, key, bytes) in [
+        (a_feature, &a_feature_token, "ka", ka.as_slice()),
+        (b_feature, &b_feature_token, "kb", kb.as_slice()),
+    ] {
+        let (status, _) = api_bytes(
+            &s.browser(),
+            "PUT",
+            &s.url(&format!("/api/v1/runners/jobs/{job}/cache?key={key}")),
+            token,
+            Some(bytes.to_vec()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+
+    // The default branch does not see the feature entries. A new commit is
+    // needed: the enqueue dedupes on (commit, job name), so the same SHA on
+    // two branches would run only the first branch's job.
+    git_ok(&work, &["checkout", "-q", "main"]).await;
+    git_ok(
+        &work,
+        &["commit", "--allow-empty", "-q", "-m", "main again"],
+    )
+    .await;
+    git_ok(&work, &["push", "-q", &url, "main"]).await;
+    let (a_main, _fence, a_main_token) = claim(&s, &runner).await;
+    let (b_main, _fence, b_main_token) = claim(&s, &runner).await;
+    for (job, token, key) in [(a_main, &a_main_token, "ka"), (b_main, &b_main_token, "kb")] {
+        let (status, _) = api_bytes(
+            &s.browser(),
+            "GET",
+            &s.url(&format!("/api/v1/runners/jobs/{job}/cache?key={key}")),
+            token,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "key {key}");
+    }
+
+    // A new feature push reads its own scope.
+    git_ok(&work, &["checkout", "-q", "feature"]).await;
+    git_ok(&work, &["commit", "--allow-empty", "-q", "-m", "again"]).await;
+    git_ok(&work, &["push", "-q", &url, "feature"]).await;
+    let (a_again, _fence, a_again_token) = claim(&s, &runner).await;
+    let (status, body) = api_bytes(
+        &s.browser(),
+        "GET",
+        &s.url(&format!("/api/v1/runners/jobs/{a_again}/cache?key=ka")),
+        &a_again_token,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, ka);
 }

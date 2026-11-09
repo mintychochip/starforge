@@ -134,6 +134,7 @@ async fn queue_job(
             revision_id: None,
             commit_sha: SHA,
             base_sha: None,
+            branch: "",
             job_name: name,
             spec: &spec,
             run_at: 0,
