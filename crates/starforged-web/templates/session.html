@@ -71,6 +71,17 @@
 </ul>
 </section>
 {% endif %}
+{% if !checkpoints.is_empty() %}
+<section class="checkpoints" aria-label="Checkpoints">
+<h3>Checkpoints ({{ checkpoints.len() }})</h3>
+<ul>
+{% for c in checkpoints %}
+<li><a href="/{{ head.owner }}/{{ head.name }}/commit/{{ c.commit }}">checkpoint {{ c.n }}</a> <span class="badge">{{ c.source }}</span> {{ c.label }} · <code>{{ c.short }}</code> · {{ c.created }}{% if let Some(p) = c.parent %} · <a href="/{{ head.owner }}/{{ head.name }}/compare/{{ p }}...{{ c.commit }}">diff</a>{% endif %}</li>
+{% endfor %}
+</ul>
+<p class="muted">Rewind locally: <code>starforge rewind {{ ulid }} --checkpoint N</code>.</p>
+</section>
+{% endif %}
 <form method="get" class="session-search">
   <label>Search in session <input type="search" name="q" value="{{ q }}"></label>
   <button type="submit">Search</button>

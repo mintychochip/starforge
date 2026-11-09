@@ -89,7 +89,7 @@ Read the [CI and sandboxes page](ci-and-sandboxes.md) for CI runs and quotas.
 
 `list_gate_rules` accepts any reader. Mutations need maintain permission. Archived repositories refuse mutations. Patterns normalize to null for match-all. Non-null patterns hold 1 to 100 characters. Patterns allow letters, digits, dot, underscore, hyphen, slash, star, and question mark.
 
-Approvals hold 0 to 20. Contexts hold at most 50 entries. Methods stay inside the set of `merge`, `squash`, and `fast_forward`. Empty methods mean all methods.
+Approvals hold 0 to 20. Contexts hold at most 50 entries. Methods stay inside the set of `merge`, `squash`, `fast_forward`, and `rebase`. Empty methods mean all methods.
 
 Intersections across matching rules narrow the allowed set. One normalized pattern exists per repository. Duplicates return `Conflict`.
 
@@ -105,6 +105,14 @@ Session evidence fails closed. Each `Starforge-Session` trailer must name an exi
 
 `merge_change` merges one change into its base branch. The caller needs write permission. The function holds the shared repository lock. The function re-evaluates gates at merge time. The function checks allowed methods.
 
+`rebase` uses `starforged_git::merge::rebase_onto`. The function reads `merge-base..head` oldest first. For each commit it runs `git merge-tree --write-tree --merge-base=<original-parent>` against the new parent. It writes the result with `commit_tree_as`, which keeps the original author and sets the server as committer.
+
+The function refuses a merge commit, a conflict, or more than 1024 commits. The base ref moves with the same CAS as the other methods.
+
+A cross-repository change has a `change_sources` row. The row stores the source repository and branch. `create_cross_repo_change` fetches the source branch with `write::fetch_branch` into a temporary import ref, verifies the object, records the change and revision, then deletes the temporary ref. The trail head ref keeps the objects reachable.
+
+`refresh_cross_repo_change` repeats the fetch and appends a revision when the head moved. The leak rule allows a public source, a same-owner source, or a source admin. `merge_change` also requires read access on the source.
+
 Gate-rule push rules act in branch protection at push time. The fields are `block_direct_push`, `block_force_push`, and `block_deletion`. `merge_change` does not re-check them.
 
 An empty intersection of allowed methods stops the merge. `finish_merge` moves the Trail to `merged` when no open change remains. `finish_merge` records `change.merge` in timeline and audit.
@@ -115,7 +123,7 @@ Read [git-hosting.md](git-hosting.md) for branch CAS updates and conflict retrie
 
 `create_trail`, `update_trail`, and `set_trail_state` manage Trails. `add_comment` and `edit_comment` manage Trail comments. `trail_by_number`, `list_trails`, and `trail_timeline` read state.
 
-`record_agit_push`, `list_changes`, and `get_change` manage changes. `submit_review`, `list_reviews`, and `dismiss_review` manage reviews. `create_thread`, `resolve_thread`, and `add_thread_comment` manage threads.
+`record_agit_push`, `list_changes`, and `get_change` manage changes. `create_cross_repo_change` and `refresh_cross_repo_change` manage cross-repository changes. `change_source` reads the source row. `submit_review`, `list_reviews`, and `dismiss_review` manage reviews. `create_thread`, `resolve_thread`, and `add_thread_comment` manage threads.
 
 `submit_status`, `list_statuses`, and `combined_status` manage checks. `evaluate_gates` reports gate state. `create_gate_rule`, `update_gate_rule`, and `delete_gate_rule` manage gate rules.
 

@@ -33,6 +33,13 @@ use crate::error::ApiError;
 use crate::time::rfc3339;
 
 #[derive(Serialize, utoipa::ToSchema)]
+pub struct ChangeSourceJson {
+    pub owner: String,
+    pub repo: String,
+    pub branch: String,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct ChangeJson {
     pub trail: i64,
     pub k: i64,
@@ -49,6 +56,8 @@ pub struct ChangeJson {
     pub mergeability: String,
     pub conflict_paths: Vec<String>,
     pub allowed_methods: Vec<String>,
+    /// Present when the change's head lives in another repository.
+    pub source: Option<ChangeSourceJson>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -79,6 +88,11 @@ async fn change_json_full(
         mergeability: view.mergeability.clone(),
         conflict_paths: view.conflict_paths.clone(),
         allowed_methods,
+        source: view.source.as_ref().map(|s| ChangeSourceJson {
+            owner: s.owner.clone(),
+            repo: s.repo.clone(),
+            branch: s.branch.clone(),
+        }),
         created_at: rfc3339(view.created_at),
         updated_at: rfc3339(view.updated_at),
     })
@@ -275,10 +289,15 @@ pub struct CreateChangeBody {
     pub kind: String,
     pub head_branch: Option<String>,
     pub base_branch: Option<String>,
+    /// `owner/repo` for a `cross_repo` change.
+    pub source_repo: Option<String>,
+    /// Source branch for a `cross_repo` change.
+    pub source_branch: Option<String>,
 }
 
-/// `POST /repos/{owner}/{repo}/trails/{n}/changes` (201): only `branch`
-/// changes exist in M2b; the body names its head and base branches.
+/// `POST /repos/{owner}/{repo}/trails/{n}/changes` (201): a `branch` change
+/// names its head and base branches; a `cross_repo` change names
+/// `source_repo` (`owner/repo`), `source_branch`, and `base_branch`.
 #[utoipa::path(
     post,
     path = "/api/v1/repos/{owner}/{repo}/trails/{n}/changes",
@@ -306,23 +325,86 @@ pub async fn create_change(
 ) -> Result<(StatusCode, Json<ChangeJson>), ApiError> {
     let auth = auth.require(Scope::TrailWrite)?;
     let Json(body) = body.map_err(|e| ApiError::Invalid(e.body_text()))?;
-    if body.kind != "branch" {
-        return Err(ApiError::Invalid(format!(
-            "invalid change kind '{}'",
-            body.kind
-        )));
-    }
-    let (Some(head), Some(base)) = (body.head_branch, body.base_branch) else {
-        return Err(ApiError::Invalid(
-            "head_branch and base_branch are required".into(),
-        ));
+    let view = match body.kind.as_str() {
+        "branch" => {
+            let (Some(head), Some(base)) = (body.head_branch, body.base_branch) else {
+                return Err(ApiError::Invalid(
+                    "head_branch and base_branch are required".into(),
+                ));
+            };
+            state
+                .core
+                .create_branch_change(&auth.user, &owner, &repo, n, &head, &base)
+                .await?
+        }
+        "cross_repo" => {
+            let (Some(source_repo), Some(source_branch), Some(base)) =
+                (body.source_repo, body.source_branch, body.base_branch)
+            else {
+                return Err(ApiError::Invalid(
+                    "source_repo, source_branch, and base_branch are required".into(),
+                ));
+            };
+            let (source_owner, source_name) = source_repo
+                .split_once('/')
+                .ok_or_else(|| ApiError::Invalid("source_repo must be owner/repo".into()))?;
+            if source_owner.is_empty() || source_name.is_empty() || source_name.contains('/') {
+                return Err(ApiError::Invalid("source_repo must be owner/repo".into()));
+            }
+            state
+                .core
+                .create_cross_repo_change(
+                    &auth.user,
+                    &owner,
+                    &repo,
+                    n,
+                    source_owner,
+                    source_name,
+                    &source_branch,
+                    &base,
+                )
+                .await?
+        }
+        other => {
+            return Err(ApiError::Invalid(format!("invalid change kind '{other}'")));
+        }
     };
-    let view = state
-        .core
-        .create_branch_change(&auth.user, &owner, &repo, n, &head, &base)
-        .await?;
     let out = change_json_full(&state, Some(&auth.user), &owner, &repo, &view).await?;
     Ok((StatusCode::CREATED, Json(out)))
+}
+
+/// `POST …/changes/{k}/refresh` (200): re-fetch a cross-repository change's
+/// source branch and append a revision when its head moved.
+#[utoipa::path(
+    post,
+    path = "/api/v1/repos/{owner}/{repo}/trails/{n}/changes/{k}/refresh",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("n" = i64, Path, description = "Trail number"),
+        ("k" = i64, Path, description = "Change number"),
+    ),
+    responses(
+        (status = 200, description = "Refreshed change", body = ChangeJson),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 422, description = "Change is not cross-repository", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+pub async fn refresh_change(
+    State(state): State<ApiState>,
+    auth: ApiAuth,
+    Path((owner, repo, n, k)): Path<(String, String, i64, i64)>,
+) -> Result<Json<ChangeJson>, ApiError> {
+    let auth = auth.require(Scope::TrailWrite)?;
+    let view = state
+        .core
+        .refresh_cross_repo_change(&auth.user, &owner, &repo, n, k)
+        .await?;
+    let out = change_json_full(&state, Some(&auth.user), &owner, &repo, &view).await?;
+    Ok(Json(out))
 }
 
 /// `GET /repos/{owner}/{repo}/trails/{n}/changes/{k}[?rev=][?from=&to=]`:

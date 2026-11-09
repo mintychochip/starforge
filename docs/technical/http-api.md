@@ -182,13 +182,14 @@ A second test matches optional security with `reader` handlers.
 | Organizations | `POST /orgs`, `GET /orgs/{org}`, `PATCH /orgs/{org}`, `DELETE /orgs/{org}` | `repo:read` for reads, `repo:write` for writes |
 | Teams | `GET /orgs/{org}/teams`, `PUT /orgs/{org}/teams/{team}/members/{handle}` | `repo:read` for reads, `repo:write` for writes |
 | Trails | `GET /repos/{owner}/{repo}/trails`, `POST /repos/{owner}/{repo}/trails`, `PATCH /repos/{owner}/{repo}/trails/{n}` | `repo:read` for reads, `trail:write` for writes |
-| Changes | `GET /repos/{owner}/{repo}/trails/{n}/changes`, `POST /repos/{owner}/{repo}/trails/{n}/changes/{k}/state` | `repo:read` for reads, `trail:write` for writes |
+| Changes | `GET /repos/{owner}/{repo}/trails/{n}/changes`, `POST /repos/{owner}/{repo}/trails/{n}/changes`, `POST /repos/{owner}/{repo}/trails/{n}/changes/{k}/refresh`, `POST /repos/{owner}/{repo}/trails/{n}/changes/{k}/state` | `repo:read` for reads, `trail:write` for writes |
 | Reviews | `GET /repos/{owner}/{repo}/trails/{n}/changes/{k}/reviews`, `POST /repos/{owner}/{repo}/trails/{n}/changes/{k}/reviews` | `repo:read` for reads, `trail:write` for writes |
 | Notifications | `GET /user/notifications`, `POST /user/notifications/{id}/read`, `POST /user/notifications/read-all` | `repo:read` |
 | Repository subscription | `GET /repos/{owner}/{repo}/subscription`, `PUT /repos/{owner}/{repo}/subscription`, `DELETE /repos/{owner}/{repo}/subscription` | `repo:read` |
 | Trail subscription | `GET /repos/{owner}/{repo}/trails/{n}/subscription`, `PUT /repos/{owner}/{repo}/trails/{n}/subscription`, `DELETE /repos/{owner}/{repo}/trails/{n}/subscription` | `repo:read` |
 | Statuses | `POST /repos/{owner}/{repo}/statuses/{sha}`, `GET /repos/{owner}/{repo}/statuses/{sha}` | `repo:read` for reads, `repo:write` for writes |
 | Sessions | `PUT /repos/{owner}/{repo}/sessions/{ulid}`, `PUT /repos/{owner}/{repo}/sessions/{ulid}/segments/{n}`, `GET /repos/{owner}/{repo}/sessions/{ulid}/events` | `session:upload` for ingest, `repo:read` for reads, raw segment reads need the uploader or a site admin |
+| Checkpoints | `GET /repos/{owner}/{repo}/sessions/{ulid}/checkpoints`, `GET /repos/{owner}/{repo}/sessions/{ulid}/checkpoints/{n}`, `PUT /repos/{owner}/{repo}/sessions/{ulid}/checkpoints/{n}` | `repo:read` for reads, `session:upload` for writes |
 | Search | `GET /search/trails`, `GET /search/sessions`, `GET /repos/{owner}/{repo}/search/code` | `repo:read` |
 | Webhooks | `GET /repos/{owner}/{repo}/hooks`, `POST /repos/{owner}/{repo}/hooks`, `GET /repos/{owner}/{repo}/hooks/{id}/deliveries` | `repo:write` |
 | Gate rules | `GET /repos/{owner}/{repo}/gate-rules`, `POST /repos/{owner}/{repo}/gate-rules` | `repo:read` for reads, `repo:write` for writes |

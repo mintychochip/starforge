@@ -22,8 +22,8 @@ use crate::permission::Permission;
 use crate::protection::{PushAllowlistDto, PushAllowlistInput};
 use crate::{Core, CoreError, CoreResult};
 
-/// Merge methods a rule may restrict merges to; `[]` means all three.
-const ALLOWED_METHODS: [&str; 3] = ["merge", "squash", "fast_forward"];
+/// Merge methods a rule may restrict merges to; `[]` means all four.
+const ALLOWED_METHODS: [&str; 4] = ["merge", "squash", "fast_forward", "rebase"];
 
 /// One gate rule for the API and the settings page.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -212,7 +212,7 @@ fn normalize(base: &GateRuleDto, input: &GateRuleInput) -> CoreResult<Normalized
     for method in &methods {
         if !ALLOWED_METHODS.contains(&method.as_str()) {
             return Err(CoreError::Invalid(format!(
-                "invalid allowed_methods entry '{method}' (expected one of merge, squash, fast_forward)"
+                "invalid allowed_methods entry '{method}' (expected one of merge, squash, fast_forward, rebase)"
             )));
         }
     }

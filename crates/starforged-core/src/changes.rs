@@ -1192,6 +1192,14 @@ pub struct NewInlineComment {
 /// Most inline comments one review may carry.
 pub const MAX_REVIEW_COMMENTS: usize = 100;
 
+/// The source repository and branch of a cross-repository change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangeSourceView {
+    pub owner: String,
+    pub repo: String,
+    pub branch: String,
+}
+
 /// Flat read shape for a change.
 #[derive(Debug, Clone)]
 pub struct ChangeView {
@@ -1213,6 +1221,8 @@ pub struct ChangeView {
     pub creator_imported_author: Option<String>,
     pub mergeability: String,
     pub conflict_paths: Vec<String>,
+    /// Present when the change's head lives in another repository.
+    pub source: Option<ChangeSourceView>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -1380,6 +1390,14 @@ fn check_limit(limit: Option<i64>) -> CoreResult<Option<usize>> {
 }
 
 impl Core {
+    fn visibility_rank(visibility: crate::permission::Visibility) -> u8 {
+        match visibility {
+            crate::permission::Visibility::Private => 0,
+            crate::permission::Visibility::Internal => 1,
+            crate::permission::Visibility::Public => 2,
+        }
+    }
+
     fn ensure_writable_g4(access: &RepoAccess) -> CoreResult<()> {
         if access.repo.archived_at.is_some() {
             return Err(CoreError::Invalid("repository is archived".into()));
@@ -1411,6 +1429,21 @@ impl Core {
                 .map(|r| r.number)
                 .unwrap_or(0),
         };
+        let source = match db_changes::change_source(self.db(), row.id).await? {
+            None => None,
+            Some(src) => {
+                let repo = starforged_db::repos::by_id(self.db(), src.source_repo_id)
+                    .await?
+                    .ok_or_else(|| {
+                        CoreError::Internal("change source repository vanished".into())
+                    })?;
+                Some(ChangeSourceView {
+                    owner: repo.owner_handle,
+                    repo: repo.name,
+                    branch: src.source_branch,
+                })
+            }
+        };
         Ok(ChangeView {
             trail_number: trail.number,
             k: row.number,
@@ -1424,6 +1457,7 @@ impl Core {
             creator_imported_author,
             mergeability: row.mergeability.clone(),
             conflict_paths: parse_paths(&row.conflict_paths),
+            source,
             created_at: row.created_at,
             updated_at: row.updated_at,
         })
@@ -1719,6 +1753,323 @@ impl Core {
         .await;
         self.change_view(
             &db_changes::change_by_id(self.db(), row.id)
+                .await?
+                .ok_or_else(|| CoreError::Internal("change vanished".into()))?,
+        )
+        .await
+    }
+
+    /// A unique temporary ref for one source fetch, so two concurrent
+    /// cross-repository operations cannot delete each other's import ref.
+    fn import_ref(source_repo_id: i64) -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        format!("refs/starforge/import/{source_repo_id}/{now}-{n}")
+    }
+
+    /// The cross-repository leak rule: a public source may go anywhere.
+    /// Otherwise the target must not be more visible than the source, so a
+    /// reader of a private source cannot copy its code into a target with a
+    /// wider audience.
+    fn ensure_source_allowed(
+        source: &RepoAccess,
+        target: &RepoAccess,
+        _user: &User,
+    ) -> CoreResult<()> {
+        // A public source may go anywhere. Otherwise the target must not be
+        // more visible than the source: a private source may feed a private
+        // target, but never an internal or public one, even for the same
+        // owner or a source admin.
+        if source.repo.visibility == crate::permission::Visibility::Public {
+            return Ok(());
+        }
+        if Self::visibility_rank(target.repo.visibility)
+            <= Self::visibility_rank(source.repo.visibility)
+        {
+            Ok(())
+        } else {
+            Err(CoreError::Forbidden)
+        }
+    }
+
+    /// Opens a change on `trail_n` whose head is `source_branch` in
+    /// (`source_owner`, `source_repo`). The source branch's objects are
+    /// fetched into the target repository, so every read and merge path is
+    /// unchanged. Requires `write` on the target and `read` on the source;
+    /// the leak rule in [`Self::ensure_source_allowed`] applies. A source
+    /// equal to the target delegates to [`Self::create_branch_change`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_cross_repo_change(
+        &self,
+        user: &User,
+        owner: &str,
+        repo: &str,
+        trail_n: i64,
+        source_owner: &str,
+        source_repo: &str,
+        source_branch: &str,
+        base: &str,
+    ) -> CoreResult<ChangeView> {
+        let access = self
+            .require_repo(Some(user), owner, repo, Permission::Write)
+            .await?;
+        Self::ensure_writable_g4(&access)?;
+        let trail = db_trails::trail_by_number(self.db(), access.repo.id, trail_n)
+            .await?
+            .ok_or(CoreError::NotFound)?;
+        if trail.state != "open" {
+            return Err(CoreError::Invalid("trail is closed".into()));
+        }
+        let source_branch = source_branch.trim();
+        let base = base.trim();
+        if source_branch.is_empty() || base.is_empty() {
+            return Err(CoreError::Invalid(
+                "source branch and base branch must not be empty".into(),
+            ));
+        }
+        let source = self.repo_for(Some(user), source_owner, source_repo).await?;
+        if source.repo.id == access.repo.id {
+            return self
+                .create_branch_change(user, owner, repo, trail_n, source_branch, base)
+                .await;
+        }
+        Self::ensure_source_allowed(&source, &access, user)?;
+        if !db_changes::open_cross_repo_changes(self.db(), trail.id, source.repo.id, source_branch)
+            .await?
+            .is_empty()
+        {
+            return Err(CoreError::Invalid(format!(
+                "a change already tracks '{source_owner}/{source_repo}:{source_branch}'"
+            )));
+        }
+        let temp_ref = format!("refs/starforge/import/{}/{}", source.repo.id, source_branch);
+        let head_tip = write::fetch_branch(
+            &self.repo_path(access.repo.id),
+            &self.repo_path(source.repo.id),
+            source_branch,
+            &temp_ref,
+        )
+        .await
+        .map_err(|e| {
+            CoreError::Invalid(format!(
+                "cannot fetch source branch '{source_owner}/{source_repo}:{source_branch}': {e}"
+            ))
+        })?;
+        if !write::object_exists(&self.repo_path(access.repo.id), &head_tip)
+            .await
+            .map_err(CoreError::from)?
+        {
+            return Err(CoreError::Internal(
+                "source branch objects were not imported".into(),
+            ));
+        }
+        let base_tip = self
+            .branch_tip(access.repo.id, base)
+            .await?
+            .ok_or_else(|| CoreError::Invalid(format!("unknown base branch '{base}'")))?;
+        let commits = self
+            .walk_revision_commits(access.repo.id, &base_tip, &head_tip)
+            .await;
+        let (row, revision) = match db_changes::insert_branch_change_with_revision(
+            self.db(),
+            trail.id,
+            source_branch,
+            base,
+            user.id,
+            &head_tip,
+            &base_tip,
+            Some(user.id),
+            now(),
+            commits.as_deref(),
+        )
+        .await
+        {
+            Ok(t) => t,
+            Err(e) if e.is_unique_violation() => {
+                return Err(CoreError::Conflict(
+                    "could not allocate a change or revision number; please retry".into(),
+                ));
+            }
+            Err(e) => return Err(e.into()),
+        };
+        db_changes::insert_change_source(self.db(), row.id, source.repo.id, source_branch, now())
+            .await?;
+        let _ = write::delete_import_ref(&self.repo_path(access.repo.id), &temp_ref).await;
+        if let Err(err) = self
+            .ensure_trail_refs(
+                access.repo.id,
+                trail.number,
+                row.number,
+                revision.number,
+                &head_tip,
+            )
+            .await
+        {
+            tracing::warn!(repo = access.repo.id, change = row.number, error = %err, "trail ref write failed; the mergeability job replays it");
+        }
+        self.change_timeline(
+            access.repo.id,
+            trail.id,
+            "change.open",
+            Some(user.id),
+            serde_json::json!({
+                "change": row.number,
+                "kind": "cross_repo",
+                "base": base,
+                "head": source_branch,
+                "source": format!("{source_owner}/{source_repo}"),
+            }),
+        )
+        .await?;
+        self.enqueue(&Job::ChangeMergeability { change_id: row.id })
+            .await?;
+        self.dispatch_trail_event(
+            access.repo.id,
+            Some(user.handle.clone()),
+            Some("updated"),
+            Some("change_opened"),
+            trail.number,
+            Some(serde_json::json!({"k": row.number, "revision": revision.number})),
+        )
+        .await;
+        self.notify(crate::notifications::NotifyEvent {
+            repo_id: access.repo.id,
+            trail_id: trail.id,
+            kind: crate::notifications::NotifyKind::ChangeOpened,
+            actor_id: Some(user.id),
+            targets: &[],
+            text: None,
+        })
+        .await;
+        self.change_view(
+            &db_changes::change_by_id(self.db(), row.id)
+                .await?
+                .ok_or_else(|| CoreError::Internal("change vanished".into()))?,
+        )
+        .await
+    }
+
+    /// Re-fetches a cross-repository change's source branch and appends a
+    /// revision when its head moved. Requires `write` on the target and
+    /// `read` on the source; the leak rule applies. A no-op returns the
+    /// current view.
+    pub async fn refresh_cross_repo_change(
+        &self,
+        user: &User,
+        owner: &str,
+        repo: &str,
+        trail_n: i64,
+        k: i64,
+    ) -> CoreResult<ChangeView> {
+        let access = self
+            .require_repo(Some(user), owner, repo, Permission::Write)
+            .await?;
+        Self::ensure_writable_g4(&access)?;
+        let trail = db_trails::trail_by_number(self.db(), access.repo.id, trail_n)
+            .await?
+            .ok_or(CoreError::NotFound)?;
+        let change = db_changes::change_by_trail_number(self.db(), trail.id, k)
+            .await?
+            .ok_or(CoreError::NotFound)?;
+        if change.state != "open" {
+            return Err(CoreError::Invalid(format!(
+                "change is {} (only open changes refresh)",
+                change.state
+            )));
+        }
+        let source = db_changes::change_source(self.db(), change.id)
+            .await?
+            .ok_or_else(|| CoreError::Invalid("change is not cross-repository".into()))?;
+        let source_repo = starforged_db::repos::by_id(self.db(), source.source_repo_id)
+            .await?
+            .ok_or_else(|| CoreError::Internal("change source repository vanished".into()))?;
+        let source_access = self
+            .repo_for(Some(user), &source_repo.owner_handle, &source_repo.name)
+            .await?;
+        Self::ensure_source_allowed(&source_access, &access, user)?;
+        let temp_ref = Self::import_ref(source.source_repo_id);
+        let head_tip = write::fetch_branch(
+            &self.repo_path(access.repo.id),
+            &self.repo_path(source.source_repo_id),
+            &source.source_branch,
+            &temp_ref,
+        )
+        .await
+        .map_err(|e| {
+            CoreError::Invalid(format!(
+                "cannot fetch source branch '{}/{}:{}': {e}",
+                source_repo.owner_handle, source_repo.name, source.source_branch
+            ))
+        })?;
+        let _ = write::delete_import_ref(&self.repo_path(access.repo.id), &temp_ref).await;
+        let current_head = match change.current_revision_id {
+            None => String::new(),
+            Some(id) => db_changes::revision_by_id(self.db(), id)
+                .await?
+                .map(|r| r.head_sha)
+                .unwrap_or_default(),
+        };
+        if current_head == head_tip {
+            return self.change_view(&change).await;
+        }
+        let base_tip = self
+            .branch_tip(access.repo.id, &change.base_branch)
+            .await?
+            .ok_or_else(|| {
+                CoreError::Invalid(format!("unknown base branch '{}'", change.base_branch))
+            })?;
+        let revision = self
+            .append_revision(
+                access.repo.id,
+                trail.number,
+                &change,
+                &head_tip,
+                &base_tip,
+                Some(user.id),
+            )
+            .await?;
+        self.change_timeline(
+            access.repo.id,
+            trail.id,
+            "change.revision",
+            Some(user.id),
+            serde_json::json!({
+                "change": change.number,
+                "revision": revision.number,
+                "head_sha": head_tip,
+                "source": format!("{}/{}", source_repo.owner_handle, source_repo.name),
+            }),
+        )
+        .await?;
+        self.enqueue(&Job::ChangeMergeability {
+            change_id: change.id,
+        })
+        .await?;
+        self.dispatch_trail_event(
+            access.repo.id,
+            Some(user.handle.clone()),
+            Some("updated"),
+            Some("revision_pushed"),
+            trail.number,
+            Some(serde_json::json!({"k": change.number, "revision": revision.number})),
+        )
+        .await;
+        self.notify(crate::notifications::NotifyEvent {
+            repo_id: access.repo.id,
+            trail_id: trail.id,
+            kind: crate::notifications::NotifyKind::RevisionPushed,
+            actor_id: Some(user.id),
+            targets: &[],
+            text: None,
+        })
+        .await;
+        self.change_view(
+            &db_changes::change_by_id(self.db(), change.id)
                 .await?
                 .ok_or_else(|| CoreError::Internal("change vanished".into()))?,
         )

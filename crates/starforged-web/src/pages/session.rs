@@ -67,6 +67,17 @@ fn related_view(
     }
 }
 
+/// One checkpoint row on the session page.
+pub struct CheckpointItem {
+    n: i64,
+    commit: String,
+    short: String,
+    label: String,
+    source: String,
+    created: String,
+    parent: Option<String>,
+}
+
 #[derive(Template, WebTemplate)]
 #[template(path = "session.html")]
 pub struct SessionPageView {
@@ -119,6 +130,8 @@ pub struct SessionPageView {
     /// True when exactly the display cap of children is shown: the list
     /// may be truncated (no total or candidate count is ever revealed).
     child_truncated: bool,
+    /// Checkpoints of this session, ascending.
+    checkpoints: Vec<CheckpointItem>,
 }
 
 /// `GET /{owner}/{repo}/sessions/{ulid}?page=N&focus=seq&q=needle&split=<sha>`:
@@ -266,6 +279,21 @@ pub async fn show(
             )
         })
         .collect::<Vec<_>>();
+    let checkpoints = state
+        .core
+        .list_session_checkpoints(user, &owner, &repo, &ulid)
+        .await?
+        .into_iter()
+        .map(|c| CheckpointItem {
+            n: c.n,
+            short: c.commit_sha.chars().take(10).collect(),
+            commit: c.commit_sha,
+            label: c.label,
+            source: c.source,
+            created: format_time(c.created_at),
+            parent: c.parent_sha,
+        })
+        .collect::<Vec<_>>();
     let page_view = SessionPageView {
         nav_user: nav(session.as_ref()),
         head: RepoHead::new(&access, "sessions", None),
@@ -325,6 +353,7 @@ pub async fn show(
         parent,
         children,
         child_truncated,
+        checkpoints,
     };
     // Sessions never reach search indexes (spec §11.1). The transcript is
     // attacker-influenced, so the viewer also carries the strict CSP (it

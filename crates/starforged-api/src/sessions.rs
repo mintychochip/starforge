@@ -8,10 +8,11 @@
 
 use axum::Json;
 use axum::body::Bytes;
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use starforged_core::ingest::{IngestAuth, SegmentPut};
 use starforged_core::permission::Permission;
@@ -866,4 +867,146 @@ pub async fn get_segment(
         HeaderValue::from_static("application/octet-stream"),
     );
     Ok((headers, bytes).into_response())
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct CheckpointJson {
+    pub n: i64,
+    pub commit: String,
+    pub tree: String,
+    pub parent: Option<String>,
+    pub label: String,
+    pub source: String,
+    pub created_at: i64,
+}
+
+#[derive(Deserialize, utoipa::ToSchema)]
+pub struct CheckpointBody {
+    pub commit: String,
+    pub tree: String,
+    #[serde(default)]
+    pub parent: Option<String>,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub created_at: Option<i64>,
+}
+
+fn checkpoint_json(row: &starforged_core::ingest::SessionCheckpointRow) -> CheckpointJson {
+    CheckpointJson {
+        n: row.n,
+        commit: row.commit_sha.clone(),
+        tree: row.tree_sha.clone(),
+        parent: row.parent_sha.clone(),
+        label: row.label.clone(),
+        source: row.source.clone(),
+        created_at: row.created_at,
+    }
+}
+
+/// `GET /repos/{owner}/{repo}/sessions/{ulid}/checkpoints`: the session's
+/// checkpoints in ascending order, §6.4-filtered for the viewer.
+#[utoipa::path(
+    get,
+    path = "/api/v1/repos/{owner}/{repo}/sessions/{ulid}/checkpoints",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("ulid" = String, Path, description = "Session ULID"),
+    ),
+    responses(
+        (status = 200, description = "Checkpoints", body = Vec<CheckpointJson>),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+    ),
+    security((), ("bearer_auth" = [])),
+)]
+pub async fn list_checkpoints(
+    State(state): State<ApiState>,
+    auth: ApiAuth,
+    Path((owner, repo, ulid)): Path<(String, String, String)>,
+) -> Result<Json<Vec<CheckpointJson>>, ApiError> {
+    let user = auth.reader()?;
+    let rows = state
+        .core
+        .list_session_checkpoints(user, &owner, &repo, &ulid)
+        .await?;
+    Ok(Json(rows.iter().map(checkpoint_json).collect()))
+}
+
+/// `GET /repos/{owner}/{repo}/sessions/{ulid}/checkpoints/{n}`: one
+/// checkpoint, §6.4-filtered for the viewer.
+#[utoipa::path(
+    get,
+    path = "/api/v1/repos/{owner}/{repo}/sessions/{ulid}/checkpoints/{n}",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("ulid" = String, Path, description = "Session ULID"),
+        ("n" = i64, Path, description = "Checkpoint number"),
+    ),
+    responses(
+        (status = 200, description = "Checkpoint", body = CheckpointJson),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+    ),
+    security((), ("bearer_auth" = [])),
+)]
+pub async fn get_checkpoint(
+    State(state): State<ApiState>,
+    auth: ApiAuth,
+    Path((owner, repo, ulid, n)): Path<(String, String, String, i64)>,
+) -> Result<Json<CheckpointJson>, ApiError> {
+    let user = auth.reader()?;
+    let row = state
+        .core
+        .session_checkpoint(user, &owner, &repo, &ulid, n)
+        .await?;
+    Ok(Json(checkpoint_json(&row)))
+}
+
+/// `PUT /repos/{owner}/{repo}/sessions/{ulid}/checkpoints/{n}`: records the
+/// metadata for a checkpoint ref the CLI already pushed. The ref must point
+/// at `commit` and `tree` must be its tree; on a public repository the
+/// session must be published.
+#[utoipa::path(
+    put,
+    path = "/api/v1/repos/{owner}/{repo}/sessions/{ulid}/checkpoints/{n}",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("ulid" = String, Path, description = "Session ULID"),
+        ("n" = i64, Path, description = "Checkpoint number"),
+    ),
+    request_body = CheckpointBody,
+    responses(
+        (status = 200, description = "Checkpoint stored", body = CheckpointJson),
+        (status = 401, description = "Unauthenticated", body = crate::openapi::ApiErrorBody),
+        (status = 403, description = "Forbidden", body = crate::openapi::ApiErrorBody),
+        (status = 404, description = "Not found", body = crate::openapi::ApiErrorBody),
+        (status = 409, description = "Ref/commit mismatch or number already used", body = crate::openapi::ApiErrorBody),
+        (status = 422, description = "Invalid checkpoint", body = crate::openapi::ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+pub async fn put_checkpoint(
+    State(state): State<ApiState>,
+    auth: SessionAuth,
+    Path((owner, repo, ulid, n)): Path<(String, String, String, i64)>,
+    body: Result<Json<CheckpointBody>, JsonRejection>,
+) -> Result<Json<CheckpointJson>, ApiError> {
+    let ingest = authorize_ingest(&state, auth, &owner, &repo).await?;
+    let Json(input) = body.map_err(|e| ApiError::Invalid(e.body_text()))?;
+    let input = starforged_core::ingest::CheckpointInput {
+        commit: input.commit,
+        tree: input.tree,
+        parent: input.parent,
+        label: input.label,
+        source: input.source,
+        created_at: input.created_at,
+    };
+    let row = state.core.put_checkpoint(&ingest, &ulid, n, &input).await?;
+    Ok(Json(checkpoint_json(&row)))
 }

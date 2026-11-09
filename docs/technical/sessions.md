@@ -140,6 +140,35 @@ Git hooks append `Starforge-Session: <ULID>` trailers. The claim source is `cli_
 
 Trailer rows and claim rows merge in one transaction. Backfill matches commits inside session bounds and touched files. Backfill adds 30 minutes after the last event too. `--dry-run` prints backfill pairs and writes nothing.
 
+### Checkpoints
+
+A checkpoint is a git commit under `refs/starforge/checkpoints/<ulid>/<n>`.
+The tree holds every tracked file plus the session-touched untracked files.
+Ignored files, `.starforge/`, binary files, and files that match a redaction
+rule stay out. The CLI writes the tree through a temporary index, so the real
+index stays unchanged. The
+`session_checkpoints` table stores the session, number, commit, tree, parent,
+label, source, and creation time. The sources are `commit`, `session_end`,
+`manual`.
+
+The `post-commit` hook makes one checkpoint for each session named by a
+`Starforge-Session` trailer. The `session-end` hook makes a final one. The
+`checkpoint create` command makes one by hand. `starforge sync` pushes the
+refs and calls `PUT .../sessions/{ulid}/checkpoints/{n}` for each entry.
+
+The API verifies that the ref points at the uploaded commit and that the tree
+is the commit's tree. Public repositories refuse checkpoint refs, so the CLI
+keeps those checkpoints local. The metadata route also refuses an unpublished
+session on a public repository. The ref policy accepts
+`refs/starforge/checkpoints/<ulid>/<n>` from a user with write permission and
+a `repo:write` or `session:upload` token. The hook validates the ULID and the
+positive number.
+
+`rewind` fetches the ref when it is absent, refuses a dirty worktree, and runs
+`git read-tree --reset -u <commit>` followed by `git clean -fd`. `--force`
+first saves the current state in a local git stash. `resume` also writes
+`.starforge/resume.md` from the session metadata and the last 20 local events.
+
 ### Viewer, search, and bundle export
 
 Page handlers call `authorize_session_read_by_ulid` once. `read_session_page` returns one page of items in seq order. `page_for_seq` finds the page that holds one seq. `search_session` lowercases the query and matches message text, tool names, and file paths. It never searches tool inputs. It reads server-redacted items.

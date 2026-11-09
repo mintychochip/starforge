@@ -170,7 +170,12 @@ impl Core {
         };
         // Orphaned sidecars (a scan that never ran) must not accumulate.
         pushsidecar::reap(&repo, pushsidecar::MAX_AGE_SECS);
-        let changes = changed_refs(&before, &after);
+        // Checkpoint refs are server-side snapshots, not user history: they
+        // must not create trailer links, branch moves, or push events.
+        let changes: Vec<(String, Option<String>, String)> = changed_refs(&before, &after)
+            .into_iter()
+            .filter(|(name, _, _)| !name.starts_with("refs/starforge/"))
+            .collect();
         // Deleted branches and tags never appear in `changed_refs` (it only
         // walks `after` — see its unit test); collect them separately so base
         // deletions still recompute mergeability.

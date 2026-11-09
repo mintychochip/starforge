@@ -674,6 +674,20 @@ fn post_commit_inner(repo: &Path, paths: &crate::config::CliPaths) -> Result<(),
             )
             .map_err(|err| format!("cannot write link watermark: {err}"))?;
     }
+    // One checkpoint per linked session at the commit boundary. A no-op when
+    // the tree is unchanged; a failure never breaks the hook.
+    let label = crate::git::commit_subject(repo, &commit).unwrap_or_else(|_| "commit".to_owned());
+    let mut seen = std::collections::HashSet::new();
+    for record in &pending {
+        if !seen.insert(record.ulid.clone()) {
+            continue;
+        }
+        if let Err(err) =
+            crate::checkpoints::create(repo, &spool, &record.ulid, &label, "commit", false)
+        {
+            eprintln!("warning: starforge checkpoint skipped: {err}");
+        }
+    }
     std::fs::remove_file(pending_path(&spool)).ok();
     Ok(())
 }

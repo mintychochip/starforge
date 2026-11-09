@@ -1635,6 +1635,91 @@ pub async fn delete_file_view(db: &Db, change_id: i64, user_id: i64, path: &str)
     Ok(())
 }
 
+/// The source repository and branch of a cross-repository change. A change
+/// without this row is same-repository.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangeSourceRow {
+    pub change_id: i64,
+    pub source_repo_id: i64,
+    pub source_branch: String,
+    pub created_at: i64,
+}
+
+fn change_source_from_row(row: &AnyRow) -> DbResult<ChangeSourceRow> {
+    Ok(ChangeSourceRow {
+        change_id: row.try_get("change_id")?,
+        source_repo_id: row.try_get("source_repo_id")?,
+        source_branch: row.try_get("source_branch")?,
+        created_at: row.try_get("created_at")?,
+    })
+}
+
+/// Records (or replaces) the source of a cross-repository change.
+pub async fn insert_change_source(
+    db: &Db,
+    change_id: i64,
+    source_repo_id: i64,
+    source_branch: &str,
+    now: i64,
+) -> DbResult<()> {
+    sqlx::query(
+        "INSERT INTO change_sources (change_id, source_repo_id, source_branch, created_at) \
+         VALUES ($1, $2, $3, $4) \
+         ON CONFLICT (change_id) DO UPDATE SET \
+         source_repo_id = excluded.source_repo_id, source_branch = excluded.source_branch",
+    )
+    .bind(change_id)
+    .bind(source_repo_id)
+    .bind(source_branch)
+    .bind(now)
+    .execute(db.pool())
+    .await?;
+    Ok(())
+}
+
+/// The source of a cross-repository change, or `None` for a same-repository
+/// change.
+pub async fn change_source(db: &Db, change_id: i64) -> DbResult<Option<ChangeSourceRow>> {
+    let row = sqlx::query(
+        "SELECT change_id, source_repo_id, source_branch, created_at \
+         FROM change_sources WHERE change_id = $1",
+    )
+    .bind(change_id)
+    .fetch_optional(db.read_pool())
+    .await?;
+    row.as_ref().map(change_source_from_row).transpose()
+}
+
+/// Removes the source row (used when a cross-repository change is deleted).
+pub async fn delete_change_source(db: &Db, change_id: i64) -> DbResult<()> {
+    sqlx::query("DELETE FROM change_sources WHERE change_id = $1")
+        .bind(change_id)
+        .execute(db.pool())
+        .await?;
+    Ok(())
+}
+
+/// Open cross-repository changes on `trail_id` whose source is exactly
+/// (`source_repo_id`, `source_branch`).
+pub async fn open_cross_repo_changes(
+    db: &Db,
+    trail_id: i64,
+    source_repo_id: i64,
+    source_branch: &str,
+) -> DbResult<Vec<ChangeRow>> {
+    let rows = sqlx::query(select_change!(
+        "WHERE trail_id = $1 AND state = 'open' AND id IN \
+         (SELECT change_id FROM change_sources WHERE source_repo_id = $2 AND source_branch = $3) \
+         ORDER BY number ASC"
+    ))
+    .bind(trail_id)
+    .bind(source_repo_id)
+    .bind(source_branch)
+    .fetch_all(db.read_pool())
+    .await?;
+    rows.iter().map(change_from_row).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -67,6 +67,9 @@ The command tree comes from `Cmd` in `cli.rs`:
 | `doctor` | Check environment, configuration, and connectivity |
 | `sync` | Upload the queued spool data to the server |
 | `sessions` | Manage local sessions and server-side session records |
+| `checkpoint` | Create and list local session checkpoints |
+| `rewind` | Restore the working tree to a session checkpoint |
+| `resume` | Rewind and write a resume context file |
 | `export` | Export session bundles to a directory |
 | `import` | Import session bundles into a repository |
 | `trail` | List, show, create, comment, push, check out, review, merge Trails |
@@ -229,12 +232,22 @@ Trail commands talk to the API through `ApiClient` in `api.rs`. The base is `{ap
 | `trail checkout <n>` | Fetch a change and move `HEAD` to it |
 | `trail review <n>` | Submit approve, request-changes, or comment verdicts |
 | `trail merge <n>` | Merge a change after server gates pass |
+| `trail change add` | Open a change from another repository's branch |
+| `trail change refresh` | Re-fetch a cross-repository change's source |
 
 `trail list` accepts `--state open`, `closed`, `merged`, or `all`. It accepts `--limit` from 1 to 100 with a default of 30. It accepts `--after` for paging and `--format text` or `--format json`.
 
 `trail create` and `trail comment` accept `--body` or `--body-file`. A body file path of `-` reads stdin. `trail push` accepts `--trail`, `--title`, `--base`, `--topic`, and `--remote`. `trail checkout` accepts `--change`, `--rev`, and `--remote`. It refuses a dirty work tree.
 
 `trail review <n>` requires exactly one verdict flag. The flags are `--approve`, `--request-changes`, and `--comment`. It accepts `--body`, `--body-file`, `--comments`, `--session`, `--change`, and `--rev`. The `--comments` value takes a JSON array, an `@<path>` file, or `@-` for stdin.
+
+`trail change add --trail <n> --from owner/repo --branch <b> --base <b>` opens a cross-repository change. `trail change refresh --trail <n> --change <k>` re-fetches its source branch.
+
+## Checkpoints, rewind, and resume
+
+`checkpoint create [--session <ulid>] [--label <text>]` snapshots the working tree for a session. Without `--session`, it uses the newest session in the spool. `checkpoint list [--session <ulid>]` lists local checkpoints with their number, commit, source, label, and upload state.
+
+`rewind <ulid> --checkpoint <n>` fetches the checkpoint ref when it is absent and restores the working tree and index. It refuses a dirty worktree. `--force` first saves the current state in a local git stash. `resume <ulid> --checkpoint <n>` does the same and writes `.starforge/resume.md` with the last 20 local events. It prints the agent command. It does not start an agent.
 
 ## Runner
 

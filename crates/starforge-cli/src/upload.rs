@@ -180,6 +180,33 @@ impl UploadClient {
         check_status(owner_repo, resp).await
     }
 
+    /// `PUT .../checkpoints/{n}` with the checkpoint metadata. The ref must
+    /// already be pushed; the server verifies it.
+    pub async fn put_checkpoint(
+        &self,
+        owner_repo: &str,
+        ulid: &str,
+        n: u64,
+        entry: &crate::spool::CheckpointEntry,
+    ) -> Result<(), UploadError> {
+        let url = format!("{}/checkpoints/{n}", self.session_url(owner_repo, ulid));
+        let resp = self
+            .client
+            .put(&url)
+            .bearer_auth(&self.token)
+            .json(&serde_json::json!({
+                "commit": entry.commit,
+                "tree": entry.tree,
+                "parent": entry.parent,
+                "label": entry.label,
+                "source": entry.source,
+                "created_at": entry.created_at,
+            }))
+            .send()
+            .await?;
+        check_status(owner_repo, resp).await
+    }
+
     /// `POST .../complete` with `{}`.
     pub async fn post_complete(&self, owner_repo: &str, ulid: &str) -> Result<(), UploadError> {
         let url = format!("{}/complete", self.session_url(owner_repo, ulid));

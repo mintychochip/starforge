@@ -107,14 +107,14 @@ fn last_event_ts(spool: &crate::spool::Spool, ulid: &str) -> Option<String> {
 /// `complete` op the way the 24 h idle rule does (only when not already
 /// complete / queued). Best-effort: warnings, never an error to the caller
 /// beyond a one-line message.
-fn mark_ended(spool: &crate::spool::Spool, session_id: &str, now_rfc3339: &str) {
+fn mark_ended(spool: &crate::spool::Spool, session_id: &str, now_rfc3339: &str) -> Option<String> {
     let records = match spool.cursor_records() {
         Ok(records) => records,
         Err(err) => {
             warn(&format!(
                 "warning: starforge session-end: cannot read cursors: {err}"
             ));
-            return;
+            return None;
         }
     };
     let ulid = records
@@ -124,16 +124,14 @@ fn mark_ended(spool: &crate::spool::Spool, session_id: &str, now_rfc3339: &str) 
             (stem == session_id).then_some(rec.ulid.clone())
         })
         .next();
-    let Some(ulid) = ulid else {
-        return;
-    };
+    let ulid = ulid?;
     let mut meta = match spool.read_meta(&ulid) {
         Ok(meta) => meta,
         Err(err) => {
             warn(&format!(
                 "warning: starforge session-end: cannot read session: {err}"
             ));
-            return;
+            return None;
         }
     };
     if meta.ended_at.is_none() {
@@ -143,7 +141,7 @@ fn mark_ended(spool: &crate::spool::Spool, session_id: &str, now_rfc3339: &str) 
             warn(&format!(
                 "warning: starforge session-end: cannot end session: {err}"
             ));
-            return;
+            return None;
         }
     }
     let complete = spool
@@ -151,20 +149,20 @@ fn mark_ended(spool: &crate::spool::Spool, session_id: &str, now_rfc3339: &str) 
         .map(|state| state.complete)
         .unwrap_or(false);
     if complete {
-        return;
+        return Some(ulid);
     }
     let queued = crate::queue::read_queue(spool).unwrap_or_default();
     if queued
         .iter()
         .any(|e| e.op == crate::queue::QueueOp::Complete && e.ulid == ulid)
     {
-        return;
+        return Some(ulid);
     }
     if let Err(err) = crate::queue::enqueue(
         spool,
         crate::queue::QueueEntry {
             op: crate::queue::QueueOp::Complete,
-            ulid,
+            ulid: ulid.clone(),
             repo: String::new(),
             segment: None,
             attempts: 0,
@@ -175,6 +173,7 @@ fn mark_ended(spool: &crate::spool::Spool, session_id: &str, now_rfc3339: &str) 
             "warning: starforge session-end: cannot queue complete: {err}"
         ));
     }
+    Some(ulid)
 }
 
 /// One best-effort upload pass over the queue (the `pre-push`/`sync` path,
@@ -277,7 +276,20 @@ async fn session_end_inner(paths: &crate::config::CliPaths) -> Result<(), String
         let now = time::OffsetDateTime::now_utc()
             .format(&Rfc3339)
             .map_err(|err| format!("cannot format time: {err}"))?;
-        mark_ended(&spool, id, &now);
+        if let Some(ulid) = mark_ended(&spool, id, &now)
+            && let Err(err) = crate::checkpoints::create(
+                &repo,
+                &spool,
+                &ulid,
+                "session end",
+                "session_end",
+                false,
+            )
+        {
+            warn(&format!(
+                "warning: starforge session-end: checkpoint skipped: {err}"
+            ));
+        }
     }
     best_effort_upload(&repo, paths).await;
     Ok(())

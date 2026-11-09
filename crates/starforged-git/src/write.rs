@@ -1,6 +1,6 @@
 //! Changing hosted repositories with git plumbing.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::path::Path;
 use std::process::Stdio;
 
@@ -113,20 +113,36 @@ pub async fn commit_tree(
     message: &str,
     author: Identity<'_>,
 ) -> Result<String, GitError> {
+    commit_tree_as(repo, tree, parents, message, author, author).await
+}
+
+/// Builds a commit object with distinct author and committer identities. The
+/// rebase path preserves the original author (name, email, time) while the
+/// server is the committer. Argv-only; `tree` and every parent must pass
+/// [`crate::refpolicy::is_oid`]. Returns the new commit id.
+pub async fn commit_tree_as(
+    repo: &Path,
+    tree: &str,
+    parents: &[&str],
+    message: &str,
+    author: Identity<'_>,
+    committer: Identity<'_>,
+) -> Result<String, GitError> {
     if !crate::refpolicy::is_oid(tree) || !parents.iter().all(|p| crate::refpolicy::is_oid(p)) {
         return Err(GitError::Failed {
             command: "commit-tree".to_owned(),
             stderr: "commit-tree needs full object ids".to_owned(),
         });
     }
-    let date = format!("@{} +0000", author.time);
+    let author_date = format!("@{} +0000", author.time);
+    let committer_date = format!("@{} +0000", committer.time);
     let env = [
         ("GIT_AUTHOR_NAME", author.name),
         ("GIT_AUTHOR_EMAIL", author.email),
-        ("GIT_AUTHOR_DATE", date.as_str()),
-        ("GIT_COMMITTER_NAME", author.name),
-        ("GIT_COMMITTER_EMAIL", author.email),
-        ("GIT_COMMITTER_DATE", date.as_str()),
+        ("GIT_AUTHOR_DATE", author_date.as_str()),
+        ("GIT_COMMITTER_NAME", committer.name),
+        ("GIT_COMMITTER_EMAIL", committer.email),
+        ("GIT_COMMITTER_DATE", committer_date.as_str()),
     ];
     let mut args: Vec<&str> = vec!["commit-tree", tree];
     for parent in parents {
@@ -141,6 +157,26 @@ pub async fn commit_tree(
         .map_err(|_| GitError::Failed {
             command: "commit-tree".to_owned(),
             stderr: "commit-tree timed out".to_owned(),
+        })?
+}
+
+/// Object id a `refs/starforge/checkpoints/*` ref points at (`rev-parse
+/// --verify <name>`). Argv-only; any other namespace is refused, so caller
+/// input cannot reach another ref.
+pub async fn rev_parse_ref(repo: &Path, name: &str) -> Result<String, GitError> {
+    if !name.starts_with("refs/starforge/checkpoints/") {
+        return Err(GitError::Failed {
+            command: "rev-parse".to_owned(),
+            stderr: format!("refusing to resolve non-checkpoint ref {name:?}"),
+        });
+    }
+    let args = ["rev-parse", "--verify", name];
+    let fut = plumbing(repo, &args, None, &[]);
+    tokio::time::timeout(WRITE_TIMEOUT, fut)
+        .await
+        .map_err(|_| GitError::Failed {
+            command: "rev-parse".to_owned(),
+            stderr: "rev-parse timed out".to_owned(),
         })?
 }
 
@@ -316,6 +352,91 @@ fn valid_tag_name(name: &str) -> bool {
     }
     name.split('/')
         .all(|part| !part.is_empty() && !part.starts_with('.') && !part.ends_with(".lock"))
+}
+
+/// True for a branch name `git check-ref-format` accepts under
+/// `refs/heads/`: the tag rules plus no leading `-` (which git would read as
+/// an option).
+fn valid_branch_name(name: &str) -> bool {
+    !name.starts_with('-') && valid_tag_name(name)
+}
+
+/// Fetches one source branch into a temporary import ref in `repo` and
+/// returns its tip. `source` is a local bare-repository path (both sides are
+/// Starforge repositories). The refspec is built here from a validated branch
+/// name; `temp_ref` must stay inside `refs/starforge/import/`. The caller
+/// deletes the temporary ref after the change's trail refs point at the tip.
+pub async fn fetch_branch(
+    repo: &Path,
+    source: &Path,
+    branch: &str,
+    temp_ref: &str,
+) -> Result<String, GitError> {
+    if !valid_branch_name(branch) {
+        return Err(GitError::Failed {
+            command: "fetch".to_owned(),
+            stderr: format!("refusing to fetch invalid branch {branch:?}"),
+        });
+    }
+    if !temp_ref.starts_with("refs/starforge/import/") {
+        return Err(GitError::Failed {
+            command: "fetch".to_owned(),
+            stderr: format!("refusing to fetch into non-import ref {temp_ref:?}"),
+        });
+    }
+    let refspec = format!("+refs/heads/{branch}:{temp_ref}");
+    let args: Vec<OsString> = vec![
+        "--git-dir".into(),
+        repo.as_os_str().to_owned(),
+        "fetch".into(),
+        "--no-tags".into(),
+        "--".into(),
+        source.as_os_str().to_owned(),
+        refspec.into(),
+    ];
+    let fut = run(args);
+    tokio::time::timeout(WRITE_TIMEOUT, fut)
+        .await
+        .map_err(|_| GitError::Failed {
+            command: "fetch".to_owned(),
+            stderr: "fetch timed out".to_owned(),
+        })??;
+    plumbing(repo, &["rev-parse", temp_ref], None, &[]).await
+}
+
+/// Deletes a temporary `refs/starforge/import/*` ref after a cross-repository
+/// change has recorded its head. Argv-only; any other namespace is refused.
+pub async fn delete_import_ref(repo: &Path, name: &str) -> Result<(), GitError> {
+    if !name.starts_with("refs/starforge/import/") {
+        return Err(GitError::Failed {
+            command: "update-ref".to_owned(),
+            stderr: format!("refusing to delete non-import ref {name:?}"),
+        });
+    }
+    run([
+        OsStr::new("--git-dir"),
+        repo.as_os_str(),
+        OsStr::new("update-ref"),
+        OsStr::new("-d"),
+        OsStr::new(name),
+    ])
+    .await?;
+    Ok(())
+}
+
+/// True when `sha` names a commit object present in `repo` (`cat-file -e
+/// <sha>^{commit}`). A malformed id is `false`, never a git call.
+pub async fn object_exists(repo: &Path, sha: &str) -> Result<bool, GitError> {
+    if !crate::refpolicy::is_oid(sha) {
+        return Ok(false);
+    }
+    let spec = format!("{sha}^{{commit}}");
+    let mut cmd = git();
+    cmd.arg("--git-dir")
+        .arg(repo)
+        .args(["cat-file", "-e", &spec]);
+    let out = cmd.output().await?;
+    Ok(out.status.success())
 }
 
 #[cfg(test)]

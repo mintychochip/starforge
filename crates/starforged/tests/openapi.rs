@@ -123,6 +123,18 @@ const ROUTES: &[(&str, &str)] = &[
         "/api/v1/repos/{owner}/{repo}/sessions/{ulid}/segments/{n}",
     ),
     (
+        "get",
+        "/api/v1/repos/{owner}/{repo}/sessions/{ulid}/checkpoints",
+    ),
+    (
+        "get",
+        "/api/v1/repos/{owner}/{repo}/sessions/{ulid}/checkpoints/{n}",
+    ),
+    (
+        "put",
+        "/api/v1/repos/{owner}/{repo}/sessions/{ulid}/checkpoints/{n}",
+    ),
+    (
         "post",
         "/api/v1/repos/{owner}/{repo}/sessions/{ulid}/complete",
     ),
@@ -244,6 +256,10 @@ const ROUTES: &[(&str, &str)] = &[
     (
         "post",
         "/api/v1/repos/{owner}/{repo}/trails/{n}/changes/{k}/merge",
+    ),
+    (
+        "post",
+        "/api/v1/repos/{owner}/{repo}/trails/{n}/changes/{k}/refresh",
     ),
     ("post", "/api/v1/repos/{owner}/{repo}/statuses/{sha}"),
     ("get", "/api/v1/repos/{owner}/{repo}/statuses/{sha}"),

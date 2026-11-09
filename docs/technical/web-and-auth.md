@@ -176,7 +176,7 @@ The router disables body limits for git routes. See [git hosting](git-hosting.md
 | Code browsing | `/{owner}/{repo}/tree/{*rest}`, `/{owner}/{repo}/blob/{*rest}`, `/{owner}/{repo}/raw/{*rest}` | `code`, `blame` |
 | History and refs | `/{owner}/{repo}/commits`, `/{owner}/{repo}/commit/{id}`, `/{owner}/{repo}/branches`, `/{owner}/{repo}/compare/{*spec}` | `history`, `refs`, `compare` |
 | Sessions | `/{owner}/{repo}/sessions`, `/{owner}/{repo}/sessions/{ulid}` | `sessions`, `session` |
-| Trails and changes | `/{owner}/{repo}/trails`, `/{owner}/{repo}/trails/{number}`, `/{owner}/{repo}/trails/{number}/changes/{k}` | `trails`, `changes` |
+| Trails and changes | `/{owner}/{repo}/trails`, `/{owner}/{repo}/trails/{number}`, `/{owner}/{repo}/trails/{number}/changes/{k}`, `POST /{owner}/{repo}/trails/{number}/changes/cross-repo` | `trails`, `changes` |
 | CI runs and usage | `/{owner}/{repo}/ci`, `/{owner}/{repo}/ci/usage`, `/{owner}/{repo}/ci/{id}`, `/{owner}/{repo}/ci/{id}/logs`, `POST /{owner}/{repo}/ci/{id}/cancel` | `ci` |
 | Archives | `/{owner}/{repo}/archive/{*rest}` | `releases` pages |
 | Releases | `/{owner}/{repo}/releases`, `/{owner}/{repo}/releases/new`, `/{owner}/{repo}/releases/tag/{*tag}`, `/{owner}/{repo}/releases/edit/{*tag}`, `/{owner}/{repo}/releases/delete/{*tag}`, `/{owner}/{repo}/releases/assets/{*tag}`, `/{owner}/{repo}/releases/asset-delete/{*rest}`, `/{owner}/{repo}/releases/download/{*rest}` | `releases` pages |

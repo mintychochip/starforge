@@ -122,6 +122,7 @@ impl Core {
         access: &RepoAccess,
         user: Option<&User>,
         scope_write: bool,
+        scope_session_upload: bool,
         nonce: &str,
     ) -> CoreResult<Vec<(&'static str, String)>> {
         let refs_for = self.refs_for_access(access.repo.id).await?;
@@ -163,6 +164,22 @@ impl Core {
                 "1".to_owned()
             } else {
                 "0".to_owned()
+            },
+        ));
+        env.push((
+            "STARFORGE_SCOPE_SESSION_UPLOAD",
+            if scope_session_upload {
+                "1".to_owned()
+            } else {
+                "0".to_owned()
+            },
+        ));
+        env.push((
+            "STARFORGE_CHECKPOINTS_ALLOWED",
+            if access.repo.visibility == crate::permission::Visibility::Public {
+                "0".to_owned()
+            } else {
+                "1".to_owned()
             },
         ));
         env.push(("STARFORGE_PUSH_NONCE", nonce.to_owned()));

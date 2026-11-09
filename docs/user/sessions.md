@@ -120,6 +120,30 @@ preserve unmapped native fields so re-normalization stays lossless; raw-transcri
 defaults ON for new repos. Test fixtures are synthesized in the native shape — each fixture
 directory carries a `SYNTHESIZED.txt` noting the native source it mimics.
 
+## Checkpoints, rewind, and resume
+
+`starforge` records a checkpoint at each commit that links a session and at
+session end. A checkpoint is a git commit whose tree is the working tree at
+that moment: every tracked file plus the session-touched untracked files.
+Ignored files, `.starforge/`, binary files, and files that match a redaction
+rule stay out. The commit is stored at
+`refs/starforge/checkpoints/<ulid>/<n>`.
+
+`starforge checkpoint create --session <ulid> --label <text>` makes one by
+hand. `starforge checkpoint list --session <ulid>` lists the local ones.
+`starforge sync` pushes the refs and uploads the metadata.
+
+`starforge rewind <ulid> --checkpoint <n>` restores the working tree and the
+index to the checkpoint. It refuses a dirty worktree. `--force` first saves the current state in a local git stash, then restores. `starforge resume <ulid>
+--checkpoint <n>` also writes `.starforge/resume.md` with the session title,
+agent, checkpoint, and the last 20 turns. It prints the agent command; it does
+not start an agent.
+
+The session page lists the checkpoints with a commit link and a diff link.
+On a public repository, checkpoint refs are not accepted; the checkpoints stay
+local. On a private or internal repository, repository readers can fetch the
+checkpoint ref.
+
 ## Where sessions are read from
 
 Capture is discovery-based (at commit, push, and `sync`): the CLI reads each

@@ -341,6 +341,7 @@ impl Handler for Connection {
                 user: user.clone(),
                 scope_read: true,
                 scope_write: true,
+                scope_session_upload: true,
             },
             KeyIdentity::Deploy {
                 key_id,
@@ -473,7 +474,13 @@ async fn spawn_pack_async(
     if is_receive {
         let nonce = pushsidecar::new_nonce();
         match core
-            .git_rpc_env(&grant.access, grant.user.as_ref(), grant.write_path, &nonce)
+            .git_rpc_env(
+                &grant.access,
+                grant.user.as_ref(),
+                grant.write_path,
+                grant.user.is_some(),
+                &nonce,
+            )
             .await
         {
             Ok(extra) => env.extend(extra),

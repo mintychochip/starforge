@@ -637,6 +637,84 @@ pub async fn create_branch(
 }
 
 #[derive(Deserialize)]
+pub struct CrossRepoChangeForm {
+    #[serde(rename = "_csrf", default)]
+    csrf: String,
+    #[serde(default)]
+    source_repo: String,
+    #[serde(default)]
+    source_branch: String,
+    #[serde(default)]
+    base: String,
+}
+
+/// `POST /{owner}/{repo}/trails/{n}/changes/cross-repo`: opens a change from
+/// another repository's branch. `Invalid` re-renders the changes tab with 422.
+pub async fn create_cross_repo(
+    State(state): State<AppState>,
+    RequireUser(session): RequireUser,
+    Path((owner, repo, number)): Path<(String, String, i64)>,
+    Form(form): Form<CrossRepoChangeForm>,
+) -> Result<Response, WebError> {
+    let access = state
+        .core
+        .repo_for(Some(&session.user), &owner, &repo)
+        .await?;
+    verify_csrf(&session.csrf_token, &form.csrf)?;
+    let (source_owner, source_name) = match form.source_repo.trim().split_once('/') {
+        Some((o, r)) if !o.is_empty() && !r.is_empty() && !r.contains('/') => (o, r),
+        _ => {
+            let page = crate::pages::trails::changes_view(
+                &state,
+                Some(&session),
+                &owner,
+                &repo,
+                number,
+                Some("source repository must be owner/repo".into()),
+            )
+            .await?;
+            return Ok((StatusCode::UNPROCESSABLE_ENTITY, detail_headers(), page).into_response());
+        }
+    };
+    match state
+        .core
+        .create_cross_repo_change(
+            &session.user,
+            &owner,
+            &repo,
+            number,
+            source_owner,
+            source_name,
+            form.source_branch.trim(),
+            form.base.trim(),
+        )
+        .await
+    {
+        Ok(saved) => Ok(Redirect::to(&format!(
+            "/{}/{}/trails/{number}/changes/{}",
+            access.repo.owner, access.repo.name, saved.k
+        ))
+        .into_response()),
+        Err(
+            starforged_core::CoreError::Invalid(message)
+            | starforged_core::CoreError::Conflict(message),
+        ) => {
+            let page = crate::pages::trails::changes_view(
+                &state,
+                Some(&session),
+                &owner,
+                &repo,
+                number,
+                Some(message),
+            )
+            .await?;
+            Ok((StatusCode::UNPROCESSABLE_ENTITY, detail_headers(), page).into_response())
+        }
+        Err(other) => Err(other.into()),
+    }
+}
+
+#[derive(Deserialize)]
 pub struct ReviewForm {
     #[serde(rename = "_csrf", default)]
     csrf: String,

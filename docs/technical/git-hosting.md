@@ -48,6 +48,7 @@ The table below lists the accepted ref namespaces.
 | `refs/tags/*` | Tag push needs write tier plus `repo:write` scope |
 | `refs/for/<base>` or `refs/for/<base>/<topic>` | Change creation needs `repo:read`, an author, and the repository access mode |
 | `refs/trails/*` | Server only. Client pushes fail |
+| `refs/starforge/checkpoints/<ulid>/<n>` | Session checkpoints. Client pushes need write tier and `repo:write` or `session:upload` scope. Public repositories refuse them. The hook validates the ULID and positive number |
 | Allow-listed namespace | Set by `git.allowed_ref_namespaces`. Client pushes need write tier and `repo:write` scope |
 
 `git.allowed_ref_namespaces` controls extra namespaces. Each entry matches `refs/.../`. Entries never overlap `refs/heads`, `refs/tags`, `refs/for`, or `refs/trails`. Branch protection never applies to allowed namespaces.
@@ -58,9 +59,11 @@ The table below lists the accepted ref namespaces.
 
 `HookCtx::from_env` builds the hook context from environment variables. `pre_receive_with` checks each line of input. `parse_line` parses one update line. A malformed line returns exit code `1`.
 
-`check_allowed` classifies each ref. `refs/for` needs an authenticated user with read permission. Deploy keys and anonymous callers fail the check. `refs/trails` fails the check. Unknown namespaces fail the check.
+`check_allowed` classifies each ref. `refs/for` needs an authenticated user with read permission. Deploy keys and anonymous callers fail the check. `refs/trails` fails the check. Checkpoint refs classify as checkpoints. Unknown namespaces fail the check.
 
-`check_branch_push` requires write permission and `repo:write` scope. `check_protected_update` enforces delete, force, and direct push rules. `check_tag_update` enforces tag globs. A missing or malformed protection snapshot fails closed for branches and tags. `refs/for` keeps working without a valid snapshot.
+`check_branch_push` requires write permission and `repo:write` scope. `check_checkpoint_push` requires write permission and `repo:write` or `session:upload` scope. `check_checkpoint_ref` validates the checkpoint ref shape.
+
+`check_protected_update` enforces delete, force, and direct push rules. `check_tag_update` enforces tag globs. A missing or malformed protection snapshot fails closed for branches and tags. `refs/for` keeps working without a valid snapshot.
 
 The hook writes one sidecar per accepted `refs/for` line. `pushsidecar::write_sidecar` stores the repository, user, base, topic, trail, title, refname, old and new object IDs, and nonce. `consume` reads those sidecars after the push. Old sidecars expire after one hour.
 

@@ -1586,3 +1586,105 @@ mod tests {
         assert_eq!(capped[0].ulid, "01LISTA");
     }
 }
+
+/// One session checkpoint: a git commit under
+/// `refs/starforge/checkpoints/<ulid>/<n>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionCheckpointRow {
+    pub id: i64,
+    pub repo_id: i64,
+    pub session_id: i64,
+    pub n: i64,
+    pub commit_sha: String,
+    pub tree_sha: String,
+    pub parent_sha: Option<String>,
+    pub label: String,
+    pub source: String,
+    pub created_at: i64,
+}
+
+fn checkpoint_from_row(row: &AnyRow) -> DbResult<SessionCheckpointRow> {
+    Ok(SessionCheckpointRow {
+        id: row.try_get("id")?,
+        repo_id: row.try_get("repo_id")?,
+        session_id: row.try_get("session_id")?,
+        n: row.try_get("n")?,
+        commit_sha: row.try_get("commit_sha")?,
+        tree_sha: row.try_get("tree_sha")?,
+        parent_sha: row.try_get("parent_sha")?,
+        label: row.try_get("label")?,
+        source: row.try_get("source")?,
+        created_at: row.try_get("created_at")?,
+    })
+}
+
+/// Inserts or updates checkpoint `n` for a session. The caller verifies the
+/// git ref before calling; a different commit for an existing `n` is a core
+/// conflict, not a silent overwrite.
+#[allow(clippy::too_many_arguments)]
+pub async fn upsert_checkpoint(
+    db: &Db,
+    repo_id: i64,
+    session_id: i64,
+    n: i64,
+    commit_sha: &str,
+    tree_sha: &str,
+    parent_sha: Option<&str>,
+    label: &str,
+    source: &str,
+    now: i64,
+) -> DbResult<SessionCheckpointRow> {
+    let row = sqlx::query(
+        "INSERT INTO session_checkpoints \
+         (repo_id, session_id, n, commit_sha, tree_sha, parent_sha, label, source, created_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+         ON CONFLICT (session_id, n) DO UPDATE SET \
+         commit_sha = excluded.commit_sha, tree_sha = excluded.tree_sha, \
+         parent_sha = excluded.parent_sha, label = excluded.label, source = excluded.source \
+         RETURNING id, repo_id, session_id, n, commit_sha, tree_sha, parent_sha, label, source, created_at",
+    )
+    .bind(repo_id)
+    .bind(session_id)
+    .bind(n)
+    .bind(commit_sha)
+    .bind(tree_sha)
+    .bind(parent_sha)
+    .bind(label)
+    .bind(source)
+    .bind(now)
+    .fetch_one(db.pool())
+    .await?;
+    checkpoint_from_row(&row)
+}
+
+/// Checkpoints of a session in ascending `n` order.
+pub async fn checkpoints_of_session(
+    db: &Db,
+    session_id: i64,
+) -> DbResult<Vec<SessionCheckpointRow>> {
+    let rows = sqlx::query(
+        "SELECT id, repo_id, session_id, n, commit_sha, tree_sha, parent_sha, label, source, created_at \
+         FROM session_checkpoints WHERE session_id = $1 ORDER BY n ASC",
+    )
+    .bind(session_id)
+    .fetch_all(db.read_pool())
+    .await?;
+    rows.iter().map(checkpoint_from_row).collect()
+}
+
+/// One checkpoint by its per-session number.
+pub async fn checkpoint_by_n(
+    db: &Db,
+    session_id: i64,
+    n: i64,
+) -> DbResult<Option<SessionCheckpointRow>> {
+    let row = sqlx::query(
+        "SELECT id, repo_id, session_id, n, commit_sha, tree_sha, parent_sha, label, source, created_at \
+         FROM session_checkpoints WHERE session_id = $1 AND n = $2",
+    )
+    .bind(session_id)
+    .bind(n)
+    .fetch_optional(db.read_pool())
+    .await?;
+    row.as_ref().map(checkpoint_from_row).transpose()
+}

@@ -126,7 +126,7 @@ async fn authorize(
     owner: &str,
     repo_segment: &str,
     service: Service,
-) -> Result<(RepoAccess, Option<User>, bool), GitHttpError> {
+) -> Result<(RepoAccess, Option<User>, bool, bool), GitHttpError> {
     let auth = match basic_password(headers) {
         Some(secret) => Some(
             state
@@ -137,11 +137,15 @@ async fn authorize(
         ),
         None => None,
     };
+    let scope_session_upload = auth
+        .as_ref()
+        .is_some_and(|a| tokens::grants(&a.scopes, Scope::SessionUpload));
     let actor = match &auth {
         Some(auth) => starforged_core::gitaccess::GitActor::User {
             user: auth.user.clone(),
             scope_read: tokens::grants(&auth.scopes, Scope::RepoRead),
             scope_write: tokens::grants(&auth.scopes, Scope::RepoWrite),
+            scope_session_upload: tokens::grants(&auth.scopes, Scope::SessionUpload),
         },
         None => starforged_core::gitaccess::GitActor::Anonymous {
             // Anonymous fetches carry no token to scope-check; a real token
@@ -170,7 +174,12 @@ async fn authorize(
     {
         return Err(GitHttpError::Archived);
     }
-    Ok((grant.access, grant.user, grant.write_path))
+    Ok((
+        grant.access,
+        grant.user,
+        grant.write_path,
+        scope_session_upload,
+    ))
 }
 
 /// Counts one git request for the client IP against the per-IP fixed
@@ -202,7 +211,7 @@ pub async fn info_refs(
         .ok_or(GitHttpError::BadRequest(
             "only the smart HTTP protocol is supported\n",
         ))?;
-    let (access, _, _) = authorize(&state, &headers, &owner, &repo, service).await?;
+    let (access, _, _, _) = authorize(&state, &headers, &owner, &repo, service).await?;
     state
         .core
         .metrics()
@@ -264,7 +273,8 @@ async fn rpc(
     body: Body,
     service: Service,
 ) -> Result<Response, GitHttpError> {
-    let (access, user, write_path) = authorize(&state, &headers, owner, repo, service).await?;
+    let (access, user, write_path, scope_session_upload) =
+        authorize(&state, &headers, owner, repo, service).await?;
     state
         .core
         .metrics()
@@ -292,7 +302,13 @@ async fn rpc(
         env.extend(
             state
                 .core
-                .git_rpc_env(&access, user.as_ref(), write_path, &nonce)
+                .git_rpc_env(
+                    &access,
+                    user.as_ref(),
+                    write_path,
+                    scope_session_upload,
+                    &nonce,
+                )
                 .await
                 .map_err(|e| GitHttpError::Internal(e.to_string()))?,
         );

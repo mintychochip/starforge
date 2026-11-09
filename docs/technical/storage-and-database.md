@@ -53,7 +53,7 @@ Reads inside open transactions use the writer pool. The engine enforces foreign 
 
 ### Migrations
 
-Embedded migrators live in `crates/starforged-db/migrations`. The SQLite and Postgres sets share filenames. Versions run from `0001` to `0043`, so `0030` to `0033` are absent. `Db::migrate` runs versions in order. Bookkeeping lives in `_sqlx_migrations`. Rerun of `migrate` is safe and idempotent.
+Embedded migrators live in `crates/starforged-db/migrations`. The SQLite and Postgres sets share filenames. Versions run from `0001` to `0047`, so `0030` to `0033` are absent. `Db::migrate` runs versions in order. Bookkeeping lives in `_sqlx_migrations`. Rerun of `migrate` is safe and idempotent.
 
 Migrations are forward only. A released migration must not change, because sqlx validates its checksum. `0034` rebuilds the SSH fingerprint table and drops orphan rows during the rebuild. `0035` adds the `jobs.rerun_at` column for rerun requests on deduplicated jobs. A request that arrives while a deduplicated job runs records its time in `rerun_at`, so the worker runs the job again after it finishes.
 
@@ -76,6 +76,12 @@ Migrations are forward only. A released migration must not change, because sqlx 
 Removal of a release cascades to its assets. Removal of a repository cascades to its releases.
 
 `0043` drops queued rows of two removed job kinds. The two names are `resolve_commit_links` and `session_webhook_outbox`.
+
+`0044` adds `ci_cache_entries`. `0045` adds `ci_cache_entries.scope` and `ci_jobs.branch`, then rebuilds the cache table.
+
+`0046` adds `change_sources`. The table stores the source repository and branch of a cross-repository change. A change without a row is same-repository.
+
+`0047` adds `session_checkpoints`. The table stores the session, number, commit, tree, parent, label, source, and creation time. The pair of session and number is unique.
 
 `auto_migrate` runs migrations at start. `starforged migrate` runs them manually. `doctor` compares latest and known versions. A difference reports a migrate action.
 

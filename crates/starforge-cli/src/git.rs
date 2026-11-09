@@ -512,6 +512,285 @@ fn status_failed(output: &std::process::Output, what: &str, repo: &Path) -> GitE
     }
 }
 
+/// `git status --porcelain`: empty when the worktree and index are clean.
+pub fn status_porcelain(repo: &Path) -> Result<String, GitError> {
+    let output = git_output(repo, &["status", "--porcelain"])?;
+    if !output.status.success() {
+        return Err(GitError::Failed(format!(
+            "git status failed in {}",
+            repo.display()
+        )));
+    }
+    stdout_utf8(output, "status")
+}
+
+/// All tracked paths in the repository (`git ls-files -z`).
+pub fn tracked_files(repo: &Path) -> Result<std::collections::HashSet<String>, GitError> {
+    let output = git_output(repo, &["ls-files", "-z"])?;
+    if !output.status.success() {
+        return Err(GitError::Failed(format!(
+            "git ls-files failed in {}",
+            repo.display()
+        )));
+    }
+    let text = stdout_utf8(output, "ls-files")?;
+    Ok(text
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// Writes a tree object for the working tree through a temporary index,
+/// leaving the real index untouched. The tree holds every tracked file at its
+/// working-tree content plus `extra_paths` (session-touched untracked files).
+/// `.starforge/` is always excluded. Deleted tracked files are absent, as in
+/// the working tree. Returns the tree id.
+pub fn write_tree(repo: &Path, extra_paths: &[String]) -> Result<String, GitError> {
+    let common = common_dir(repo)?;
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let index = common.join(format!(
+        "starforge-checkpoint-index-{}-{unique}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&index);
+    let run = |args: &[&str]| -> Result<std::process::Output, GitError> {
+        Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .env("GIT_INDEX_FILE", &index)
+            .args(args)
+            .output()
+            .map_err(|err| GitError::Spawn(err.to_string()))
+    };
+    let result = (|| {
+        // Start from HEAD so tracked files are present; an unborn HEAD starts
+        // empty. `add -u` then copies the working-tree content of every
+        // tracked file into the temporary index.
+        let head = run(&["read-tree", "HEAD"])?;
+        if !head.status.success() {
+            let empty = run(&["read-tree", "--empty"])?;
+            if !empty.status.success() {
+                return Err(GitError::Failed(format!(
+                    "git read-tree failed in {}: {}",
+                    repo.display(),
+                    String::from_utf8_lossy(&empty.stderr).trim()
+                )));
+            }
+        }
+        let updated = run(&["add", "-u", "--", ".", ":(exclude).starforge"])?;
+        if !updated.status.success() {
+            return Err(GitError::Failed(format!(
+                "git add -u failed in {}: {}",
+                repo.display(),
+                String::from_utf8_lossy(&updated.stderr).trim()
+            )));
+        }
+        // Remove any tracked `.starforge` entry from the snapshot.
+        let _ = run(&[
+            "rm",
+            "--cached",
+            "-r",
+            "-q",
+            "--ignore-unmatch",
+            "--",
+            ".starforge",
+        ]);
+        if !extra_paths.is_empty() {
+            let mut args: Vec<OsString> = vec![
+                "-C".into(),
+                repo.as_os_str().to_owned(),
+                "add".into(),
+                "--".into(),
+            ];
+            // Force literal pathspecs: a session-touched name must never be
+            // read as glob or pathspec magic.
+            args.extend(
+                extra_paths
+                    .iter()
+                    .map(|path| OsString::from(format!(":(literal){path}"))),
+            );
+            let added = Command::new("git")
+                .env("GIT_INDEX_FILE", &index)
+                .args(&args)
+                .output()
+                .map_err(|err| GitError::Spawn(err.to_string()))?;
+            if !added.status.success() {
+                return Err(GitError::Failed(format!(
+                    "git add failed in {}: {}",
+                    repo.display(),
+                    String::from_utf8_lossy(&added.stderr).trim()
+                )));
+            }
+        }
+        let output = run(&["write-tree"])?;
+        if !output.status.success() {
+            return Err(GitError::Failed(format!(
+                "git write-tree failed in {}: {}",
+                repo.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        Ok(stdout_utf8(output, "write-tree")?.trim().to_string())
+    })();
+    let _ = std::fs::remove_file(&index);
+    result
+}
+
+/// Creates a commit object without touching any ref (`git commit-tree`).
+/// The author and committer are `Starforge <checkpoint@starforge>`.
+pub fn commit_tree(
+    repo: &Path,
+    tree: &str,
+    parents: &[&str],
+    message: &str,
+    time: i64,
+) -> Result<String, GitError> {
+    let date = format!("@{time} +0000");
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(repo).args(["commit-tree", tree]);
+    for parent in parents {
+        cmd.arg("-p").arg(parent);
+    }
+    cmd.arg("-m").arg(message);
+    cmd.env("GIT_AUTHOR_NAME", "Starforge")
+        .env("GIT_AUTHOR_EMAIL", "checkpoint@starforge")
+        .env("GIT_AUTHOR_DATE", &date)
+        .env("GIT_COMMITTER_NAME", "Starforge")
+        .env("GIT_COMMITTER_EMAIL", "checkpoint@starforge")
+        .env("GIT_COMMITTER_DATE", &date);
+    let output = cmd
+        .output()
+        .map_err(|err| GitError::Spawn(err.to_string()))?;
+    if !output.status.success() {
+        return Err(GitError::Failed(format!(
+            "git commit-tree failed in {}: {}",
+            repo.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(stdout_utf8(output, "commit-tree")?.trim().to_string())
+}
+
+/// Points `refs/starforge/checkpoints/*` at `sha` (`git update-ref`).
+pub fn update_checkpoint_ref(repo: &Path, name: &str, sha: &str) -> Result<(), GitError> {
+    if !name.starts_with("refs/starforge/checkpoints/") {
+        return Err(GitError::Failed(format!(
+            "refusing to write non-checkpoint ref {name:?}"
+        )));
+    }
+    let output = git_output(repo, &["update-ref", name, sha])?;
+    if !output.status.success() {
+        return Err(GitError::Failed(format!(
+            "git update-ref failed in {}: {}",
+            repo.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(())
+}
+
+/// `git rev-parse --verify <rev>`: the object id, or an error.
+pub fn rev_parse(repo: &Path, rev: &str) -> Result<String, GitError> {
+    let output = git_output(repo, &["rev-parse", "--verify", rev])?;
+    if !output.status.success() {
+        return Err(GitError::Failed(format!(
+            "git rev-parse {rev} failed in {}",
+            repo.display()
+        )));
+    }
+    Ok(stdout_utf8(output, "rev-parse")?.trim().to_string())
+}
+
+/// `git rev-parse <sha>^{tree}`.
+pub fn rev_parse_tree(repo: &Path, sha: &str) -> Result<String, GitError> {
+    rev_parse(repo, &format!("{sha}^{{tree}}"))
+}
+
+/// `git cat-file -e <sha>^{commit}`: true when the commit exists locally.
+pub fn object_exists(repo: &Path, sha: &str) -> Result<bool, GitError> {
+    let output = git_output(repo, &["cat-file", "-e", &format!("{sha}^{{commit}}")])?;
+    Ok(output.status.success())
+}
+
+/// Fetches one checkpoint ref from `remote` into the same local ref.
+pub fn fetch_checkpoint(repo: &Path, remote: &str, ulid: &str, n: u64) -> Result<(), GitError> {
+    let name = format!("refs/starforge/checkpoints/{ulid}/{n}");
+    let refspec = format!("{name}:{name}");
+    let output = git_output(repo, &["fetch", "--no-tags", remote, &refspec])?;
+    if !output.status.success() {
+        return Err(GitError::Failed(format!(
+            "git fetch {name} failed in {}: {}",
+            repo.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(())
+}
+
+/// Restores the index and working tree to `sha` (`git read-tree --reset -u`).
+pub fn read_tree_reset(repo: &Path, sha: &str) -> Result<(), GitError> {
+    let output = git_output(repo, &["read-tree", "--reset", "-u", sha])?;
+    if !output.status.success() {
+        return Err(GitError::Failed(format!(
+            "git read-tree failed in {}: {}",
+            repo.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(())
+}
+
+/// Saves the current tracked and untracked state in a local stash
+/// (`git stash push --include-untracked`). The stash never leaves the
+/// repository and is the recovery point for a forced rewind.
+pub fn stash_untracked(repo: &Path, message: &str) -> Result<(), GitError> {
+    let output = git_output(
+        repo,
+        &["stash", "push", "--include-untracked", "-m", message],
+    )?;
+    if !output.status.success() {
+        return Err(GitError::Failed(format!(
+            "git stash failed in {}: {}",
+            repo.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(())
+}
+
+/// Removes untracked, non-ignored files and directories (`git clean -fd`).
+pub fn clean_untracked(repo: &Path) -> Result<(), GitError> {
+    let output = git_output(repo, &["clean", "-fd"])?;
+    if !output.status.success() {
+        return Err(GitError::Failed(format!(
+            "git clean failed in {}: {}",
+            repo.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(())
+}
+
+/// The first line of the commit message (`git log -1 --format=%B`). Git's
+/// `%s` collapses the first paragraph, which includes a trailer on the next
+/// line when the message has no blank line; the first line is the real
+/// subject for a checkpoint label.
+pub fn commit_subject(repo: &Path, sha: &str) -> Result<String, GitError> {
+    let output = git_output(repo, &["log", "-1", "--format=%B", sha])?;
+    if !output.status.success() {
+        return Err(GitError::Failed(format!(
+            "git log failed in {}",
+            repo.display()
+        )));
+    }
+    let text = stdout_utf8(output, "log")?;
+    Ok(text.lines().next().unwrap_or("").trim().to_string())
+}
+
 #[cfg(test)]
 mod sync_tests {
     use super::*;

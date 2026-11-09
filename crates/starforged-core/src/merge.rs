@@ -1,6 +1,6 @@
-//! Server-side merge (spec §6.2, M2c H4): `merge`, `squash`, and
-//! `fast_forward` onto the base branch with a compare-and-swap, plus the
-//! Trail `merged` transition.
+//! Server-side merge (spec §6.2, M2c H4): `merge`, `squash`,
+//! `fast_forward`, and `rebase` onto the base branch with a compare-and-swap,
+//! plus the Trail `merged` transition.
 //!
 //! The merge path never trusts a client report: it re-resolves the base tip
 //! and head, re-evaluates gates at merge time, refuses archived repos,
@@ -32,9 +32,9 @@ use crate::permission::Permission;
 use crate::{Core, CoreError, CoreResult};
 
 /// Merge methods the server understands.
-pub const MERGE_METHODS: [&str; 3] = ["merge", "squash", "fast_forward"];
+pub const MERGE_METHODS: [&str; 4] = ["merge", "squash", "fast_forward", "rebase"];
 
-/// The merge form body (`{"method": "merge"|"squash"|"fast_forward"}`),
+/// The merge form body (`{"method": "merge"|"squash"|"fast_forward"|"rebase"}`),
 /// shared by the API route and the web form.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct MergeRequest {
@@ -73,6 +73,10 @@ impl PreCasHook {
 /// still merge, carrying the newest `MAX_SQUASH_COMMITS` commits' subjects.
 /// (Session-evidence caps are a gate concern, not a message concern.)
 const MAX_SQUASH_COMMITS: usize = 1024;
+
+/// Cap on the `merge_base..head` replay for a rebase merge; a longer range is
+/// refused rather than replayed unbounded.
+const MAX_REBASE_COMMITS: usize = 1024;
 
 /// How many conflict paths a 409 message names before summarizing the rest.
 const MAX_REPORT_PATHS: usize = 10;
@@ -392,6 +396,65 @@ impl Core {
         }
     }
 
+    /// Replays `merge_base..head` onto `base` and returns the new head. The
+    /// commits keep their author and message; the server is the committer and
+    /// appends a `Starforge-Trail` trailer. Refuses conflicts, merge commits,
+    /// and ranges over [`MAX_REBASE_COMMITS`].
+    #[allow(clippy::too_many_arguments)]
+    async fn build_rebase(
+        &self,
+        repo_id: i64,
+        trail_n: i64,
+        owner: &str,
+        repo: &str,
+        base: &str,
+        head: &str,
+        merge_base: Option<&str>,
+    ) -> CoreResult<String> {
+        let Some(merge_base) = merge_base else {
+            return Err(CoreError::Conflict(format!(
+                "cannot rebase: base and the change head share no history (base_sha: {base}, head_sha: {head})"
+            )));
+        };
+        let repo_path = self.repo_path(repo_id);
+        let stamp = format!("{owner}/{repo}#{trail_n}");
+        let committer = write::Identity {
+            name: "Starforge",
+            email: "forge@local",
+            time: now(),
+        };
+        match starforged_git::merge::rebase_onto(
+            &repo_path,
+            base,
+            head,
+            merge_base,
+            committer,
+            &stamp,
+            MAX_REBASE_COMMITS,
+        )
+        .await
+        {
+            Ok(outcome) => Ok(outcome.head),
+            Err(starforged_git::merge::RebaseError::Conflict { commit, paths }) => {
+                Err(CoreError::Conflict(format!(
+                    "rebase conflict at commit {commit}: {} (base_sha: {base}, head_sha: {head})",
+                    conflict_summary(&paths)
+                )))
+            }
+            Err(starforged_git::merge::RebaseError::NonLinear { commit, parents }) => {
+                Err(CoreError::Invalid(format!(
+                    "cannot rebase: commit {commit} has {parents} parents; rebase requires a linear history"
+                )))
+            }
+            Err(starforged_git::merge::RebaseError::TooMany { total, max }) => {
+                Err(CoreError::Invalid(format!(
+                    "cannot rebase: {total} commits exceeds the {max}-commit limit"
+                )))
+            }
+            Err(starforged_git::merge::RebaseError::Git(err)) => Err(CoreError::from(err)),
+        }
+    }
+
     /// Server-side merge (binding): re-resolves the base tip and head,
     /// re-evaluates gates AT MERGE TIME (never trusts a client report),
     /// refuses archived repos, closed/merged changes, failing gates, unknown
@@ -410,7 +473,7 @@ impl Core {
     ) -> CoreResult<MergeOutcome> {
         if !MERGE_METHODS.contains(&method) {
             return Err(CoreError::Invalid(format!(
-                "unknown merge method '{method}' (expected one of merge, squash, fast_forward)"
+                "unknown merge method '{method}' (expected one of merge, squash, fast_forward, rebase)"
             )));
         }
         // Write+ on a non-archived repo: merging mutates the base branch, the
@@ -436,6 +499,16 @@ impl Core {
         let change = db_changes::change_by_trail_number(self.db(), trail.id, k)
             .await?
             .ok_or(CoreError::NotFound)?;
+        // A cross-repository change also requires the actor to read its
+        // source repository; the objects are already in the target, but the
+        // source is part of the change's provenance.
+        if let Some(source) = db_changes::change_source(self.db(), change.id).await? {
+            let source_repo = starforged_db::repos::by_id(self.db(), source.source_repo_id)
+                .await?
+                .ok_or_else(|| CoreError::Internal("change source repository vanished".into()))?;
+            self.repo_for(Some(user), &source_repo.owner_handle, &source_repo.name)
+                .await?;
+        }
         if change.state != "open" {
             return Err(CoreError::Invalid(format!(
                 "change is {} (only open changes merge)",
@@ -517,6 +590,17 @@ impl Core {
         // check above; merge/squash refuse them inside the builder.
         let mut new_sha = if method == "fast_forward" {
             head.clone()
+        } else if method == "rebase" {
+            self.build_rebase(
+                access.repo.id,
+                trail.number,
+                owner,
+                repo,
+                &base_tip,
+                &head,
+                merge_base.as_deref(),
+            )
+            .await?
         } else {
             self.build_merge_commit(
                 access.repo.id,
@@ -586,6 +670,17 @@ impl Core {
             }
             new_sha = if method == "fast_forward" {
                 head.clone()
+            } else if method == "rebase" {
+                self.build_rebase(
+                    access.repo.id,
+                    trail.number,
+                    owner,
+                    repo,
+                    &tip,
+                    &head,
+                    merge_base.as_deref(),
+                )
+                .await?
             } else {
                 self.build_merge_commit(
                     access.repo.id,

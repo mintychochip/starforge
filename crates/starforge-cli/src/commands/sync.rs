@@ -421,8 +421,96 @@ async fn sync_with_retries(
             Err(err) => return Err(err),
         }
     }
+    sync_checkpoints(spool, &client, owner_repo).await;
     summary.remaining = working.len();
     Ok(summary)
+}
+
+/// Pushes each session's checkpoint refs and uploads their metadata. Best
+/// effort: a failure leaves the entries unuploaded for the next sync.
+async fn sync_checkpoints(spool: &Spool, client: &UploadClient, owner_repo: &str) {
+    let Some(common) = spool.root.parent() else {
+        return;
+    };
+    let Some(remote) = checkpoint_remote(&client.api_url, owner_repo, &client.token) else {
+        tracing::warn!("sync: cannot build the checkpoint remote url");
+        return;
+    };
+    for ulid in session_ulids(spool) {
+        let entries = match spool.read_checkpoints(&ulid) {
+            Ok(entries) => entries,
+            Err(err) => {
+                tracing::warn!("sync: cannot read checkpoints for `{ulid}`: {err}");
+                continue;
+            }
+        };
+        let pending: Vec<_> = entries
+            .into_iter()
+            .filter(|entry| !entry.uploaded)
+            .collect();
+        if pending.is_empty() {
+            continue;
+        }
+        let refspec =
+            format!("refs/starforge/checkpoints/{ulid}/*:refs/starforge/checkpoints/{ulid}/*");
+        if let Err(err) = push_checkpoint_refs(common, &remote, &refspec) {
+            tracing::warn!("sync: checkpoint ref push failed for `{ulid}`: {err}");
+            continue;
+        }
+        for entry in pending {
+            match client
+                .put_checkpoint(owner_repo, &ulid, entry.n, &entry)
+                .await
+            {
+                Ok(()) => {
+                    if let Err(err) = spool.mark_checkpoint_uploaded(&ulid, entry.n) {
+                        tracing::warn!("sync: cannot mark checkpoint uploaded: {err}");
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        "sync: checkpoint {} of `{ulid}` not uploaded: {err}",
+                        entry.n
+                    );
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// `http://git:<token>@host/owner/repo.git` for the checkpoint ref push.
+fn checkpoint_remote(api_url: &str, owner_repo: &str, token: &str) -> Option<String> {
+    let mut url = url::Url::parse(&format!(
+        "{}/{}.git",
+        api_url.trim_end_matches('/'),
+        owner_repo
+    ))
+    .ok()?;
+    url.set_username("git").ok()?;
+    url.set_password(Some(token)).ok()?;
+    Some(url.to_string())
+}
+
+/// `git -C <common> push <remote> <refspec>`; stderr is scrubbed of the
+/// credential URL before it reaches a log.
+fn push_checkpoint_refs(
+    common: &std::path::Path,
+    remote: &str,
+    refspec: &str,
+) -> Result<(), String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(common)
+        .args(["push", "--no-verify", remote, refspec])
+        .output()
+        .map_err(|err| format!("cannot run git push: {err}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let scrubbed = stderr.replace(remote, "<remote>");
+    Err(scrubbed.trim().to_string())
 }
 
 /// Per-entry settle statistics.

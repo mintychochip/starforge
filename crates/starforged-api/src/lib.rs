@@ -215,6 +215,14 @@ pub fn router(core: Core, base_url: String) -> Router {
                 .route_layer(axum::extract::DefaultBodyLimit::max(segment_limit)),
         )
         .route(
+            "/repos/{owner}/{repo}/sessions/{ulid}/checkpoints",
+            get(sessions::list_checkpoints),
+        )
+        .route(
+            "/repos/{owner}/{repo}/sessions/{ulid}/checkpoints/{n}",
+            get(sessions::get_checkpoint).put(sessions::put_checkpoint),
+        )
+        .route(
             "/repos/{owner}/{repo}/sessions/{ulid}/complete",
             post(sessions::post_complete),
         )
@@ -341,6 +349,10 @@ pub fn router(core: Core, base_url: String) -> Router {
         .route(
             "/repos/{owner}/{repo}/trails/{n}/changes/{k}/merge",
             post(changes::merge_change),
+        )
+        .route(
+            "/repos/{owner}/{repo}/trails/{n}/changes/{k}/refresh",
+            post(changes::refresh_change),
         )
         .route(
             "/repos/{owner}/{repo}/statuses/{sha}",

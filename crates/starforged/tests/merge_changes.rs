@@ -840,7 +840,7 @@ async fn merge_rejects_archived_unknown_method_and_non_writers() {
     c.create_branch_change(n, "feature/x", "main").await;
 
     // Unknown method.
-    let (status, body) = c.post_merge(n, 1, &c.alice_repo, "rebase").await;
+    let (status, body) = c.post_merge(n, 1, &c.alice_repo, "octopus").await;
     assert_eq!(status, 422, "{body}");
 
     // A reader cannot merge (403); anonymous callers cannot either (401).
@@ -1012,4 +1012,80 @@ async fn one_authors_two_approvals_count_once() {
     );
     let (status, body) = c.post_merge(n, 1, &c.alice_repo, "merge").await;
     assert_eq!(status, 422, "{body}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rebase_replays_commits_onto_base_with_authors_and_trailer() {
+    let c = Ctx::start().await;
+    let (work, _url) = c.push_basic().await;
+    let server = c.server().await;
+    let n = c.trail().await;
+    c.create_branch_change(n, "feature/x", "main").await;
+
+    let (status, body) = c.post_merge(n, 1, &c.alice_repo, "rebase").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["method"], "rebase");
+    let sha = body["sha"].as_str().unwrap().to_owned();
+    assert_eq!(server_rev(&work, &server, "refs/heads/main").await, sha);
+
+    // The base now has the original commit plus the two replayed commits.
+    let gd = git_dir_arg(&server);
+    let count = git_ok(&work, &[&gd, "rev-list", "--count", "refs/heads/main"]).await;
+    assert_eq!(count.trim(), "3");
+    assert_eq!(server_parents(&work, &server, &sha).await.len(), 1);
+    let subjects = git_ok(&work, &[&gd, "log", "--format=%s", "refs/heads/main"]).await;
+    let subjects: Vec<&str> = subjects.lines().collect();
+    assert_eq!(subjects, vec!["add bee", "add two", "initial commit"]);
+    let bodies = git_ok(&work, &[&gd, "log", "--format=%B", "refs/heads/main"]).await;
+    assert!(
+        bodies.matches("Starforge-Trail: alice/proj#1").count() >= 2,
+        "{bodies}"
+    );
+    assert_eq!(
+        git_ok(&work, &[&gd, "show", "refs/heads/main:a.txt"]).await,
+        "one\ntwo\n"
+    );
+    assert_eq!(
+        git_ok(&work, &[&gd, "show", "refs/heads/main:b.txt"]).await,
+        "bee\n"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rebase_refuses_conflicts_and_non_linear_histories() {
+    let c = Ctx::start().await;
+    let (work, url) = c.push_basic().await;
+    let n = c.trail().await;
+    c.create_branch_change(n, "feature/x", "main").await;
+
+    // Move main under the change with a conflicting edit.
+    git_ok(&work, &["checkout", "-q", "main"]).await;
+    commit_files(&work, &[("a.txt", b"main side\n")], "main side").await;
+    git_ok(&work, &["push", "-q", &url, "main"]).await;
+    git_ok(&work, &["checkout", "-q", "feature/x"]).await;
+
+    let (status, body) = c.post_merge(n, 1, &c.alice_repo, "rebase").await;
+    assert_eq!(status, 409, "{body}");
+    let text = serde_json::to_string(&body).unwrap();
+    assert!(text.contains("rebase conflict"), "{text}");
+    assert!(text.contains("a.txt"), "{text}");
+
+    // A merge commit in the change range is refused before any replay.
+    let c2 = Ctx::start().await;
+    let (work2, url2) = c2.push_basic().await;
+    let n2 = c2.trail().await;
+    c2.create_branch_change(n2, "feature/x", "main").await;
+    git_ok(&work2, &["checkout", "-q", "-b", "side", "main"]).await;
+    commit_files(&work2, &[("side.txt", b"side\n")], "side commit").await;
+    git_ok(&work2, &["checkout", "-q", "feature/x"]).await;
+    git_ok(
+        &work2,
+        &["merge", "-q", "--no-ff", "side", "-m", "merge side"],
+    )
+    .await;
+    git_ok(&work2, &["push", "-q", &url2, "feature/x"]).await;
+    let (status, body) = c2.post_merge(n2, 1, &c2.alice_repo, "rebase").await;
+    assert_eq!(status, 422, "{body}");
+    let text = serde_json::to_string(&body).unwrap();
+    assert!(text.contains("linear history"), "{text}");
 }

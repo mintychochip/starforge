@@ -112,6 +112,7 @@ It covers secrets at rest, audit reads, and known limits.
 - A site admin alone is not a member.
 - Implicit read is not membership.
 - Deploy keys grant `Read` or `Write` and never `refs/for` access.
+- Checkpoint refs need write tier and a `repo:write` or `session:upload` token. Public repositories refuse checkpoint refs, because every reader can fetch an unpublished session's working tree. The CLI keeps those checkpoints local. The metadata route also refuses an unpublished session on a public repository.
 - The admin pages answer 404 to non admin callers.
 - The server refuses to suspend or delete the caller. The server allows self-demotion unless the caller is the last active admin.
 - The server refuses to suspend, delete, or demote the last active admin.

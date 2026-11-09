@@ -44,6 +44,36 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: SessionsCmd,
     },
+    /// Manage session checkpoints (working-tree snapshots).
+    Checkpoint {
+        #[command(subcommand)]
+        cmd: CheckpointCmd,
+    },
+    /// Restore the working tree to a session checkpoint.
+    Rewind {
+        /// Session ULID.
+        session: String,
+        /// Checkpoint number.
+        #[arg(long)]
+        checkpoint: u64,
+        /// Overwrite a dirty worktree (a pre-rewind checkpoint is created).
+        #[arg(long)]
+        force: bool,
+    },
+    /// Rewind to a checkpoint and write a resume context file.
+    Resume {
+        /// Session ULID.
+        session: String,
+        /// Checkpoint number.
+        #[arg(long)]
+        checkpoint: u64,
+        /// Overwrite a dirty worktree (a pre-rewind checkpoint is created).
+        #[arg(long)]
+        force: bool,
+        /// Agent name to print in the resume instructions.
+        #[arg(long)]
+        agent: Option<String>,
+    },
     /// Export session bundles to a directory.
     Export {
         /// Source repository as `owner/repo`.
@@ -506,6 +536,69 @@ pub enum TrailCmd {
         #[arg(long, value_enum, default_value_t = crate::commands::trail::TextJson::Text)]
         format: crate::commands::trail::TextJson,
     },
+    /// Cross-repository changes.
+    Change {
+        #[command(subcommand)]
+        cmd: TrailChangeCmd,
+    },
+}
+
+/// `trail change` subcommands.
+#[derive(Debug, Subcommand)]
+pub enum TrailChangeCmd {
+    /// Open a change from another repository's branch.
+    Add {
+        /// Trail number.
+        #[arg(long)]
+        trail: i64,
+        /// Source repository as `owner/repo`.
+        #[arg(long)]
+        from: String,
+        /// Source branch.
+        #[arg(long)]
+        branch: String,
+        /// Base branch in the target repository.
+        #[arg(long, default_value = "main")]
+        base: String,
+        /// Output format.
+        #[arg(long, value_enum, default_value_t = crate::commands::trail::TextJson::Text)]
+        format: crate::commands::trail::TextJson,
+    },
+    /// Re-fetch a cross-repository change's source branch.
+    Refresh {
+        /// Trail number.
+        #[arg(long)]
+        trail: i64,
+        /// Change number.
+        #[arg(long)]
+        change: i64,
+        /// Output format.
+        #[arg(long, value_enum, default_value_t = crate::commands::trail::TextJson::Text)]
+        format: crate::commands::trail::TextJson,
+    },
+}
+
+/// `checkpoint` subcommands.
+#[derive(Debug, Subcommand)]
+pub enum CheckpointCmd {
+    /// Snapshot the working tree for a session.
+    Create {
+        /// Session ULID (default: the newest session in this spool).
+        #[arg(long)]
+        session: Option<String>,
+        /// Checkpoint label.
+        #[arg(long, default_value = "manual")]
+        label: String,
+        /// Create even when the tree is unchanged.
+        #[arg(long)]
+        force: bool,
+    },
+    /// List local checkpoints for a session.
+    List {
+        /// Session ULID (default: the newest session in this spool).
+        #[arg(long)]
+        session: Option<String>,
+    },
 }
 
 /// CLI errors. Every non-root cause maps to an exit code (0/1/2).
@@ -577,6 +670,18 @@ fn sync_stub(cli: Cli, paths: CliPaths) -> std::process::ExitCode {
         Cmd::Enable => run_enable(paths, dry_run),
         Cmd::Disable => run_disable(paths, dry_run),
         Cmd::Sessions { cmd } => run_sessions(cmd, dry_run),
+        Cmd::Checkpoint { cmd } => run_checkpoint(cmd, dry_run),
+        Cmd::Rewind {
+            session,
+            checkpoint,
+            force,
+        } => run_rewind(&session, checkpoint, force, dry_run),
+        Cmd::Resume {
+            session,
+            checkpoint,
+            force,
+            agent,
+        } => run_resume(&session, checkpoint, force, agent.as_deref(), dry_run),
         Cmd::Spool { cmd } => run_spool(cmd, dry_run),
         Cmd::HookPrepare { msg_file } => run_hook_prepare(paths, msg_file),
         Cmd::HookPostCommit => run_hook_post_commit(paths),
@@ -737,6 +842,9 @@ pub async fn run_async(cli: Cli, paths: CliPaths) -> std::process::ExitCode {
             | SessionsCmd::Delete { .. } => run_session_admin(cmd, paths, dry_run).await,
             _ => run_sessions(cmd, dry_run),
         },
+        Cmd::Checkpoint { .. } | Cmd::Rewind { .. } | Cmd::Resume { .. } => {
+            unreachable!("checkpoint commands dispatch via the sync path")
+        }
         Cmd::Spool { cmd } => run_spool(cmd, dry_run),
         Cmd::Export { dir, repo, session } => run_export(dir, repo, session, paths, dry_run).await,
         Cmd::Import { dir, repo } => run_import(dir, repo, paths, dry_run).await,
@@ -889,6 +997,12 @@ async fn run_trail(cmd: TrailCmd, paths: CliPaths, dry_run: bool) -> std::proces
             TrailCmd::Checkout { n, .. } => format!("trail checkout {n}"),
             TrailCmd::Review { n, .. } => format!("trail review {n}"),
             TrailCmd::Merge { n, .. } => format!("trail merge {n}"),
+            TrailCmd::Change { cmd } => match cmd {
+                TrailChangeCmd::Add { trail, .. } => format!("trail change add --trail {trail}"),
+                TrailChangeCmd::Refresh { trail, change, .. } => {
+                    format!("trail change refresh --trail {trail} --change {change}")
+                }
+            },
         };
         println!("would run `{planned}` (dry run)");
         return std::process::ExitCode::SUCCESS;
@@ -1060,7 +1174,124 @@ async fn run_trail(cmd: TrailCmd, paths: CliPaths, dry_run: bool) -> std::proces
             let args = crate::commands::trail::decide::MergeArgs { n, change, method };
             crate::commands::trail::decide::merge(&ctx, &args, format.into()).await
         }
+        TrailCmd::Change { cmd } => match cmd {
+            TrailChangeCmd::Add {
+                trail,
+                from,
+                branch,
+                base,
+                format,
+            } => {
+                let args = crate::commands::trail::write::ChangeAddArgs {
+                    trail,
+                    from: &from,
+                    branch: &branch,
+                    base: &base,
+                };
+                crate::commands::trail::write::change_add(&ctx, &args, format.into()).await
+            }
+            TrailChangeCmd::Refresh {
+                trail,
+                change,
+                format,
+            } => {
+                crate::commands::trail::write::change_refresh(&ctx, trail, change, format.into())
+                    .await
+            }
+        },
     };
+    if code == 0 {
+        println!("{out}");
+    } else {
+        eprintln!("{out}");
+    }
+    std::process::ExitCode::from(code)
+}
+
+/// `checkpoint create|list`.
+fn run_checkpoint(cmd: CheckpointCmd, dry_run: bool) -> std::process::ExitCode {
+    let Some(repo) = cwd_repo() else {
+        return std::process::ExitCode::from(1);
+    };
+    let (out, code) = match cmd {
+        CheckpointCmd::Create {
+            session,
+            label,
+            force,
+        } => {
+            if dry_run {
+                (
+                    format!(
+                        "would create a checkpoint for {} (label {label})",
+                        session.as_deref().unwrap_or("the newest session")
+                    ),
+                    0,
+                )
+            } else {
+                crate::commands::checkpoint::create(&repo, session.as_deref(), &label, force)
+            }
+        }
+        CheckpointCmd::List { session } => {
+            if dry_run {
+                (
+                    format!(
+                        "would list checkpoints for {}",
+                        session.as_deref().unwrap_or("the newest session")
+                    ),
+                    0,
+                )
+            } else {
+                crate::commands::checkpoint::list(&repo, session.as_deref())
+            }
+        }
+    };
+    if code == 0 {
+        println!("{out}");
+    } else {
+        eprintln!("{out}");
+    }
+    std::process::ExitCode::from(code)
+}
+
+/// `rewind <session> --checkpoint <n>`.
+fn run_rewind(
+    session: &str,
+    checkpoint: u64,
+    force: bool,
+    dry_run: bool,
+) -> std::process::ExitCode {
+    let Some(repo) = cwd_repo() else {
+        return std::process::ExitCode::from(1);
+    };
+    if dry_run {
+        println!("would rewind {session} to checkpoint {checkpoint} (dry run)");
+        return std::process::ExitCode::SUCCESS;
+    }
+    let (out, code) = crate::commands::checkpoint::rewind(&repo, session, checkpoint, force);
+    if code == 0 {
+        println!("{out}");
+    } else {
+        eprintln!("{out}");
+    }
+    std::process::ExitCode::from(code)
+}
+
+/// `resume <session> --checkpoint <n>`.
+fn run_resume(
+    session: &str,
+    checkpoint: u64,
+    force: bool,
+    agent: Option<&str>,
+    dry_run: bool,
+) -> std::process::ExitCode {
+    let Some(repo) = cwd_repo() else {
+        return std::process::ExitCode::from(1);
+    };
+    if dry_run {
+        println!("would resume {session} at checkpoint {checkpoint} (dry run)");
+        return std::process::ExitCode::SUCCESS;
+    }
+    let (out, code) = crate::commands::checkpoint::resume(&repo, session, checkpoint, force, agent);
     if code == 0 {
         println!("{out}");
     } else {

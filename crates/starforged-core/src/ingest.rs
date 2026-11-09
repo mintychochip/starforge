@@ -9,7 +9,9 @@ use std::collections::HashSet;
 
 use starforge_format::{FormatError, SessionMeta, blake3_hex, decompress_bounded, parse_event};
 use starforged_db::ci as db_ci;
+use starforged_db::repos as db_repos;
 use starforged_db::sessions::{self as db_sessions, NewSession, SessionRow};
+use starforged_git::write;
 use ulid::Ulid;
 
 use crate::accounts::User;
@@ -20,6 +22,27 @@ use crate::quota;
 use crate::repos::RepoAccess;
 use crate::tokens::TokenAuth;
 use crate::{Core, CoreConfig, CoreError, CoreResult};
+
+pub use starforged_db::sessions::SessionCheckpointRow;
+
+/// One checkpoint upload: the git commit/tree under
+/// `refs/starforge/checkpoints/<ulid>/<n>` plus its label.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct CheckpointInput {
+    pub commit: String,
+    pub tree: String,
+    #[serde(default)]
+    pub parent: Option<String>,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub created_at: Option<i64>,
+}
+
+/// Checkpoint sources the server accepts.
+const CHECKPOINT_SOURCES: [&str; 3] = ["commit", "session_end", "manual"];
 
 /// Proof that an authenticated caller may upload sessions to a repository:
 /// a PAT caller ([`IngestAuth::Pat`], gated on `session:upload` + `write`
@@ -590,6 +613,143 @@ impl Core {
         db_sessions::session_by_ulid(self.db(), repo_id, ulid)
             .await?
             .ok_or_else(|| CoreError::Internal("session vanished after complete".into()))
+    }
+
+    /// Records or refreshes one checkpoint for a session. The caller must be
+    /// able to write the session; the git ref must already point at `commit`
+    /// (the CLI pushes refs before metadata) and `tree` must be that commit's
+    /// tree. On a public repository the session must be published, so a
+    /// checkpoint ref cannot expose an unpublished transcript's working tree
+    /// to every repo reader.
+    pub async fn put_checkpoint(
+        &self,
+        auth: &IngestAuth,
+        ulid: &str,
+        n: i64,
+        input: &CheckpointInput,
+    ) -> CoreResult<SessionCheckpointRow> {
+        if n <= 0 {
+            return Err(CoreError::Invalid(
+                "checkpoint number must be positive".into(),
+            ));
+        }
+        let repo_id = auth.repo_id();
+        let session = db_sessions::session_by_ulid(self.db(), repo_id, ulid)
+            .await?
+            .ok_or(CoreError::NotFound)?;
+        self.authorize_session_write(&session, auth).await?;
+        if session.quarantine == "quarantined" {
+            return Err(CoreError::Invalid("session is quarantined".into()));
+        }
+        let repo = db_repos::by_id(self.db(), repo_id)
+            .await?
+            .ok_or(CoreError::NotFound)?;
+        if repo.visibility == "public" && session.visibility != "published" {
+            return Err(CoreError::Invalid(
+                "publish the session before uploading checkpoints".into(),
+            ));
+        }
+        if !starforged_git::refpolicy::is_oid(&input.commit)
+            || !starforged_git::refpolicy::is_oid(&input.tree)
+            || input
+                .parent
+                .as_deref()
+                .is_some_and(|p| !starforged_git::refpolicy::is_oid(p))
+        {
+            return Err(CoreError::Invalid(
+                "commit, tree, and parent must be full object ids".into(),
+            ));
+        }
+        let source = if input.source.is_empty() {
+            "manual"
+        } else {
+            input.source.as_str()
+        };
+        if !CHECKPOINT_SOURCES.contains(&source) {
+            return Err(CoreError::Invalid(format!(
+                "unknown checkpoint source '{source}'"
+            )));
+        }
+        if input.label.chars().count() > 200 {
+            return Err(CoreError::Invalid(
+                "checkpoint label is too long (200 characters)".into(),
+            ));
+        }
+        let repo_path = self.repo_path(repo_id);
+        let ref_name = format!("refs/starforge/checkpoints/{ulid}/{n}");
+        let ref_sha = write::rev_parse_ref(&repo_path, &ref_name)
+            .await
+            .map_err(|_| {
+                CoreError::Conflict(
+                    "checkpoint ref not found; push the checkpoint ref before its metadata".into(),
+                )
+            })?;
+        if ref_sha != input.commit {
+            return Err(CoreError::Conflict(
+                "checkpoint ref does not point at the uploaded commit".into(),
+            ));
+        }
+        let tree = write::rev_parse_tree(&repo_path, &input.commit)
+            .await
+            .map_err(CoreError::from)?;
+        if tree != input.tree {
+            return Err(CoreError::Conflict(
+                "checkpoint tree does not match the commit's tree".into(),
+            ));
+        }
+        if let Some(existing) = db_sessions::checkpoint_by_n(self.db(), session.id, n).await?
+            && existing.commit_sha != input.commit
+        {
+            return Err(CoreError::Conflict(
+                "checkpoint number already holds a different commit".into(),
+            ));
+        }
+        let created_at = input.created_at.unwrap_or_else(starforged_db::now);
+        let created_at = created_at.min(starforged_db::now() + 300);
+        Ok(db_sessions::upsert_checkpoint(
+            self.db(),
+            repo_id,
+            session.id,
+            n,
+            &input.commit,
+            &input.tree,
+            input.parent.as_deref(),
+            &input.label,
+            source,
+            created_at,
+        )
+        .await?)
+    }
+
+    /// Lists a session's checkpoints, §6.4-filtered for the viewer.
+    pub async fn list_session_checkpoints(
+        &self,
+        viewer: Option<&User>,
+        owner: &str,
+        repo: &str,
+        ulid: &str,
+    ) -> CoreResult<Vec<SessionCheckpointRow>> {
+        let (_, session) = self
+            .authorize_session_read_by_ulid(viewer, owner, repo, ulid)
+            .await?;
+        Ok(db_sessions::checkpoints_of_session(self.db(), session.id).await?)
+    }
+
+    /// One checkpoint by number, §6.4-filtered for the viewer.
+    pub async fn session_checkpoint(
+        &self,
+        viewer: Option<&User>,
+        owner: &str,
+        repo: &str,
+        ulid: &str,
+        n: i64,
+    ) -> CoreResult<SessionCheckpointRow> {
+        let (_, session) = self
+            .authorize_session_read_by_ulid(viewer, owner, repo, ulid)
+            .await?;
+        db_sessions::checkpoint_by_n(self.db(), session.id, n)
+            .await?
+            .ok_or(CoreError::NotFound)
     }
 
     /// The shared step after a session reaches `complete`, whether the

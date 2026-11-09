@@ -1,5 +1,34 @@
 # Changelog
 
+## Unreleased
+
+### Trails
+
+- `rebase` merge method: replays the change's commits onto the base tip,
+  preserves each author and message, appends a `Starforge-Trail` trailer,
+  and refuses merge commits, conflicts, and ranges over 1024 commits.
+- Cross-repository changes: a Trail change can track a branch in another
+  repository. The server fetches the source objects into the target
+  repository, so diffs, gates, and merges use the existing paths. A private
+  source is allowed only for the same owner or a source admin. The API and
+  CLI can refresh the source branch.
+
+### Sessions
+
+- Session checkpoints: the CLI snapshots the working tree at each linked
+  commit and at session end, stores the snapshot at
+  `refs/starforge/checkpoints/<ulid>/<n>`, and uploads the ref and metadata.
+  The session page lists checkpoints. `starforge rewind` restores a
+  checkpoint; `starforge resume` also writes `.starforge/resume.md` with the
+  last turns.
+
+### Migrations
+
+| Migration | Purpose |
+|---|---|
+| 0046 | Cross-repository change sources (`change_sources`) |
+| 0047 | Session checkpoints (`session_checkpoints`) |
+
 ## 0.1.0-rc.2 (2026-11-08)
 
 ### CI

@@ -258,13 +258,34 @@ null means all branches, at most one rule per pattern) with approval, context, a
 method requirements, and every change lands exactly one `gate_rule.*` timeline row.
 
 Merging needs write access on a non-archived repo: `POST .../changes/{k}/merge` with
-`{"method": "merge|squash|fast_forward"}`. `merge` writes a two-parent merge commit,
+`{"method": "merge|squash|fast_forward|rebase"}`. `merge` writes a two-parent merge commit,
 `squash` condenses the head into one commit (subject lines first, then one
-`Starforge-Session:` trailer per session in order of appearance), and `fast_forward`
-moves the ref only when the head already contains the base; every commit carries a
-`Starforge-Trail: <owner>/<repo>#<n>` trailer. The change flips to `merged`, and its
-trail closes once no open change remains. Conflicts and CAS races answer `409` with the
-fresh SHAs; failing gates answer `422` with the reasons.
+`Starforge-Session:` trailer per session in order of appearance), `fast_forward`
+moves the ref only when the head already contains the base, and `rebase` replays each
+commit in `merge-base..head` onto the base tip. A rebase keeps each author and
+message, adds a `Starforge-Trail: <owner>/<repo>#<n>` trailer, and refuses merge
+commits, conflicts, and ranges over 1024 commits. Every merge commit carries the
+same trailer. The change flips to `merged`, and its trail closes once no open change
+remains. Conflicts and CAS races answer `409` with the fresh SHAs; failing gates
+answer `422` with the reasons.
+
+### Cross-repository changes
+
+A change can track a branch in another repository. Open one from the Trail
+changes tab, with `POST .../trails/{n}/changes` and
+`{"kind": "cross_repo", "source_repo": "owner/repo", "source_branch": "b",
+"base_branch": "main"}`, or with
+`starforge trail change add --trail <n> --from <owner>/<repo> --branch <b>`.
+The server fetches the source branch's objects into the target repository, so
+diffs, gates, and merges work as for a same-repository change. The change page
+shows the source as `owner/repo:branch`.
+
+The source repository must be public, share the target's owner, or grant the
+actor admin permission. This rule stops a reader of a private source from
+copying its code into a target with a wider audience. A source branch that
+moved is re-fetched with `POST .../changes/{k}/refresh` or
+`starforge trail change refresh --trail <n> --change <k>`. Merging also needs
+read access on the source repository.
 
 Gate rules double as branch protection. Each rule carries three push
 restrictions alongside its merge gates: `block_direct_push` (changes must go

@@ -529,6 +529,10 @@ fn page_routes() -> Router<AppState> {
             post(pages::changes::create_branch),
         )
         .route(
+            "/{owner}/{repo}/trails/{number}/changes/cross-repo",
+            post(pages::changes::create_cross_repo),
+        )
+        .route(
             "/{owner}/{repo}/trails/{number}/changes/{k}",
             get(pages::changes::detail),
         )

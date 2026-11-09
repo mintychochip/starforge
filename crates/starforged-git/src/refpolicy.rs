@@ -254,6 +254,11 @@ pub enum RefKind {
     /// pushes need write plus a write-scoped token like branches, but are
     /// never subject to branch protection.
     Namespace,
+    /// A session checkpoint ref (`refs/starforge/checkpoints/<ulid>/<n>`):
+    /// pushes need write plus a write-scoped token; the ref shape is
+    /// validated, and the server checks the session's visibility when the
+    /// metadata is uploaded.
+    Checkpoint,
 }
 
 /// Pure push policy (spec §8.2). Branches/tags need no identity at hook level
@@ -278,6 +283,9 @@ pub fn check_allowed(
     }
     if name.starts_with("refs/tags/") {
         return Ok(RefKind::Tag);
+    }
+    if name.starts_with("refs/starforge/checkpoints/") {
+        return Ok(RefKind::Checkpoint);
     }
     if namespaces.iter().any(|ns| name.starts_with(ns.as_str())) {
         return Ok(RefKind::Namespace);
@@ -331,6 +339,25 @@ pub fn check_branch_push(permission: Option<&str>, scope_write: bool) -> Result<
     }
     if !scope_write {
         return Err("branch and tag pushes need a token with repo:write scope".to_owned());
+    }
+    Ok(())
+}
+
+/// Checkpoint refs need a write-level permission and either a `repo:write`
+/// or a `session:upload` token scope: the CLI's device-flow token carries
+/// `session:upload` but not `repo:write`.
+pub fn check_checkpoint_push(
+    permission: Option<&str>,
+    scope_write: bool,
+    scope_session_upload: bool,
+) -> Result<(), String> {
+    if !matches!(permission, Some("write" | "maintain" | "admin")) {
+        return Err("checkpoint pushes need write permission".to_owned());
+    }
+    if !scope_write && !scope_session_upload {
+        return Err(
+            "checkpoint pushes need a token with repo:write or session:upload scope".to_owned(),
+        );
     }
     Ok(())
 }
@@ -527,9 +554,52 @@ pub fn check_tag_update(protection: &Protection, update: &RefUpdate) -> Result<(
     ))
 }
 
+/// Validates a checkpoint ref's shape: `refs/starforge/checkpoints/<ulid>/<n>`
+/// with an uppercase Crockford ULID and a positive decimal number. The hook
+/// calls this before accepting the ref; the server re-checks the session and
+/// object when the metadata is uploaded.
+pub fn check_checkpoint_ref(name: &str) -> Result<(), String> {
+    let rest = name
+        .strip_prefix("refs/starforge/checkpoints/")
+        .ok_or_else(|| format!("{name} is not a checkpoint ref"))?;
+    let (ulid, n) = rest
+        .split_once('/')
+        .ok_or_else(|| format!("checkpoint ref {name} must be <ulid>/<n>"))?;
+    if n.contains('/') || !is_ulid_shape(ulid) {
+        return Err(format!("checkpoint ref {name} must be <ulid>/<n>"));
+    }
+    let n: u64 = n
+        .parse()
+        .map_err(|_| format!("checkpoint ref {name} has a non-numeric number"))?;
+    if n == 0 {
+        return Err(format!("checkpoint ref {name} must have a positive number"));
+    }
+    Ok(())
+}
+
+/// True for 26 uppercase Crockford base32 characters (a ULID's textual
+/// shape; the server parses the real value).
+fn is_ulid_shape(value: &str) -> bool {
+    value.len() == 26
+        && value.as_bytes()[0].is_ascii_digit()
+        && value.as_bytes()[0] <= b'7'
+        && value.bytes().all(|b| {
+            matches!(
+                b,
+                b'0'..=b'9' | b'A'..=b'H' | b'J' | b'K' | b'M' | b'N' | b'P'..=b'T' | b'V'..=b'Z'
+            )
+        })
+}
+
 /// Namespaces the hook must never admit pushes into, even allow-listed:
 /// branch, tag, review, and trail storage.
-const RESERVED_NAMESPACES: [&str; 4] = ["refs/heads/", "refs/tags/", "refs/for/", "refs/trails/"];
+const RESERVED_NAMESPACES: [&str; 5] = [
+    "refs/heads/",
+    "refs/tags/",
+    "refs/for/",
+    "refs/trails/",
+    "refs/starforge/",
+];
 
 /// Validates the site-admin namespace allow-list at startup: every entry
 /// must start with `refs/` and end with `/`, and must neither equal nor

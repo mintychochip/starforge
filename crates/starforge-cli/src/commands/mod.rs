@@ -2,6 +2,7 @@
 
 pub mod auth;
 pub mod bundle;
+pub mod checkpoint;
 pub mod ci;
 pub mod doctor;
 pub mod hook;

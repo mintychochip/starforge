@@ -48,20 +48,22 @@ if [[ "${STARFORGE_TEST_PG:-0}" == "1" ]]; then
     # The SQLite run above covers the whole workspace. Postgres reruns the
     # packages whose tests exercise SQL behavior: the DB layer, and the
     # integration tests for backup/restore, pooling, search, audit
-    # retention, admin display, and the CI tables (the cache SQL runs
-    # through api_ci_runs and api_ci_usage).
+    # retention, admin display, the CI tables (the cache SQL runs through
+    # api_ci_runs and api_ci_usage), and the cross-repository/checkpoint SQL.
     if cargo nextest --version >/dev/null 2>&1; then
       cargo nextest run -p starforged-db
       cargo nextest run -p starforged \
         --test backup_restore --test db_pool --test search_index \
         --test admin_pages --test audit_retention --test api_ci_runs \
-        --test api_ci_usage
+        --test api_ci_usage --test cross_repo_changes --test api_checkpoints \
+        --test merge_changes --test checkpoint_e2e
     else
       cargo test -p starforged-db
       cargo test -p starforged \
         --test backup_restore --test db_pool --test search_index \
         --test admin_pages --test audit_retention --test api_ci_runs \
-        --test api_ci_usage
+        --test api_ci_usage --test cross_repo_changes --test api_checkpoints \
+        --test merge_changes --test checkpoint_e2e
     fi
   fi
 fi

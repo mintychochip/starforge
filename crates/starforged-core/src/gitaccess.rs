@@ -31,6 +31,9 @@ pub enum GitActor {
         user: User,
         scope_read: bool,
         scope_write: bool,
+        /// The token carries `session:upload` (checkpoint refs accept it
+        /// instead of `repo:write`).
+        scope_session_upload: bool,
     },
     /// A deploy key, bound to exactly one repository. It never uses the
     /// `refs/for` read tier: read-only keys may only fetch, and `refs/for`
@@ -89,6 +92,7 @@ impl Core {
                     user,
                     scope_read,
                     scope_write,
+                    scope_session_upload: _,
                 },
                 service,
             ) => {

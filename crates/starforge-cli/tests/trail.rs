@@ -1167,3 +1167,50 @@ fn review_verdict_group_accepts_one_flag_without_body() {
     .unwrap_err();
     assert_eq!(err.exit_code(), 2, "{err}");
 }
+
+#[tokio::test]
+async fn change_add_and_refresh_post_expected_bodies() {
+    let (base, app) = start(vec![
+        (
+            "POST",
+            "/api/v1/repos/o/r/trails/12/changes",
+            201,
+            json!({"k": 3, "current_revision": 1}),
+        ),
+        (
+            "POST",
+            "/api/v1/repos/o/r/trails/12/changes/3/refresh",
+            200,
+            json!({"k": 3, "current_revision": 2}),
+        ),
+    ])
+    .await;
+    let ctx = ctx_for(&base);
+    let args = starforge_cli::commands::trail::write::ChangeAddArgs {
+        trail: 12,
+        from: "alice/source",
+        branch: "feature/x",
+        base: "main",
+    };
+    let (out, code) =
+        starforge_cli::commands::trail::write::change_add(&ctx, &args, Format::Text).await;
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("opened change #3"), "{out}");
+    let (out, code) =
+        starforge_cli::commands::trail::write::change_refresh(&ctx, 12, 3, Format::Text).await;
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("revision 2"), "{out}");
+
+    let recorded = app.recorded.lock().unwrap();
+    assert_eq!(recorded[0].method, "POST");
+    assert_eq!(recorded[0].path, "/api/v1/repos/o/r/trails/12/changes");
+    let body: Value = serde_json::from_slice(&recorded[0].body).unwrap();
+    assert_eq!(body["kind"], "cross_repo");
+    assert_eq!(body["source_repo"], "alice/source");
+    assert_eq!(body["source_branch"], "feature/x");
+    assert_eq!(body["base_branch"], "main");
+    assert_eq!(
+        recorded[1].path,
+        "/api/v1/repos/o/r/trails/12/changes/3/refresh"
+    );
+}

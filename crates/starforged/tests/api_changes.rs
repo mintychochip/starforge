@@ -1499,7 +1499,7 @@ async fn change_json_carries_allowed_methods() {
     c.create_branch_change(n, &c.bob_rw).await;
     let client = reqwest::Client::new();
 
-    // No rule: all three merge methods are allowed.
+    // No rule: all four merge methods are allowed.
     let detail: Value = client
         .get(c.change(n, 1))
         .bearer_auth(&c.carol_rw)
@@ -1511,7 +1511,7 @@ async fn change_json_carries_allowed_methods() {
         .unwrap();
     assert_eq!(
         detail["change"]["allowed_methods"],
-        json!(["merge", "squash", "fast_forward"])
+        json!(["merge", "squash", "fast_forward", "rebase"])
     );
 
     // A rule restricting to squash narrows the list to exactly that.

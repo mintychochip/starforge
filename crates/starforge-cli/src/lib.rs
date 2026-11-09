@@ -5,6 +5,7 @@
 
 pub mod api;
 pub mod auth;
+pub mod checkpoints;
 pub mod cli;
 pub mod commands;
 pub mod config;

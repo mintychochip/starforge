@@ -304,6 +304,38 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     result
 }
 
+/// One checkpoint recorded for a session: a git commit whose tree is the
+/// working-tree snapshot, stored at
+/// `refs/starforge/checkpoints/<ulid>/<n>`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CheckpointEntry {
+    /// Per-session number, starting at 1.
+    pub n: u64,
+    pub commit: String,
+    pub tree: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default = "default_checkpoint_source")]
+    pub source: String,
+    pub created_at: i64,
+    /// True once the ref and metadata reached the server.
+    #[serde(default)]
+    pub uploaded: bool,
+}
+
+fn default_checkpoint_source() -> String {
+    "manual".to_owned()
+}
+
+/// Whole `checkpoints.json` file.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+struct CheckpointsFile {
+    #[serde(default)]
+    entries: Vec<CheckpointEntry>,
+}
+
 impl Spool {
     /// Open the spool rooted at the given git common dir.
     pub fn open(common_dir: &Path) -> Self {
@@ -340,6 +372,74 @@ impl Spool {
         }
         tighten_tree(&self.root);
         Ok(())
+    }
+
+    /// Checkpoints recorded for `ulid`, ascending. A missing file is empty.
+    pub fn read_checkpoints(&self, ulid: &str) -> Result<Vec<CheckpointEntry>, SpoolError> {
+        let path = self.session_dir(ulid)?.join("checkpoints.json");
+        match std::fs::read(&path) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(e.into()),
+            Ok(bytes) => {
+                let file: CheckpointsFile = serde_json::from_slice(&bytes)?;
+                Ok(file.entries)
+            }
+        }
+    }
+
+    /// Appends a checkpoint, assigning the next per-session number.
+    pub fn append_checkpoint(
+        &self,
+        ulid: &str,
+        mut entry: CheckpointEntry,
+    ) -> Result<CheckpointEntry, SpoolError> {
+        let dir = self.session_dir(ulid)?;
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("checkpoints.json");
+        let mut entries = self.read_checkpoints(ulid)?;
+        entry.n = entries.last().map(|e| e.n + 1).unwrap_or(1);
+        entries.push(entry.clone());
+        let file = CheckpointsFile { entries };
+        atomic_write(&path, &serde_json::to_vec_pretty(&file)?)?;
+        tighten_file(&path);
+        Ok(entry)
+    }
+
+    /// Inserts or replaces a checkpoint with its explicit number (used for
+    /// a checkpoint fetched from the server, whose number is fixed).
+    pub fn record_checkpoint(&self, ulid: &str, entry: CheckpointEntry) -> Result<(), SpoolError> {
+        let dir = self.session_dir(ulid)?;
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("checkpoints.json");
+        let mut entries = self.read_checkpoints(ulid)?;
+        entries.retain(|existing| existing.n != entry.n);
+        entries.push(entry);
+        entries.sort_by_key(|existing| existing.n);
+        atomic_write(
+            &path,
+            &serde_json::to_vec_pretty(&CheckpointsFile { entries })?,
+        )?;
+        tighten_file(&path);
+        Ok(())
+    }
+
+    /// Marks checkpoint `n` as uploaded.
+    pub fn mark_checkpoint_uploaded(&self, ulid: &str, n: u64) -> Result<(), SpoolError> {
+        let path = self.session_dir(ulid)?.join("checkpoints.json");
+        let mut entries = self.read_checkpoints(ulid)?;
+        if let Some(entry) = entries.iter_mut().find(|e| e.n == n) {
+            entry.uploaded = true;
+        }
+        atomic_write(
+            &path,
+            &serde_json::to_vec_pretty(&CheckpointsFile { entries })?,
+        )?;
+        Ok(())
+    }
+
+    /// The newest checkpoint, if any.
+    pub fn last_checkpoint(&self, ulid: &str) -> Result<Option<CheckpointEntry>, SpoolError> {
+        Ok(self.read_checkpoints(ulid)?.pop())
     }
 
     /// Load the effective redaction rules for `repo`: `built_in()` merged with

@@ -73,6 +73,166 @@ pub async fn merge_tree(repo: &Path, base: &str, head: &str) -> Result<MergeTree
     })
 }
 
+/// Dry-runs merging `head` into `base` with an explicit merge base (the
+/// rebase/cherry-pick probe): `git merge-tree --write-tree
+/// --merge-base=<merge_base> <base> <head>`. All three must be full object
+/// ids. Same output contract as [`merge_tree`].
+pub async fn merge_tree_with_base(
+    repo: &Path,
+    base: &str,
+    head: &str,
+    merge_base: &str,
+) -> Result<MergeTreeOutcome, GitError> {
+    if !refpolicy::is_oid(base) || !refpolicy::is_oid(head) || !refpolicy::is_oid(merge_base) {
+        return Err(GitError::Failed {
+            command: "merge-tree --write-tree".to_owned(),
+            stderr: "merge-tree needs full object ids".to_owned(),
+        });
+    }
+    let mut cmd = git();
+    cmd.arg("-C")
+        .arg(repo)
+        .arg("merge-tree")
+        .arg("--write-tree")
+        .arg("--name-only")
+        .arg(format!("--merge-base={merge_base}"))
+        .arg(base)
+        .arg(head);
+    let out = tokio::time::timeout(MERGE_TREE_TIMEOUT, cmd.output())
+        .await
+        .map_err(|_| GitError::Failed {
+            command: "merge-tree --write-tree".to_owned(),
+            stderr: "merge-tree timed out".to_owned(),
+        })??;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let (tree, mut paths) = parse_merge_tree(&stdout);
+    paths.truncate(MAX_CONFLICT_PATHS);
+    Ok(MergeTreeOutcome {
+        clean: out.status.success(),
+        tree,
+        paths,
+    })
+}
+
+/// Why a rebase could not produce a new head.
+#[derive(Debug)]
+pub enum RebaseError {
+    /// A git command failed (missing objects, timeout, bad input).
+    Git(GitError),
+    /// The range contains a merge commit; rebase requires a linear history.
+    NonLinear { commit: String, parents: usize },
+    /// The range is longer than the caller's cap.
+    TooMany { total: usize, max: usize },
+    /// Replaying `commit` onto the new parent conflicted.
+    Conflict { commit: String, paths: Vec<String> },
+}
+
+/// The result of a successful rebase: the new head commit and how many
+/// commits were replayed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RebaseOutcome {
+    pub head: String,
+    pub commits: usize,
+}
+
+/// Replays every commit in `merge_base..head` onto `base`, oldest first,
+/// preserving each commit's author (name, email, time) and message, with
+/// `committer` as the committer. Each replayed commit gets `trail_stamp`
+/// appended as a `Starforge-Trail` trailer when absent. Refuses merge
+/// commits and conflicts; the caller maps [`RebaseError`] to its own error
+/// type. No ref moves here.
+pub async fn rebase_onto(
+    repo: &Path,
+    base: &str,
+    head: &str,
+    merge_base: &str,
+    committer: crate::write::Identity<'_>,
+    trail_stamp: &str,
+    max_commits: usize,
+) -> Result<RebaseOutcome, RebaseError> {
+    if !refpolicy::is_oid(base) || !refpolicy::is_oid(head) || !refpolicy::is_oid(merge_base) {
+        return Err(RebaseError::Git(GitError::Failed {
+            command: "rebase".to_owned(),
+            stderr: "rebase needs full object ids".to_owned(),
+        }));
+    }
+    let repo_path = repo.to_path_buf();
+    let (from, to) = (merge_base.to_owned(), head.to_owned());
+    let (mut commits, total) = tokio::task::spawn_blocking(move || {
+        crate::read::range_log(&repo_path, &from, &to, max_commits)
+    })
+    .await
+    .map_err(|e| {
+        RebaseError::Git(GitError::Failed {
+            command: "rebase".to_owned(),
+            stderr: e.to_string(),
+        })
+    })?
+    .map_err(RebaseError::Git)?;
+    if total > max_commits {
+        return Err(RebaseError::TooMany {
+            total,
+            max: max_commits,
+        });
+    }
+    commits.reverse();
+    let mut new_parent = base.to_owned();
+    let mut replayed = 0_usize;
+    for commit in commits {
+        if commit.parents.len() != 1 {
+            return Err(RebaseError::NonLinear {
+                commit: commit.id,
+                parents: commit.parents.len(),
+            });
+        }
+        let original_parent = commit.parents[0].clone();
+        let probe = merge_tree_with_base(repo, &new_parent, &commit.id, &original_parent)
+            .await
+            .map_err(RebaseError::Git)?;
+        if !probe.clean {
+            return Err(RebaseError::Conflict {
+                commit: commit.id,
+                paths: probe.paths,
+            });
+        }
+        let tree = probe.tree.ok_or_else(|| {
+            RebaseError::Git(GitError::Failed {
+                command: "merge-tree --write-tree".to_owned(),
+                stderr: "merge-tree reported clean with no tree".to_owned(),
+            })
+        })?;
+        let message = append_trail_trailer(&commit.message, trail_stamp);
+        let author = crate::write::Identity {
+            name: &commit.author_name,
+            email: &commit.author_email,
+            time: commit.author_time,
+        };
+        let new_commit =
+            crate::write::commit_tree_as(repo, &tree, &[&new_parent], &message, author, committer)
+                .await
+                .map_err(RebaseError::Git)?;
+        new_parent = new_commit;
+        replayed += 1;
+    }
+    Ok(RebaseOutcome {
+        head: new_parent,
+        commits: replayed,
+    })
+}
+
+/// Appends `Starforge-Trail: <stamp>` to a commit message unless it already
+/// carries that trailer.
+fn append_trail_trailer(message: &str, stamp: &str) -> String {
+    if message.contains("Starforge-Trail:") {
+        return message.to_owned();
+    }
+    let mut out = message.trim_end().to_owned();
+    out.push_str("\n\nStarforge-Trail: ");
+    out.push_str(stamp);
+    out.push('\n');
+    out
+}
+
 /// True when `ancestor` is reachable from `head` (`merge-base --is-ancestor`:
 /// exit `0` is true, `1` is false). Both must be full object ids. Any other
 /// outcome — bad repo, missing object, an unexpected exit, or running past

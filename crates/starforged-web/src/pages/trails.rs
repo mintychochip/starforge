@@ -599,6 +599,8 @@ pub struct ChangeListItem {
     mergeability: String,
     gates_passed: bool,
     gate_summary: String,
+    /// `owner/repo:branch` for a cross-repository change.
+    source: Option<String>,
 }
 
 #[derive(Template, WebTemplate)]
@@ -1020,6 +1022,10 @@ pub(crate) async fn changes_view(
             mergeability: c.mergeability,
             gates_passed: gates.passed,
             gate_summary: summary,
+            source: c
+                .source
+                .as_ref()
+                .map(|s| format!("{}/{}:{}", s.owner, s.repo, s.branch)),
         });
     }
     Ok(TrailChangesPage {

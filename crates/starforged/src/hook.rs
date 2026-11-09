@@ -18,6 +18,10 @@ pub struct HookCtx {
     /// The token granted `repo:write` scope. Branch/tag pushes need it on top
     /// of a write-level permission; the RPC admits readers for `refs/for`.
     pub scope_write: bool,
+    pub scope_session_upload: bool,
+    /// Checkpoint refs are accepted only on non-public repositories; the
+    /// RPC layer sets this from the repository visibility.
+    pub checkpoints_allowed: bool,
     pub refs_for: String,
     /// The parsed `STARFORGE_PROTECTION` snapshot; `Err` (missing or
     /// malformed) fails closed for branch and tag pushes, while `refs/for`
@@ -91,6 +95,8 @@ impl HookCtx {
             permission: env("STARFORGE_PERMISSION"),
             is_member: env("STARFORGE_IS_MEMBER").is_some_and(|v| v == "1"),
             scope_write: env("STARFORGE_SCOPE_WRITE").is_some_and(|v| v == "1"),
+            scope_session_upload: env("STARFORGE_SCOPE_SESSION_UPLOAD").is_some_and(|v| v == "1"),
+            checkpoints_allowed: env("STARFORGE_CHECKPOINTS_ALLOWED").is_some_and(|v| v == "1"),
             refs_for: env("STARFORGE_REFS_FOR").unwrap_or_else(|| "anyone_with_read".to_owned()),
             protection,
             git_dir,
@@ -376,6 +382,38 @@ pub fn pre_receive_with(input: impl BufRead, mut err: impl Write, ctx: &HookCtx)
                     }
                 }
             }
+            Ok(refpolicy::RefKind::Checkpoint) => {
+                // Checkpoints need the write tier like branches, and the ref
+                // shape must be <ulid>/<n>. Public repositories refuse the
+                // refs entirely: a ref is fetchable by every reader, so an
+                // unpublished session's tree would leak.
+                if !ctx.checkpoints_allowed {
+                    let _ = writeln!(
+                        err,
+                        "starforge: pushing to {} is not allowed: checkpoints are not accepted on public repositories; keep them local",
+                        update.name
+                    );
+                    code = 1;
+                    continue;
+                }
+                if let Err(message) = refpolicy::check_checkpoint_push(
+                    ctx.permission.as_deref(),
+                    ctx.scope_write,
+                    ctx.scope_session_upload,
+                ) {
+                    let _ = writeln!(
+                        err,
+                        "starforge: pushing to {} is not allowed: {message}",
+                        update.name
+                    );
+                    code = 1;
+                    continue;
+                }
+                if let Err(message) = refpolicy::check_checkpoint_ref(&update.name) {
+                    let _ = writeln!(err, "starforge: {message}");
+                    code = 1;
+                }
+            }
             Ok(refpolicy::RefKind::Namespace) => {
                 // Allow-listed namespaces need the write tier like branches,
                 // but are never subject to branch protection. A missing or
@@ -478,6 +516,8 @@ mod tests {
             permission: Some("read".to_owned()),
             is_member: false,
             scope_write: true,
+            scope_session_upload: true,
+            checkpoints_allowed: true,
             refs_for: "anyone_with_read".to_owned(),
             protection: Ok(refpolicy::Protection {
                 branches: vec![],
