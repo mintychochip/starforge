@@ -13,7 +13,7 @@
 # for the server image in the repo root):
 #
 #   podman build --build-arg STARFORGE_TARGET=x86_64-unknown-linux-musl \
-#     -t starforge-sandbox:0.1.0-rc.1 -f packaging/sandbox/Containerfile .
+#     -t starforge-sandbox:0.1.0-rc.2 -f packaging/sandbox/Containerfile .
 #
 # For aarch64, pass --build-arg STARFORGE_TARGET=aarch64-unknown-linux-musl
 # (and a matching build host / --platform).
@@ -25,7 +25,7 @@
 #   podman run --rm -it \
 #     -v starforge-workspace:/workspace \
 #     -e STARFORGE_TOKEN="<per-job token>" \
-#     starforge-sandbox:0.1.0-rc.1
+#     starforge-sandbox:0.1.0-rc.2
 
 FROM docker.io/library/alpine:3
 

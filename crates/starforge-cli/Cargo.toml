@@ -30,7 +30,7 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
-starforge-ci-spec = { path = "../starforge-ci-spec", version = "0.1.0-rc.1" }
+starforge-ci-spec = { path = "../starforge-ci-spec", version = "0.1.0-rc.2" }
 clap.workspace = true
 reqwest = { workspace = true, features = ["rustls"] }
 serde.workspace = true
@@ -39,7 +39,7 @@ starforge-capture.workspace = true
 starforge-format.workspace = true
 starforge-redact.workspace = true
 starforge-runner.workspace = true
-starforge-sandbox-protocol = { path = "../starforge-sandbox-protocol", version = "0.1.0-rc.1" }
+starforge-sandbox-protocol = { path = "../starforge-sandbox-protocol", version = "0.1.0-rc.2" }
 thiserror.workspace = true
 time.workspace = true
 tokio.workspace = true

@@ -13,7 +13,7 @@ and an egress directory:
 starforge-sandboxd \
   --socket /run/starforge/sandboxd.sock \
   --token-file /run/starforge/sandboxd.token \
-  --image localhost/starforge-sandbox:0.1.0-rc.1 \
+  --image localhost/starforge-sandbox:0.1.0-rc.2 \
   --egress-dir /var/lib/starforge/egress
 ```
 
@@ -25,7 +25,7 @@ sandbox to run the egress forwarder.
 
 ```shell
 starforge sandbox run \
-  --image localhost/starforge-sandbox:0.1.0-rc.1 \
+  --image localhost/starforge-sandbox:0.1.0-rc.2 \
   --allow-host github.com \
   -- sh -c 'git clone https://github.com/owner/repo /workspace && cd /workspace && make test'
 ```
