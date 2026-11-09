@@ -512,6 +512,7 @@ A plain ES-module script enhances server-rendered HTML; without JavaScript the p
 | `sessions publish`, `sessions unpublish`, `sessions delete` | Visibility and deletion (permissions per §6.4) |
 | `sync` | Upload queued sessions now |
 | `export`, `import` | Session bundles (§7.9) |
+| `memory search <query>`, `memory context <query>` | Recall past sessions through the search index; `context` frames snippets as untrusted data |
 | `trail list`, `trail show`, `trail create`, `trail comment` | Trail basics |
 | `trail checkout <n>` | Fetch and check out a change |
 | `trail push [--trail <n>]` | Push `HEAD` to `refs/for/<base>/<topic>` |
@@ -536,6 +537,8 @@ A plain ES-module script enhances server-rendered HTML; without JavaScript the p
 - Permission enforcement: every query is restricted to repositories the user can read; session documents carry the repository's visibility class, the session's published flag, quarantine state, and uploader, and are filtered with the §6.4 read rule. Each hit is re-checked against the database before rendering.
 - Code search runs `git grep` on the default branch of one repository.
 - `starforged index rebuild` rebuilds the index from the database and blobs.
+- The CLI `memory search` and `memory context` expose the session index as
+  agent memory. `context` writes a Markdown file with untrusted-data frames.
 
 ### 10.6 Accessibility and translation
 

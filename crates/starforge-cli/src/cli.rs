@@ -98,6 +98,11 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: TrailCmd,
     },
+    /// Search past sessions as agent memory.
+    Memory {
+        #[command(subcommand)]
+        cmd: MemoryCmd,
+    },
     /// Agent hook entry points (invoked by Claude Code hooks).
     Hook {
         #[command(subcommand)]
@@ -578,6 +583,42 @@ pub enum TrailChangeCmd {
     },
 }
 
+/// `memory` subcommands.
+#[derive(Debug, Subcommand)]
+pub enum MemoryCmd {
+    /// Search past sessions and print matching snippets.
+    Search {
+        /// Search text.
+        query: String,
+        /// Only this repository (`owner/repo`).
+        #[arg(long)]
+        repo: Option<String>,
+        /// Only sessions from this agent.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Result count (1–100).
+        #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u32).range(1..=100))]
+        limit: u32,
+        /// Output format.
+        #[arg(long, value_enum, default_value_t = crate::commands::trail::TextJson::Text)]
+        format: crate::commands::trail::TextJson,
+    },
+    /// Write a Markdown memory context for an agent.
+    Context {
+        /// Search text.
+        query: String,
+        /// Only this repository (`owner/repo`).
+        #[arg(long)]
+        repo: Option<String>,
+        /// Result count (1–100).
+        #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u32).range(1..=100))]
+        limit: u32,
+        /// Write the context here (default: stdout).
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+}
+
 /// `checkpoint` subcommands.
 #[derive(Debug, Subcommand)]
 pub enum CheckpointCmd {
@@ -613,6 +654,7 @@ pub fn run(cli: Cli, paths: CliPaths) -> std::process::ExitCode {
     | Cmd::HookPrePush
     | Cmd::Hook { .. }
     | Cmd::Trail { .. }
+    | Cmd::Memory { .. }
     | Cmd::Sessions {
         cmd:
             SessionsCmd::Publish { .. } | SessionsCmd::Unpublish { .. } | SessionsCmd::Delete { .. },
@@ -670,6 +712,7 @@ fn run_sync_commands(cli: Cli, paths: CliPaths) -> std::process::ExitCode {
         Cmd::Export { .. } => unreachable!("export dispatches via run_async"),
         Cmd::Import { .. } => unreachable!("import dispatches via run_async"),
         Cmd::Trail { .. } => unreachable!("trail dispatches via run_async"),
+        Cmd::Memory { .. } => unreachable!("memory dispatches via run_async"),
         Cmd::Sandbox { .. } => unreachable!("sandbox dispatches via run_async"),
         Cmd::Runner { .. } => unreachable!("runner dispatches via run_async"),
         Cmd::Ci { .. } => unreachable!("ci dispatches via run_async"),
@@ -828,6 +871,7 @@ pub async fn run_async(cli: Cli, paths: CliPaths) -> std::process::ExitCode {
         Cmd::Export { dir, repo, session } => run_export(dir, repo, session, paths, dry_run).await,
         Cmd::Import { dir, repo } => run_import(dir, repo, paths, dry_run).await,
         Cmd::Trail { cmd } => run_trail(cmd, paths, dry_run).await,
+        Cmd::Memory { cmd } => run_memory(cmd, paths, dry_run).await,
         Cmd::HookPrepare { msg_file } => run_hook_prepare(paths, msg_file),
         Cmd::HookPostCommit => run_hook_post_commit(paths),
         Cmd::HookPrePush => run_hook_pre_push_async(paths).await,
@@ -1271,6 +1315,69 @@ fn run_resume(
         return std::process::ExitCode::SUCCESS;
     }
     let (out, code) = crate::commands::checkpoint::resume(&repo, session, checkpoint, force, agent);
+    if code == 0 {
+        println!("{out}");
+    } else {
+        eprintln!("{out}");
+    }
+    std::process::ExitCode::from(code)
+}
+
+/// `memory search|context`: resolve the server from the current repo and
+/// query the global session search.
+async fn run_memory(cmd: MemoryCmd, paths: CliPaths, dry_run: bool) -> std::process::ExitCode {
+    let Some(repo) = cwd_repo() else {
+        return std::process::ExitCode::from(1);
+    };
+    let ctx = match crate::commands::trail::TrailCtx::resolve(&repo, &paths).await {
+        Ok(ctx) => ctx,
+        Err(err) => {
+            eprintln!("error: {err}");
+            return std::process::ExitCode::from(1);
+        }
+    };
+    let (out, code) = match cmd {
+        MemoryCmd::Search {
+            query,
+            repo,
+            agent,
+            limit,
+            format,
+        } => {
+            if dry_run {
+                (format!("would search sessions for {query:?}"), 0)
+            } else {
+                crate::commands::memory::search(
+                    &ctx,
+                    &query,
+                    repo.as_deref(),
+                    agent.as_deref(),
+                    limit,
+                    format,
+                )
+                .await
+            }
+        }
+        MemoryCmd::Context {
+            query,
+            repo,
+            limit,
+            out,
+        } => {
+            if dry_run {
+                (format!("would write a memory context for {query:?}"), 0)
+            } else {
+                crate::commands::memory::context(
+                    &ctx,
+                    &query,
+                    repo.as_deref(),
+                    limit,
+                    out.as_deref(),
+                )
+                .await
+            }
+        }
+    };
     if code == 0 {
         println!("{out}");
     } else {

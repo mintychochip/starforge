@@ -169,6 +169,14 @@ positive number.
 first saves the current state in a local git stash. `resume` also writes
 `.starforge/resume.md` from the session metadata and the last 20 local events.
 
+### Memory search
+
+`starforge memory search` calls `GET /api/v1/search/sessions` and prints the
+matching sessions and snippets. `memory context` writes the same results as a
+Markdown file. The command frames each snippet with the untrusted-data
+nonce, so an agent treats it as data. The server search index is the memory
+store. This command adds no storage.
+
 ### Viewer, search, and bundle export
 
 Page handlers call `authorize_session_read_by_ulid` once. `read_session_page` returns one page of items in seq order. `page_for_seq` finds the page that holds one seq. `search_session` lowercases the query and matches message text, tool names, and file paths. It never searches tool inputs. It reads server-redacted items.

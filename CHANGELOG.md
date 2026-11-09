@@ -21,6 +21,9 @@
   The session page lists checkpoints. `starforge rewind` restores a
   checkpoint; `starforge resume` also writes `.starforge/resume.md` with the
   last turns.
+- `starforge memory search/context` recalls past sessions through the
+  existing search index. The context output frames snippets as untrusted
+  data.
 
 ### Hardening
 
@@ -35,7 +38,7 @@
 ### Release
 
 - `SECURITY.md`, `CONTRIBUTING.md`, and issue templates.
-- CI runs `cargo-audit` and the real sandbox e2e.
+- CI runs a non-blocking `cargo-audit` and the real sandbox e2e.
 - A server release workflow adds the static tarballs and SHA-256 sums to the
   cargo-dist release.
 

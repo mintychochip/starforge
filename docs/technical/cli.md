@@ -67,6 +67,7 @@ The command tree comes from `Cmd` in `cli.rs`:
 | `doctor` | Check environment, configuration, and connectivity |
 | `sync` | Upload the queued spool data to the server |
 | `sessions` | Manage local sessions and server-side session records |
+| `memory` | Search past sessions and write an agent memory context |
 | `checkpoint` | Create and list local session checkpoints |
 | `rewind` | Restore the working tree to a session checkpoint |
 | `resume` | Rewind and write a resume context file |
@@ -217,6 +218,13 @@ ULID prefixes resolve to one session. An exact match wins. A single prefix match
 
 `export --repo owner/repo [--session ULID...] <dir>` writes session bundles. Without `--session`, export covers all readable sessions. `import <dir>
 --repo owner/repo` copies bundles into a repository.
+
+## Memory search
+
+`memory search <query> [--repo owner/repo] [--agent <name>] [--limit]` queries
+the global session search and prints the matching sessions and snippets.
+`memory context <query> [--out <path>]` writes a Markdown context with the
+same matches. The command frames each snippet with the untrusted-data nonce.
 
 ## Trail commands
 

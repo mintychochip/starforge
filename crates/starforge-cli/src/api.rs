@@ -116,6 +116,38 @@ impl ApiClient {
         }
     }
 
+    /// `GET {server}/api/v1/search/sessions?q=...` across every repository
+    /// the token can read. `repo` and `agent` narrow the search.
+    pub async fn search_sessions(
+        &self,
+        query: &str,
+        repo: Option<&str>,
+        agent: Option<&str>,
+        per_page: u32,
+    ) -> Result<serde_json::Value, ApiError> {
+        let mut url = url::Url::parse(&format!("{}/api/v1/search/sessions", self.server))
+            .map_err(|err| ApiError::Transport(format!("invalid search url: {err}")))?;
+        {
+            let mut pairs = url.query_pairs_mut();
+            pairs.append_pair("q", query);
+            pairs.append_pair("per_page", &per_page.to_string());
+            if let Some(repo) = repo {
+                pairs.append_pair("repo", repo);
+            }
+            if let Some(agent) = agent {
+                pairs.append_pair("agent", agent);
+            }
+        }
+        let response = self
+            .client
+            .get(url)
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|err| ApiError::Transport(err.to_string()))?;
+        self.read(response).await
+    }
+
     /// `GET {api_base}{path}` as raw bytes (segment downloads); the body is
     /// never parsed as JSON. Non-2xx answers [`parse_error`] like [`get`].
     pub async fn get_bytes(

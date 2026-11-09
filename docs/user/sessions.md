@@ -144,6 +144,15 @@ On a public repository, checkpoint refs are not accepted; the checkpoints stay
 local. On a private or internal repository, repository readers can fetch the
 checkpoint ref.
 
+## Session memory
+
+`starforge memory search <query> [--repo owner/repo] [--agent <name>]`
+searches past sessions and prints matching snippets. `starforge memory
+context <query> [--out <path>]` writes a Markdown file with the same matches,
+framed as untrusted data, ready to give to an agent. The search covers message
+text, tool names, and file paths; it never searches tool inputs. Results
+follow the session read rules, so you see only sessions you can read.
+
 ## Where sessions are read from
 
 Capture is discovery-based (at commit, push, and `sync`): the CLI reads each

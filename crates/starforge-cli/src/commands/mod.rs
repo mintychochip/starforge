@@ -7,6 +7,7 @@ pub mod ci;
 pub mod doctor;
 pub mod hook;
 pub mod hooks;
+pub mod memory;
 pub mod runner;
 pub mod sandbox;
 pub mod session_admin;
